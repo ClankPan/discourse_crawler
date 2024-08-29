@@ -1,0 +1,221 @@
+levi | 2023-09-27 20:49:48 UTC | #1
+
+Hi everyone, 
+
+This post is about a new rust library for canisters: [canister-tools](https://crates.io/crates/canister-tools).
+
+The main features of this library make it easy to handle upgrades of global-data-variables in the main-heap-memory and at the same time simple to create serialized snapshots of the global-data, download the snapshots in chunks, and can upload a serialized snapshot in chunks and then load it onto the global variable(s) giving maximum controll over the global-heap-data.
+
+The library works with the memory-manager's [virtual-memories](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/memory_manager/struct.VirtualMemory.html) feature of the [ic-stable-structures](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/index.html) library so each global variable is registered with a unique [memory-id](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/memory_manager/struct.MemoryId.html) and is serialized it it's own corresponding memory-id during upgrades. This makes it so that a canister can use stable-structures like a [StableBTreeMap](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/btreemap/struct.BTreeMap.html) at the same time as holding global-variables in the main-heap.
+
+This library is compatible with global-variables in a `thread_local!` with a `RefCell` as is the custom when writing rust canisters. 
+
+Usage of the library is as follows:
+```rust
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Data {
+    ...
+}
+
+thread_local! {
+    static DATA: RefCell<Data> = RefCell::new(Data::default());
+}
+  
+const DATA_MEMORY_ID: MemoryId = MemoryId::new(0);
+  
+#[init]
+fn init() {
+    canister_tools::init(&DATA, DATA_MEMORY_ID);
+}  
+  
+#[pre_upgrade]
+fn pre_upgrade() {
+    canister_tools::pre_upgrade();
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+    canister_tools::post_upgrade(&DATA, DATA_MEMORY_ID, None::<fn(Data) -> Data>);
+}
+
+```
+   
+When updating the global-variable struct fields or type during an upgrade, use the optional old_as_new convert function to deserialize as the old struct, then convert to the new struct using the function, then load onto the global-variable. Or pass None if the type stays the same.
+
+Take a look at the [docs](https://docs.rs/canister-tools/0.1.4/canister_tools/) for the candid file of the controller methods that can be used to create snapshots, download snapshots, and even upload snapshots onto the global-variables in the heap.
+
+By default, types that implement serde's Serialize and Deserialize traits are compatible out-of-the-box and use the [bincode](https://docs.rs/bincode/1.3.3/bincode/index.html) serialization format. The library is compatible with a different or custom serialization format by implementing the [canister_tools::Serializable](https://docs.rs/canister-tools/0.1.4/canister_tools/trait.Serializable.html) trait on the types. 
+
+I'm glad to help people use this library, let me know if there are questions.
+
+:Levi.
+
+-------------------------
+
+ydr990318 | 2024-05-24 09:00:11 UTC | #2
+
+Hey,levi,I've been looking for a method to figure out my question till I saw your post.But I'm a rookie in Rust,I don't know hot to integrate your code into my project.Could you please tell me how to use your code in my project?Thanks a lot!
+
+-------------------------
+
+levi | 2024-05-24 19:54:01 UTC | #3
+
+Hi @ydr990318, sure thing. From your post, it looks like your question is about changing the type or adding or removing fields of the global data during a canister upgrade. 
+
+The first step to integrate the library is to add it to the Cargo.toml file of your project, in the dependencies section, `canister-tools = "0.2.2"`. Then, global variables in the main memory of a rust canister are stored in a thread_local with a refcell like this:
+```rust
+#[derive(Default, CandidType, Deserialize)]
+struct Data {
+    field_one: u64,
+    field_two: String,
+}
+
+thread_local! {
+    static DATA: RefCell<Data> = RefCell::new(Data::default());
+}
+```
+In your code, you can access this data using the `with_borrow` and `with_borrow_mut` methods specified here: https://doc.rust-lang.org/std/thread/struct.LocalKey.html#impl-LocalKey%3CRefCell%3CT%3E%3E like this:
+```rust
+#[update]
+fn sample_canister_method() {
+    DATA.with_borrow_mut(|data| {
+        data.field_one += 1;
+    });
+}
+
+```
+
+To save this data through upgrades, first choose a stable-memory memory-id for this data-type. There can be memory-ids from 0-255 and make sure to use a different memory-id for each global-variable you have. Here we have one global variable and we choose memory-id: 0.
+
+```rust
+use canister_tools::MemoryId;
+const DATA_MEMORY_ID: MemoryId = MemoryId::new(0);
+``` 
+Call the canister_tools::init, canister_tools::pre_upgrade, and canister_tools::post_upgrade functions in the canister init and upgrade hooks like this:
+```rust
+#[init]
+fn init() {
+    canister_tools::init(&DATA, DATA_MEMORY_ID);
+}  
+  
+#[pre_upgrade]
+fn pre_upgrade() {
+    canister_tools::pre_upgrade();
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+    canister_tools::post_upgrade(&DATA, DATA_MEMORY_ID, None::<fn(Data) -> Data>);
+}
+``` 
+Now the data will persist through upgrades.
+
+When it comes time to change the Data type, adding or removing some fields, you can use the built-in `opt_old_as_new_convert` parameter on the [canister_tools::post_upgrade](https://docs.rs/canister-tools/latest/canister_tools/fn.post_upgrade.html) function. First we keep the existing Data type definition in the canister for the upgrade and rename it to `OldData`. Then define the new Data type next to it like this:
+```rust
+#[derive(Default, CandidType, Deserialize)]
+struct OldData {
+    field_one: u64,
+    field_two: String,
+}
+
+#[derive(Default, CandidType, Deserialize)]
+struct Data {
+    field_one: u64,
+    field_two: String,
+    new_field: u64,
+}
+```
+Then in the post_upgrade function, pass a conversion function from the OldData to the new Data like this:
+```rust
+#[post_upgrade]
+fn post_upgrade() {
+    canister_tools::post_upgrade(
+        &DATA, 
+        DATA_MEMORY_ID, 
+        Some::<fn(OldData) -> Data>(
+            |old_data: OldData| {
+                Data{
+                    field_one: old_data.field_one,
+                    field_two: old_data.field_two,
+                    new_field: 564, // set the new_field value
+                }
+            }
+        )
+    );
+}
+```
+Then upgrade the canister, and after the upgrade, remove the OldData type definition from your code, and set the `opt_old_as_new_convert` parameter back to `None` in the canister_tools::post_upgrade function:
+```rust
+#[post_upgrade]
+fn post_upgrade() {
+    canister_tools::post_upgrade(&DATA, DATA_MEMORY_ID, None::<fn(Data) -> Data>);
+}
+```
+And there you go.
+
+-------------------------
+
+ydr990318 | 2024-05-27 08:04:32 UTC | #4
+
+Wow!Good to see your reply,but here is the new problem:my "ic-cdk" version is "0.12.0" because "pocket-ic" asks for that,but canister tools need "0.12.1",there is a conflict between them,and I haven't find a suitable "ic-cdk" version to resolve this problem,may you give me some suggestion?
+
+-------------------------
+
+levi | 2024-05-28 17:41:15 UTC | #5
+
+@ydr990318, I published canister-tools "0.2.3" lowering the ic-cdk version minimum to "0.12.0". So you can use `canister-tools = "0.2.3"` now in your project and I think it will work for you.
+
+-------------------------
+
+ydr990318 | 2024-05-30 08:20:53 UTC | #6
+
+Oh,thanks a lot!I changed the version of "canister-tools" and it seemed work!And then I deployed my backend normally,but I found that the old data was totally cleaned.It reminds me that there is a data recovery method in "canister-tools"?I don't know if it has.Would you please tell me how to resolve this problem?Thanks~bigwig!
+
+-------------------------
+
+ydr990318 | 2024-06-03 09:01:24 UTC | #7
+
+Hey~bigwig, I'm wondering if you have seen my reply hhh.I've tried methods that you listed, I downloaded snapshot and then loaded it and found that it didn't work.So I guessed that maybe I should confirm whether the snapshot truly be downloaded,so I ran "controller_download_state_snapshot" and get the blob,then I ran "
+controller_stable_memory_read" to find out that it wasn't the same blob,maybe here is the problem? I'm looking forward to your reply. Thanks,bigwig!
+
+-------------------------
+
+ydr990318 | 2024-06-03 09:14:24 UTC | #8
+
+Oh, and I guess that maybe the upgrade strategy didn't work at all?Because I added two sentences into the code but the outcome didn't show that
+![20240603-171319|621x500](upload://2tLHoT5Hn7CaxucTD12eovB9fAh.jpeg)
+![20240603-171344|690x206](upload://o1BcQkvR2WWLST224AHoou0cANZ.jpeg)
+
+-------------------------
+
+e274426380 | 2024-06-13 09:04:26 UTC | #9
+
+Hello, levi.
+I created a hello project and successfully used your canister-tool in the hello project.
+But I have a problem now, which is that I want to backup each user's data in order to restore it if I have to modify the data structure.
+And based on my current understanding of canister-tool, it seems that there is some difficulty in backing up each user's data using global variables?
+
+-------------------------
+
+levi | 2024-06-13 13:19:52 UTC | #10
+
+Hello @e274426380,
+
+[quote="e274426380, post:9, topic:23356"]
+But I have a problem now, which is that I want to backup each user’s data in order to restore it if I have to modify the data structure.
+[/quote]
+
+If you are modifying the data structure, there is no need to backup the data. You can follow the steps [here](https://forum.dfinity.org/t/rust-library-canister-tools-for-simple-upgrades-data-snapshots-download-and-upload-and-some-handy-tools/23356/3?u=levi) when changing the data structure and the library will take care of it.
+
+The library does handle backups of global variables using snapshots and serialization through controller methods but that is not needed for what you are writing about.
+
+-------------------------
+
+e274426380 | 2024-06-14 07:22:08 UTC | #11
+
+That's what I did with the backup operation as you described here, and it did work.
+But next I would like to use canister-tool to save each user's data, and I would like to inquire if this is theoretically possible?
+
+-------------------------
+

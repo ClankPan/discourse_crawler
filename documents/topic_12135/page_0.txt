@@ -1,0 +1,151 @@
+lastmjs | 2022-04-13 20:49:21 UTC | #1
+
+I have a canister that has a balance of ICP and is able to send that ICP to other addresses. Locally my code works just fine, and I've been able to send any valid amount. But the same canister deployed to production is always returning `TransferError.InsufficientFunds`, even though the balance of the canister is far greater than the amount being transferred plus the fee.
+
+The canister in production only has 1 ICP for testing, and I'm trying to send .01 ICP. I've checked that the `nat64` e8s amounts are all correct. Is there some limit on ICP transfers from canisters that I do not know about?
+
+-------------------------
+
+Maxfinity | 2022-04-13 20:57:29 UTC | #2
+
+[quote="lastmjs, post:1, topic:12135"]
+TransferError.InsufficientFunds
+[/quote]
+
+Not sure if this will help you but we occasionally got this error if sending a payment with a transaction fee from the minter account. I would check this is not the case.
+
+-------------------------
+
+lastmjs | 2022-04-13 21:28:39 UTC | #3
+
+What do you mean by from the minter account? Getting the tx fee from the minter account? I'm sending from the canister account I presume, and the problem remains even with a hard coded fee
+
+-------------------------
+
+Maxfinity | 2022-04-13 21:34:56 UTC | #4
+
+When you deploy a ledger canister to production, you can set the minting account. That is an account that should be able to send ICP without a transaction fee. I would just try setting the fee in e8s to 0 when transferring, and see if that fixes it.  If your deployment of the ledger looks anything like this, then you shouldn't send ICP with a transaction fee from the minting account.
+```
+dfx deploy --argument "record
+{
+    minting_account=\"$minter\"; 
+    initial_values=vec {
+        record{
+            \"$account\";
+            record{
+                e8s=1000000000;
+            }
+        }
+    }; 
+    max_message_size_bytes=null;
+    transaction_window=null;
+    archive_options=null;
+    send_whitelist=vec{};
+}"
+
+```
+
+-------------------------
+
+lastmjs | 2022-04-13 21:54:45 UTC | #6
+
+Oh yes, I am not deploying my own ledger, I am just doing ICP transactions
+
+-------------------------
+
+paulyoung | 2022-04-14 05:02:15 UTC | #7
+
+[quote="lastmjs, post:1, topic:12135"]
+InsufficientFunds
+[/quote]
+
+I think this error is supposed to include the balance of the debit account. Does it?
+
+-------------------------
+
+lastmjs | 2022-04-14 11:38:55 UTC | #8
+
+It doesn't, it is undefined in Azle. I will need to check if it's an issue with Azle or not
+
+-------------------------
+
+lastmjs | 2022-04-14 15:59:25 UTC | #9
+
+The balance is actually defined in the InsufficientFunds error (there was a bug in Azle). The balance returned is 0, even though the canister has a balance of 1 ICP. If I am initiating a call to transfer on the ICP ledger from a canister, the sender of the ICP will be the canister correct?
+
+-------------------------
+
+kpeacock | 2022-04-14 16:04:27 UTC | #10
+
+I'm assuming that you are using the default subaccount by refraining to pass a subaccount to `from_subaccount`, right?
+
+```
+// Arguments for the `transfer` call.
+type TransferArgs = record {
+    // Transaction memo.
+    // See comments for the `Memo` type.
+    memo: Memo;
+    // The amount that the caller wants to transfer to the destination address.
+    amount: Tokens;
+    // The amount that the caller pays for the transaction.
+    // Must be 10000 e8s.
+    fee: Tokens;
+    // The subaccount from which the caller wants to transfer funds.
+    // If null, the ledger uses the default (all zeros) subaccount to compute the source address.
+    // See comments for the `SubAccount` type.
+    from_subaccount: opt SubAccount;
+    // The destination account.
+    // If the transfer is successful, the balance of this address increases by `amount`.
+    to: AccountIdentifier;
+    // The point in time when the caller created this request.
+    // If null, the ledger uses current IC time as the timestamp.
+    created_at_time: opt TimeStamp;
+};
+```
+
+-------------------------
+
+lastmjs | 2022-04-14 16:06:59 UTC | #11
+
+[quote="lastmjs, post:9, topic:12135"]
+If I am initiating a call to transfer on the ICP ledger from a canister, the sender of the ICP will be the canister correct?
+[/quote]
+
+Correct, but I have also tried it with subaccount 0 explicitly.
+
+-------------------------
+
+lastmjs | 2022-04-14 16:09:41 UTC | #12
+
+I used the default subaccount (all zeros) to generate this address `d50b85b889e1eada7f6767bcb13c88114ce2a19a365f93791c801c66cc8d7cf3` from this principal `jiyou-fiaaa-aaaam-aad6q-cai`. I then sent 1 ICP to that address. When I ask for the balance of that address, I get the equivalent of 1 ICP. When I send a transfer, assuming from that address since the transfer originates from that canister and I have not passed in a subaccount (and I have tried explicitly passing in the correct number of 0s as well), I get the InsufficentFunds error which says there is a balance of 0.
+
+-------------------------
+
+lastmjs | 2022-04-14 16:11:03 UTC | #13
+
+Ah, I think my conversion to addresses is wrong somehow
+
+-------------------------
+
+paulyoung | 2022-04-14 16:11:48 UTC | #14
+
+Are you able to try this outside of Azle to see what happens? e.g. use `dfx` or make the call from a web page.
+
+-------------------------
+
+lastmjs | 2022-04-14 16:59:41 UTC | #15
+
+I think I've found the root of the problem, there doesn't seem to be anything wrong with the ICP ledger or Azle's calls to the ledger. What's wrong is my code that is translating principals into addresses.
+
+But the code itself isn't wrong, it does work for this principal: `rrkah-fqaaa-aaaaa-aaaaq-cai` which returns this address: `082ecf2e3f647ac600f43f38a68342fba5b8e68b085f02592b77f39808a8d2b5` but it does not work for this principal `jiyou-fiaaa-aaaam-aad6q-cai` which returns this address: `d50b85b889e1eada7f6767bcb13c88114ce2a19a365f93791c801c66cc8d7cf3`. It should return this address: `f2d15691cca0b6986e6506d17aea55c34ff5764f36b136a1f4c5b8d056469478` according to `dfx ledger account-id --of-principal jiyou-fiaaa-aaaam-aad6q-cai`.
+
+This is probably a bug in the Boa JS engine which I will need to track down, I've found similar bugs before.
+
+-------------------------
+
+lastmjs | 2022-04-14 21:26:45 UTC | #16
+
+Turns out it was my own code, my JavaScript translation from principals to addresses didn't work for the canister's principal in production but did work for the local principal. I referred to this code https://github.com/Toniq-Labs/entrepot-app/blob/5004eb5cb3c98805b665d3fa24d95483ce2a8cda/src/ic/utils.js and tried doing everything with arrays more than I was (I was converting to strings more than desirable and I assume somewhere in there things got messed up).
+
+-------------------------
+

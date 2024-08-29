@@ -1,0 +1,96 @@
+jaesharma | 2023-02-24 09:27:00 UTC | #1
+
+How to upload big files in asset canister using [@dfinity/assets](https://www.npmjs.com/package/@dfinity/assets) ?
+with `batch.store()` i was able to upload files upto 1MB but when uploading files of size 5MB i get error:
+```
+ Code: 400 (Bad Request)
+  Body: Expiry is 36 seconds in the past
+
+      at HttpAgent.readState (node_modules/@dfinity/agent/lib/cjs/agent/http/index.js:329:19)
+      at processTicksAndRejections (node:internal/process/task_queues:96:5)
+      at async pollForResponse (node_modules/@dfinity/agent/lib/cjs/polling/index.js:48:19)
+      at async caller (node_modules/@dfinity/agent/lib/cjs/actor.js:193:35)
+      at async /custom_asset_canister/node_modules/@dfinity/assets/lib/cjs/index.js:199:38
+      at async Promise.all (index 1)
+      at async /custom_asset_canister/node_modules/@dfinity/assets/lib/cjs/index.js:193:30
+      at async Promise.all (index 0)
+      at async AssetManagerBatch.commit (node_modules/@dfinity/assets/lib/cjs/index.js:249:29)
+      at async AssetManager.upload (file:///custom_asset_canister/test/helper.js:83:5)
+      at async Context.<anonymous> (file:///custom_asset_canister/test/unit.test.js:90:1
+```
+is it possible to chunk upload big files with @dfinity/assets library?
+
+-------------------------
+
+Severin | 2023-02-24 09:56:16 UTC | #2
+
+Looking at the [source](https://github.com/dfinity/agent-js/blob/main/packages/assets/src/index.ts#L299) I would expect it to do chunking automatically.
+
+Looking at the asset canister source I don't see an error message like `Expiry is 36 seconds in the past`, so I think this is an error served by the IC itself. Is there a chance that your system's time and the IC's time are drifting apart?
+
+-------------------------
+
+jaesharma | 2023-02-24 10:25:55 UTC | #3
+
+not sure, might be posssible. i'm running this in containerised docker environment.
+how could i confirm if this is caused by mis-match time?
+also if time is mismatch shouldn't small size files also through same error? rn small files are not having any issue.
+
+-------------------------
+
+Severin | 2023-02-24 13:57:41 UTC | #4
+
+@kpeacock do you have experience debugging this?
+
+-------------------------
+
+sea-snake | 2023-02-24 14:09:37 UTC | #5
+
+The chunked upload (larger files and batch) makes multiple calls to the asset canister in order:
+- create batch
+- create chunk (multiple calls in parallel)
+- commit batch
+
+While the non batch upload uses a single call to store files:
+- store
+
+If a file is larger than `maxSingleFileSize`, the library will use the batch implementation under the hood.
+
+All 4 canister methods mentioned above are calls and not queries and should have the same time mismatch issues in theory.
+
+But it seems I might have made a mistake in the non chunked small file upload error handling, errors from the IC might not throw an exception. I'll look into this. 
+
+If I'm correct that means that it seemed the upload of small files succeeded but in reality they did not and aren't uploaded when you verify it by fetching the files.
+
+Regarding time being out of sync in a dev environment, which is something that tends to happen, you can try the `syncTime` method on the agent to make the agent in sync with the replica.
+
+-------------------------
+
+jaesharma | 2023-02-28 07:29:42 UTC | #6
+
+@sea-snake Tried `syncTime` still getting same error on upload.
+here is relevant part of my code:
+```js
+    this.agent = new HttpAgent({ identity: this.identity, host: AGENT_HOST });
+
+    await this.agent.fetchRootKey();
+    await this.agent.syncTime();
+
+```
+with syncTime this error is thrown:
+```
+Caught exception while attempting to sync time: AgentError: Invalid certificate: Signature verification failed
+```
+& on big file uploads, error remains the same: 400 (Bad Request)
+Also, small files are getting uploaded successfully, no issue with that. after uploading of 1 MB file, i used `list` from `@dfinity/asset` & got uploaded files listed.
+
+**Update :**
+looks like `Invalid certificate` error is not caused by `syncTime` and i'm not facing it anymore. it seems to be related to this [thread](https://forum.dfinity.org/t/fail-to-verify-certificate-in-development-update-calls/4078/29).
+but even after `syncTime` the 400 error is still there:
+```
+ Code: 400 (Bad Request)
+ Body: Expiry is 35 seconds in the past
+```
+
+-------------------------
+

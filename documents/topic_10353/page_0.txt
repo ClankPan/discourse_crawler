@@ -1,0 +1,178 @@
+northman | 2022-01-18 19:15:09 UTC | #1
+
+When will it be possible to veriify the integrity of a smart contract on-chain?
+While the WASM hash can be checked off chain using DFX canister info, it presently cannot be checked on chain.
+
+How is it possible to trust a smart contract when the controller could update the code to perform something not desireable without onchain detection?
+
+Is it correct to say not having the ability to check the wasm hash on chain undermines composibility and security or is that an overstatement?
+
+-------------------------
+
+jorgenbuilder | 2022-01-18 19:37:50 UTC | #2
+
+I think that's accurate. Verifying that a canister is blackhole controlled is one option. https://covercode.ooo/ is a good start on another approach where source code can be verified and audited, and verification status of a canister can be queried.
+
+-------------------------
+
+skilesare | 2022-01-18 19:58:01 UTC | #3
+
+This would be a good place to see some activity relevant to this request:  https://forum.dfinity.org/t/rfc-standardising-how-smart-contracts-expose-state/8544
+
+-------------------------
+
+PaulLiu | 2022-01-18 20:14:01 UTC | #4
+
+Developers have the freedom to decide whether states like wasm hash or cycle balance should be exposed or not. 
+
+I create the black hole canister exactly for this purpose:
+
+ [Introduce the black hole to help with canister status lookup + make them immutable](https://forum.dfinity.org/t/introduce-the-black-hole-to-help-with-canister-status-lookup-make-them-immutable/5755)
+
+-------------------------
+
+PaulLiu | 2022-01-18 20:14:48 UTC | #5
+
+Also, once outgoing HTTP call is implemented, one can use it to call the `read_state` API endpoint of the iC itself to get this info.
+
+-------------------------
+
+northman | 2022-01-19 00:47:49 UTC | #6
+
+While blackholed and controllerless canisters are suitable for some applications, it does not address all.  There are usecases that support the need to detect a canister has changed its code base on chain without the developer having to relinquish control.  Canister consumers could review the code base if open-sourcce and then chose to execute or not the call to get service.  A simple method like canisterHash() would be useful in my opinion.  It would make configuration management of the services fabric much easier to orchestrate.  I am a big fan of being able to provide telemetry about the smart contract state.
+
+-------------------------
+
+PaulLiu | 2022-01-19 01:34:28 UTC | #7
+
+[quote="northman, post:6, topic:10353"]
+There are usecases that support the need to detect a canister has changed its code base on chain without the developer having to relinquish control
+[/quote]
+
+Oh no, it is a typical misunderstanding of how blackhole can be used (the blame is on me choosing this name), but one can always have multiple controllers on a canister, with blackhole being one of them would be good enough to programmatically detect canister hash changes.
+
+-------------------------
+
+northman | 2022-01-19 03:24:16 UTC | #8
+
+So maybe I can rephrase to ensure my understanding.
+  
+**Canister A** is a canister with some critical code whose hash we want to check on-chain.
+
+A second canister called **Canister B** is created and made a controller of **Canister A** in addition to the existing controller.  That way the existing controller can still do code upgrades as the canister is not immutable. 
+
+**Canister B** can expose a public function to show the hash of **Canister A**.
+**Canister B** can query the hash of **Canister A** because it is also a controller of **Canister A**.  
+
+Am I on the right track?
+
+The downside is that the public showhash() function could be implemented differently by each canister vs having it built in to the base canister management API.  There is also a cost of having to create and maintain the **"watcher"** canister.  The upside is this can be implemented now.
+
+Thanks for clarifying.  The title - Blackhole **and making them immutable** threw me off a little.
+
+-------------------------
+
+PaulLiu | 2022-01-19 03:30:01 UTC | #9
+
+Yes, you summarized it well. I'd add that the downside is "Canister B" may not be trustworthy to show the hash to a 3rd party. This is where using blackhole can help.
+
+-------------------------
+
+bjoern | 2022-01-19 05:52:19 UTC | #10
+
+[quote="northman, post:1, topic:10353"]
+While the WASM hash can be checked off chain using DFX canister info, it presently cannot be checked on chain.
+[/quote]
+
+Just wanted to mention that the ability to check for a controller "on chain" is on our backlog.
+
+-------------------------
+
+jzxchiang | 2022-01-19 07:52:53 UTC | #11
+
+> Developers have the freedom to decide whether states like wasm hash or cycle balance should be exposed or not.
+
+My understanding is that wasm hash is public state and should be queryable by anyone, controller or not. (Although in practice, getting the wasm hash is easier done via ingress calls, as only controllers can currently call the IC method canister_status to get the hash.)
+
+But more generally, when you say that developers have this freedom, are you referring to their choice to set the blackhole canister as one of their canister's controllers?
+
+-------------------------
+
+jzxchiang | 2022-01-19 07:54:19 UTC | #12
+
+Will checking for a canister's wasm hash on-chain (without the caller needing to be a controller) also be part of that?
+
+Both a canister's controllers and its wasm hash are "public state" that any user can query for via [ingress calls](https://smartcontracts.org/docs/interface-spec/index.html#state-tree). In fact, I think there's only those two.
+
+-------------------------
+
+jzxchiang | 2022-01-19 08:06:50 UTC | #13
+
+[quote="northman, post:6, topic:10353"]
+There are usecases that support the need to detect a canister has changed its code base on chain without the developer having to relinquish control.
+[/quote]
+
+This is actually quite deep and I suspect will become increasingly important in the months and years to come.
+
+IIUC the solution proposed here is to add the blackhole canister as a controller to the canister of interest, without removing the original developer as a controller. The blackhole canister is immutable (i.e. its only controller is itself) and it's open source with only 30 lines of code, so it can be trusted to return the correct wasm of the original canister. Does that sound accurate?
+
+-----
+
+What if the developer pushes a malicious update to the dapp canister that isn't reflected in their github? 
+
+Sure, if you query the blackhole canister for the wasm hash of the dapp canister, it will differ from the hash of a wasm built from the source on github. But who will check? What if a couple of users accidentally call the malicious dapp canister before remembering to check, and as a result loses some funds?
+
+I think there one day may need to be some open internet service that sits between clients and dapps, whose job is to verifiably build a dapp's wasm from source (ideally stored on-chain but could also fetch from github once canisters can make HTTP requests), take the hash, call the blackhole canister for the live dapp canister's wasm hash, and compare the two. If they're the same, then proxy the call to the dapp; otherwise, return an error to the user. Of course, this service itself needs to be an immutable canister. I guess this is what [Cover](https://covercode.ooo/) is doing?
+
+-------------------------
+
+oggy | 2022-01-19 08:38:15 UTC | #14
+
+[quote="northman, post:6, topic:10353"]
+There are usecases that support the need to detect a canister has changed its code base on chain without the developer having to relinquish control. Canister consumers could review the code base if open-sourcce and then chose to execute or not the call to get service.
+[/quote]
+
+This is susceptible to time-of-check-time-of-use bugs; the canister code could in principle change under your feet between the time that you check the hash, and the time where your call is performed  (obviously, the attacker would have to time this right). One way of addressing this would be to allow callers to pin a call to a canister hash, but IC doesn't currently support this, and I don't think it's on the roadmap - if there's wider interest from the community, this can obviously change.
+
+We also have some documentation on how to verify canister integrity here:
+https://smartcontracts.org/docs/developers-guide/tutorials/reproducible-builds.html
+
+-------------------------
+
+akhilesh.singhania | 2022-01-19 09:29:24 UTC | #15
+
+@bogdanwarinschi , @bjoern , and I have been discussing the RFC and we are going to start working on the spec changes.
+
+-------------------------
+
+JensGroth | 2022-01-19 10:02:03 UTC | #16
+
+A query call can also be issued as an update call, so it is possible to read a wasm hash on-chain with the read_state call you linked to.
+
+-------------------------
+
+PaulLiu | 2022-01-19 16:03:19 UTC | #17
+
+[quote="jzxchiang, post:11, topic:10353"]
+But more generally, when you say that developers have this freedom, are you referring to their choice to set the blackhole canister as one of their canister’s controllers?
+[/quote]
+Yes.
+
+[quote="jzxchiang, post:13, topic:10353"]
+I think there one day may need to be some open internet service that sits between clients and dapps
+[/quote]
+
+I believe that is one of the things SNS is meant to do. [Open Governance canister for SNS | Design proposal](https://forum.dfinity.org/t/open-governance-canister-for-sns-design-proposal/10224)
+
+Correction: I meant not exactly the same "check hash before calling canister", but more generally to ensure code update goes through security reviews, etc.
+
+-------------------------
+
+northman | 2022-01-19 20:12:19 UTC | #18
+
+I thought a video on the issue might be useful.
+
+https://youtu.be/HeVzYhRVlWw
+
+-------------------------
+

@@ -1,0 +1,206 @@
+bitbruce | 2021-11-16 11:00:06 UTC | #1
+
+1. Add a constructor for actor class, which can call internal private function.
+2. If the entry function is a shared function, the private function it calls allows to call an await external function.
+
+-------------------------
+
+rossberg | 2021-11-16 11:53:09 UTC | #2
+
+1. If I understand the question correctly, that is already possible, you just have to order the declarations appropriately (this is to prevent access to uninitialised fields). For example:
+  ```motoko
+  actor class A(x : Int) {
+    func f(x : Int) : Int { x + 1 };
+    let y = f(x);
+  };
+  ```
+2. That is possible as well, as long as the private function is still async:
+```motoko
+actor A {
+  public func m() : async Nat { 42 }
+};
+
+actor B {
+  func g() : async Nat {
+      await A.m();
+  };
+  public func m() : async Nat {
+    await g();
+  };
+};
+```
+
+-------------------------
+
+bitbruce | 2021-11-16 13:44:38 UTC | #3
+
+
+```
+actor class A(x : Int)  = this {
+  func f(x : Int) : Principal { 
+    Principal.fromActor(this);
+ };
+  let y = f(x);
+};
+```
+
+It does not work.
+
+--------------
+
+
+```
+actor B {
+  func g() : Nat {    //without  async
+      let future = A.m();      //without await calling
+  };
+  public func m() : async Nat {
+    g();
+  };
+};
+```
+
+g() Can't remove “async”, this will lose the atomicity.
+
+-------------------------
+
+rossberg | 2021-11-17 08:47:35 UTC | #4
+
+Right, you cannot access `this` before the actor has finished intialising. There are at least two reasons for that. One is that, without complicated restrictions or runtime checks, it would allow observing uninitialised state in the actor. The other is that there isn't even a way to compile this on the IC, at least not in general. The actor isn't available yet at that point.
+
+The second is a bit more tricky to explain. We would actually love to allow things along these lines. However, there is a serious restriction that is imposed by the messaging model of the IC: we cannot allow a future produced in one call in to be waited for in another call. The IC does not support that, as it would violate its call tree structure. So we have to restrict the use of first-class futures. Simpler examples like yours would actually be possible, as long as we make sure somehow that a future does not escape its call tree. But the devil is in the details. We are aware of this shortcoming, and hope that we can support certain future-related abstractions at some point.
+
+-------------------------
+
+bitbruce | 2021-11-17 13:16:21 UTC | #5
+
+Thank you very much for your answers.
+
+-------------------------
+
+nomeata | 2021-11-17 17:37:26 UTC | #6
+
+[quote="rossberg, post:4, topic:8617"]
+One is that, without complicated restrictions or runtime checks, it would allow observing uninitialised state in the actor. The other is that there isn’t even a way to compile this on the IC, at least not in general. The actor isn’t available yet at that point.
+[/quote]
+
+Is that actually true? Everything you do with `self` is asynchronous, so won't be acted on until after the canister initialization is done.
+
+I believe the problems we have faced were only in the case of mutually recursive actors (indeed a hard nut). The self reference _should_ be fine in all cases, and it may only require a small change in the definedness checker to allow that (unless our ~~intermediate frontend language~~ desugaring gets in the way).
+
+-------------------------
+
+claudio | 2021-11-18 18:41:16 UTC | #7
+
+ You can't send any message during initialization anyway, so it would be safe. 
+
+I think all we really need is some dedicated syntax for Principal.fromActor so we can treat it specially when checking definedness (or some other way of special casing this function and similar safe ones).
+
+-------------------------
+
+claudio | 2021-11-18 18:47:30 UTC | #8
+
+Isn't the second ask just another example of wanting to abstract messaging without the overhead, and loss of atomicity, of doing an unnecessary async/await call? 
+
+We had a solution for that... but it wasn't to our satisfaction because it gave up the guarantee that every await forces a commit. We're still waiting for a better solution.
+
+-------------------------
+
+rossberg | 2021-11-19 06:38:28 UTC | #9
+
+@claudio, no special syntax would be necessary, we could simply make Principal a supertype of all actors, as we have discussed a couple of times (there might even be an issue for that).
+
+However, I don't think that solves the problem. The restriction is due to the definedness check, which is the same for objects and actors. The self variable is only deemed defined once the whole object/actor is. Presumably, we could make some extra hack here to treat it more liberally in an actor, but that doesn't seem desirable, especially since the problem itself is not specific to actors.
+
+I'm not sure the second example has much to do with the await shortcut. Note that `g` isn't async, and the example doesn't even contain an await.
+
+-------------------------
+
+claudio | 2021-11-19 17:19:11 UTC | #10
+
+I would be reluctant to change subtyping because that ties down our internal representation of actors - someday, we might decide we want something fatter than the current. Adding special syntax, or perhaps just a special member `actor.toPrincipal()` would be preferable in my opinion. On the IC the principal is actually defined before the actor is initialized, so this would reflect that reality a little better.
+
+
+
+The way the old proposal would have written the example (after removing the type error) is like so:
+
+```
+actor B {
+  func g() : async Nat {    //with  async
+      let future = A.m();
+      //without await calling
+      0;
+  };
+  public func m() : async Nat {
+    await g(); // won't actually suspend or commit because g() does not (but will send)
+  };
+};
+```
+
+
+But none of the awaits would actually suspend (or commit). 
+But I don't fully grokk the intention of the original code? I assumed it was to abstract out a send, without introducing additional suspends that break atomicity.
+
+-------------------------
+
+claudio | 2021-11-19 10:14:49 UTC | #11
+
+
+If we wanted g() to return the future, we would need to relax the restriction that async can only contain shared data and move it to the co-domain of shared, async functions (only), which Joachim and I also favoured.
+
+```
+actor B {
+  func g() : async (async Nat) {    // with  async of non-shared type
+     A.m();
+  };
+  public func m() : async Nat {
+    let f = await g(); // this await won't suspend (nor commit) because g() does not suspend (nor commit)
+    await f;
+  };
+};
+```
+
+-------------------------
+
+nomeata | 2021-11-19 10:35:24 UTC | #12
+
+[quote="claudio, post:7, topic:8617"]
+You can’t send any message during initialization anyway, so it would be safe.
+[/quote]
+
+Even if you could (and I think you should be able to and hope the system allows it eventually), it'd be safe, wouldn't it?
+
+-------------------------
+
+claudio | 2021-11-19 14:14:25 UTC | #13
+
+Wouldn't something like this be problematic if allowed? 
+```
+actor this {
+   let y = await this.f();
+   let x = 666;
+   public shared func f() : async Nat { return x; };
+}
+```   
+Seems similar to the hole caused by virtual method calls on self from constructors in (some) OO languages.
+
+-------------------------
+
+nomeata | 2021-11-20 13:14:02 UTC | #14
+
+Oh, right. I was thinkig of the system level, not the motoko level, pre-CPS. But note that the problem isn't (really) the `this`, it's the `await`, because it delays initialization. So what would be safe is to allow `this` to be used right away, and also allow inter-canister calls, but only one-shot (no `await`). But that is then less useful. Darn.
+
+BTW, what happens today if you try to do an inter-canister call (without `await`ing it) in the top level of an actor? The IC system doesn't allow that; does our type prevent that? Or are we only preventing `await`s?
+
+Ok, I checked. We track send capability and await capability separately. So we could allow send from init, without allowing `await`, and it would be sound to allow `this` being used already in init (should the system allow that). Whether that is useful (send without await) is a different question.
+
+-------------------------
+
+claudio | 2021-11-20 13:59:53 UTC | #15
+
+Glad there's no bug.
+
+It might be useful to, e.g. send notifications of an upgrade or queue some initial messages, though I'm not sure you could guarantee those are executed first.
+
+-------------------------
+

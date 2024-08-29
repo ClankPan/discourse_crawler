@@ -1,0 +1,130 @@
+tomijaga | 2024-02-27 02:47:04 UTC | #1
+
+
+I'm excited to introduce the [augmented-btrees](https://mops.one/augmented-btrees) library, which contains different variants of the B-Tree data structure. 
+
+https://github.com/NatLabs/augmented-btrees
+
+The library consists of two variants:
+- **B+Tree** - A [B-Tree](https://forum.dfinity.org/t/heap-based-btreemap-library-for-motoko/18668) that stores all entries in its leaf nodes and allows you to iterate through them like a linked list.
+- **Max Value B+Tree** - A B+Tree that keeps entries in sorted order and guarantees accessing the max value in `O(log n)` time. *(still under construction, will be used to improve the performance in the [MemoryRegion](https://github.com/NatLabs/memory-region#readme) module)*
+> Helpful explanation of B-Trees -> https://shachaf.net/w/b-trees
+
+The structure of the B+Tree allows for faster and more efficient range queries - functions like `entries()` and `scan()` don't need to go up and down the tree multiple times, instead they just iterate through the leaf nodes. This implementation also adds some more functionality to the existing [stableheapbtree](https://forum.dfinity.org/t/heap-based-btreemap-library-for-motoko/18668) that allows you to access keys and values by their index like you would in a sorted array.
+
+- `getIndex(bptree, cmp, key)` - Returns the sorted index of a key in the tree
+- `getFromIndex(bptree, i)` - Returns the entry at the given index
+- `range(bptree, cmp, start, end)` - Returns an iterator over elements bounded by the given start and end index.
+
+Combining these functions allows us to create more complex queries. For example, if we needed to make a query to retrieve the first 3 elements after a given key. We can get the index of the given key and make a call to `range()` for the next 3 elements.
+
+```rust
+	import { BpTree; Cmp } "mo:augmented-btrees";
+	
+	let bptree = BpTree.fromArray(?32, [('A', 0), ('B', 1), ('C', 2), ('D', 3), ('E', 4)], Char.compare);
+	
+    let rank = BpTree.getIndex(bptree, Cmp.Char, 'B');
+    assert rank == 1;
+    
+    let range = BpTree.range(bptree, rank + 1, rank + 3);
+    assert Iter.toArray(range) == [('C', 2), ('D', 3), ('E', 4)];
+```
+
+#### Reversible Iterators (`RevIter`)
+These iterators allow us to retrieve data from the B+Tree in ascending or descending order. The iterators are in ascending order by default and can be updated in the other direction simply by calling the `.rev()` method.  For example:
+```rust
+let iter = BpTree.scan(bptree, Cmp.Char, ?'A', ?'C'); 
+
+assert Iter.toArray(iter.rev()) == [('C', 2), ('B', 1), ('A', 0)];
+```
+> More information on how to add reversible iterators to your library can be found in the [itertools docs](https://mops.one/itertools/docs/RevIter)
+
+A reversible iterator can be created from a B+ Tree using any of these functions:  `entries()`, `keys()`, `vals()`, `scan()`, `range()`
+
+#### Int8 Comparator
+
+The B Trees in this module use a different compare function to the one implemented in Motoko's base module. They return an `Int8` type which requires less heap allocations and overhead than the `Order` type. This overhead can mostly be neglected if the comparator is not used frequently. However, some functions in the B+Tree rely heavily on it, causing a significant reduction in performance. 
+I've provided a convenient module with Int8 compare functions for all the primitive Motoko types: `Cmp.Nat8`, `Cmp.Blob`, `Cmp.Text`, `Cmp.Principal` ...
+
+```rust
+import { Cmp } "mo:augmented-btrees";
+```
+
+This specific change resulted in a **90% reduction** in the heap allocation of the `getIndex()` function.
+
+| getIndex() | Instructions | Heap |
+| :--- | ---: | ---- |
+| Base compare | 207_875_247 | 5_195_228 |
+| Int8 compare | 167_272_699 | 586_764 |
+
+### Performance Benchmarks
+
+#### Comparing RBTree, BTree and B+Tree
+
+Benchmarking the performance with 10k entries
+ 
+|**Instructions** | insert() | replace() | get() | entries() | scan() | remove()|
+|--- | --- | --- | --- | --- | --- | ---|
+|RBTree | 105_236_358 | 103_166_554 | 44_269_891 | 17_795_354 | ----- | 141_566_101|
+|BTree | 114_964_951 | 83_757_726 | 78_246_105 | 10_944_900 | 24_351_645 | 130_728_937|
+|B+Tree | 116_288_125 | 91_553_971 | 81_264_499 | 4_854_853 | 6_634_687 | 128_646_576|
+
+|**Heap** | insert() | replace() | get() | entries() | scan() | remove()|
+|--- | --- | --- | --- | --- | --- | ---|
+|RBTree | 9_051_876 | 8_268_740 | 13_008 | 1_889_084 | ----- | 17_129_008|
+|BTree | 1_234_048 | 1_157_052 | 484_648 | 602_324 | 1_014_620 | 1_968_892|
+|B+Tree | 735_132 | 613_852 | 213_848 | 9_132 | 31_472 | 213_524|
+
+ Other B+Tree Functions
+ 
+| B+Tree | Instructions |  Heap |
+| :--- | ---: | ---- |
+| getFromIndex() | 73_058_045 | 345_424 |
+| getIndex() | 167_272_699 | 586_764 |
+| getFloor() | 79_670_902 | 230_268 |
+| getCeiling() | 79_671_555 | 230_268 |
+| removeMin() | 154_039_771 | 529_504 |
+| removeMax() | 119_099_923 | 525_640 |
+
+> Link to the [benchmark code](https://github.com/NatLabs/augmented-btrees/tree/ab52e992c1b5db4134b5c24042ede95d12938872/bench)
+> The benchmarks generated using  [`mops bench`](https://docs.mops.one/cli/mops-bench) 
+
+A couple things I used to improve the memory efficiency of the library that seem obvious now but were not during the implementation:
+- Previously, each B+Tree node was a record with fields containing information about the entries or child references in that node. I improved memory efficiency significantly by rearranging fields with the same datatype into mutable arrays and storing them in a tuple instead of a record.
+```swift
+	// record
+    public type Branch<K, V> = {
+        id : Nat;
+        var parent : ?Branch<K, V>;
+        var index : Nat;
+        var keys : [var ?K];
+        var children : [var ?Node<K, V>];
+        var count : Nat;
+        var subtree_size : Nat; 
+    };
+
+	// tuple
+	public type Branch<K, V> = (
+		nats: [var Nat], // [id, index, count, subtree_size]
+		parent: [var ?Branch<K, V>], // parent
+		keys: [var ?K], // [...keys]
+		children: [var ?Node<K, V>], // [...children]
+	);
+```
+- Avoided unnecessary internal heap allocations (creating or returning tuples, records or variants) within functions. 
+- Switching from for loops to while loops helped by avoiding the memory overhead needed to create an iterator.
+  
+Thanks for taking the time to read this post! I'm excited to see how you use this library. If you encounter issues, bugs, or have suggestions, please open a GitHub issue or post them in this thread.
+
+-------------------------
+
+claudio | 2024-02-27 12:26:24 UTC | #2
+
+Nice!
+
+It's a shame you had to re-define your types to avoid the allocations. 
+
+Perhaps we should put some effort into avoiding the extra indirection around var fields, if possible. Unfortunately, I think other aspects of Motoko currently rely on the indirection being there.
+
+-------------------------
+

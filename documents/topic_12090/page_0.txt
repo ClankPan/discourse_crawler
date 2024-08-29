@@ -1,0 +1,460 @@
+RMCS | 2022-04-12 14:34:02 UTC | #1
+
+:wave: 
+
+Can somebody explain why the heartbeat consumes so much cycles, even when the function body is empty it burns through `3_000_000` on every beat.
+
+Just a explainer what i am trying to do / how i set it up;
+
+I am trying to set up self-sustaining canisters-system where each canister can request cycles from a management canister if their current cycles are below a certain threshold. 
+
+I first implemented a heartbeat in every canister, but after seeing what they burned i moved all the logic over to the management canister.
+
+In the management canister i loop over all the canisters and do a inter-canister call to see if they need to be topped-up, these inter-canister calls consume about `1_000_000_000` cycles each and are checked every 24 hours.
+
+```
+#[heartbeat]
+async fn check_canister_cycles()
+  let day = 1 * 24 * 60 * 60 * 1_000_000_000;
+  if time() > last_triggered_time + day { 
+    // do calls
+  }
+}
+```
+
+So i'm kind of trying to find the sweet-spot, when managing the heartbeat in the management canister the inter-canister calls consume a lot of cycles, which would increase by every canister that is added dynamically. But when doing it in the canisters themselves it consumes `3_000_000` every beat but doesnt require a inter-canister call until it reaches the threshold.
+
+Is there maybe a other(better) way to handle this? Maybe something that gets triggered once a call fails because it doesnt have enough cycles to handle the request?
+
+-------------------------
+
+jzxchiang | 2022-04-12 20:24:18 UTC | #2
+
+I wonder if the heartbeat *needs* to consume so many cycles, or whether it is a side effect of the particular implementation. I've heard this [complaint](https://forum.dfinity.org/t/why-does-a-canister-keep-consuming-cycles/10821/7?u=jzxchiang) of high cycle consumption quite a number of times.
+
+@PaulLiu, do you happen to know? (Sorry for the ping, but I believe you may have implemented the heartbeat in Motoko. Can you tag the person who implemented the heartbeat in the replica?)
+
+-------------------------
+
+AnonymousCoder | 2022-04-12 21:05:12 UTC | #3
+
+I wonder if just having some kind of "manual trigger" mechanism in place instead of heartbeat for the apps that don't need checks so often would be a viable way of going around of using heartbeat for "cron like" things that need to be occasionally done inside of the canister?
+ie: have a method that does not trigger on a heartbeat, but instead it's a regular method that only allows certain caller to trigger it (an admin for example) and it then does the same thing a heartbeat will. It can then be perhaps done manually by whoever needs to do it and however often it needs to be called, or some kind of a web2 app could be created just for the sakes of calling the canister method that acts as a hearbeat every so often?
+
+-------------------------
+
+jzxchiang | 2022-04-12 21:13:09 UTC | #4
+
+Yeah I'm thinking of going that route if necessary. I would prefer to have everything done on the Internet Computer though...
+
+-------------------------
+
+RMCS | 2022-04-12 21:47:50 UTC | #5
+
+Yeah creating a webworker on digital ocean for example also crossed my mind, but as @jzxchiang mentioned, i would rather do it al in a decentralized matter on the IC.
+
+It would be nice if we could only trigger the heartbeat call every x amount of beats for example. That would drastically reduce the cycles spent. And for a functionality like checking and updating the cycles it isnt really bound to precise timing. 
+
+so something like
+`#[heartbeat(trigger_at = 60)]`
+
+-------------------------
+
+AnonymousCoder | 2022-04-12 22:16:36 UTC | #6
+
+Tbh I see no issue with "not going the IC way" for this specific thing as it does not, in any way, defeat the purpose of the blockchain in the first place. The things that should be decentralized should be added into the blockchain, but things like these, imo are not that important as they are not the source of truth or data itself that needs to live and be 100% legit and validated by nodes.
+
+-------------------------
+
+AnonymousCoder | 2022-04-12 22:19:49 UTC | #7
+
+There is a way to trigger something only on a specific amount of beats in a way... You can find the example that does that exact thing in the documentation. I will paste the code here for reference.
+
+
+```
+import Debug "mo:base/Debug";
+
+actor Alarm {
+
+  let n = 5;
+  var count = 0;
+
+  public shared func ring() : async () {
+    Debug.print("Ring!");
+  };
+
+  system func heartbeat() : async () {
+    if (count % n == 0) {
+      await ring();
+    };
+    count += 1;
+  }
+}
+```
+
+This code would run on every 5 heartbeats. So on 5th, 10th, 15th etc
+
+-------------------------
+
+RMCS | 2022-04-12 23:04:26 UTC | #8
+
+yeah your example is exactly the same as in the message that started this thread, only i used `time` instead of a counter to prevent updating the state. But this still triggers the heartbeat and burns cycles.
+
+So to take your example
+```
+system func heartbeat() : async () {}
+```
+This empty function still burns cycles every time the heartbeat is triggered
+
+So the counter should be on higher level then the heartbeat itself.
+
+-------------------------
+
+AnonymousCoder | 2022-04-12 23:06:30 UTC | #9
+
+Oh I see :) Makes no sense to burn it every time if it's not used at all :) Yeah... I guess the only way around this rn would be to do what I mentioned earlier perhaps and go around heartbeat completely.
+
+-------------------------
+
+PaulLiu | 2022-04-13 03:31:17 UTC | #10
+
+Just waking up your canister every second is work, actually a lot of work. It is not heartbeat that is charging more, but try sending your canister 1 message every block, not cheap either!
+
+For more flexible scheduling, you could use something like [IC Cron](https://forum.dfinity.org/t/ic-cron-lets-schedule-some-tasks-bois/6506). I'm not sure if @senior.joinu (author of IC Cron) is offering a deployed IC Cron canister as a public service for everyone. But as a community, if enough people find it useful, you can collectively fund such a public service (e.g. using [tip jar](https://forum.dfinity.org/t/worry-about-your-favorate-canister-running-low-on-cycles-you-got-it-covered/10307)) in an open and transparent way that benefits everyone.
+
+-------------------------
+
+domwoe | 2022-04-13 05:20:51 UTC | #11
+
+If you have occasional update calls to your canister, you could also check your balance during these calls, and call your management canister to top up if your balance is below a threshold.
+
+-------------------------
+
+domwoe | 2022-04-13 05:43:11 UTC | #12
+
+This could be a useful mixed, i.e. legacy and IC, infrastructure service that canisters on the IC could use. 
+
+The service consists of a canister that can be paid to watch the balance and top up other canisters and a simple cloud function that checks the cycles of the registered canisters.
+
+-------------------------
+
+jzxchiang | 2022-04-13 06:00:16 UTC | #13
+
+It definitely takes some work, but the proportions just seem off.
+
+0.5 TC a day works out to almost $0.70 per day, which is roughly $21 per month or $252 per year.
+
+That means `heartbeat` (a simple version) is 50x more expensive than storing 1 GB of data for a year on the IC.
+
+I definitely agree that a public heartbeat canister that anyone can subscribe to and whose cycle costs are split among its subscribers would be very useful, but I don't think the community will be able to organize around such a service in the near future...
+
+-------------------------
+
+RMCS | 2022-04-13 06:58:37 UTC | #14
+
+Yeah also thought of this, but issue is that my implementation is for a self-scaling storage solution, so for example; 
+there is a storage canister, once it reaches a certain memory threshold it locks up for any further update calls and spins up a "brother" canister. So eventually the update calls will stop once the canister is full. 
+
+I think the only way your solution would work is to make every query call an update call, or can a query call internally call an update call? :thinking:
+
+-------------------------
+
+domwoe | 2022-04-13 07:03:56 UTC | #15
+
+> so eventually the update calls will stop once the canister is full.
+
+Ah, I see. 
+
+> or can a query call internally call an update call? 
+
+No, it can't do any inter-canister call.
+
+-------------------------
+
+icme | 2022-04-13 07:11:20 UTC | #16
+
+Since inter-canister update calls take awhile, I wonder if there’s a hacky solution in here where you can set up a canister to recursively call other canisters, and only repeat the inter-canister call once the calling canister has received a response (2+ sec).
+
+This “heartbeat” wouldn’t be as predictable in terms of timing, but would most likely be less expensive.
+
+-------------------------
+
+RMCS | 2022-04-13 07:32:06 UTC | #17
+
+haha this sound like worth trying, but my assumption is that it would be pretty expensive.
+
+If i understand you correctly it would be something like
+
+```
+--storage canister--
+fn get_cycles() {
+  storage_management_canister_request_cycles().await
+} 
+
+--storage management canister--
+fn request_cycles() {
+   storage_canister_get_cycles().await // based on caller
+}
+```
+
+And then maybe work with some kind of delay solution
+
+-------------------------
+
+Maxfinity | 2022-04-13 21:10:16 UTC | #18
+
+[quote="icme, post:16, topic:12090"]
+Since inter-canister update calls take awhile, I wonder if there’s a hacky solution in here where you can set up a canister to recursively call other canisters, and only repeat the inter-canister call once the calling canister has received a response (2+ sec).
+[/quote]
+
+Yes, or even self-calls although that is less safe - https://forum.dfinity.org/t/ic-cron-lets-schedule-some-tasks-bois/6506/3
+
+-------------------------
+
+cryptoschindler | 2022-04-16 10:13:59 UTC | #19
+
+[quote="PaulLiu, post:10, topic:12090"]
+It is not heartbeat that is charging more, but try sending your canister 1 message every block, not cheap either!
+[/quote]
+
+It's way cheaper to do this instead of using heartbeat. I moved to running a script on a server that calls an upgrade method on my canister every 2 seconds because of costs. It would be nice if we could reduce heartbeat costs to make it as cheap as calling the canister from the "outside".
+
+-------------------------
+
+skilesare | 2022-04-16 14:09:12 UTC | #20
+
+I have this hacky system I’m my ICDevs bounty roadmap. A dao that owns this “scheduler” public utility would be a fun project. 
+
+Maybe I’ll code it up for supernova.
+
+Interesting problem and needed data: 
+
+How many fire and forget intercanister calls can fit into one round of consensus?
+
+Do we need guaranteed delivery? Rouge canisters probably break in line processing of returns….would need to use @nomeata ’s upgrade pattern.
+
+How do the economic play out? How much for 10,000 notifications, etc.
+
+-------------------------
+
+paulyoung | 2022-04-16 16:58:45 UTC | #21
+
+[quote="RMCS, post:1, topic:12090"]
+I am trying to set up self-sustaining canisters-system where each canister can request cycles from a management canister if their current cycles are below a certain threshold.
+[/quote]
+
+It’s sounds like what you really want is a hook into when a canister reaches the freezing threshold so that you can provide a method that will get called where you could top up the cycles.
+
+-------------------------
+
+PaulLiu | 2022-04-16 17:29:32 UTC | #22
+
+Do you have any numbers, e.g. average cost per call? At a 2s interval, it could be 1/2 of the cost, since heartbeat runs roughly every 1s.
+
+-------------------------
+
+skilesare | 2022-04-16 17:42:51 UTC | #23
+
+Or help us implament https://forum.dfinity.org/t/icdevs-org-bounty-17-a-dao-for-cycles-10-000-ht-cycle-dao/11427
+
+-------------------------
+
+RMCS | 2022-04-18 14:41:05 UTC | #25
+
+Yeah if there was a way to trigger a function once the canister doenst have enough cycles to process the call, that would be a great addition
+
+-------------------------
+
+PaulLiu | 2022-04-18 15:24:32 UTC | #26
+
+That is exactly what [https://tipjar.rocks](https://tipjar.rocks) does. It will maintain a canister's cycle balance to the average of last 10 days, and refill as needed.
+
+-------------------------
+
+jzxchiang | 2022-04-21 22:32:43 UTC | #27
+
+I wish there was an analogous `inspect_message` for heartbeats, where a canister can choose to accept or reject a heartbeat call and not pay any cycles if it chooses to reject it... I don't think this exists though.
+
+-------------------------
+
+Zane | 2022-05-03 23:40:16 UTC | #28
+
+Honestly I think a way to create custom heartbeats should be provided by default by the ICP, its a feature needed for many use cases and in my opinion we shouldn't rely on a 3rd party service that has to be trusted and somehow funded to do something so basic.
+
+-------------------------
+
+PaulLiu | 2022-05-06 07:30:11 UTC | #29
+
+[quote="Zane, post:28, topic:12090"]
+has to be trusted and somehow funded to do something so basic
+[/quote]
+
+That is exactly the spirit of open services. Why shun away from it?
+
+-------------------------
+
+Zane | 2022-05-06 07:58:05 UTC | #30
+
+Because in my opinion having to pay to use a basic feature like custom heartbeats is just stupid, the fact its not offered by the "framework" by default and we as a community have to gather and discuss how and who will implement it even more, it looks really bad from an outside perspective. Like imagine if you were introduce a friend of your to ICP:
+-"Hey how can I define a custom heartbeat?" 
+-"Well you can't, the community has been discussing it but still no ETA and you'll have to pay for it, if you don't want to wait you can do it yourself and spend lot of cycles everyday"
+
+Most would laugh, I welcome the nature of web3 but we should be building new stuff not a web3 version of setTimeout.
+
+-------------------------
+
+AdamS | 2022-05-06 17:47:00 UTC | #31
+
+What's the difference between that and any other feature of the IC? You pay to compute. It costs X cycles to store a value in stable64 memory, it costs Y cycles to call the management canister, it costs Z cycles to call the (community provided) cron canister. Computation as a service is the entire model.
+
+I'm not saying that a custom-length heartbeat would be bad - there is a line between stuff the IC should provide and stuff it shouldn't, and I'm not sure which side I think this falls on - but scheduled execution and consensus every second for potentially every canister on a subnet *does* have a computational cost, and the cycle cost is meant to represent that.
+
+-------------------------
+
+Zane | 2022-05-06 17:55:45 UTC | #32
+
+The difference is you pay cycles for what you actually use be it computation or storage, if I want to run a function once every 24 hours and I have to pay for useless calls every second, that is stupid. If it were a very niche use case then I'd agree with you, but this is something lots of dApps need. I want to use the IC to build new stuff not reinvent the wheel.
+
+-------------------------
+
+levi | 2022-05-06 18:01:44 UTC | #33
+
+[quote="Zane, post:32, topic:12090"]
+The difference is you pay cycles for what you actually use be it computation or storage, if I want to run a function once every 24 hours and I have to pay for useless calls every second, that is stupid.
+[/quote]
+
+So who’s gonna pay for keeping track of the schedules?
+
+-------------------------
+
+Zane | 2022-05-06 18:07:20 UTC | #34
+
+Ideally nobody, it should be part of the protocol, wouldn't it be better performance wise to have a system level canister (or more not sure about scalability requirements) take care of scheduling instead of having hundreds of user level ones wasting CPU cycles every second for no reason?
+
+-------------------------
+
+GLdev | 2022-05-06 18:19:52 UTC | #35
+
+[quote="Zane, post:34, topic:12090"]
+instead of having hundreds of user level ones wasting CPU cycles every second for no reason?
+[/quote]
+
+I think a lot of people agree that a better solution needs to be available for working with heartbeat functionality. The difference in opinion seems to be regarding who gets to design, build and maintain that canister. Is it dfinity - through developing a system level canister as you say? Or is it the community with open sourced, blackholed services that can be audited. 
+
+There are pros and cons with both approaches, IMO. System one would be easier for the devs, but it would take resources, it would take time, and it would probably be a single approach system. On the other hand, if people come up with many variations, and publish them on github, license them permissively, and blackhole the canisters, it will probably be faster to test, reasonably "safe", many possible standards, etc. Eventually from many one standard could evolve and dfinity could "adopt" it, either directly or through a perpetual grant or whatever.
+
+-------------------------
+
+Zane | 2022-05-06 18:34:17 UTC | #36
+
+I agree but I'd like if progress were a bit quicker cause while we discuss on what's the better approach, who's going to do it and how is it going to be funded, there are devs who need the feature and either have to pay more than they actually use or wait for a solution to be released, whenever that happens.
+I just want to avoid another "token standard" scenario, the community had 1 year to discuss it and we all know what happened with that, Dfinity had to step in to somehow figure out the mess that it had become and as a result the whole ecosystem suffered from it.
+
+-------------------------
+
+AdamS | 2022-05-06 19:29:33 UTC | #37
+
+If your goal is quick progress at the expense of the best solution, that is a goal *built* for community-made canisters. Those can be iterated upon and refined. But to embed something in the protocol is to make a serious support commitment; it has to be the version developers can use for everything and implementors can support forever. 'Move fast and break things' doesn't work so well in that context. The 'mess' of the token standard as you put it is primarily due to several mistakes in existing standards - mistakes dfinity is very capable of making itself, and if we had officially centralized on a standard with those mistakes a year ago we'd never have heard the end of it.
+
+-------------------------
+
+Zane | 2022-05-06 19:38:39 UTC | #38
+
+When I talk about quick progress I don't mean I want the feature to be delivered tomorrow, what I'd like is to have active conversation and a general idea on how the issue is going to be solved, if the ETA to do it right is 6 months so be it, at least I know in 6 months I'll have a solution.
+
+What I see instead is a very common use case that has been ignored for over a year and hasn't made much progress even in the concept stage, let alone implementation, this thread is almost 2 months old and it was inactive for 12 days until I posted, yet so far we still have no idea on what's gonna happen.
+
+-------------------------
+
+jzxchiang | 2022-05-07 05:23:49 UTC | #39
+
+I agree with @Zane. It's not even just building, auditing, and blackhole-ing a public heartbeat canister that's a problem. It's also convincing enough people to start using it such that the costs get spread out enough to make it worth it.
+
+I'd be in favor of charging the canister storage cycles for the replica having to maintain the desired cron schedule of the canister. That would still be better than the status quo, as the current costs are ridiculously high and don't make sense IMO.
+
+-------------------------
+
+jzxchiang | 2022-05-22 17:27:46 UTC | #40
+
+FWIW my heartbeat canister (which doesn't do inter-canister calls) burns around 90 B cycles every 12 hours, so roughly 0.18 T cycles every 24 hours.
+
+This is lower than @PaulLiu's [tip jar canister](https://forum.dfinity.org/t/why-does-a-canister-keep-consuming-cycles/10821/7?u=jzxchiang), which apparently burns ~0.5 T cycles every 24 hours.
+
+I guess it also depends on how much work is being done in your heartbeat function.
+
+-------------------------
+
+free | 2022-06-09 12:16:49 UTC | #41
+
+FYI, I just found out where the main cost in having a heartbeat handler comes from: it's the [590K cycles charged per message execution](https://internetcomputer.org/docs/current/developer-docs/deploy/computation-and-storage-costs/) (since a heartbeat is considered to be a message/transaction).
+
+Considering a block rate of about 1.1/s (was looking at a couple of subnets that pretty much execute only heartbeat messages), this comes out to about 55B cycles per day or 20T cycles per year. 20T cycles is the cost of 5 GB of storage for a year (which seems like much); or just 7 hours of 100% CPU usage.(which seems quite cheap).
+
+Personal opinion: I would see the use of a system provided mechanism to execute heartbeats at lower frequency (in blocks or seconds) mostly as a way of spreading out the execution of said heartbeats over time. I.e. instead of (very likely) all heartbeats trying to run all at once at midnight or on the hour, (because a canister developer is most likely to code it along the lines of `time() % interval == 0`) they would run every N rounds or every M seconds, but with a random offset (e.g. computed from the canister ID). Something like that may offset the cost of implementing and maintaining the feature.
+
+-------------------------
+
+jzxchiang | 2022-06-09 21:45:29 UTC | #42
+
+> Personal opinion: I would see the use of a system provided mechanism to execute heartbeats at lower frequency (in blocks or seconds) mostly as a way of spreading out the execution of said heartbeats over time. I.e. instead of (very likely) all heartbeats trying to run all at once at midnight or on the hour
+
+Exactly! It frees up more CPU cycles on the nodes to do other stuff instead of wasting resources running stuff that's not needed.
+
+-------------------------
+
+free | 2022-06-10 07:32:06 UTC | #43
+
+Yes and no. It saves CPU cycles for canisters, but there still needs to be logic somewhere to decide for each heartbeat handler whether it should run that round or not. So we would be merely moving said logic out of canisters and not charging them for it.
+
+As said, for me the main benefit would be that (as opposed to developers likely all choosing to execute periodic logic at the same time, causing latency spikes) the system could randomly spread out periodic heartbeats and the load that comes with them. I.e. it would only guarantee that the heartbeat is called once an hour (e.g. at 23 past) rather than once an hour on the hour.
+
+-------------------------
+
+bob11 | 2022-06-12 15:30:35 UTC | #44
+
+I would like to chime in on this. At Entrepot we run a few update calls every heartbeat for each NFT canister, and so our cycles burn rate is about 0.5T cycles per day per NFT canister. We are maintaining about 130 canisters at this point, so we are burning through around 65T cycles per day. If we had a nice configurable heartbeat cron (and could run every 10 seconds instead of every second), we could immediately cut our costs by 10x. 
+
+We are currently thinking maybe we just use an external (centralized) cron service to call functions regularly rather than rely on heartbeat because of the costs right now. Our cycles burn per canister before heartbeat was closer to 0.05T cycles / day.
+
+A few other notes:
+- yes, we should just push this cost on NFT creators, but we don't have good tooling for that yet
+- yes, we could optimize our heartbeat update calls, but not by THAT much I don't think
+- generally, we just need a nice cron service on the IC, and I don't care where it is. Could be system level (my strong preference), but even a community cron service would work. We might just build one for ourselves and then open it up to the community, but if anyone else is working on it that would be awesome
+
+-------------------------
+
+levi | 2022-06-13 20:42:25 UTC | #45
+
+How bout make the heartbeat wake up every 10 blocks instead of every block on the whole network? to start for now.
+
+-------------------------
+
+ulan | 2022-07-07 13:51:35 UTC | #46
+
+FYI: https://forum.dfinity.org/t/heartbeat-improvements-timers-community-consideration/14201
+
+-------------------------
+
+maksym | 2022-11-08 10:54:28 UTC | #47
+
+> 0.5 TC a day works out to almost $0.70 per day, which is roughly $21 per month or $252 per year.
+
+I tried to reproduce those costs for a simple heartbeat canister.
+
+I created a simple benchmark to measure a heartbeat cost for empty canisters written both in Rust and Motoko, see https://github.com/maksymar/heartbeat-cost
+
+Taking into account a median finalization rate of 1.09 blocks/s (or 917 ms per block) I got the following results after ~15 minutes of measurements:
+- Rust – ~21 TC/year
+- Motoko – ~71 TC/year
+
+Calculation for Rust
+- `execution_cost = update_message_execution_fee + instructions_to_cycles(0) = update_message_execution_fee` per single heartbeat call
+- with `update_message_execution_fee = 590_000` it converts to `590_000 * (1_000/917) * (60*60*24*365) / 10^12 = 20.29 TC /year`, very close to the measured ~21 TC/year
+
+Motoko implementation has some extra code with sending a message which results in higher cost.
+
+Without seeing the initial code it’s difficult to explain 182 TC/year cost. 
+Maybe it executes a heavy heartbeat payload on every call. In that case I’d suggest not executing heartbeat payload on every call which may reduce the cost x2.5 times for Motoko or x8.5 times for Rust.
+
+-------------------------
+

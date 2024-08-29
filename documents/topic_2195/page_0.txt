@@ -1,0 +1,228 @@
+flyq | 2021-03-16 07:17:41 UTC | #1
+
+There are two canisters, and when using a function in canister A to call a function in canister B, need to pass in the canister id `<Principal>` of canister A as a parameter, so is there any way to get the canister id in the motoko code? like `address(this)` in [Ethereum solidity](https://docs.soliditylang.org/en/develop/control-structures.html?highlight=address(this#salted-contract-creations-create2))
+
+One way that is not so good, is adding the below code to canister B, and canister A call this function in canister B to get its canister id:
+```
+    // Return the principal of the message caller/user identity
+    public shared(msg) func callerPrincipal() : async Principal {
+        return msg.caller;
+    };
+```
+
+-------------------------
+
+dpdp | 2021-03-16 09:59:02 UTC | #2
+
+https://github.com/dfinity/examples/blob/master/motoko/whoami/src/Main.mo#L22
+
+-------------------------
+
+claudio | 2021-03-17 11:21:55 UTC | #3
+
+While that solution works, it's quite slow since it requires an expensive `await`.
+
+A more direct solution is to declare the optional `this` parameter of the actor or actor class and return its `principal` using the `Principal.fromActor` base library function. Something like:
+
+    import Principal "mo:base/Principal";
+
+    shared (install) actor class WhoAmI(someone : Principal) = 
+      this { // Bind the optional `this` argument (any name will do)
+      ...
+
+      // Return the principal identifier of this canister via the optional `this` binding.
+      // This is much quicker than `id()` above, since it avoids the latency of `await whoami()`.
+      public func idQuick() : async Principal {
+        return Principal.fromActor(this);
+      };
+    };
+
+I'll post a PR to the examples repository to include this faster alternative.
+
+-------------------------
+
+dpdp | 2021-03-16 11:58:10 UTC | #4
+
+Interesting
+
+The call `Principal.fromActor(this)` is basically free compared to 18k~ cycles burned by the `await` call
+
+
+cf.
+
+Main.mo
+
+```
+
+  // Return the principal identifier of this canister.
+  public func id() : async (Principal, Nat, Nat) {
+    let before = Cycles.balance();
+    let result = await whoami();
+    let after = Cycles.balance();
+    return (result, before, after);
+  };
+
+  // Return the principal identifier of this canister via the optional `this` binding.
+  // This is much quicker than `id()` above, since it avoids the latency of `await whoami()`.
+  public func idQuick() : async  (Principal, Nat, Nat) {
+    let before = Cycles.balance();
+    let result = Principal.fromActor(this);
+    let after = Cycles.balance();
+    return (result, before, after);
+  };
+```
+
+
+```
+(base) dp@dps-MacBook-Pro whoami % dfx canister call whoami id \
+                | grep "$(dfx canister id whoami)" && echo 'PASS'
+(principal "rrkah-fqaaa-aaaaa-aaaaq-cai", 994_631_194_103, 994_631_176_232)
+PASS
+(base) dp@dps-MacBook-Pro whoami % dfx canister call whoami idQuick \
+                | grep "$(dfx canister id whoami)" && echo 'PASS'
+(principal "rrkah-fqaaa-aaaaa-aaaaq-cai", 994_631_123_350, 994_631_123_350)
+PASS
+```
+
+-------------------------
+
+claudio | 2021-03-16 12:23:33 UTC | #5
+
+Yes, it's essentially free. The only cost here is the enclosing method itself, but if you were using it to pass on the principal of actor A to actor B as an explicit argument, just obtaining the principal of A can be dead cheap.
+
+-------------------------
+
+flyq | 2021-03-17 04:53:00 UTC | #6
+
+[quote="claudio, post:3, topic:2195"]
+```
+shared (install) actor class WhoAmI(someone : Principal) = 
+  this { // Bind the optional `this` argument (any name will do)
+  ...
+```
+[/quote]
+Actor class is ok:
+```
+actor class Test() = this {
+```
+
+and actor is not ok:
+```
+actor Test = this {
+```
+```
+Stdout:
+
+Stderr:
+main.mo:6.14-6.18: syntax error [M0001], unexpected token 'this', expected one of token or <phrase> sequence:
+  <obj_body>
+```
+
+-------------------------
+
+claudio | 2021-03-17 11:21:54 UTC | #7
+
+For an actor declaration, you can just pass the name of the actor (the name, if provided, is the "this" reference).
+
+    actor Test {
+        ...
+        public func idQuick() : async Principal { 
+           return Principal.fromActor(Test);
+        };
+    } 
+
+(Classes need additional syntax to reference  "this" because the name of the class names the constructor (a function), not the instance being constructed (an object)).
+
+Hope that helps.
+
+-------------------------
+
+Maxfinity | 2021-05-15 22:20:51 UTC | #8
+
+[quote="claudio, post:7, topic:2195"]
+(Classes need additional syntax to reference “this” because the name of the class names the constructor (a function), not the instance being constructed (an object)).
+[/quote]
+
+Hi, do you know how to refer to the identity of a class?
+
+-------------------------
+
+claudio | 2021-05-15 22:38:22 UTC | #9
+
+I'm note sure I understand the question, but does the example above not answer it?
+
+[quote="claudio, post:3, topic:2195"]
+```
+import Principal "mo:base/Principal";
+
+shared (install) actor class WhoAmI(someone : Principal) = 
+  this { // Bind the optional `this` argument (any name will do)
+  ...
+
+  // Return the principal identifier of this canister via the optional `this` binding.
+  // This is much quicker than `id()` above, since it avoids the latency of `await whoami()`.
+  public func idQuick() : async Principal {
+    return Principal.fromActor(this);
+  };
+};
+```
+[/quote]
+
+`this` names the instance returned by the constructor, `Principal.fromActor(this)` give the raw principal of that instance.
+
+The class itself has no identity per se, but I may be misunderstanding your question. I'm off to bed, but can answer tomorrow if you provide more context.
+
+-------------------------
+
+Ishmael-Chepsoi | 2023-11-14 12:05:10 UTC | #10
+
+Binding this to the actor class to obtain its principal id, however, calling it from next js file an error Error: Impossible to convert undefined to Principal. is thrown while trying to pass some inputs from a form.
+
+-------------------------
+
+danb92 | 2024-02-05 10:51:22 UTC | #11
+
+I'm trying to use this approach :
+
+[quote="claudio, post:7, topic:2195"]
+```
+actor Test {
+    ...
+    public func idQuick() : async Principal { 
+       return Principal.fromActor(Test);
+    };
+} 
+```
+[/quote]
+
+But I get an error, is this approach no longer allowed?
+
+This is the error :
+cannot use Test before Test has been definedMotoko(M0016)
+
+Thanks in advance!
+
+-------------------------
+
+Severin | 2024-02-05 12:31:32 UTC | #12
+
+I have this in my code somewhere:
+
+```
+actor class Test() = self {
+  func a() : async Principal {
+    return Principal.fromActor(self);
+  }
+}
+```
+
+-------------------------
+
+danb92 | 2024-02-05 14:37:11 UTC | #13
+
+Thanks for your response!
+I just realized the problem, I was trying to use self to declare a variable in my global state rather than inside a function. Makes sense now I suppose.
+Cheers!
+
+-------------------------
+

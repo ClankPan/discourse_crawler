@@ -1,0 +1,355 @@
+bob11 | 2022-05-28 04:58:34 UTC | #1
+
+Here are steps to replicate:
+1. Set up heartbeat to run a specific function (pulling from a queue) every time it runs
+2. Make sure that the process fails
+3. Turn on heartbeat. Heartbeat will now run forever trying to run the job in the queue, but will forever fail.
+4. Try to stop the canister. Canister won't stop because heartbeat has callbacks. But all requests from this point forward will fail and say "canister stopping"
+5. At this point, you cannot call the canister at all (because canister is stopping), the canister will never stop (it can't because heartbeat is running continuously), and heartbeat can't stop because there is an item in the queue that keeps failing.
+
+This is what I am affectionately calling the canister death spiral.
+
+I know this may not be the best way to implement a queue with heartbeat, but it seems like there should be something I can do to rescue a canister in this state. Current best idea is wait for the canister to run really low on cycles (at the freezing threshold) and then regain control of the canister.
+
+Any other thoughts/ideas?
+
+-------------------------
+
+paulyoung | 2022-05-28 05:05:39 UTC | #2
+
+Upgrade the canister to remove the heartbeat function?
+
+-------------------------
+
+bob11 | 2022-05-28 05:10:32 UTC | #3
+
+Tried it. Can't upgrade the canister. Got this error:
+
+`
+error: code 5, message: "Canister 4fcza-biaaa-aaaah-abi4q-cai trapped explicitly: canister_pre_upgrade attempted with outstanding message callbacks (try stopping the canister before upgrade)"
+`
+
+-------------------------
+
+paulyoung | 2022-05-28 05:11:34 UTC | #4
+
+Under “Canister Status”, the [spec](https://internetcomputer.org/docs/current/references/ic-interface-spec/) says this:
+
+> In all cases, calls to the [management canister](https://internetcomputer.org/docs/current/references/ic-interface-spec/#the-ic-management-canister) are processed, regardless of the state of the managed canister.
+
+The management canister is the one that can install
+code and perform upgrades.
+
+-------------------------
+
+paulyoung | 2022-05-28 05:12:56 UTC | #5
+
+I guess using one way functions would have prevented this. That doesn’t help now though.
+
+-------------------------
+
+paulyoung | 2022-05-28 05:14:53 UTC | #6
+
+Depending on the data involved, maybe you can `reinstall` instead of `upgrade`. You would lose all state though.
+
+-------------------------
+
+paulyoung | 2022-05-28 05:16:57 UTC | #7
+
+Not sure there’s much benefit to _reinstalling_ over _uninstalling_ other than I don’t remember if `dfx` has a command to uninstall.
+
+-------------------------
+
+bob11 | 2022-05-28 05:17:35 UTC | #8
+
+Yeah, we really need to preserve state, so hoping to not have to uninstall/reinstall
+
+-------------------------
+
+paulyoung | 2022-05-28 05:20:11 UTC | #9
+
+What’s the nature of the failure with processing the queue? Does the queue live in another canister?
+
+I’m wondering if you can upgrade that instead to address the problem from that side.
+
+-------------------------
+
+bob11 | 2022-05-28 05:27:23 UTC | #10
+
+Queue lives on the same canister, so can't upgrade on that side either
+
+-------------------------
+
+paulyoung | 2022-05-28 05:35:46 UTC | #11
+
+Does `canister_pre_upgrade` here only mean there’s a `pre_upgrade` function defined in your code?
+
+If so, what happens if you remove both that and the heartbeat function and then try to upgrade using that?
+
+-------------------------
+
+paulyoung | 2022-05-28 05:43:46 UTC | #12
+
+If that doesn’t work, you should be able to downgrade the Motoko compiler to a version before this pull request and recompile your canister using that.
+
+https://github.com/dfinity/motoko/pull/2677
+
+When you upgrade again you won’t get the `canister_pre_upgrade` error.
+
+-------------------------
+
+paulyoung | 2022-05-28 07:54:11 UTC | #13
+
+If downgrading is problematic you should be able to remove the relevant lines of code and build the Motoko compiler yourself.
+
+I could do that and send you a build if you can tell me which version you’re using.
+
+I’d also need to know some info on your system architecture. I’m on an M1 MacBook Pro so a similar device would be the most convenient. I also have a Linux VM that I can probably use if necessary.
+
+-------------------------
+
+diegop | 2022-05-28 16:09:17 UTC | #14
+
+Let me ping folks internally to see if anyone has any other ideas
+
+-------------------------
+
+levi | 2022-05-28 20:26:09 UTC | #15
+
+Seems to me it is better if the heartbeat stops waking up as soon as the canister is put into the stopping mode.
+
+-------------------------
+
+torates | 2022-05-29 00:33:28 UTC | #16
+
+Hey Paul, I'm working with Bob through this issue. The canister is controlled by my ```default``` identity on dfx.
+
+Also, I have a M1, but mine is a MacBook Air 2022, running ```dfx 0.9.3```. Any clue on how to re-build the motoko compiler and use it instead of my current compiler?
+
+Your help is much appreciated.
+
+-------------------------
+
+paulyoung | 2022-05-29 00:41:18 UTC | #17
+
+It required some non-trivial tweaks but I did a custom build of Motoko recently using a variation of the branch linked here: https://github.com/dfinity/motoko/issues/3041#issuecomment-1125688621
+
+I should easily be able to do a build of 0.9.3 that removes the trap in the pre upgrade hook based on that. You’d be trusting that I’m not doing anything malicious in a build I send you though.
+
+If you want to try it yourself and you’re familiar with nix, using https://github.com/ninegua/ic-nix might be easier. Then it would be a case of following the instructions here: https://github.com/dfinity/motoko/blob/master/Building.md#development-using-nix
+
+-------------------------
+
+levi | 2022-05-29 01:20:55 UTC | #18
+
+The pre-upgrade hook gets run on the module that is already running in the canister. only the post-upgrade hook is called on the new module. There is no way to upgrade the canister if the pre-upgrade hook fails. The motoko code that traps is in the pre-upgrade hook. the only way to upgrade that canister (without reinstalling or uninstalling) is to stop all the pending callbacks. If the heartbeat keeps waking up when the canister is stopping that seems like a bug to me.
+
+-------------------------
+
+paulyoung | 2022-05-29 01:29:01 UTC | #19
+
+That would make sense.
+
+In that case the only way to address this might be to propose a change to the way heartbeat works and wait for that to land.
+
+-------------------------
+
+torates | 2022-05-29 13:14:59 UTC | #20
+
+In any case, I think the following error message should be reformatted to avoid this issue in the future:
+```
+Error: The Replica returned an error: code 5, message: "Canister <canister_id> trapped explicitly: canister_pre_upgrade attempted with outstanding message callbacks (try stopping the canister before upgrade)"
+```
+Maybe include a clause to not try the stop the canister if the user is using heartbeat in the current state?
+
+-------------------------
+
+nomeata | 2022-05-30 20:13:04 UTC | #21
+
+One could argue that a canister in state `stopping` shouldn’t be running the heartbeat, just like it shouldn’t handle other “incoming” calls. And in fact that’s how it is specified in the Interface Spec (<https://ic-interface-spec.netlify.app/#_call_context_creation>, in “Call context creation: Heartbeat”.
+
+So what should happens when you put the canister into stopping mode that it waits for outstanding callbacks, but eventually comes to rest.
+
+We should get confirmation from the execution team whether the heartbeat is really not running for stopping canisters.
+
+-------------------------
+
+berestovskyy | 2022-05-30 20:50:40 UTC | #22
+
+hey all,
+@nomeata yes, we do not allow heartbeats to run when the canister is in `stopping` state ([GitHub link](https://github.com/dfinity/ic/blob/98abf58dbe1b8b46bfa8150ba8791b9322b2fcf5/rs/execution_environment/src/execution/heartbeat.rs#L55))
+
+@bob11 I guess it's not the heartbeat but rather a call inside a callback, which is allowed by the spec:
+> Note that when processing responses, a stopping canister can make calls to other canisters and thus create new call contexts.
+
+I also agree that falling below a freezing threshold might help, as:
+> a canister cannot perform calls if that would, due the cost of the call and transferred cycles, would push the balance into frozen territory; these calls fail with ic0.call_perform returning a non-zero error code.
+
+There is an hidden option in `dfx` which allow to set a freezing threshold:
+```
+dfx canister update-settings --freezing-threshold <FREEZING_THRESHOLD>
+```
+
+Could you please try to set it arbitrary high and see if it breaks the `death spiral`?
+
+-------------------------
+
+torates | 2022-05-30 21:53:35 UTC | #23
+
+We decided to reinstall the canister, we had a record of the transactions so we were able to recover the state somewhat. Seems I was late!
+
+But, this is a very useful option, is there any particular reason why is it hidden? I think it should be included in the official documentation.
+
+-------------------------
+
+berestovskyy | 2022-05-31 10:38:40 UTC | #24
+
+Ah, super cool that you were able to recover the data, @torates 
+
+We should try to address this issue on the IC level, so other folks won't get into the same troubles...
+
+Looking into your source code, do you think you could have a retry logic like this:
+```
+fn heartbeat() {
+    ...
+    retry: loop {
+        if call().await == error { continue retry }
+        else { break retry }
+    }
+    ...
+}
+```
+Maybe not explicitly, but scattered across the code base?
+
+-------------------------
+
+LightningLad91 | 2022-06-13 17:10:10 UTC | #25
+
+Hello. I recently deployed a canister that has been burning through 2T cycles an hour. When I tried to upgrade the canister (adding CanisterGeek methods for monitoring) I received the same error as @bob11.
+
+The canister provides a method to “kill” the heartbeat. It basically toggles a Boolean that is checked before the methods in the heartbeat function are called. Unfortunately, this does not resolve the issue.
+
+@berestovskyy do you still think that raising the freezing threshold is a good path to take? Can I upgrade while the canister is frozen or would I need to lower the threshold first?
+
+@torates would you be willing to share how you were able to recover the state of your canister?
+
+Thanks all!
+
+-------------------------
+
+berestovskyy | 2022-06-13 13:55:18 UTC | #26
+
+Raising the threshold should stop the Canister burning the Cycles. That's a good first step IMO.
+
+The next step would be to try to upgrade the Canister with a fix as normal before going into other hacks...
+
+-------------------------
+
+LightningLad91 | 2022-06-13 14:24:52 UTC | #27
+
+I'm not sure what a fix to normal would look like in this case. I don't really have a lot of insight into what the canister is doing, that's why i was hoping to add some methods for monitoring activity. It sounds like raising the threshold is a good first step so I will take this back to the team so we can plan our response. Thank you
+
+-------------------------
+
+LightningLad91 | 2022-06-13 17:15:28 UTC | #28
+
+Raising the freezing threshold succeeded using the command provided. Unfortunately, it seems to have set the threshold to an absurdly high number.
+
+> Error: The replica returned an HTTP Error: Http Error: status 503 Service Unavailable, content type "application/cbor", content: Canister t2mog-myaaa-aaaal-aas7q-cai is out of cycles: requested 1410000 cycles but the available balance is 29059112097781 cycles and the freezing threshold 10019854835671809501 cycles
+
+This is the command I used to raise the threshold:
+
+> dfx canister --network=ic update-settings --all --freezing-threshold 27563000000000
+
+I don't understand why the threshold was set so high. I've submitted a support ticket to Dfinity. Hopefully we can find a path forward.
+
+-------------------------
+
+berestovskyy | 2022-06-13 18:06:17 UTC | #29
+
+Oh, sorry @LightningLad91 
+
+It's counter-intuitive, but the freezing threshold is in seconds, not in cycles: https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-create_canister
+
+Now the limit can't be lowered the Canister is controlled by a user, and IC tries to charge the Canister for an ingress message.
+
+We're preparing a patch to unblock you...
+
+-------------------------
+
+LightningLad91 | 2022-06-13 18:07:41 UTC | #30
+
+Thank you @berestovskyy ! Both Dfinity and Toniq have been very helpful in this matter and I appreciate that.
+
+-------------------------
+
+LightningLad91 | 2022-06-14 23:00:35 UTC | #31
+
+Our canister is up and running! Thank you again to @berestovskyy @bob11 and everyone at Dfinity who helped push this fix so quickly.
+
+-------------------------
+
+icme | 2022-09-14 05:34:25 UTC | #32
+
+[quote="berestovskyy, post:29, topic:13328"]
+[The Internet Computer Interface Specification | Internet Computer Home](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-create_canister)
+[/quote]
+
+According to the `freezing_threshold` in this link :point_up: 
+
+> "A canister is considered frozen whenever the IC estimates that the canister would be depleted of cycles before `freezing_threshold` seconds pass, given the canister's current size and the IC's current cost for storage."
+
+Where and how is this estimate is calculated?
+
+
+A few follow-up questions regarding behavior **after** hitting the freezing threshold:
+* Does a canister continue to burn through cycles at roughly the storage cost rate?
+* Can the freezing threshold be lowered via the management canister in order to "un-freeze" the canister
+* Can all remaining cycles be harvested from the canister in order to "zombify it"?
+
+-------------------------
+
+Severin | 2022-09-14 16:18:47 UTC | #33
+
+I'm no expert in this topic, but my understanding is as follows:
+
+[quote="icme, post:32, topic:13328"]
+Does a canister continue to burn through cycles at roughly the storage cost rate?
+[/quote]
+Yes, freezing means that your canister will be unresponsive for a while so you can notice it and top it up with cycles before it runs out of cycles entirely and the data is deleted.
+
+[quote="icme, post:32, topic:13328"]
+Can all remaining cycles be harvested from the canister in order to “zombify it”?
+[/quote]
+Almost all cycles. `dfx canister delete` requires an unfrozen canister to withdraw cycles, but if you do the management call `uninstall_code` you should be able to unfreeze basically any canister. EDIT: I probably misunderstood this question, please disregard.
+
+-------------------------
+
+dsarlis | 2022-09-14 12:53:34 UTC | #34
+
+Allow me to add some more colour to Severin's response:
+
+> Can the freezing threshold be lowered via the management canister in order to “un-freeze” the canister
+
+Yes, it's possible.
+
+> Can all remaining cycles be harvested from the canister in order to “zombify it”?
+
+Things are a bit more tricky if you really want to salvage cycles from a canister that's frozen. If you use `uninstall_code` as Severin said, technically your canister will be unfrozen but that's because your canister's data will be deleted so there's nothing that you need to keep paying for. The wasm module will also be gone, which means you won't have a working canister to transfer cycles out.
+
+I think you actually need to unfreeze it first and then be able to transfer the cycles out somehow (e.g. if the canister exposes some method to transfer them to someone else). You'll likely also need to tune down your freezing threshold so you can send out as many of your cycles as possible (you cannot dip into your freezing threshold because we need it to ensure your canister can pay out storage but if your drop it to something that would be enough to pay for a couple hours and then transfer out your loss would be negligible).
+
+Finally, canister deletion wouldn't work since remaining cycles are discarded in that case as [per the interface spec.](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-delete_canister)
+
+-------------------------
+
+Severin | 2022-09-14 16:20:10 UTC | #35
+
+[quote="dsarlis, post:34, topic:13328"]
+Can all remaining cycles be harvested from the canister in order to “zombify it”?
+[/quote]
+
+Thank you for correcting, @dsarlis, I misunderstood the question. I was answering for "can the cycles be harvested from a zombified canister (I read this as 'a frozen canister') ?"
+
+-------------------------
+

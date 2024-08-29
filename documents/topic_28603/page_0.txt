@@ -1,0 +1,208 @@
+ferMartz | 2024-03-18 21:26:33 UTC | #1
+
+I'm trying to implement regular Internet Identity login with @dfinity/auth-client in React Native. However, since React Native lacks support for `localStorage` or `IndexedDB` like web browsers, I'm encountering some confusion regarding the implementation.
+
+I'm aware that I can use `AsyncStorage` in React Native to achieve similar results as browser `localStorage`, but I'm still unsure about how to integrate a custom storage solution into the auth-client.
+
+Any pointers or guidance on how to proceed would be greatly appreciated.
+
+-------------------------
+
+NathanosDev | 2024-03-18 22:01:56 UTC | #2
+
+I'm not sure if there's any out of the box solutions for React Native, but you can easily provide a wrapper for `AsyncStorage` by implementing the `AuthClientStorage` interface and giving it to your `AuthClient` when you create it: https://agent-js.icp.xyz/auth-client/index.html#storage-and-key-management
+
+-------------------------
+
+ilbert | 2024-03-19 12:00:24 UTC | #3
+
+Assuming that you can provide a custom `AuthClientStorage` with the `AsyncStorage`, how are you planning to successfully use the [AuthClient.login](https://agent-js.icp.xyz/auth-client/classes/AuthClient.html#login) function?
+As also stated in the function's docs:
+> Opens up a new window to authenticate with Internet Identity
+
+it will attempt to open a new browser window. However, React Native doesn't support opening browser windows out of the box, you need external packages like [WebBrowser](https://docs.expo.dev/versions/latest/sdk/webbrowser/).
+
+@kpeacock's guide can help you:
+https://kyle-peacock.com/blog/dfinity/ic-expo
+
+-------------------------
+
+ferMartz | 2024-03-19 14:48:18 UTC | #4
+
+@NathanosDev thanks for info.
+
+I was able to create the wrapper now and I'm opening the web browser window at AuthClient.login but after authenticating the auth client does not get the identity. I'm looking at @kpeacock example below.
+
+Thanks for the help
+
+-------------------------
+
+ferMartz | 2024-03-19 14:51:01 UTC | #5
+
+@ilbert thanks for the link...extremely useful.
+
+I'm opening the browser window at [AuthClient.login](https://agent-js.icp.xyz/auth-client/classes/AuthClient.html#login) but still struggling with getting the identity after authentication.
+
+Will keep you posted!
+
+Thanks again
+
+-------------------------
+
+ilbert | 2024-03-19 15:09:10 UTC | #6
+
+[quote="ferMartz, post:5, topic:28603"]
+I’m opening the browser window at [AuthClient.login](https://agent-js.icp.xyz/auth-client/classes/AuthClient.html#login)
+[/quote]
+Could you share how you configured the `AuthClient` in order to achieve this?
+
+-------------------------
+
+ferMartz | 2024-03-19 16:43:15 UTC | #7
+
+Sorry for the confusion.
+
+Correction: I was able to initialized the auth client with a custom storage wrapper and open a web browser window on a button click but it is not in the AuthClient.login context. I'm digging into @kpeacock [mvp repo](https://github.com/krpeacock/ic-expo-mvp) to see if I can find a viable solution for delegation because it looks to me that you really can't use AuthClient.login with react native unless you create a custom solution.
+
+Here is the AsyncAStorageWrapper.ts
+```
+import AsyncStorage from "@react-native-async-storage/async-storage";
+export type StoredKey = string | CryptoKeyPair;
+export interface AuthClientStorage {
+  get(key: string): Promise<StoredKey | null>;
+
+  set(key: string, value: StoredKey): Promise<void>;
+
+  remove(key: string): Promise<void>;
+}
+
+export class AsyncStorageWrapper implements AuthClientStorage {
+  async get(key: string): Promise<StoredKey | null> {
+    try {
+      const value = await AsyncStorage.getItem(key);
+      if (value !== null) {
+        const parsedValue: StoredKey = JSON.parse(value);
+        return parsedValue;
+      }
+      return null;
+    } catch (error) {
+      console.error("Error retrieving data from AsyncStorage:", error);
+      return null;
+    }
+  }
+
+  async set(key: string, value: StoredKey): Promise<void> {
+    try {
+      const serializedValue = JSON.stringify(value);
+      await AsyncStorage.setItem(key, serializedValue);
+    } catch (error) {
+      console.error("Error storing data in AsyncStorage:", error);
+    }
+  }
+
+  async remove(key: string): Promise<void> {
+    try {
+      await AsyncStorage.removeItem(key);
+    } catch (error) {
+      console.error("Error removing data from AsyncStorage:", error);
+    }
+  }
+}
+```
+Initialization:
+```
+useEffect(() => {
+    console.log("init auth");
+    const asyncStorageWrapper = new AsyncStorageWrapper();
+    const initAuthClient = async () => {
+      try {
+        let authClient = await AuthClient.create({
+          storage: asyncStorageWrapper,
+          keyType: "Ed25519",
+        });
+        const isAuthenticated = await authClient.isAuthenticated();
+        if (isAuthenticated) {
+          const user = {};
+          setAuthState({ isAuthenticated, user, authClient });
+        } else {
+          setAuthState((state) => ({ ...state, authClient }));
+        }
+      } catch (error) {
+        console.error("Error initializing the auth client: ", error);
+      }
+    };
+
+    initAuthClient();
+  }, []);
+```
+And login function (on-Press) that opens the browser and let you login but how to grab delegation from here? :man_shrugging: Any suggestions @ilbert ?
+
+```
+const login = async () => {
+    console.log("entering login");
+    const { authClient } = authState;
+    
+    console.log("auth client", authClient);
+    if (authClient) {
+      console.log("we have auth client initialized");
+       // authClient.login - only throws a warning
+       authClient.login({
+        identityProvider: "https://identity.ic0.app/#authorize",
+        onSuccess: () => {
+          console.log("success");
+        },
+      });
+      WebBrowser.openBrowserAsync("https://identity.ic0.app/#authorize");
+     
+    }
+  };
+```
+
+-------------------------
+
+ilbert | 2024-03-19 18:29:16 UTC | #8
+
+[quote="ferMartz, post:7, topic:28603"]
+but how to grab delegation from here?
+[/quote]
+
+Kai's blog post covers this, so I'd suggest you to follow it.
+
+-------------------------
+
+kpeacock | 2024-03-19 21:15:57 UTC | #9
+
+Yeah, you definitely need to open a web page and proceed from the browser. The protocol won't let you use auth-client directly in the React Native app.
+
+We'll be able to do a formal example for this once this feature is merged - https://github.com/dfinity/agent-js/pull/817
+
+-------------------------
+
+ferMartz | 2024-03-20 13:11:30 UTC | #10
+
+@kpeacock, thank you very much for the explanation.
+
+I'll keep an eye out for that release. If you get the chance, please tag me in the post when you do the release.
+
+One more question: Do you think it's possible to write the authentication client in a React Native style, incorporating its own async storage, event handler, etc.? I might take a stab at it :sweat_smile:
+
+-------------------------
+
+kpeacock | 2024-03-20 16:19:12 UTC | #11
+
+It's still more complicated than the normal web flow because you need to have an extra website to authenticate to.
+
+But yeah, you could have a nice hook for React Native specificaly
+
+-------------------------
+
+ferMartz | 2024-03-20 16:24:46 UTC | #12
+
+Got it!
+
+I will wait for the release and take it from there.
+
+Thanks @kpeacock
+
+-------------------------
+

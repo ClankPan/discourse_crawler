@@ -1,0 +1,178 @@
+Time | 2023-11-03 13:05:49 UTC | #1
+
+It was correct when deployed to the mainnet for the first time, but after adding new functions
+When deploying using **dfx deploy --network ic**, the following error will be prompted
+```
+Error: Failed while trying to deploy canisters.
+Caused by: Failed while trying to deploy canisters.
+  Failed while trying to install all canisters.
+    Failed to install wasm module to canister 'counter'.
+      Failed during wasm installation call: The replica returned a replica error: reject code CanisterError, reject message Canister p3ava-uiaaa-aaaal-qcira-cai trapped explicitly: IDL error: principal too long, error code None
+```
+ Use **dfx canister --network=ic install counter --mode=upgrade**
+  Will also report an error
+
+```
+Error: Failed to install wasm module to canister 'counter'.
+Caused by: Failed to install wasm module to canister 'counter'.
+  Failed during wasm installation call: The replica returned a replica error: reject code CanisterError, reject message Canister p3avo-uiaaa-aaaal-qcira-cai trapped explicitly: IDL error: principal too long, error code None
+```
+
+It is normal to use **dfx canister --network=ic install counter --mode=reinstall**, but the user's data will be cleared. I don't know how to solve this problem, which makes my application unable to upgrade.
+
+-------------------------
+
+Severin | 2023-11-03 15:42:46 UTC | #2
+
+[quote="Time, post:1, topic:24392"]
+`IDL error: principal too long, error code None`
+[/quote]
+
+I've had this error before and it was always correct so far. Are you handling principals anywhere in `init`, `pre_upgrade`, or `post_upgrade`?
+
+-------------------------
+
+Time | 2023-11-03 16:46:56 UTC | #3
+
+I am developing an application using MOTOKO, but all upgrade commands prompt an error. 
+**reinstall** works for upgrading, but it results in data loss.
+
+-------------------------
+
+Time | 2023-11-04 04:47:00 UTC | #4
+
+@claudio @Manu Can anyone solve this problem? This is a very fatal problem, which makes it impossible to upgrade the application, which is very unfriendly to users. :sweat:
+
+-------------------------
+
+chenyan | 2023-11-04 17:20:02 UTC | #5
+
+Can you share the code?
+
+-------------------------
+
+Time | 2023-11-04 19:09:33 UTC | #6
+
+Sorry, my source code has several thousand lines and it is not convenient to provide it.
+
+-------------------------
+
+claudio | 2023-11-04 20:53:38 UTC | #7
+
+Does dfx give you any warning about the upgrade being incompatible?
+
+-------------------------
+
+claudio | 2023-11-04 21:55:38 UTC | #8
+
+The error should only occur if Candid or stable variable decoding encounters an (illega) principal with > 29 bytes.
+Are you constructing principals or Candid blobs manually somewhere?
+
+-------------------------
+
+claudio | 2023-11-04 22:09:12 UTC | #9
+
+So I can reproduce the error with this code:
+
+```
+import Principal "mo:base/Principal";
+actor this {
+
+   stable var self = Principal.fromBlob("012345678901234567890123456789");
+
+
+}
+```
+
+If you deploy the code, it deploys, fine, but if you then try to upgrade (without any code change) it produces the error you report.
+
+https://play.motoko.org/?tag=3122476074
+
+One problem here is that Motoko is (incorrectly or at least unsafely) letting you construct a principal with >29 bytes. I'm surprised we don't prevent that. Are you doing any manual construction of principals like this, using `Principal.fromBlob()`?
+
+-------------------------
+
+Time | 2023-11-05 10:05:35 UTC | #11
+
+Yes, I tested it, and even when my updated code only contains "actor {}", it still prompts an error. So, is the problem actually with the deployed code
+
+-------------------------
+
+Time | 2023-11-05 10:15:39 UTC | #12
+
+I didn't manually construct the principal; in most cases, it is converted through methods, such as:
+
+
+
+```
+let principal = Account.accountIdentifier(Principal.fromActor(this), Account.principalToSubaccount(caller));
+Principal.fromBlob(principal);
+```
+
+-------------------------
+
+Time | 2023-11-05 17:06:01 UTC | #13
+
+Thank you for your help.
+I seem to have found the problem.
+`Account.accountIdentifier(Principal.fromActor(this), Account.principalToSubaccount(caller)).`
+It seems that Principal with different lengths are generated. If they are stored in stable, the length will be incorrect.
+But if there is already a large user base, it seems that the data has to be cleared to upgrade. Can this problem be verified during the deploy stage?
+
+-------------------------
+
+claudio | 2023-11-05 17:37:17 UTC | #14
+
+It turns out that the Candid specification doesn't limit the size of Candid principals but both the Rust and Motoko implementations do on deserialization , because IC principals are less than 29 bytes.
+
+For consistency we should **either** make Principal.fromBlob trap if the blob is too long, and never allow the construction of large principals, **or** 
+allow longer Motoko Principals for internal use and Candid and rely on the IC limit checks when they are passed to the IC via Candid.
+
+How important is your data at the moment? Can you afford to lose it because it is just test code?
+
+ If so, I suggest we consider going for the first option and restrict Principal.fromBlob to trap on large Blobs, and you use your own implementation of that until it is fixed in base. But that is  a breaking change for everyone.
+
+If not, maybe we could modify Motoko to not enforce the  length of Candid principals on deserialization, allowing you to upgrade, perhaps using a special compiler flag to allow large principals.
+
+Where does this Account type come from, btw? Are accounts supposed to fit in principals or would it be better to just use Blob anyway.
+
+@chenyan, @nomeata what do you think?
+
+-------------------------
+
+claudio | 2023-11-05 17:46:43 UTC | #15
+
+I see that ICRC1 represents accounts as a record of a principal and a 32-byte blob. Perhaps trying to reduce this to a single principal is a bad idea.
+
+I'm sorry that the missing check in Principal.fromBlob prevented you from detecting this earlier.
+
+-------------------------
+
+Time | 2023-11-05 18:28:36 UTC | #16
+
+It's still in the testing phase. Fortunately, we found this problem in advance. Your solution is right. Thank you very much.
+
+-------------------------
+
+claudio | 2023-11-05 20:23:22 UTC | #17
+
+Tracking issue https://github.com/dfinity/motoko/issues/4267
+
+-------------------------
+
+timo | 2023-11-06 04:36:05 UTC | #18
+
+[quote="claudio, post:15, topic:24392"]
+I see that ICRC1 represents accounts as a record of a principal and a 32-byte blob. Perhaps trying to reduce this to a single principal is a bad idea.
+[/quote]
+
+Where does such a reduction happen? I thought that ICRC-1 does not do that except maybe in outdated draft.
+
+-------------------------
+
+claudio | 2023-11-06 11:24:43 UTC | #19
+
+I don't think it happens in ICRC1 - I was just suggesting that the code discussed here might be doing that extra step, given the fragments above.
+
+-------------------------
+

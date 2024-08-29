@@ -1,0 +1,157 @@
+lastmjs | 2021-06-14 21:47:41 UTC | #1
+
+I have an init function in my Rust canister, and I am trying to get access to randomness from the random beacon within that init function. I get the following error `"ic0_call_new" cannot be executed in init mode`.
+
+I am trying to do this from the init function:
+
+```rust
+let call_result: Result<(Vec<u8>,), _> = ic_cdk::api::call::call(ic_cdk::export::Principal::management_canister(), "raw_rand", ()).await;
+```
+
+-------------------------
+
+skilesare | 2021-06-14 22:01:26 UTC | #2
+
+I'm pretty sure that that is a limitation. I ran across it in the IC code somewhere Init can't do cross canister.
+
+-------------------------
+
+claudio | 2021-06-14 22:14:18 UTC | #3
+
+Yes, I can confirm that is a limitiation, documented in the Interface Spec. 
+
+Motoko will actually statically reject actors that try to send messages from their initialisation code, but I guess the Rust library cannot or is not designed to enforce this.
+
+-------------------------
+
+claudio | 2021-06-14 22:19:31 UTC | #4
+
+If you look at the spec, the system functions have comments that use codes to indicate in which contexts they can be called (trapping on violation).
+
+https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-imports
+
+In particular, `ic0_call_new` cannot be called in mode `I`.
+
+-------------------------
+
+flyq | 2021-06-30 08:52:49 UTC | #5
+
+My experience is that you can’t use `await` in the init function, which means you can’t do cross-canister call and get the result in init function.
+
+-------------------------
+
+senior.joinu | 2021-06-30 10:41:19 UTC | #6
+
+Could you elaborate on this limitation, please? Why does it work that way?
+
+-------------------------
+
+claudio | 2021-06-30 10:47:36 UTC | #7
+
+My understanding is that the `canister_init` method is used to set up the initial invariants of the canister. 
+If you allowed messaging during `canister_init`, then another canister, or the canister itself, could call into the canister under construction, before its invariants have been established. 
+
+This is a well-known flaw with constructors in some OO languages, IIRC.
+
+(NB: I didn't design the System API and am just speculating on the rationale.)
+
+-------------------------
+
+senior.joinu | 2021-06-30 12:01:35 UTC | #8
+
+Thanks a lot!
+Then, I believe, it should be possible to introduce some kind of `post_init` lifecycle hook? That would be handy.
+
+-------------------------
+
+lastmjs | 2021-07-02 00:03:32 UTC | #9
+
+I can definitely use `await` from the init function
+
+-------------------------
+
+flyq | 2021-07-02 00:33:51 UTC | #10
+
+I don't try it in Rust, but in motoko: 
+```sh
+Stdout:
+
+Stderr:
+/Users/flyq/workspace/test/test_await/src/main1.mo:8.13-8.30: type error [M0038], misplaced await
+```
+source:
+```mo
+import Test2 "./main2";
+import Principal "mo:base/Principal";
+actor class Test1() {
+
+    var a = 0;
+
+    let b = await Test2.Test2; // line 8
+...
+```
+
+-------------------------
+
+senior.joinu | 2022-03-19 16:18:24 UTC | #11
+
+It looks like there is a workaround for this limitation. Just discovered it.
+
+You can use `ic-cron` library to schedule a task inside `init()` function and then immediately process that task in the first ever `heartbeat` of your canister.
+
+```rust
+implement_cron!();
+
+#[derive(CandidType, Deserialize)]
+pub enum CronTaskType {
+    Init(Principal);
+};
+
+#[init]
+fn init(external_canister: Principal) {
+    cron_enqueue(
+        CronTaskType::Init(external_canister), 
+       
+        // these options represent an immediate one-time task
+        SchedulingOptions {
+            delay_nano: 0,
+            interval_nano: 0,
+            iterations: Iterations::Exact(1),
+        }
+    );
+}
+
+#[heartbeat]
+fn tick() {
+    for task in cron_ready_tasks() {
+        let task_type: CronTaskType = task.get_payload().expect("get_payload failed");
+
+        match task_type {
+            CronTaskType::Init(external_canister) => {
+                spawn(async move {
+                    call(external_canister, "test", ()).await
+                });
+            }
+        };
+    }
+}
+```
+
+-------------------------
+
+paulyoung | 2022-03-19 20:55:39 UTC | #12
+
+[quote="claudio, post:7, topic:5187"]
+If you allowed messaging during `canister_init` , then another canister, or the canister itself, could call into the canister under construction, before its invariants have been established.
+[/quote]
+
+Would this be an issue in a system based on capabilities?
+
+-------------------------
+
+skilesare | 2022-03-19 21:24:34 UTC | #13
+
+Post init would be a great system hook to have.
+
+-------------------------
+

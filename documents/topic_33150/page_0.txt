@@ -1,0 +1,113 @@
+ghostwhoowalks | 2024-07-13 07:07:13 UTC | #1
+
+My understanding based on what I have consumed so far. For each canister when deployed the following queue infrastructure is setup to listen to messages received:
+(1) one ingress queue that is messages/transaction from the block.
+(2) one input queue that is messages from other canisters
+(3) one egress queue that is responses that need to be processed i.e. update the StateTree.
+
+When a canister A wants to communicate with another canister B in the same subnet then there is a queue setup for this pair as part of the queue infrastructure for the canister A. This message will be delivered to the "input queue" of canister B correct? 
+
+Is my understanding correct so far? Thanks in advance.
+
+-------------------------
+
+derlerd-dfinity1 | 2024-07-15 08:25:01 UTC | #2
+
+[quote="ghostwhoowalks, post:1, topic:33150"]
+(1) one ingress queue that is messages/transaction from the block.
+[/quote]
+Correct. Responses to such ingress messages will then be put into the ingress history where they are certified by the subnet and can be read by users. 
+
+[quote="ghostwhoowalks, post:1, topic:33150"]
+(2) one input queue that is messages from other canisters
+(3) one egress queue that is responses that need to be processed i.e. update the StateTree.
+[/quote]
+
+For each canister it is an input + output queue pair per remote canister. Every message a canister produces (except responses to ingress messages) is first put into the canister's output queue for the receiving canister. From there the message is routed into the subnet-to-subnet stream to the subnet hosting the destination canister (possibly the local subnet), where it will eventually be picked up by the destination subnet (as part of block making) and end up in the destination canister's input queue (the one containing the messages from the sending canister). Once the message is into an input queue, execution will eventually pick up the message. Execution may result in further messages (e.g., a response to the initial message if it was a request) which are then also handled in the same way as described above.  
+
+[quote="ghostwhoowalks, post:1, topic:33150"]
+When a canister A wants to communicate with another canister B in the same subnet then there is a queue setup for this pair as part of the queue infrastructure for the canister A. This message will be delivered to the “input queue” of canister B correct?
+[/quote]
+
+The setup is the same for inter and intra subnet messages -- a queue pair per remote canister. Also the routing etc. happens in very similar way for same subnet and cross subnet messages. The only material difference (at this abstraction level) is that for same-subnet messages execution has an optimization built in, which will directly route messages from the sending canister's output queue to the receiving canister's input queue directly during an execution round if there are still cycles left in that round (i.e., one may skip the subnet-to-subnet streams for same subnet messages in certain cases).
+
+-------------------------
+
+ghostwhoowalks | 2024-07-15 14:58:54 UTC | #3
+
+Thanks for the detailed response. Now, how does IC order the executions so that every node in the subnet (let's assume all inter canister calls are intra subnet) follows the same ordering in order to yield the same end result? Any literature I can read about how that is accomplished? Thanks in advance.
+
+-------------------------
+
+derlerd-dfinity1 | 2024-07-15 16:10:00 UTC | #4
+
+[quote="ghostwhoowalks, post:3, topic:33150"]
+. Now, how does IC order the executions so that every node in the subnet (let’s assume all inter canister calls are intra subnet) follows the same ordering in order to yield the same end result?
+[/quote]
+
+Message routing is part of deterministic processing; queues, streams etc. are all part of the replicated state and evolve in the same way on all nodes. High-level the reason how ordering is kept up is because both queues and streams will respect the request ordering. The optimization inside execution to directly route messages from output queues into input queues is also built so that it respects the ordering.
+
+[quote="ghostwhoowalks, post:3, topic:33150"]
+Any literature I can read about how that is accomplished?
+[/quote]
+
+For a high level overview of message routing I'd recommend [this](https://www.youtube.com/watch?v=YexfeByBXlo) video. For a more detailed (and formal) overview, [this](https://wiki.internetcomputer.org/wiki/IC_message_routing_layer) wiki page might be a good start.
+
+-------------------------
+
+ghostwhoowalks | 2024-07-16 06:50:11 UTC | #5
+
+Thanks for the response. I went over the video and the relevant portions of the wiki. Please explain to me how the following scenario can be avoided:
+
+Let's assume there is a block with two transactions. txn_1 is a call to canister A which at some point calls canister B. txn_2 is a call to canister B alone. Now this means that txn_1 is placed in the ingress queue of A and txn_2 is placed in the ingress queue of B. Now at some point of processing of txn_1 there will be a message that will be placed on the input queue of B (from A). 
+
+Due to race conditions it can happen that on node N1 canister B picks txn_2 for processing first while on node N2 txn_1 shows up on input queue of B sooner than txn_2's call to canister B. In this case the order of execution will be messed up. How is this avoided? 
+
+Thanks in advance.
+
+-------------------------
+
+derlerd-dfinity1 | 2024-07-16 07:26:23 UTC | #6
+
+The only ordering guarantee the protocol gives is the following: *If a canister A sends two requests m_1 and m_2 to canister B then m_1 will be be processed before m_2 **if both messages are accepted**.* Furthermore, there are no guarantees on response ordering. 
+
+Note that the "if both messages are accepted" is important here, because the protocol doesn't give a request delivery guarantee, which means that the message being rejected by the system (e.g., because there is no message memory left, or the receiver canister traps upon executing the request, or some other reject reason that makes it look to the canister as if the request never existed) can lead to a situation where m_2 is executed while m_1 is rejected by the system. 
+
+So if ordering is important to an dApp the best is to build the ordering guarantees into the dApp. How this is best built heavily depends on the application, but one thing that comes to mind would be to put sequence numbers into the message payloads and have the receiver canister re-request messages at the sender side in case it detects a gap in the sequence numbers. 
+
+For the particular case you are asking about, note that there is nothing in the protocol that would guarantee a global order of transactions. So for your use case there seems to be some synchronization between canister A and canister B required to make sure they use consistent sequence numbers so that they can ensure a global (i.e., across canister A and B) order of execution. 
+
+Finally, also note that for ingress messages there are generally no ordering and delivery guarantees. So in your example it could already happen that `txn_1` is included into a block much later than `txn_2` and your intended ordering is already broken at this point.
+
+-------------------------
+
+ghostwhoowalks | 2024-07-16 07:50:43 UTC | #7
+
+Thanks for the response. I was not alluding to the need of a global order. I was merely pointing out in the example that context switching, race conditions could easily change the order of executions. This implies that different nodes can arrive at a different end result. Hence the question about how is any deterministic order guaranteed? At the end of the day what is needed is a deterministic order that everyone adheres to correct? Thanks again.
+
+-------------------------
+
+derlerd-dfinity1 | 2024-07-16 16:25:11 UTC | #8
+
+[quote="ghostwhoowalks, post:7, topic:33150"]
+I was merely pointing out in the example that context switching, race conditions could easily change the order of executions.
+[/quote]
+
+Correct.
+
+[quote="ghostwhoowalks, post:7, topic:33150"]
+This implies that different nodes can arrive at a different end result.
+[/quote]
+
+In your example *the dApp* might see arbitrary orders of execution of messages due to the race condition you point out. *However, this does not mean that nodes would see non determinism -- if it would be possible to trigger non determinism of nodes this would result in a stall of the subnet chain.* 
+
+Note that everything that affects deterministic processing is agreed upon beforehand via Consensus and only once a block is finalized (i.e., all honest nodes agree on **the** block at a certain height) it is passed to the deterministic state machine where all nodes will apply the same deterministic changes to the state relative to the block. So the race condition you are pointing to doesn't come from the fact that different nodes might do different things at the same height (which they won't do as per the protocol), but from the fact that it is unclear whether `txn_1` will end up before `txn_2` in the agreed upon block and that -- depending on which scheduling (e.g., is canister `B` scheduled before `A`, does canister `B` take longer to execute `txn_2` than `A` takes for executing `txn_1`, etc.) and routing decisions (e.g., is the message for `B` that `A` produces as a result of executing `txn_1` still routed within the execution round, or is it routed to the stream and only inducted in the next round) are made during deterministic processing of the transactions -- different (but still deterministic on all nodes) execution orders can happen.
+
+[quote="ghostwhoowalks, post:7, topic:33150"]
+At the end of the day what is needed is a deterministic order that everyone adheres to correct?
+[/quote]
+
+Correct.
+
+-------------------------
+

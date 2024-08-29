@@ -1,0 +1,97 @@
+icme | 2022-04-11 14:36:18 UTC | #1
+
+I’m looking into solutions that would allow me to build an auto-scaling solution for canisters based on the current memory utilization of the canister, and part of this solution involves being able to fully clone or partially replicate the data stored in the canister and then to repartition the data amongst the original canister and clone(s).
+
+The only (and most expensive option) I can think of right now is to use inter-canister update calls, but when we’re talking about 1-2 GB of data this would be a somewhat slow process based on what I’ve seen from others. I could also maintain multiple canisters from the start, but this is then 2X the cost.
+
+Is there any way to pull out a canister replica for this purpose via a clone() type of functionality? If not, are there any other current solutions or ongoing work/roadmap items that might help IC Devs clone or repartition the data in canisters?
+
+-------------------------
+
+skilesare | 2022-04-11 16:00:56 UTC | #2
+
+Also see discussion here:  https://forum.dfinity.org/t/canister-backup/11777/19?u=skilesare
+
+This would be great. I know that there is work underway for downloading the current wasm state, but it would also be great if the replica could just copy it and start running it under a different canister id.
+
+-------------------------
+
+icme | 2022-04-11 21:25:35 UTC | #3
+
+Thanks for linking that discussion.
+
+[quote="skilesare, post:19, topic:11777"]
+It is much easier to copy a canister and delete the first half of the data on the first and the second half on the other than to do 4GB/2MB= 2000 intercanister calls to move data from one to another.
+[/quote]
+
+This clone/copy and delete methodology is exactly my thinking. Fully copying a canister through inter-canister calls is both expensive and would take a significant amount of time, not to mention you now introduce a whole bunch of distributed systems problems with what to do if a 1-2GB canister data copy fails in the middle (since you would be splitting the copy process into multiple update calls supposedly).
+
+[quote="senior.joinu, post:18, topic:11777"]
+Why don’t you just use another canister for the backup?
+[/quote]
+
+While this works great for backups, you have to start out by spinning up that extra canister before. This doesn't work if you're auto scaling out in a reactionary fashion, and to top it off doesn't effectively tackle the problem of if you have data that is unevenly distributed (based on a particular primary key).
+
+The intermediate solution that a few teams have come up with is to find a specific entity that they do not believe will push the 4GB canister limit anytime soon (say a user, or a message chat on OpenChat) and just spin up a new canister for each of those entities. I think that the above will most likely be my approach (in the intermediate term), as I'm certain that a deeper IC based solution (either the replica copy solution or another solution) is the way to go in the long term.
+
+Building off of this, I'm assuming these clones would then be bounded by the individual subnet of a particular application - which would then be the next bottleneck.
+
+@diegop From a brief glance I didn't see this on the [2022 Sneak Preview RoadMap](https://forum.dfinity.org/t/ic-roadmap-milestones-for-2022-sneak-preview/10527). Are there any Roadmap items that might tackle this problem or engineers that might be able to comment on the feasibility/work required to perform efficient canister data cloning?
+
+-------------------------
+
+jzxchiang | 2022-04-12 01:31:36 UTC | #4
+
++1, this would be very useful.
+
+Even a feature that lets canister owners download/upload a canister's state would essentially allow us to clone a canister. Last I checked it was on the roadmap, but I don't know the current status.
+
+@akhilesh.singhania, do you happen to know? Thanks!
+
+-------------------------
+
+icme | 2022-05-30 23:32:27 UTC | #5
+
+From https://forum.dfinity.org/t/how-would-internet-identity-handle-a-denial-of-service-attack/12791/10
+
+[quote="faraz.shaikh, post:10, topic:12791"]
+Consensus: The P2P layer implements fixed-sized i/o queues per replica. So malicious replicas cannot overwhelm other replicas. These queues are sized (size and count of messages) sufficiently well such that replicas operating within the protocol limits will never run out of queue space. I a replica genuinely falls behind (transient sluggish network) it can ask for retransmission to do a quick resync. **If a part of the subnet is lagging behind for longer periods of time - it will fail to do quick resyncs and eventually fall back to CUP-based state-syncs. This queuing model works on the premise the CUP-based state syncs are orders of magnitude faster than actual consensus-based progress.**
+[/quote]
+
+This got me looking into CUPs, or catch-up packages, which are very briefly described in section 8.2 of https://dfinity.org/whitepaper.pdf.
+
+From the whitepaper, section 8.2.
+
+
+> 
+> A CUP is a special message (not on the blockchain) that has (mostly) everything a
+> replica needs to begin working in a given epoch, without knowing anything about previous
+> epochs. It consists of the following data fields:
+> 
+> • The root of a Merkle hash tree for the entire replicated state (as opposed to the
+> partial, per-round certified state as in Section 6.1).
+> • The summary block for the epoch.
+> • The random beacon for the first round of the epoch.
+> • A signature on the above fields under the (n − f )-out-of-n threshold signing key for
+> the subnet.
+> 
+> To generate a CUP for a given epoch, a replica must wait until the summary block
+> for that epoch is finalized and the corresponding per-round state is certified. As already
+> mentioned, the entire replicated state must be hashed as a Merkle tree — even though a
+> number of techniques are used to accelerate this process, this is still quite expensive, which
+> is why it is only done once per epoch. Since a CUP contains only the root of this Merkle
+> tree, a special state sync subprotocol is used that allows a replica to pull any state that it
+> needs from its peers — again, a number of techniques are used to accelerate this process,
+> but it is still quite expensive. Since we are using a high-threshold signature for a CUP, we
+> can be sure that there is only one valid CUP in any epoch, and moreover, there will be
+> many peers from which the state may be pulled. Also, since the public key of the threshold
+> signature scheme remains constant over time, the CUP can be validated without knowing
+> the current participants of the subnet
+
+
+@faraz.shaikh The section describes how "expensive" a CUP sync is, but are there any performance tests on how long it takes to CUP sync catch up something like 1GB of canister state?
+
+The reason why I ask is I'm wondering if CUP syncs could be used for cloning or forking of a canister at a given point of time (spinning up a new, but distinct canister from a CUP sync).
+
+-------------------------
+

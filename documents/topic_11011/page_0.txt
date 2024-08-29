@@ -1,0 +1,1315 @@
+jwiegley | 2022-02-22 06:40:58 UTC | #1
+
+# Draft Proposal: Compounding Maturity
+
+Following the [Medium post](https://medium.com/dfinity/proposal-to-improve-icp-governance-staking-re-tax-and-tokenomics-df09903a2e0b) from Dominic Williams, and the [subsequent discussion on this forum](https://forum.dfinity.org/t/dominic-s-proposal-to-improve-icp-governance-staking-re-tax-and-tokenomics/10530/108), a new draft proposal has been written with an approach to implementing these new maturity features for Governance. I welcome everyone to contribute their thoughts to this thread, as this will be very helpful to further refining the changes under consideration. Thank you!
+
+John Wiegley
+Principal Engineer
+
+# Objective
+
+## The Problem
+
+Those with ICP staked in neurons face two main challenges when dealing with the maturity they earn as a result of voting rewards:
+
+- How to avoid incurring a tax burden;
+- How to compound maturity with the least manual effort.
+
+## Proposed Changes
+
+The objective of this proposal is to address these concerns by making several changes to the way maturity is handled by the NNS governance canister:
+
+1. There will be two types of maturity:
+
+   a. **staked maturity**, which contributes to voting power, but no ICP is produced from this maturity until the neuron is dissolved; and
+   b. **maturity**, which can be staked, used to produce ICP, or "traded in for stake" (see below) once it is received.
+
+2. Daily voting rewards may be received either as staked maturity or maturity, and this choice can be changed _for future rewards_ at any time. Note that if rewards are received as staked maturity, this has the same effect as compounding rewards daily.
+
+3. When ICP is produced from maturity, this can take place in one of two ways:
+
+   a. If there is sufficient staked ICP in the neuron, maturity can be "traded in" by exchanging an equal amount of staked ICP for staked maturity. For example: If a neuron has 100 staked ICP, 0 staked maturity and 10 maturity, the result of a "trade in" would yield 10 ICP and leave the neuron with 90 staked ICP, 10 staked maturity and 0 maturity. Note that this has may have tokenomics implications described in more detail in the "Impact on Tokenomecs" section.
+
+   b. If there is not sufficient staked ICP in the neuron, newly minted ICP is produced.
+
+4. ICP is produced from staked maturity only when the neuron is disbursed, at which point it is subject the "modulation" described below.
+
+5. Whenever ICP is produced from maturity by minting, it is subject to a mandatory 7 day waiting period followed by a modulation of the amount received, up to +/- 5%, based on the recent market price of ICP. How this is calculated is described in the section "Modulated production of ICP from maturity" below.
+
+## Rationale
+
+It is hoped that these changes will improve the tax situation for neuron holders based on the fact that, when ICP is produced from maturity, it is unknown how much ICP will result; and also because this process may be change in the future based on governance proposals. A neuron with compounding maturity will have no definite future value.
+
+# Neuron management changes
+
+It may be helpful to explain how management of neurons will be changed by this proposal, using a set of examples.
+
+## `merge_maturity` → `stake_maturity`
+
+Merge maturity is now called "stake maturity", and simply converts `maturity` into `staked_maturity`.
+
+### Before proposed change:
+
+- Before `merge_maturity`: Neuron has 100 ICP stake and 10 maturity.
+- After `merge_maturity`: Neuron has 110 ICP stake and 0 maturity.
+
+### After proposed change
+
+- Before `stake_maturity`: Neuron has 100 ICP stake, 0 staked maturity and 10 maturity.
+- After `stake_maturity`: Neuron has 100 ICP stake 10 staked maturity and 0 maturity.
+
+## `spawn_maturity` → `disburse_maturity`
+
+Spawn maturity is now called "disburse maturity". This operation begins a 7 day clock that completes with a modulation of the amount to be received (see below). This final amount of newly minted ICP may then be transferred into the neuron holder's account.
+
+### Before proposed change:
+
+- Before `spawn_maturity`: Neuron has 100 ICP stake and 10 maturity.
+- After `spawn_maturity`: Neuron has 100 ICP stake and 0 maturity, while a newly created reward neuron has 10 ICP stake and 0 maturity.
+
+### After proposed change
+
+- Before `disburse_maturity`: Neuron has 100 ICP stake, 0 staked maturity and 10 maturity.
+- After `disburse_maturity`: Neuron has 100 ICP stake 0 staked maturity and 0 maturity. After 7 days, between 9.5 and 10.5 ICP is transferred to the user's account.
+
+## `exchange_maturity`
+
+If there is sufficient staked ICP in the neuron, this operation exchanges maturity for staked ICP in the neuron, while converting that maturity into staked maturity.
+
+### Example
+
+- Before `exchange_maturity`: Neuron has 100 ICP stake, 0 staked maturity and 10 maturity.
+- After `exchange_maturity`: Neuron has 90 ICP stake 10 staked maturity and 0 maturity. 10 ICP is immediately transferred to the user's account.
+
+## split_neuron
+
+The meaning of this operation is more accurately "split neuron stake".
+
+When a neuron is split, its staked maturity is also split according to the same percentage. Any maturity, or currently disbursing maturity, remains in the parent neuron.
+
+## merge_neurons
+
+When neurons are merged, all stake is merged, all staked maturity is merged, and all maturity is merged. Any maturity in the source neuron that is waiting to produce ICP (meaning, completing its 7 day waiting period) will remain, and be transferred to the user's account when the waiting period ends, according to the modulation factor described below.
+
+# Proposed changes to the governance canister
+
+To meet the objectives stated above, the followed changes will be made to governance.
+
+## Change 1: Staked maturity
+
+Each neuron presently has an amount of ICP staked and an amount of maturity earned. In order to introduce the idea of "staked maturity" as separate from "maturity", the two amounts will be tracked separately.
+
+## Change 2: Auto-compounding
+
+Once there are two separate kind of maturity, a flag is provided to decide which is increased when rewards are granted. This flag may be changed at any time.
+
+## Change 3: Disburse directly from the neuron
+
+In the past a separate reward neuron was used to manage the "7 day delay" required when spawning. Instead, we would like to find a mechanism that allows for disbursing actions to take place within a single neuron only. The exact mechanics are still being designed.
+
+## Change 4: Trading-in staked ICP
+
+While a neuron contains staked ICP, maturity may be traded in without any minting and thus no new income. To compensate the loss of staked ICP, the same amount is added to the `staked_maturity` so that no voting power is lost. See the example above for `exchange_maturity`.
+
+This means that if rewards are harvested regularly from a neuron, it will eventually contain only stake maturity -- which behaves exactly like the original staked ICP in terms of voting power and future rewards. The primary difference is when the neuron is finally dissolved and disbursed, the amount of ICP received is subject to modulation according to change 5.
+
+## Change 5: Modulated production of ICP
+
+Whenever newly minted ICP is produced from maturity, the amount actually
+minted is modulated to take recent price movements into account. The algorithm
+used to do this is as follows:
+
+  1. Determine the 30 day moving average for each of the last 28 days. Label these `a₁` (today) through `a₂₈`.
+
+  2. Compute the average price delta for each of the last four weeks. Thus, `d₁ = (a₁ - a₇) / a₇`, etc. This value is bounded from `-0.05` to `0.05` by clipping values to the limits of this range.
+
+  3. Take the average of these adjusted deltas: `(d₁ + d₂ + d₃ + d₄) / 4`.
+
+The resulting value is a number between `-0.05` to `0.05` that determines the percentage change of the modulation. This is multiplied by the maturity to determine the amount of ICP that should be minted.
+
+# Impact on security
+
+There should be no security implications from this change.
+
+# Impact on simplicity
+
+There are a few ways in which this proposal affects the simplicity of staking ICP in a neuron:
+
+1. Reward neurons are no longer needed to disburse maturity. This is managed within each neuron itself.
+
+2. There are now two kinds of maturity to be aware of: staked maturity and regular maturity.
+
+3. There is a new flag (a checkbox in the UI) to decide which type of maturity rewards are received as. Choosing "staked maturity" is equivalent to a neuron that automatically compounds daily.
+
+4. The modulation of maturity that occurs before minting is the largest source of complexity in this proposal. It remains to be seen what effect this will actually have on tax authorities, and whether the algorithm employed should be refined in the future.
+
+# Impact on tokenomics
+
+This proposal will impact tokenomics in several ways.
+
+## Deferring inflation
+
+The most immediate effect is that over the next several years the minting rate, or increase in supply, will drop to much lower numbers, as the majority of disbursed maturity is transferred out of neurons' staked ICP rather than minting new ICP. This also means that when these neurons finally dissolve, the minting that was deferred will happen then. The intent is that this will happen at a time when burn rates are established and can better absorb the increase in supply.
+
+## Less forced selling
+
+At present, tax authorities may consider maturity to be income the moment it is received. In such situations, there is a constant pressure to frequently realize maturity as ICP and to sell some part of it on the open market. This is both inflationary and increases selling pressure. By removing the need to constantly produce ICP from maturity there is less forced selling on the market and more freedom to wait until market conditions are favorable and better able to absorb the incoming ICP.
+
+## Improved return in the initial years
+
+If a neuron is staked for multiple years, any income generated by that neuron, at the beginning of its dissolve delay, will be in the form of staked maturity and not newly minted ICP. This happens because stake is paid out in exchange for staked maturity, as described above. What this means for stake holders is that they will not need to sell for taxes during this initial phase, so all of that ICP can be re-staked to increase voting power, which increases overall returns.
+
+## Further price stability
+
+The next effect is that neuron holders with available maturity could be incentivized to produce and sell ICP when prices have been trending upward, and not when the market for ICP has been recently falling. The potential lifting of tax burden due to this uncertainty is what would permit this freedom of choice.
+
+# Alternatives considered
+
+Several alternative modulation algorithms were considered, including a more simple price delta algorithm, one based on a 30-day linear regression slope, and even one using price/volume trends. The algorithm chosen above was analyzed by calculating the modulation it would have yielded over the current history of ICP prices.
+
+The choice of algorithm, and the bounding factor of +/- 5%, should at present be regarded as an experiment. Without real market experience to observe the economic impact, it is impossible to foreknow the perfect algorithm for inducing uncertainty while at the same time reflecting overall market trends.
+
+# Community conversation & Timeline
+
+The NNS team is ready to work on this feature! To get the design approved by the community, we followed the following schedule:
+
+- Jan 27: Initial post by Dominic Williams on Medium.
+- Jan 27-...: Discussion on the Forums.
+
+# What we are asking the community
+
+- Participate in technical discussions as the motion is developed
+
+Previous thread: https://forum.dfinity.org/t/dominic-s-proposal-to-improve-icp-governance-staking-re-tax-and-tokenomics/10530/108
+
+-------------------------
+
+Roman | 2022-02-21 10:59:27 UTC | #2
+
+Dear John,
+
+Thanks a lot for this exhaustive description for the proposal to come. 
+
+This is my question : accordingly to one of your declarations, I thought that the current system would also be kept, as optional : convert maturity immediately into staked ICP within the neuron whose is the maturity. I understand you still offer this here, but mediately : by adding a 7 days delay. So why just keeping things like they are, optionally of course.
+
+Why would not we offer to people to keep this, even applying the +5%/-5% rule, in addition to the whole new system you are proposing ?
+
+By maintaining this, you would be offering a complete staking system, with 3 options, perfect in my opinion : 
+- stake maturity AS maturity staked
+- stake simple maturity AS icp into the neuron
+- accumulate simple maturity in order to trade in or to disburse icp for X reason.
+
+-------------------------
+
+jwiegley | 2022-02-21 16:41:20 UTC | #3
+
+I really appreciate you asking about this, as I asked about this feature as well. It was decided to drop the current `merge_maturity` functionality (merging maturity directly into staked ICP), and to reconsider at a later time. There is a 4th option you didn't mention: staking staked maturity as ICP in order to "lock-in" the current discount.
+
+If you draw out the box of possibilities, it naturally leads to a family of related options:
+
+- `exchange_maturity`: maturity -> staked maturity + staked ICP -> liquid ICP
+- `stake_maturity`: maturity -> staked maturity
+- `disburse_maturity`: maturity -> liquid ICP
+- _not in this proposal (was `merge_maturity`)_: maturity -> staked ICP
+- _not in this proposal_: staked maturity -> staked ICP
+
+One issue with permitting "all that is logically possible" are the ways in which it adds more detail to the UI and documentation. But I will bring up your question again, especially since it came up in the first response!
+
+-------------------------
+
+Roman | 2022-02-21 17:40:28 UTC | #4
+
+I am very glad you thought about this too ! I really do like the second one you add too ! But if I had to choose between the two possibilities not included in this proposal described above, I would prefer this one : 
+
+[quote="jwiegley, post:3, topic:11011"]
+*not in this proposal (was `merge_maturity` )* : maturity → staked ICP
+[/quote]
+
+I justify this preference by its historicity : people already know this feature and are already used to doing this, but I would prefer to not have to choose and add these two ones, because the both are very beautiful. I think it is very important for people to be able to convert at least maturity directly into staked icp, and convert staked maturity into staked ICP would be "the cherry on the cake" ! But what a cherry !
+
+Anyway, this proposal is already very beautiful in its current state, but if it covers all the logical possibilities by adding these two ones, it would become a piece of art, since it would be exhaustive : what a most beautiful system than an exhaustive one and what a more exhaustive blockchain than ICP. 
+
+If I can reassure you about the UI, I am not sure it very complicates things : it just maintains an original feature and introduces a variant of the main new one. And the difference between 3 possibilities and 5 possibilities is very thin, furthermore if it articulates the same concepts. Plus : when it is about maximisation of they rewards, people definitely prefer to have the choice, they will see it as a good point rather than a weakness and they even would quickly wonder why these two features are not available. So they will definitely prefer exhaustivity rather than an arbitrary choice.
+
+So an immediate implementation could be good as much for "marketing" reasons as for gaining time by preventing the addition of an update sooner than later for this feature or these features.
+
+Anyway, I only can congratulate you for this whole design. Wonderful.
+
+-------------------------
+
+Ang | 2022-02-21 19:28:38 UTC | #5
+
+Great job designing this new system! I think it's a big improvement. A couple questions: 
+
+Question 1: 
+
+- With `exchange_maturity` what happens if there is 0 ICP in the neuron remaining to exchange (ie. all ICP has been drained/exchanged out of neuron)? At that point will the `exchange_maturity` function no longer be available. Then the user would have two available options: (1) Claim rewards through minting new ICP with the `disburse_maturity` function, or (2) Reenable  `exchange_maturity` by depositing ICP into the Neuron from external account? Essentially, a user could re-add the same ICP (if they didn't sell it) back into the Neuron that they had previously exchanged? What implications, if any, would this have that the same ICP could be re-added and exchanged indefinitely? 
+
+Question 2: 
+
+- After a user calls the `disburse_maturity` function and seven days passes. How would a user check retrospectively to confirm how much of a bonus/penalty was applied to the disbursal?
+
+-------------------------
+
+jwiegley | 2022-02-21 19:49:16 UTC | #6
+
+Hi AA, to your Question 1: `exchange_maturity` is only available if sufficient stake exists to cover the maturity to be exchanged. If there is not enough, that option will be greyed out in the UI, or return an error of "insufficient stake" from Governance. And yes, you could topup the neuron to the necessary amount, in case you want all the maturity out but only have a little stake left.
+
+To question 2: This is a very good question, and has yet to be decided. The UI being designed shows a list of "producing amounts" that each head toward their 7 day limit, at which point the discount is calculated and reported. The real question is how to cause the transfer to happen in a way that allows for errors to be noticed and dealt with. TBD.
+
+-------------------------
+
+lastmjs | 2022-02-21 23:27:36 UTC | #7
+
+I've been lagging behind and haven't read everything yet, so please forgive any of my misunderstandings. I just want to get a short opinion out before it's too late.
+
+So far I am not in favor of this proposal. I have some high level concerns. Again I'm not going to take the time now to fully formulate my thoughts unfortunately.
+
+My concerns are around the following:
+
+1. Increased complication of the system
+2. The possibility that we're falling into the fatal conceit by trying to control our little economy based on the suggestions of a small group that thinks they can control the price of ICP through tinkering
+3. Feeding the price of ICP into the monetary system, this coupling the IC's monetary policy to current markets and requiring an oracle (no major blockchain that I know of does this, and the most successful monetary assets BTC and ETH definitely do not do this. I believe some Ethereum researchers have strong opinions on why ETH's monetary policy should be decoupled from its current market price)
+4. Trying to hide/obscure staking rewards based on a limited understanding of tax laws (the US situation may be changing, will the IRS and other tax authorities look kindly on this blatant attempt to obfuscate taxes, and how much legal consultation with tax authorities have we considered)
+5. More on point 4, the basis for these changes is to fix a tax situation and make automatic compounding easier. If our understanding of the tax situation is nebulous now, then basing an entire overhaul of the monetary policy of the IC on these shaky foundations seems like folly
+6. I just don't like how complicated it is now. I had a personal setup I felt worked with my current tax situation, and now it's being taken away from me. My understanding of the situation (not a CPA or whatever) is that maturity is not taxable, and the IRS may even go beyond that saying that staking rewards aren't taxable until sold
+
+I feel we're trying to meddle too much with an already complicated system, making it more complicated, and assuming it will fix tax situations the world over when the largest tax authority in the world might come out any day and say staking rewards aren't taxable.
+
+I think we should be vary wary of this type of meddling, like I said the fatal conceit.
+
+-------------------------
+
+lastmjs | 2022-02-22 00:42:17 UTC | #8
+
+@jwiegley There are numerous concerns that people have brought up in the original forum post. I don't see that you've addressed any really but the technical. I would love for you and those who seem quite eager to push these changes through to address those concerns.
+
+After reading through that very long thread with the numerous points of concern, why has this proposal even been created? We definitely did not reach any kind of consensus on what to do in that forum.
+
+This proposal should be dropped. It's far too complicated, based on very weak foundations, and it's very difficult to determine the long-term impact, considering the enormous number of variables to consider including human psychology, various tax laws, and complex economics.
+
+I would like to understand also the motivations for pushing this through, I sense there is a small group of people very eager to see this pass, thus leading to a suboptimal conversation in the previous thread. The community said a lot, the designers/implementers (I only really remember @jwiegley being in there, were other DFINITY team members designing this proposal in the thread?) focused on technical issues rather than the more complex systemic issues.
+
+-------------------------
+
+lastmjs | 2022-02-22 00:46:43 UTC | #9
+
+It would be nice if those with major concerns in the thread could concisely summarize them here so they can each be addressed.
+
+-------------------------
+
+wpb | 2022-02-22 05:17:28 UTC | #10
+
+John,
+
+Several questions and considerations:
+
+1) I’m in full agreement that tax considerations are good justification for changes to a tokenomics design and I have no objections to creating a tokenomics design that has the best tax advantages.  We all expect our CPAs to give us the best tax advantages while still following the laws and it seems reasonable to shape tokenomics features to enable optimal tax considerations.  That said, I’m still having trouble understanding how staked ICP as defined here would be treated differently from a tax perspective than our current definition of maturity.  To be honest, I also don’t understand how our current definition of maturity can be considered taxable.  Accumulation of maturity is not receipt of ICP and no ICP has been minted when maturity has been earned.  Maturity has no value until the owner exercises their option to merge or spawn.  If maturity is considered taxable, I don’t understand how staked ICP would not be taxable.
+
+2. One feature I especially appreciate is the clarification on the modulation equation.  I like it a lot.  I think it accounts for medium term market trends in a very reasonable way and does indeed encourage dispersing at times of price uptrend instead of downtrend.  In my opinion, we should go back to the min and max that Dom proposed of +5% / -30%.  Otherwise, I don’t think a -5% min loss will be enough incentive for people to consider market price direction when they decide if they want to disperse.  It really needs a higher penalty to be effective.
+
+3. My observation is that voting rewards have not been the major source of inflation of circulating supply of ICP.  The biggest source of inflation is dissolving neurons.  The circulating supply has increased approx 77M ICP since genesis (see [ICP Supply](https://dashboard.internetcomputer.org/circulation) chart).  Yet only 8M ICP has been disbursed from voting reward minting (see [Total Rewards](https://dashboard.internetcomputer.org/circulation) chart), a large portion of which has been merged instead of sold on exchanges.  I know a major driver for this proposal is to enable neuron owners to reduce minting to pay taxes, which is great, but the bigger issue seems to be dissolving neurons.  I would really like there to be incentives for neuron owners of dissolving neurons to change their dissolve state and to increase their dissolve delay.  Would you please advise if you think this proposal has features that would incentivize that action?  That would be a major selling point for me.
+
+4. I think one of the biggest future problems facing the IC tokenomics and circulating supply is the growing amount of undisbursed voting rewards (see [Total Rewards](https://dashboard.internetcomputer.org/circulation) chart).  There are currently 26M ICP that have been earned, yet have not been minted.  It exists as maturity in neurons and is not represented in circulating supply or total supply calculations.  For reference, this is currently an equivalent amount of ICP to what is known to be dissolving from neurons over the next 6 months, but the difference is that this undispersed maturity can be minted any time.  There is also no way to know what neurons have how much maturity.  Basically, it is currently unpredictable and the neuron owners can flood the market with new, previously unaccounted circulating supply with only 7 days notice.  This problem is currently growing linearly and will continue to get bigger.  I’m still trying to understand if this proposal helps address that issue or if it makes it worse in the near term.  While I think there is value in the idea of exchange_maturity, it seems like it gives incentives to large genesis neurons to extract their ICP into the circulating supply on a tax free basis.  Then in a couple of years when they have consumed all their previously minted ICP from genesis they can also dissolve and disperse their staked ICP (the new definition) after having maximize voting rewards over that time frame through compounding.  At the moment this feels like another huge advantage to the OG whales in the ecosystem.  I want to be wrong about this and would be receptive to an explanation of how my logic is flawed.
+
+5. When do you plan to submit this proposal?  In the beginning of this post you said you are requesting community feedback, but by the end it sounds like there will be a proposal submitted very soon for a vote.  It seems this proposal is a pretty big deviation from what Dom posted and what was deliberated in the previous thread, so I’d prefer for this modified version to be deliberated longer before submitting the proposal.
+
+-------------------------
+
+tsetse | 2022-02-22 05:45:05 UTC | #11
+
+I am against this proposal because it cements and augments centralisation. The fundamental problem with Dfinity in the minds of the crypto community at large is its highly centralised nature. The Foundation's decision to abstain from voting on certain measures is a good step but does not address the basic issue which is that not only are too many coins in too few hands but, crucially, the tokenomics is structured to favour their persistence in the same hands by rewarding them disproportionately. Anything that counters this centralisation is to my mind a good thing even if it inflates supply at a time such as now when the market is in terrible condition. If maturity has to be converted into liquid ICP and sold for tax reasons, so be it. In the long run, it will be a good thing that the ICP flowed to new owners. I am willing to bear the notional loss on my stake during this period. 
+The second reason I am against the proposal is that it takes insufficient heed of the discussion that happened on this forum, and underlines the opaqueness of Dfinity's decision-making. Who, precisely, was involved in formulating this proposal? What is the process followed for such proposals? Which tax lawyers, if any, were officially consulted? How certain are we that the IRS will not find a way to tax maturity despite the change proposed? Are there any economists advising Dfinity? Or are cryptographers and programmers making all the decisions? When I look at publicly listed corporations, I can easily understand their hierarchies and practices. After reading literally everything there is in the public domain about Dfinity, I still have little clue how the Foundation actually works.
+
+-------------------------
+
+OVVOVVO | 2022-02-22 06:34:57 UTC | #12
+
+[quote="jwiegley, post:3, topic:11011"]
+* `exchange_maturity` : maturity → staked maturity + staked ICP → liquid ICP
+* `stake_maturity` : maturity → staked maturity
+* `disburse_maturity` : maturity → liquid ICP
+* *not in this proposal (was `merge_maturity` )* : maturity → staked ICP
+* *not in this proposal* : staked maturity → staked ICP
+[/quote]
+
+After reading the proposal several times and the subsequent posts, I see nothing that hinders anyone from actions they can already take with their maturity, save for the 7-day delay and modulation of the amount when someone wants to create minted ICP from their maturity and cash out.  And if the two additional options John mentions per the above quote are included then no current choices are eliminated.  On this point, I agree with Roman.
+
+This proposal, in my opinion, is not too complicated for those who consider it thoughtfully.  In our UI we already see "i" information bubbles next to the word "Maturity" and the phrase "Voting Power" to explain their meaning.  There is no reason why something similar couldn't be included next to 5 options to explain what one can do with their maturity.
+
+I think this proposal does the opposite of increasing centralization - in fact, it puts additional controls of maturity into our hands.  No one at Dfinity will be forcing us to do anything we don't want to do.
+
+It's true we cannot predict what tax laws will happen in the future.  I completely agree that maturity can reasonably NOT be considered a capital gain when merged into an existing neuron, or put into the Community Fund, thereby keeping it in the ICP ecosystem, even if it's converted into newly minted ICP (e.g. pumping oil out of the ground and putting it into a barrel is not a taxable event.  It's only a capital gain when it's brought out into a market and sold).  While hoping for the best, however, it is prudent to expect the worst.
+
+For those who want to stake for compounding purposes, having the option to stake and not even require their maturity to be converted into ICP is a real benefit, and the greatest argument yet to completely sever the possible false notion that there is a relationship between staked maturity and a taxable event.  It will be hard to put a tax on a token that wasn't ever created.
+
+I am in favor of the five options listed by John.  
+
+I also continue to propose that voting be made on each option individually, over five successive days.  No doubt, each option will have its own clear explanation as to what it means, or doesn't mean, for its effect on maturity.  I think five options grouped together in one vote hinders voters from considering each option's unique mechanism and advantage.
+
+-------------------------
+
+jwiegley | 2022-02-22 06:48:11 UTC | #13
+
+These are excellent questions, and I am reading them all carefully. I will come back with answers to some points tomorrow, but there are others questions raised here that will need to move "higher up the chain", so to speak. In the end much of this proposal and its design is from Dominic Williams, which I have translated into the proposed governance changes. So while I'm fully able to answer any technical questions, when it comes to taxation, or why certain changes are being proposed at all, I too will be seeking those answers in order to report them here as I can.
+
+-------------------------
+
+Roman | 2022-02-22 13:30:46 UTC | #14
+
+Maybe a good manner to address the complexification of the UI pointed by @lastmjs and @jwiegley would be to maintain the current system (converting maturity into staked ICP) and add a button "advanced settings" which would display these additional options : 
+
+[quote="jwiegley, post:3, topic:11011"]
+* `exchange_maturity` : maturity → staked maturity + staked ICP → liquid ICP
+* `stake_maturity` : maturity → staked maturity
+* `disburse_maturity` : maturity → liquid ICP
+* *not in this proposal* : staked maturity → staked ICP
+[/quote]
+
+By doing this, we would offer the 5 logical possibilities @jwiegley and me were talking about (yesterday) and that I really think necessary to prevent any complaining about arbitrarity of the calls which would be made.
+
+I also have to underline, with @lastmjs, that we did not get any feedback about the concerns we shared into the previous thread, as if the previous thread did not really exist.
+
+-------------------------
+
+Roman | 2022-02-22 08:17:29 UTC | #15
+
+[quote="wpb, post:10, topic:11011"]
+In my opinion, we should go back to the min and max that Dom proposed of +5% / -30%. Otherwise, I don’t think a -5% min loss will be enough incentive for people to consider market price direction when they decide if they want to disperse. It really needs a higher penalty to be effective.
+[/quote]
+
+In my opinion, as I explained it [there](https://forum.dfinity.org/t/dominic-s-proposal-to-improve-icp-governance-staking-re-tax-and-tokenomics/10530/101?u=roman), I think a go back to the original rates would provoke sooner than later the collapse of ICP. Plus, like @lastmjs said it and as I had said it into the thread : 
+
+[quote="lastmjs, post:7, topic:11011"]
+Feeding the price of ICP into the monetary system, this coupling the IC’s monetary policy to current markets and requiring an oracle (no major blockchain that I know of does this, and the most successful monetary assets BTC and ETH definitely do not do this. I believe some Ethereum researchers have strong opinions on why ETH’s monetary policy should be decoupled from its current market price)
+[/quote]
+
+-------------------------
+
+borovan | 2022-02-22 08:33:46 UTC | #16
+
+It's not tying it to the price of ICP though, just the change in price over time.  It effectively just limits the outflow of ICP onto exchanges.
+
+-------------------------
+
+borovan | 2022-02-22 08:35:37 UTC | #17
+
+[quote="lastmjs, post:7, topic:11011"]
+Feeding the price of ICP into the monetary system, this coupling the IC’s monetary policy to current markets and requiring an oracle (no major blockchain that I know of does this, and the most successful monetary assets BTC and ETH definitely do not do this. I believe some Ethereum researchers have strong opinions on why ETH’s monetary policy should be decoupled from its current market price)
+[/quote]
+
+We already have a price oracle, that's how the network calculates how many cycles you get for burning 1 ICP.
+
+-------------------------
+
+tsetse | 2022-02-22 12:03:51 UTC | #18
+
+I addressed this in the thread about Dominic Williams' post.
+
+-------------------------
+
+borovan | 2022-02-22 12:25:26 UTC | #19
+
+You voiced your opinion, yes.
+
+-------------------------
+
+borovan | 2022-02-22 13:11:45 UTC | #20
+
+[quote="tsetse, post:11, topic:11011"]
+The Foundation’s decision to abstain from voting on certain measures is a good step but does not address the basic issue which is that not only are too many coins in too few hands
+[/quote]
+
+Compared to what project? About 30% of ETH was owned by three people in the genesis block. Pretty much all projects are heavily weighted towards the founders (if they aren't outright scams.)  DFinity has been around for years and the contributors in Pebble, String Labs were all compensated in ICP as far as I know.  I think they've done pretty well.
+
+Also look at the seed round, 24% of ICP. ic.rocks isn't working any more, but out of 450 or so investors only three had locked up for more than four years and about 2/3 were dissolving.
+
+[quote="tsetse, post:11, topic:11011"]
+the tokenomics is structured to favour their persistence in the same hands by rewarding them disproportionately.
+[/quote]
+
+It's proportional though, with a bonus if you're a long term staker. Are you saying that the age / dissolve bonus is making it disproportionate, and if so is that a bad thing?
+
+-------------------------
+
+lastmjs | 2022-02-22 15:06:23 UTC | #21
+
+Yes there's already one price oracle, and I think it makes sense to have it. Its function is limited to converting the main IC asset to a medium of exchange and unit of account for computation that much more closely resembles traditional cloud computing. This makes reasoning about paying for computation easier, and I'm okay with it.
+
+But now we're talking about tightly coupling the minting of ICP itself to the current state of the markets. We should be very careful when considering such a tight coupling.
+
+-------------------------
+
+borovan | 2022-02-22 15:33:48 UTC | #22
+
+Yes, we can be careful but I think saying that it's "tightly coupled" is a bit unfair.  +/- 5% is more of a gentle nudge, and that can be easily altered via a proposal.
+
+If anything it acts as a bit of a volatility dampener, less selling when the price is low and more selling when it's high.
+
+-------------------------
+
+tsetse | 2022-02-22 15:41:57 UTC | #23
+
+> Blockquote
+
+Compared to what project? About 30% of ETH was owned by three people in the genesis block. Pretty much all projects are heavily weighted towards the founders (if they aren't outright scams.)  DFinity has been around for years and the contributors in Pebble, String Labs were all compensated in ICP as far as I know.  I think they've done pretty well.
+
+> Blockquote
+
+How much do those three own now? Nowhere close to 30%. How much would they have owned if they had the opportunity to lock it for 8 years at a huge interest rate? I have noticed that a number of apples and oranges comparisons made in order to assert that ICP is not any more centralised than other blockchains. Of course founders and contributors deserve to be rewarded. I wouldn't mind them having millions of ICP, as long as they felt incentivised to sell and therefore decentralise holdings rather than hoard, get more interest than the average investor who cannot stake for 8 years, and thus maintain or increase centralisation over time.
+ICP is a great project, absolutely revolutionary, and I have a stake in its success. I just don't believe success will come by drinking the Kool Aid like, say, the people over at Cardano who treat one individual as an oracle.
+
+-------------------------
+
+borovan | 2022-02-22 18:17:16 UTC | #24
+
+[quote="tsetse, post:23, topic:11011"]
+How much do those three own now? Nowhere close to 30%. How much would they have owned if they had the opportunity to lock it for 8 years at a huge interest rate? I have noticed that a number of apples and oranges comparisons made in order to assert that ICP is not any more centralised than other blockchains. Of course founders and contributors deserve to be rewarded. I wouldn’t mind them having millions of ICP, as long as they felt incentivised to sell and therefore decentralise holdings rather than hoard, get more interest than the average investor who cannot stake for 8 years, and thus maintain or increase centralisation over time.
+ICP is a great project, absolutely revolutionary, and I have a stake in its success. I just don’t believe success will come by drinking the Kool Aid like, say, the people over at Cardano who treat one individual as an oracle.
+[/quote]
+
+It was a different time, this was the first promising non-Bitcoin blockchain that offered something new.  I personally would have loved that option having sold the majority of my ETH at $10.
+
+You say that an average investor cannot stake for 8 years, why not?  ISAs/IRAs are open to everybody and have a much longer timeframe. If they're not staking they're speculators not investors.
+
+It seems you're focused on individuals who have long supported DFinity, who have bet everything on the long term success of the project.  Their holdings may be increasing in nominal terms but not significantly as a percentage of overall tokens. This is not a case of the rich get richer and we end up with the same old oligarchy.
+
+Allowing neurons to auto-compound, for instance, is great for decentralisation. The people that have the time and the motivation to merge their neurons daily no longer get an advantage for doing so.
+
+People being incentivised to sell to help the overall decentralisation of the project, that's just not good game theory, it will never happen.  What we should be looking at are ways for large stakers to use their ICP to support projects that better humanity as a whole, such as perhaps moving from a 8 year neuron to an 8 year investment in the community fund (not sure how that works!)
+
+-------------------------
+
+borovan | 2022-02-22 18:19:35 UTC | #25
+
+[quote="tsetse, post:23, topic:11011"]
+the people over at Cardano who treat one individual as an oracle.
+[/quote]
+
+I know some other words that can be used to describe him.. not safe for this forum though
+
+-------------------------
+
+jwiegley | 2022-02-22 19:46:08 UTC | #26
+
+[quote="wpb, post:10, topic:11011"]
+Several questions and considerations:
+
+3. I would really like there to be incentives for neuron owners of dissolving neurons to change their dissolve state and to increase their dissolve delay. Would you please advise if you think this proposal has features that would incentivize that action? That would be a major selling point for me.
+
+5. When do you plan to submit this proposal? In the beginning of this post you said you are requesting community feedback, but by the end it sounds like there will be a proposal submitted very soon for a vote. It seems this proposal is a pretty big deviation from what Dom posted and what was deliberated in the previous thread, so I’d prefer for this modified version to be deliberated longer before submitting the proposal.
+[/quote]
+
+To #3, this proposal has nothing to do with incentivizing longer dissolve times.
+
+To #4, I expect this to be submitted within the next week. While I can address most technical questions, it is likely that the more high level "why do this now" questions can only be addressed by the vote itself.
+
+-------------------------
+
+LefterisJP | 2022-02-22 22:28:01 UTC | #27
+
+Hello. I am a seed investor of Dfinity and I am fervently against this proposal.
+
+It impacts the tokenomics in an unnecessary way. I understand this is an attempt to take action on this: https://medium.com/dfinity/proposal-to-improve-icp-governance-staking-re-tax-and-tokenomics-df09903a2e0b blogpost.
+
+You can't "optimize" for taxes on a global scale since none of you is a tax accountant, there is as many tax interpretations as there are countries and the tax authorities on any jurisdiction don't even understand how the current staking will be taxed.
+
+The proposed solution is in no way an improvement for taxes. Your "hope" on how this will "improve" the tax situation has no logical basis. Absolutely none.
+
+What's more the proposal modifies the tokenomics in a significant way changing the rules on people who have staked for as much as 8!!! years. You can't have your users make such a commitment and then go and change the rules under their feet in such a manner. You already screwed us over once by locking all our seed neurons right before the launch of the project. Proposing yet another change which will affect every single dfinity user is a spit in the face.
+
+Finally what the proposal implies is that selling/disbursing during a bear market should be punished. This is bonkers insane. It's ridiculous. Absolutely batshit crazy.
+
+-----
+
+A more generic comment. I feel like the team thinks the token is trading at lower lows all the time and are trying to find ways to "fix it". This is not how you do it. Such a proposal is how you make your users lose all hope and eventually send the price to zero.
+
+----
+
+> The NNS team is ready to work on this feature! To get the design approved by the community, we followed the following schedule:
+
+Instead of working on shit like this perhaps try to fix the faulty NNS app that can't handle a large number of neurons, does not allow merging a neuron via ledger, does not allow filtering and so much more: https://github.com/dfinity/nns-dapp/issues/231 ?
+
+-------------------------
+
+Forreal | 2022-02-22 21:51:58 UTC | #28
+
+This should be rejected not on the basis of merit but because the community have not discussed this enough to come to a conclusion this is how we should proceed. I don't necessarily disagree with the proposal but the way it's done is not right. I will be voting against this and hopefully this will force the conversation and a better way to move forward.
+
+-------------------------
+
+coteclaude | 2022-02-22 22:13:52 UTC | #29
+
+I totally agree with @lastmjs and @LefterisJP but the situation is even worst than what they describe.
+Before I go deep in the subject, I want to share how much frustration I have with this proposals.  
+
+Dfinity is not a tax advisor, neither should spend any time and effort in taxes planning.  This is insane.
+
+I have done business in US and Canada been in court with Canadian Tax agency for 8 years.  Canada and USA have almost 100% tax law copy - paste with some small variation here and there. One thing I can tell you right now that apply to both countries:  Colluding to create a mechanism with the goal to avoid taxes is a criminal offense by itself.  Dominic, please go see a criminal lawyer specialize in taxation first.  You will find out what you are doing is so wrong.  Dominic, please stay in what you know and understand.
+I will take a copy of this forum and send it to IRS. Let see what they think about this forum.
+If people vote for this, they will shoot themselves in their 2 feet.  In few years from now, if ever rewards are a taxable event, they will come back at every American citizen who bought ICP (they will have their name very easy from the exchanges) and they will have an interview with them.  If the citizen have use that mechanism to avoid taxes, here come huge trouble. Pay everything back now, plus compounded penalties and interest and possible criminal accusation if his name appear in threads like this one.
+If you have a discomfort that I send this thread to IRS, to Cointelegrah, to Coindesk, Coinbureau, etc, then you know what you guys are doing here is totally wrong.
+There is so much to say about this to be so wrong but I will stop here as my 2 colleagues @lastmjs and @LefterisJP have expressed quiet clearly.
+
+Merge Neurons function would be very nice to have.  Nothing else.
+
+Sorry for the tone.  I am neither a taxable individual in both Canada or USA countries.  But as a heavy investor post genesis, all locked for 8 years, with no plan of dissolving, I am working hard for Dfinity to get some kind of reputation so the FUD would vanish slowly.  Wow man, I can tell you this proposal is a huge FUD builder and look so bad for everyone.
+Insane, Insane, Insane
+Guess what I will vote for?
+
+-------------------------
+
+coteclaude | 2022-02-22 22:20:06 UTC | #30
+
+Let's do a proposal asking to send the TAX Avoidance proposal to IRS and all the media first to see their reactions on the topic.  a 1 month waiting period should be enough. That could help neurons voters to make up their mind?
+I will certainly spend 1 ICP to make it if we need to.
+
+-------------------------
+
+ricprive | 2022-02-22 23:03:33 UTC | #32
+
+@jwiegley @lastmjs 
+
+I can see a bit of backlash in this feedback proposal.
+
+Would it not be better to have the Dfinity foundation or a strong group within the community to get a few people (maybe economists/mathematicians) together to discuss the tokenomics and the best approach to it which will incentivise seed investors and holders alike, as well as with an approach to tax which is what some people are concerned about I see.
+After they have discuss this they could maybe put one or two options in a video for the community with the pros and cons of each option. We can then go for option 1/2/(maybe 3). I know there are some intelligent people within this group but I think it would be best to get it as close to right sooner rather than later as it has been an ongoing discussion for sometime.
+It is a situation which requires a good deal of analysis from people that can operate within blockchain and tadefi so might be best left to the experts to put into lamens terms and explain to the community in a video which option is best before the vote.
+If the economics are not well structured why would the average person want to be part of that ecosystem or provide liquidity after all? I’m sure it helps to have plenty of liquidity flowing through the ecosystem and would be beneficial for everyone if the tokenomics were sorted out in the best way possible where people were confident with everything presented.
+Hire some people, maybe even within Ripple. Anyone that has experience in blockchain and tradefi so they can put the problems to rest asap and still incentivise all those involved. Dfinity are the best at research and development but it might be worth leaving these issues to people that specialize in them and know what has and has not worked before.
+
+-------------------------
+
+ricprive | 2022-02-22 23:15:33 UTC | #34
+
+I would say getting the community's confidence back is the number 1 priority and that it would pay off massively to spend some money getting professional assistance with this matter. Let’s let engineers and devs do what they do best and build the best blockchain @jwiegley
+Community votes can come afterwards. There may not be a one size fits all exactly but if we can get this as close to perfect as we can it may give some assurances to many people in the community as well as newcomers.
+
+-------------------------
+
+coteclaude | 2022-02-22 23:20:30 UTC | #35
+
+Dfinity is based in Switzerland.  Investors could very well be from 100 different countries.
+What country law would you try avoid the taxes on reward?  What about al the other countries afterwards?
+What will Dfinity do or the NNS voters do when the taxes requirement will change in any one country?
+It is just impossible for Dfinity or the NNS voters to get involved in the taxes management.
+How Dfinity and/or Dominic Williams knows this will avoid taxes (which is not permitted to create a special mechanism).  Maybe because of all the manipulation, it would create more taxes  Who knows?
+
+For the tokenomics, I think it is way too late to make major changes.  People jumped onboard with the actual tokenomics , unless there is a proven way to improve for all.  Something like to find a way to burn more (Like ETH have done).
+We need to remember that within the actual tokenomics, people have different goal and we have to respect that.
+I have staked for 8 years and the price does not bother me at all in short term.  I want accumulate as much as I can now with the 8 years staking
+Some other people just want trade short term and do not stake at all
+Some will hold longer term but keep their bag available to sell at higher price (100% post genesis are at lost now)
+and many more options.
+I think we need to live with the actual tokenomics and be patient.
+I only hope Dfinity will keep focusing on the fantastic programming of the blockchain itself and get out of everything else like Taxes Avoidance system, Peoples party, etc.  All other topics can be taken in charge by independent identities.
+
+-------------------------
+
+coteclaude | 2022-02-22 23:35:10 UTC | #36
+
+One last thing to show how nonsense this is.
+If the vote pass to make the change to avoid taxes, this would mean the community admits the actual reward system is a taxable event. 
+So how you guys will handle the rewards obtained so far until the new change?   Will you declare it as taxable income?
+You want make a change to avoid taxes.  So it clear you guys think it is taxable now.
+So much non sense to me.
+I hope the community will get it and every individual will manage their own taxes in their own country.
+Let"s go back to the blockchain growth both in technology and reputation please.  It really needs it.
+
+-------------------------
+
+Kyle_Langham | 2022-02-23 00:30:38 UTC | #37
+
+I believe this proposal:
+
+1. Is overly complicated and will come at the expense of dissuading future potential new NNS stakers from participating in the NNS.
+
+1. Aims to optimize something (taxes) that is not part of the NNS's core objectives.  I don't even believe taxes are something that can be optimized due to the opaque and changing nature of major tax codes.
+
+I also worry that if this proposal were to pass, it would pass despite massive community opposition, which carries a massive risk of alienating the IC community and providing a clear data point that the NNS is far too centralized.
+
+-------------------------
+
+Kyle_Langham | 2022-02-23 00:40:09 UTC | #38
+
+I should also add too that there already exists an incentive to spawn neurons during ICP price increases and to not spawn neurons during ICP price decreases.
+
+-------------------------
+
+kmanxhuka | 2022-02-23 00:55:05 UTC | #39
+
+I've stated in some other comments that I oppose to this proposal.
+But I'm really shocked to find out how fast this came to become an actual proposal on the NNS, despite the negative and opposed comments of community here on this forum.
+Optimising the ICP to avoid USA taxes, it gives me the feeling that it's purpose is to serve US people more than the rest of the world. What about tax implications in China, Europe and other countries, shouldn't each community make proposals to avoid their country's taxes? Taxes are made to be paid, and whatever changes we make here, we don't have guarantees that we will flee from tax obligations. You may flee temporary, but it backfires later.
+
+I like the option of auto-compoundig, but having all these changes inside one proposal, it would push me to vote NO :x:
+
+Thinking like this: to avoid taxes and price-based modulations, feels like we don't belive the ICP has the capability to attract users for its tech innovation. And this adds more FUD in and out this community.
+
+If you want to lower inflation, then think of ways how to make ICP burn more, and not how to punish those who sell. I've never heard nor seen this. It takes the freedom of my hands. I want to sell whenever I want, without being extra punished. This doesn't feel right for decentralisation.
+
+I will vote NO :x: to this proposal (and hope that there are no voting manipulations, it smells fishy)
+
+-------------------------
+
+memetics | 2022-02-23 01:12:37 UTC | #40
+
+This is way too complicated. I seriously hope this proposal is optional… for the internet computers sake.
+
+Literally no-one wanted this proposal implemented bar a few people.
+
+-------------------------
+
+Dylan | 2022-02-23 01:16:21 UTC | #41
+
+While I admire the clever thinking behind this proposal (the recent addition of `exchange_maturity` is especially cool), I've been opposed to it since I read the Medium article. The main reason I'm opposed is that I don't think it's going to achieve its goal of deferring taxes on maturity. Are tax authorities really going to let people accumulate tax-deferred maturity worth possibly hundreds of millions dollars over the course of several years? Under this system, you are guaranteed to receive at least 95% of your maturity as ICP (unless the rules are changed later), so tax authorities can just choose to tax you on that 95%, and we're back where we started from.
+
+So what we may end up with if it passes is an overly complicated staking system that doesn't achieve its "avoid incurring a tax burden" goal. If I knew this system would work as intended and defer taxes until maturity is converted to ICP, I'd be all for it.
+
+My stance could change if this proposal were reviewed, scrutinized, discussed, and perhaps amended by several independent tax attorneys in the US (insert your country here). I'm particularly interested in hearing of similar examples where a system like this has worked as intended and stood up to legal challenges.
+
+-------------------------
+
+coteclaude | 2022-02-23 01:23:37 UTC | #42
+
+There is something really fishy about all this.  Why would Dominic care so much about avoiding taxes?  
+Any supportive documents to convince this all will be good and achieve the primary goal of avoiding taxes for US citizen (although US will not be mentioned in the proposal to come)?
+Does not make sense, unless he has pressure from a (or few) big investor(s)?
+Only asking...
+Dfinity and ICP have enough reputation problem now.  Why adding more with something fishy like this?
+Really, I don't get it.
+
+-------------------------
+
+aaa10247 | 2022-02-23 02:00:07 UTC | #43
+
+I am in favor of the proposal. 
+
+I think a good middle ground to address critics concerns would be to allow those users who wish to continue merging maturity and minting and staking ICP to do so. While adding the option for those who want to stake maturity without minting new icp. This way users can choose whether to use the new system, or continue operating under the current system. I think an expert opinion should be used to determine if allowing both options to exist would threaten the tax benefits of the new option. To the extent that an expert says it would have a negative impact, then I think the old option should be removed and replaced as contemplated in the proposal. 
+
+Other benefits of this proposal in addition to potential tax benefits:
+
+- Reduced minting and inflation of new ICP. 
+
+- Critics have said it complicates the system. But it also simplifies because it removes the spawning of a new reward neuron, it enables auto compounding to simplify the need to constantly merge maturity manually. The UI can be designed in a way to maintain the simplicity without adding confusion, while giving advanced users ability to access advanced options. 
+
+- This change could benefit people who are currently forced to sell upfront to pay taxes. It may or may not achieve that goal. However this change comes at no cost, if it is successful in achieving this goal, it would overall reduce downward pressure caused by forced selling, but if it fails, it would not have any negative impact on those who aren't required to force sell to pay taxes upfront because they wouldn't need to make any changes. 
+
+- To those who say there hasn't been enough discussion, I think there has been over 4 weeks since the original blog post was released, and forum discussion has been over 100 posts. Some are against, and others are for the proposal. The next stage is to go to a vote. 
+
+- To those who say that the concerns from critics in the original forum post weren't addressed, this proposal actually adjusted the price modulation mechanism from the original proposal, and stated it can be adjusted further in the future.
+
+- To those who say that they already staked for 8 years, and therefore now a change can't be voted in through the NNS. I think this is a misunderstanding of how the NNS works. By locking for 8 years, you therefore have a right to participate in governance and vote on changes. It is the very opposite of what you are asserting that since you staked, no more changes can be made.
+
+-------------------------
+
+LightningLad91 | 2022-02-23 02:19:50 UTC | #44
+
+I share the same concerns as @lastmjs, @Kyle_Langham and many others on this thread. If this proposal is submitted, I will be voting to reject.
+
+If Dfinity does move forward with this proposal, I would like them to go on record with a vote. Given the recent change to remove Dfinity as the default followee I believe it’s well within reason to ask them to vote. 
+
+Dfinity is a powerful stakeholder. Most people look to them as a benevolent leader while we wait for the NNS to decentralize. However, I think true intent will be shown in their voting record. Abstaining just hides that truth from stakeholders who may otherwise choose to follow a different neuron.
+
+-------------------------
+
+wpb | 2022-02-23 02:40:52 UTC | #45
+
+This is a very thoughtful analysis.  Thank you for sharing.  I agree with all your points.
+
+-------------------------
+
+wpb | 2022-02-23 05:27:36 UTC | #46
+
+My biggest concern is still the exchange maturity feature coupled with the narrow modulation range.  In my opinion, the modulation range needs to be the full +5% / -30% that Dom initially proposed.  
+
+I have a lot of concerns about seed investors who are dissolving and have accumulated a lot of maturity suddenly being able to extract their locked minted ICP in a tax free way and replacing it with the unminted "staked ICP" that is auto compounding voting rewards until the neuron fully dissolved.  This enables people who are trying to exit the system to take a larger fraction of the total voting reward pie than they get now.  It also seems like a lot of ICP will suddenly flood the market unless the modulation algorithm has a greater penalty for dissolving in a down market.  
+
+The narrow modulation range of the current proposal seems like a big mistake to me.  Our biggest problem is dissolving neurons and I would much rather see a disincentive for disbursing in a down market or a penalty for dispersing that softens the impact of all those dissolving neurons.  I think if the modulation range were wider I would be in support of this proposal.
+
+-------------------------
+
+jwiegley | 2022-02-23 03:23:57 UTC | #47
+
+Just to note, the modulation being proposed affects only maturity, not stake. The majority of ICP coming onto the market is from dissolving neuron stake, and not from maturity being realized as ICP.
+
+-------------------------
+
+Forreal | 2022-02-23 03:28:40 UTC | #48
+
+Hasn't the IRS in the USA already said staked tokens aren't taxable until sold? I could be wrong.
+
+-------------------------
+
+Forreal | 2022-02-23 03:32:39 UTC | #49
+
+This thing isn't going pass.
+
+-------------------------
+
+jwiegley | 2022-02-23 03:33:07 UTC | #50
+
+There was a court ruling about staking rewards, but as yet no clear statement from the IRS.
+
+-------------------------
+
+justmythoughts | 2022-02-23 05:08:22 UTC | #51
+
+It looks like there’s a poll for this on the r/Dfinity subreddit. Please vote your thoughts there.
+
+[https://www.reddit.com/r/dfinity/comments/syhhay/poll_regarding_the_current_compounding_maturity/](https://www.reddit.com/r/dfinity/comments/syhhay/poll_regarding_the_current_compounding_maturity/)
+
+It would be nice to gauge enthusiasm on this by a headcount, as that might help as a preliminary gauge of pro/con interest that isn’t inflated by voting power before we get to the actual thing. 
+
+I would hate for this to be such an unpopular proposal that if it passes by a majority in terms of voting power, but a minority in terms of on an individual basis that it would break trust irreparably and drive developers away from the platform at a time when we need them the most.
+
+Feel free to repeat the poll here if it would be more visible
+
+-------------------------
+
+ajismyid | 2022-02-23 05:12:42 UTC | #52
+
+@ [jwiegley](https://forum.dfinity.org/u/jwiegley)
+
+(1). Staked maturity still can be treated as taxable event, if tax authority decide to do it. They can tax your floating reward based on historical reference yield, and then ask you to do tax calculation again when you materialized the reward to know your real amount of the tax you owe. So the proposal will cause more headache and compliant cost for investor.
+
+(2). If the proposal thinks that obscuring the price of ICP (+/- %) prevent tax authority from forcing taxable event, then it is a wrong assumption. Tax authority still can decide to use a 'reference price point' as the base calculation for the taxable event if they had to. 
+They can use like 5 days moving average price as the reference point for taxable event calculation. 
+So, obscuring future price is pointless.
+
+-------------------------
+
+LauZ | 2022-02-23 05:21:16 UTC | #53
+
+I've left my two cents there. They need outside assistance from blockchain-tradefi to put forward a couple of good proposals to the community. It's been an ongoing issue for some time and needs sorting out sooner rather than later to restore faith.
+
+-------------------------
+
+kmanxhuka | 2022-02-23 07:25:18 UTC | #54
+
+Why do they keep saying that the selling pressure is coming from disbursed ICP to pay taxes, in the other hand, looking to the charts, there is only 8M disbursed ICP from rewards, meanwhile the circulation supply is 84M ICP more from the genesis. **This states that 76M ICP has flown in from somewhere else than disbursing rewards (which the proposal tries to fix). So the selling pressure isn't coming from disbursing neurons, but from the dissolving of genesis neurons.**
+
+Also, if you say there is selling pressure on ICP now, I think this is a mistake, because the market is all on bearish trend. From my experience when the market is going down as a whole, you can't escape. Having this in mind, why the rush? The ICP is so early, are there any studies made on this topic so we would clearly know if the proposal would fix anything, or just make it worse?
+
+Having unstable tokenomics like this, which change every time the laws of a country change, that makes things worse and scares people away. How could we achieve a wider adoption of ICP then?
+
+-------------------------
+
+jzxchiang | 2022-02-23 07:57:20 UTC | #55
+
+People are latching onto the +/-5% modulation of newly minted ICP, but that's only one part of the proposal.
+
+> If a neuron is staked for multiple years, any income generated by that neuron, at the beginning of its dissolve delay, will be in the form of staked maturity and not newly minted ICP. This happens because stake is paid out in exchange for staked maturity, as described above. What this means for stake holders is that they will not need to sell for taxes during this initial phase, so all of that ICP can be re-staked to increase voting power, which increases overall returns.
+
+I strongly urge people to read this paragraph from the proposal. If you don't understand every word, then read it again. I had to read it at least 10 times.
+
+---
+
+I admit the 7-day modulation of newly minted ICP is a bit of a gimmick. Is it possible to cut out that portion of the proposal, but keep the rest? Or does the entire proposal make no sense without the modulation part?
+
+-------------------------
+
+MrPink13 | 2022-02-23 10:42:32 UTC | #56
+
+Alright, so I'm new here.
+
+So I will try to thread lightly.
+
+This proposal is almost unreadable. Maybe its so absolutely alien and concept defying that it renders itself unreadable to the common individual. Either way it definitely needs to be broken down and explained in more simple terms or it will only create unnecessary confusion and stigmatization from already wary investors.
+
+Why complicate an already complicated system. Why not wait and see how a countries crypto tax systems develop before we commit to our own tax mechanisms. ICP staking is only a plus, a monetary incentive to join the community and become a part of its governance. but it is only that an incentive and nothing more. It is not what will generate mass adoption, it is not what will drive droves of individuals to participate in an ecosystem day in and day out. it is a very small incentive that dwindles over time.
+
+The focus at the moment should not be on improving ICP staking, tax simplicity or Maturity systems.
+
+The focus should be on delivering on what was outlined, on decentralization, making sure no one individual has more authority or pull then another for whatever reason. on the Core tech. On the ecosystem. On making sure those with immense voting power don't fully drive the narrative. 
+
+I may however have read this completely wrong. It is very hard to follow.
+
+-------------------------
+
+christian | 2022-02-23 14:02:36 UTC | #57
+
+Another 2 cents from an 8-years neuron holder. I'm in favour of the motivation for this proposal, but not sure _yet_ if I'd would vote for adoption of the proposal in it's current form.
+
+## What I like
+
+- The proposal _adds_ many new options and doesn't take any away: everyone can have exactly the same workflow as before (some see this as controversial).
+- Staked maturity has the same effect (or globally a more positive one) as minting and restaking of ICP now, so I don’t consider this option as being lost.
+- I kind of see, that the modulation is likely to help with the price stabilization even though the effects might be negligible. I concervatively assume that the modulation will have _no_ effects on the tax burden.
+- Even though I can keep doing what I did before, I _would_ start using the new feature of exchanging the maturity for staked ICP to get my own coins back and defer the taxation of the gains to the day where I need them (if there will be any gains at all).
+
+## Addressing some of the concerns
+
+1. **Complexity**. I agree. It’s getting more complex to comprehend and to explain to others. And I _am_ an advocate of simplicity as a central design principle for everything, especially when designing reliable systems. However, there is a difference between simplicity in how things are built and simplicity of the actual task to accomplish. E.g. you build a rocket in simple way, but you can't have a “simple” rocket. To build a rocket, you need to apply the rocket science. And we’re trying to build a complex system working well in a multi-dimensional space (dimensions are jurisdictions, nations, developers, users, what not). I'm not convinced that NNS can be super simple and still make a dent in the universe. Also, even if we could universally stick with simple things, how to avoid that all we can dream about are “faster horses”? (quote by Henry Ford)
+2. **Tax-evasion**. I do not understand yet how you can pay _less_ taxes on _new_ money if this proposal passes? If my understanding is correct, with the new proposal, you either pay the same taxes as before or you actually **don't make any new money**. The staked maturity increases the VP (can this be taxed?), but is a dead weight for everything else. And if you exchange maturity for your stake — you get literally your own ICP without any bonus back. Effectively, I locked them up for actually nothing and even lost some value (inflation of the fiat e.g.). This is true until (and if ever) I disburse my staked maturity, which will be _properly taxed_! Also, my assumption is that the modulation will _not_ help with the taxes at all.
+3. **Tax-optimization is bad**. C’mon, it exists as long as taxes do. We _all_ do it and should do it just as IRS does the opposite on their side. This proposal does not help you avoid taxes, but it enables more options for different taxation systems making ICP an attractive investment across the globe. I can’t see how this part can hurt?
+
+## CONCERNS
+
+I still do have concerns.
+
+1. **Minor**: too many changes in one proposal. The simplicity principle is violated and, as expected, it dilutes the focus and makes the deliberation difficult.
+2. **Major**: the main “feature” of this proposal IMO is the _automated and tax-free compounding_. If the proposal passes, everyone (not just the whales!) can start compounding and growing their shares in the distribution. The problem I have is that this is an **arm race** and to not loose your share you _have to_ start compounding as well. But the difference with the whales is that they can afford to compound on their 8 year neurons (it's just an entry in their portfolio), while many small investors probably cannot because they rely on these returns to pay their rents. One could say that the small investors are still investors and need to compound partially, but this requires some advanced thinking, which can't be expected from everyone. So I wonder if this change could facilitate the NNS to become even more of a "business oligarchy"?
+
+-------------------------
+
+BenTaylor | 2022-02-23 15:15:16 UTC | #58
+
+This is not a tax avoidance proposal. First, it is unlikely that merging neurons today creates a taxable event, but there is some uncertainty around the issue. This proposal (as far as I can tell) is designed to remove the uncertainty. Second, the question isn't *whether* you pay taxes on rewards, it's *when* you pay taxes on rewards. You still have to pay taxes on rewards: the new mechanism would just make it 100% clear that taxes aren't due when maturity is merged, but rather at a later date. Finally, it is not illegal to read the tax code and design a system in accordance with that code. It's what lawyers do all the time (and I'd be shocked if lawyers didn't help design the system proposed here). How is this any different from, say, a business looking at the tax code and deciding to reinvest earnings on future growth to avoid paying taxes on that earnings today?
+
+-------------------------
+
+plsak | 2022-02-23 15:24:55 UTC | #59
+
+Hi,
+
+I'm not commenting directly the proposed changes as I didn't study them in detail, don't seem to be currently relevant for region where I live.
+
+**But as it seems to make the general staking process more complicated** (which might discourage mainly newcomers) I'm quoting below my suggestion from previous discussion - **can be the choice optional per neuron?**
+
+[quote="plsak, post:30, topic:10530"]
+**In order to solve different expectations and needs of stakers from different regions/environments, what about to make the choice optional per neuron?**
+
+I mean, under each neuron (WEB GUI) could be a **check box to use `advanced` rewards processing, which, if checked, would change the behaviour as is described in the proposal, otherwise things would stay as are now** :slight_smile:
+
+* in case that the change should be **permanent** it could be **button similar to `Join Community Fund`** …
+
+Also thinking, as there might be **unlimited number of similar neuron options** (as anyone can propose any change), it would be good to **put them into some menu** , like `Neuron Options` or `Advanced` , as orientation in the GUI is becoming quite difficult and prone to mistakes, mainly for new users.
+[/quote]
+
+-------------------------
+
+jzxchiang | 2022-02-23 16:46:56 UTC | #60
+
+I agree with every word here.
+
+I really hope people take the time to read the proposal in full. The writing and examples are very clear. It does take some time to process, but there are some really interesting ideas. For example, the part about inflation.
+
+-------------------------
+
+BenTaylor | 2022-02-23 17:24:47 UTC | #61
+
+This is **not** tax evasion. I cannot state that strongly enough. Here's the issue from my perspective. People are rewarded for voting on governance proposals and they have the option of effectively redeeming that reward for newly minted ICP. When people physically receive the new ICP, that is likely a taxable event (although I could be wrong about that). Currently, there is a "merge" option that mints new ICP, but the ICP is locked up and therefore not in the control of the person who merged it. The question is whether the minting of new ICP alone is sufficient to create a taxable event. This proposal seeks to render that question moot and allow people to compound their rewards by giving them an option where it is crystal clear that the compounding does not actually mint new ICP. 
+
+That does not evade taxes: it just provides a guarantee to people who use that option that they don't owe taxes on their rewards until they actually mint the new ICP.
+
+The "trade in" feature proposed also does not help people evade taxes. Instead, it ensures that they don't pay double taxes. Under the current system, if someone uses the FIFO system (first in first out) and they spawn a new neuron with ICP that they then sell, they have to pay taxes on (1) the newly minted ICP, and (2) the difference between the price of the new ICP they sold and the price of ICP when they first bought it. For example, under the current system, if I buy 100 ICP at $20 and spawn a new neuron with 10 ICP when ICP is $100 and then sell those 10 ICP, I would have to pay taxes on both (1) the 10 ICP I received at $100, and (2) the $80 gain for each ICP I sold. That's double taxation. The new proposal makes it clear that when they "trade in," they only have to pay taxes on the gain in ICP price: because the new ICP hasn't actually been created yet.
+
+Edit: To be clear, I had nothing to do with this proposal, and this is just my interpretation.
+
+-------------------------
+
+tsetse | 2022-02-23 18:18:12 UTC | #62
+
+This is a comment not only about the current proposal but also about one that was put forward in the recent past by Wenzel Bartlett and Kyle Langham to increase the bonus provided to long-term stakers. It is also about the philosophy of ICP's tokenomics which is explicitly aimed at having 90% of total ICP staked on the NNS.
+All of these proposals and ideas have in common the notion that drying up liquidity is unquestionably good for ICP's price. And I can see why. Simple supply and demand dictates that the scarcer a commodity the higher its price, other factors staying constant.
+However, having sufficient liquidity in a token is equally important, something that can best be explained through the idea of 'float' in stock trading. A stock's float is the percentage of its total equity that is available for purchase. In general, mature investors dislike stocks with low float, because they are vulnerable to excess volatility and to manipulation. Stocks with very low floats of around 10% typically see wild swings and boom-bust cycles driven by cartels. Conversely, a stock like Apple, which has a very high percentage float, with some 16 billion shares out in the market, has not suffered as a consequence of the absence of scarcity. 
+Of course, crypto does not work precisely like stocks, so this is not an exact analogy. Nevertheless, if the market assigns a particular value to the approximately 500 million ICP tokens, that value will not depend much on the 'float' of ICP in the long term. The overall inflation of ICP matters far more than the percentage available in exchanges.
+To conclude, while the idea of encouraging staking is good in general, tied as it is to community engagement and the functioning of the NNS, there definitely can be too much of a good thing. I hope that proposals in the future do not make a fetish of increasing the amount of ICP staked. Attempts to influence the price of ICP through tokenomics should be thought through carefully because markets often don't follow common sense rules.
+
+-------------------------
+
+lastmjs | 2022-02-23 18:53:50 UTC | #63
+
+Some in the community seem uncomfortable with the idea that the Internet Computer will take time to succeed. They seem to think that we can tweak our way to success (I am speaking here of tokenomics/monetary policy). I believe this is folly.
+
+Patience.
+
+-------------------------
+
+coteclaude | 2022-02-23 18:57:10 UTC | #64
+
+Since the Medium text by Dominic Williams back in January, I am wondering why Dfinity is getting involved with the US tax management for investors.
+
+Is it the duty of a blockchain developer to manage taxes?
+
+This blockchain is supposed to be decentralize and worldwide. Why caring about US tax?
+
+What is the Tax expertise of Dfinity in order to do it the right way?
+
+**If you want the answer, keep reading this post. Of course this is only a scenario but it is a very very plausible one** .
+
+It is because **of the 27 millions undisbursed rewards** (still accumulating as maturity, but not getting compounded rewards) versus the 8 millions disbursed, resold or restake in the NNS. About 35 millions have been rewarded for NNS so far.
+
+@Kyle_Langham was always wondering why so many neurons were not processed and kept as maturity. In a tweet last summer, I suggest it was probably for tax purposes. Clearly I was right then.
+
+I assume these are whales (early investors who have paid anywhere between 4 cents and 70 cents per ICP) and they must getting frustrated to stay aside without the compounding advantages, thinking they won't pay tax if they leave it as maturity. So they have pressure Dfinity to create a system where they can stay as maturity but be part of the compounding rewards. And here comes Dfinity to manipulate the system so maturity can compound everyday as well.
+
+For this reason, this proposal will pass 100% sure because they represent 75% of the voting. They control Dfinity and IC.
+
+Expect an important decrease (although the governance thing have increased it for many lately) in daily rewards due to their arrival in the everyday compounding.
+
+Clearly to me this proposal is to get these whales to have their maturity getting rewards everyday while trying to avoid taxes.
+
+Now, let’s be clear. Neither me or anyone here will decide how IRS will manage these rewards for taxes purposes. They don’t even know themselves yet. Maturity is a nice trick they have never seen before and are probably not even aware of yet. Assuming it will not be taxable because we call it maturity instead of minting a new ICP is only a dream for here. One day or the other, they will get on this for sure. And this is when those dreams may reverse as nightmare if they ever win the case to get any form of rewards taxable at receipt instead of at selling, minting or maturity.
+
+In all case, it is not Dfinity responsibility to manage this. But it will happen because we have no control.  I can see Dominic have a lot of pressure to please them.  I understand that.  But still...  This is happening so quick with so much priority.  It is so obvious to me.
+
+So this thread is useless as everything is all decided already. Rewards these whales while keeping their bag as maturity.
+
+Of course IRS and many media will get in to this. This is so interesting for them. This is only then we will have all answers about what is taxable or not.
+
+Sad but reality.
+
+![Non taxable rewards|690x385](upload://xcceYhxNORwqpZSMAnF0WsiHAcO.jpeg)
+
+-------------------------
+
+BenTaylor | 2022-02-23 19:11:53 UTC | #65
+
+First, it's not up to the IRS to determine what is considered a taxable event. There's a tax code and there are judicial opinions that contain interpretations of the tax code. If the IRS says "we think this is is a taxable event," you can take them to court when they try to enforce their decision. My impression is that a group of tax lawyers reviewed the tax code and judicial opinions (quite possibly from many countries around the world, not just the US) and came up with a proposal that doesn't create a taxable event under the code. Could the tax code change? Yes. But that change would have to come from the legislative branch of government. 
+
+Second, why shouldn't Dfinity want a system that provides greater clarity tax wise for ICP token holders? If this proposal doesn't come from Dfinity (with the help of tax attorneys), where would it come from? 
+
+Third, you seem to be worried that your daily rewards will be reduced if the rewards that haven't yet been merged/spawned are eventually merged. But here's another concern for you: what if the people/funds who haven't yet merged their rewards decide to do so, but take out and sell half of their rewards to cover tax just in case merging creates a taxable event? Would you rather have slightly lower rewards or millions of newly minted ICP dumped on the open market?
+
+-------------------------
+
+coteclaude | 2022-02-23 19:12:34 UTC | #66
+
+Ben, don't get me wrong.  My worry is a blockchain developer managing taxes for US.  What about other countries?  Why managing taxes?
+
+This is what makes no sense to me.  I am trying to understand why.  Nothing else.  And this is my personal conclusion.
+
+-------------------------
+
+BenTaylor | 2022-02-23 19:14:18 UTC | #67
+
+It's not "managing taxes." It's saying that the system as currently designed might potentially have negative, unintended tax consequences. And slightly tweaking the design of the system to remove those unintended consequences.
+
+-------------------------
+
+lastmjs | 2022-02-23 19:32:23 UTC | #68
+
+We should also remember that selling isn't inherently bad (especially in these early days). Good things come from selling ICP, such as ridding ourselves of people that don't believe in the success of the IC, decentralizing governance, and generally distributing the ICP asset.
+
+-------------------------
+
+borovan | 2022-02-23 19:36:29 UTC | #69
+
+[quote="coteclaude, post:64, topic:11011"]
+So this thread is useless as everything is all decided already. Rewards these whales while keeping their bag as maturity.
+[/quote]
+
+Yes you are correct, the Gnomes of Zurich have made their decision.
+
+-------------------------
+
+coteclaude | 2022-02-23 19:42:14 UTC | #70
+
+With all the respect Ben.
+You are right about IRS only applying the tax code.  But IRS ask for all the change requirement they need to or want to and hope to get them.
+I can only imagine you in front of a judge saying :We made a slightly tweak to our system so our people can avoid paying hundred of millions of taxes.
+Some others want to see it as Tax Optimization.  I was supposed to pay 10 millions of taxes but with that slight tweak, I avoid to pay all and pay zero taxes.
+Do you really think they will see it as a slight tweak? Really?
+Well, I respect how you guys think.  I think differently and we both will not change our mind anyway
+Although my question and concern is still why Dfinity are getting in to this. But I have my own answer now. Fine.  Let's vote and get it implemented because the vote will pass.
+The consequences will come only in few years anyway
+
+-------------------------
+
+coteclaude | 2022-02-23 19:53:04 UTC | #71
+
+MAybe you guys should read what IRS think about Taxable Rewards.  Read this below.
+It does not talk about minted or maturity.  It talk about reward is taxable.  It is their position now.
+You may interpret this to make you happy.  But the reality may be different:
+
+https://www.coindesk.com/layer2/taxweek/2022/02/08/your-staking-rewards-are-still-taxable/
+
+-------------------------
+
+BenTaylor | 2022-02-23 20:05:40 UTC | #72
+
+If you are actually interested in learning about the topic, there are far better sources for understanding what the law says. For example, here is an article from a reputable law firm: https://www.mwe.com/insights/taxation-of-virtual-currency-staking-activities/.
+
+-------------------------
+
+wpb | 2022-02-24 00:24:12 UTC | #73
+
+I really appreciate your well reasoned, practical, civilized, and easy to follow explanation of your perspective on this proposal.   This helps me a lot.
+
+-------------------------
+
+lastmjs | 2022-02-24 00:32:49 UTC | #74
+
+[quote="christian, post:57, topic:11011"]
+The proposal *adds* many new options and doesn’t take any away: everyone can have exactly the same workflow as before (some see this as controversial).
+[/quote]
+
+I believe the opposite is true. This proposal takes away the current staking/maturity system.
+
+https://forum.dfinity.org/t/request-for-feedback-compounding-maturity-proposal/11011/3
+
+-------------------------
+
+wpb | 2022-02-24 00:44:46 UTC | #75
+
+Thanks for this comment.  I actually agree with your points in general.  The concern I have is that the circulating supply is increasing too quickly.  Approx 43% of total ICP is in the circulating supply, which has increased from 26% shortly after genesis.  I simply think we are moving too quickly in the wrong direction on circulating supply and the primary cause is dissolving neurons.  The tokenomics are intended to add stability while also incentivizing decentralized participation in governance.  I prefer that we attempt to address this issue by tweaking the tokenomics in thoughtful ways, but I respect that you have a different opinion.
+
+-------------------------
+
+lastmjs | 2022-02-24 01:00:57 UTC | #76
+
+Do you take into account the effects these proposals will have on decentralization? If we want to become more decentralized, why would we want to keep the current dissolving neurons from fully dissolving and possibly being sold to a broader audience?
+
+Based on all of the numbers I've seen newcomers are generally staking for 8 years and it looks very healthy. The most unhealthy part of this whole system IMO is the amount of original ICP held by a small number of people. If anything we want to encourage them to sell their stakes for the sake of decentralization. But proposals like this might encourage them to sell even less.
+
+-------------------------
+
+OVVOVVO | 2022-02-24 00:54:39 UTC | #77
+
+[quote="wpb, post:75, topic:11011"]
+too quickly in the wrong direction on circulating supply and the primary cause is dissolving neurons.
+[/quote]
+
+Wouldn't the proposed staked maturity function, along with further Community Fund development in support of ICP ecosystem investment, have a positive impact on regulating ICP circulation?
+
+-------------------------
+
+wpb | 2022-02-24 01:18:01 UTC | #78
+
+I think the signal that decentralization is improving will be when circulating supply is decreasing at a moderate rate instead of increasing at a high rate.  I believe success attracts success…more people will want to buy ICP and get more involved in governance when the current momentum on circulating supply and price both change in more favorable directions and the IC starts hosting major projects and businesses that provide high value.
+
+-------------------------
+
+wpb | 2022-02-24 01:27:17 UTC | #79
+
+I think I favor the staked maturity feature, but I’m quite concerned about the exchange maturity feature.  It seems to incentivize seed investors who have accumulated a lot of maturity since genesis to flood the market with ICP on a tax free basis.  There is far more maturity from voting rewards available to be minted than what has been minted so far.
+
+I’m really looking forward to the Community Fund, but need to see more info published about it.  That fund has a lot of potential to help regulate ICP circulation depending on how it is structured and implemented.
+
+-------------------------
+
+LightningLad91 | 2022-02-24 02:18:20 UTC | #80
+
+I agree with @lastmjs on this point. I think we need to stop trying to entice whales and just let the four year dissolve play out. We all know what the dissolve schedule looks like and I’d say the market has absorbed it pretty well the last few months. We need to be patient.
+
+-------------------------
+
+icme | 2022-02-24 03:35:25 UTC | #81
+
+> "Traditional venture capital funds operate on a close-ended structure that involves creating a series of funds that open, invest, and close on a seven-to-10-year cycle. In this cycle, most initial investments are completed within the first three to five years of the fund’s life. The remaining time of the lifecycle is used as a harvesting period for the fund to make additional investments in existing portfolio companies. At the end of the fund’s lifecycle, returns are generated through a liquidity event."
+[Source](https://www.capco.com/Intelligence/Capco-Intelligence/Sequoia-Breaks-Free-From-The-10-Year-Cycle)
+
+What we're seeing here is part of the normal VC cycle. VCs invested at a great time and price, and now are harvesting profits, which will be followed by a predetermined liquidation event. Attempting to fight/prolong this by bolstering rewards to these VCs/early whales in tempting them to stake instead of liquidate only puts more profit and control in the hands of the early investors and acts to centralize the IC. Compound this with the current crypto bear market and global macro issues, and it makes complete sense for VCs and larger investors to be making additional risk-off portfolio readjustments.
+
+Historically, liquidity is vital to healthy markets, and while it is true that a flood of liquidity can lead to lower prices in the short term, a lack of liquidity can lead to crises and market panics. While promising, the IC is still in it's early stages with a lot to deliver and prove, which means there is still a lot of risk associated with investment. Should we artificially incentivize people to take on more risk and lock up their tokens in the NNS by paying them out more, or should we allow the market decide what the appropriate risk to reward price should be in terms of the intrinsic value of the ICP currently + the extrinsic value of what buyers believe it will be in the future.
+
+
+
+[quote="wpb, post:78, topic:11011"]
+"I believe success attracts success…more people will want to buy ICP and get more involved in governance when the current momentum on circulating supply and price both change in more favorable directions..."
+[/quote]
+
+The types of investors that are attracted by short-term price movement are generally also short-term holders who are only motivated by "get rich quick" price action. These "gamblers" likely will not stake in the system for any considerable amount of time, and their primary concern will be making more money as soon as possible. Do we want voters with these priorities locked up in the NNS for 8 years?
+
+I would imagine at this time, the investors who will buy and lock up liquidity during the crypto and ICP bear market are generally technical and/or entrepreneurial in nature and see the promise and benefit of the Internet Computer to society - these are exactly the investors we want to attract and who will stake for a considerable amount of time, not [How to Get $100M... get 18,000 ICP first](https://kylelangham.substack.com/p/how-to-get-100m-get-18000-icp-first?utm_source=url) type of investors. While maybe not the case a year or so ago, Dfinity currently has a strong, and super positive PR machine - @diegop and the developer outreach and marketing teams are absolutely killing it in terms of attracting developers and entrepreneurs, and my personal opinion is that lower prices at this stage will further incentivize and accelerate adoption by this crowd, leading to quicker decentralization.
+
+One final thought... When the foundation & members of the community try to incentivize staking by first boosting staking rewards higher than the sky high APY% they are already at, plus now compounding that with more incentives in this proposal - it has the opposite effect on me. It makes me question the project and financial incentives of those who have the most to gain or lose from these types of proposals and issues.
+
+-------------------------
+
+tsetse | 2022-02-24 03:40:53 UTC | #82
+
+Thanks for the response, William. I greatly appreciate everything you are doing for the IC ecosystem, and Kyle Langham's data driven analyses are fabulous, so don't take what I have written as anything more than a difference of opinion from someone also concerned about IC's long-term health. It is true that in specific cases, a lot of IC coming to market could drive prices low enough to lead to a death spiral. I think one of Kyle Langham's posts concentrates on this subject. My sense is that such short term threats, if indeed they are existential, should be dealt with using short term measures rather than changing fundamental tokenomics in a way that could compromise the long-term health of the system.
+
+-------------------------
+
+lastmjs | 2022-02-24 14:11:23 UTC | #83
+
+@wpb it seems as if you believe that if we tweak the tokenomics enough we'll stop the extremely large dissolving neurons from dissolving, and that they'll instead stake and thus not dump ICP on the market.
+
+I hope comments like the one I'm replying to and the various others that myself and others have made are somewhat convincing that this will not be the case. Not only that, we may end up creating many unforeseen issues because of the tweaks, and still end up with those extremely large neurons dissolved and that ICP dumped.
+
+I say let them dissolve. Let them do what they want with the ICP. If they choose to sell, let many more interested people come and take their place. Let's decentralize ICP ownership and this governance power, not encourage it to stay in a few hands. And let's be patient with this amazing technology that needs time to mature. If you need examples of how long similar technologies took to mature, study the history of Bitcoin and Ethereum since 2008.
+
+Constantly meddling with the tokenomics foundations I'm afraid could be very harmful to the IC.
+
+Really these types of conversations are the most worrisome to me, and that they keep coming up is a constant existential threat IMO.
+
+@wpb please reconsider your assumptions and the means you are proposing, because I believe they could cause a lot more harm than you anticipate.
+
+-------------------------
+
+aaa10247 | 2022-02-24 15:12:44 UTC | #84
+
+My understanding is that the proposal is aimed not towards preventing large dissolving neurons from dissolving, but instead to stop non dissolving neurons from being forced to sell their maturity indefinitely. For these people this problem will never go away.
+
+-------------------------
+
+wpb | 2022-02-24 15:12:50 UTC | #85
+
+I don't think I made any proposals here.  I've responded with my opinion and questions regarding a few features of this proposal and I have answered a few questions that were directed at me, but I'm just trying to figure this proposal out like everyone else.  I'm trying to remain as objective as possible in my evaluation of the merits of this proposal and have been very impressed with many of the points made in this deliberation, including the one you referenced by @icme.
+
+-------------------------
+
+BenTaylor | 2022-02-24 15:22:32 UTC | #86
+
+You beat me to it, @aaa10247. My understanding is that this proposal is specifically designed to deal with potential unintended tax consequences from the current design. That's something that impacts all of us who merge. If a court ultimately determines that merging maturity creates a taxable event because new ICP is technically minted, everyone in the US who has merged will owe back taxes on the ICP that they merged. It could take years for that determination to be made, so it's *possible* that if we continue to use the system we are using today, people in the US who merge constantly could face a hefty tax bill.
+
+I personally think it's likely that merging does not create a taxable event. But I recognize it's quite possible that it does. And clearly some major holders agree that it's at least possible. 
+
+When I mention the issue with selling, what I mean is that *if* merging is considered a taxable event, US investors will be *forced* to sell a large portion of their rewards to cover their taxes. Do we want a large portion of the daily rewards to be sold on the open market day in and day out? Is there enough demand for ICP to withstand that kind of sell pressure without ICP cratering further?
+
+-------------------------
+
+lastmjs | 2022-02-24 15:35:40 UTC | #87
+
+I'm referring generally to your advocation for changes to tokenomics (not just in this thread) based on what I assume one of your underlying motivations is, which is to stop the genesis neurons from dumping ICP on the market.
+
+I hope you know I'm not trying to attack you personally or say you aren't being objective nor a good-faith member of the community.
+
+Just based on your comments and the conclusions I perceive you may be coming to, I just think they could be harmful. Really it's the constant desire to change the tokenomics, I oppose that desire and think it's harmful.
+
+If I've mischaracterized anything please feel free to tell me. I just want the best system possible, as I hope you do as well.
+
+-------------------------
+
+lastmjs | 2022-02-24 15:39:52 UTC | #88
+
+[quote="BenTaylor, post:86, topic:11011"]
+Do we want a large portion of the daily rewards to be sold on the open market day in and day out? Is there enough demand for ICP to withstand that kind of sell pressure without ICP cratering further?
+[/quote]
+
+Maybe we do, especially now. And such a focus on the short-term price action of ICP I think is unhealthy.
+
+Let the current price of ICP crater! Let as many people as possible get in now and help us build a robust government for the IC.
+
+The long-term demand for ICP, if the IC achieves the vision we all believe in, should completely dwarf any of the sources of demand that are present now (obviously there isn't much demand now).
+
+-------------------------
+
+BenTaylor | 2022-02-24 17:03:40 UTC | #89
+
+This isn't focusing on the "short-term price action." The issue of forced selling is a problem that will exist in perpetuity if merging maturity is in fact taxable. That said, there are consequences to ICP cratering further in the short term: namely, Dfinity's treasury could dwindle. Given that Dfinity is the research outfit charged with doing research to improve the IC, and given that Dfinity is using some portion of its funds to help onboard developers, the dwindling of its treasury could have some consequences for the long-term term success of the IC. I don't want to sound alarmist because I have no visibility into their finances, but it seems to me that there is certainly a price point for ICP where Dfinity suffers.
+
+Edit: I'm editing to clarify that this is comment getting a little far afield. The question in my mind here is simple: should we tweak the design of the merge maturity function so that it doesn't create a taxable event? I think we should. My primary reason for thinking that is that the change would provide greater clarity tax-wise for ICP stakers. My secondary reason is that I think it is unfair that the design of the merge maturity function means that it would not be taxable in some jurisdictions, but might be taxable in others: we should fix that. My third and final reason is that there could be unintended consequences if we don't do this--namely that it could create sell pressure as people sell ICP to pay taxes on their rewards. This specific post deals with one of the several reasons that constant sell pressure is on my list of reasons why I support this proposal.
+
+-------------------------
+
+lastmjs | 2022-02-24 15:58:05 UTC | #90
+
+I agree it's a risk if the price falls too far too fast in the short-term.
+
+I just don't think the way out is messing with the tokenomics as has been proposed.
+
+The way out is to keep building and getting people to use the IC.
+
+Instead of obsessing over the exact mechanics of ICP minting, focus on creating reasons to use ICP.
+
+If ICP is actually valuable, meaning people have real reasons to want to own it, then its price will reflect that. Obviously the supply has to be kept in check, but I think the current tokenomics will do that in time.
+
+Also, Bitcoin and Ethereum have long been subject to taxation on mining and staking rewards and they're doing just great, if those two examples could possibly serve as useful case studies.
+
+-------------------------
+
+BenTaylor | 2022-02-24 16:04:07 UTC | #91
+
+Here are two questions for you.
+
+1. If the "merge maturity" function was originally designed so that merging maturity would not be taxable in any jurisdiction, but lawyers have since determined that the design may have failed to achieve that goal, do you think we should try to fix the design?
+
+1. If the "merge maturity" function creates a taxable event only in some countries, but it can be fixed so that it creates a taxable event in no countries, should we implement that fix? 
+
+I personally think the answer to both of those questions is "yes." Which is why I like this proposal.
+
+-------------------------
+
+LightningLad91 | 2022-02-24 16:11:12 UTC | #92
+
+From what I recall, Merge Maturity was a feature requested by the community so they wouldn’t have to manually spawn a neuron, wait for it to dissolve, and the stake it back in the neuron. I do not recall any discussion about be a way to avoid taxes when it was requested or introduced
+
+-------------------------
+
+lastmjs | 2022-02-24 16:10:09 UTC | #93
+
+It depends on the consequences of the fixes and if the fixes are actually possible. If we knew for sure that we could legally stop taxation then yes, assuming again that the fix didn't introduce new undesirable consequences.
+
+That's the problem with the proposal. We don't even know, and probably can't know anytime soon, that it will work legally, and it introduces mechanisms that may end up making ICP staking undesirable because of its complexity, and our attempt to control when people mint may have other unintended consequences as we try to steer people's choices based on market conditions instead of letting them choose for themselves what is best.
+
+-------------------------
+
+lastmjs | 2022-02-24 16:12:16 UTC | #94
+
+We really need some Bitcoin maximalists to come school us on why we're destroying ourselves.
+
+-------------------------
+
+BenTaylor | 2022-02-24 16:19:22 UTC | #95
+
+This proposal was almost certainly drafted in consultation with (or entirely by) tax attorneys who specialize in understanding what exactly the tax code says. I doubt they would propose this unless it were iron clad legally. That said, you are right that I don't know whether the modulation will have negative consequences.
+
+-------------------------
+
+tsetse | 2022-02-24 16:30:41 UTC | #96
+
+Well, if they actually told people what the treasury is composed of, how much was converted to fiat over the past few months, just basic stuff that a publicly listed corporation would be compelled to reveal, it would help the community make a better judgement on how problematic the fall in price could get. The community has, as you put it, no visibility on Dfinity's finances, because the organisation has been obdurate and opaque about the matter. If they have enough fiat to tide over the current dip, no shift in tokenomics is needed.
+In the longer run, 'forced selling' is the best thing that could happen to the IC ecosystem. It is the only way to decentralise, aside from neurons becoming tradable.
+
+-------------------------
+
+ayjayem | 2022-02-24 17:34:14 UTC | #97
+
+The discussion so far seems to boil down to 2 main questions: whether the proposed changes...
+
+1. would in fact improve tax clarity;
+2. are worth pursuing even if they would improve tax clarity.
+
+In the background, there are broader questions whether:
+
+3. we should be making fundamental tokenomics changes at all, since this introduces instability;
+4. the process followed in introducing this proposal is “appropriate,” given prior community feedback.
+
+Echoing much of what has already been said, I personally think that on all counts this proposal should be dropped:
+
+1. Circumspect that this proposal would improve tax clarity - many tax authorities around the world, all motivated to get what they deem due, regardless of technical implementation.
+2. Cost of proposal complexity and opportunity cost of Dfinity team’s time far outweigh potential benefits for the IC of tax clarity (esp. since by far most ICP supply growth right now is coming from dissolving neurons, not maturity sales - so unlikely to meaningfully reduce price erosion, if that's part of the aim).
+3. Instability in fundamental tokenomics likely to deter potential stakers, and interferes with developers looking to innovate on firm ground.
+4. Proposal does not seem to reflect prior community consensus regarding priority of pursuing.
+
+-------------------------
+
+borovan | 2022-02-24 17:35:08 UTC | #98
+
+I think the merge maturity function predated the launch of the network, it was on the roadmap from the inception of the NNS.
+
+-------------------------
+
+borovan | 2022-02-24 18:04:58 UTC | #99
+
+The DFinity foundation having enough money to ride out the current market isn't the issue. I though this was more about the individual stakers who are at a tax disadvantage because of this ICP minting event.
+
+I think it's a fairly simple change to move from "here is a 10 ICP Neuron" to "here is a slight increase in voting power", the difference whether they can be easily quantifiable as income.
+
+-------------------------
+
+BenTaylor | 2022-02-24 18:44:49 UTC | #100
+
+I've spoken quite a bit, so this will be my last post on the topic for a while. But here are my answers to the two main questions you noted.
+
+**Would this proposal improve tax clarity?**  Tax liability is inherently a legal question. Laws state what is and is not taxable; tax agencies interpret those laws and try to enforce them according to the agencies' interpretation; if a tax agency's interpretation is called into question, the court system ultimately determines whether the tax agency's interpretation of the tax laws is correct. Because tax is inherently a legal question, I find it a little head scratching that people in this thread have called into question whether the proposal provides tax clarity without actually citing any case law or provisions of the various tax codes. Instead, people just kind of assume that any attempt to read/interpret tax laws and design a system in accordance with those tax laws is futile. But companies do that all the time: they hire attorneys to figure out what the law says and then figure out how to operate within the confines of those laws. Dom's post is full of legal conclusions that were clearly written with the help of tax lawyers, and (in my mind) are fairly persuasive. I see no reason to believe the proposed plan would not actually provide greater tax clarity.
+
+**Is it worth pursuing even if they would improve tax clarity?**  Tax clarity is incredibly important. If I make a determination that I do not owe taxes on merged maturity and a judge later concludes that I'm wrong, I owe back taxes on all of the maturity that I merged. Moreover, the amount of tax I would owe would depend on the price of ICP when I merged. Thus, if I merged maturity at $60/ICP and a judge determines that merging is taxable, I would owe taxes on that $60/ICP even though ICP is now worth $16/ICP *and* my ICP is locked up.  In fact, I would still owe even if ICP (god forbid) went to $0/ICP: meaning that I can actually lose more than I originally invested. 
+
+To avoid that bad outcome, investors in jurisdictions (like the US) where there is tax uncertainty will either (1) merge some portion of their maturity and sell the remainder to cover taxes or (2) let their maturity grow. For investors, there are a few issues with choice number one. First, investors don't want to have to pay taxes that aren't actually due. Second, minting and selling new ICP creates tax issues for investors who use the FIFO system because they have to pay taxes on both the newly minted ICP and on the capital gains (if any) they have accrued since they bought their first ICP that they currently hold. Third, it reduces the incentive to buy and stake ICP because the rewards are lower than they would be if you could compound without actually paying taxes on the newly minted ICP. And finally, it creates constant sell pressure for the ICP token.
+
+There are also issues with choice number two. If only a few jurisdictions might consider merging a taxable event, investors in those countries will be the only ones who don't use the merge function. The issue that creates is that the staking rewards for people in those jurisdictions will be materially lower than the staking rewards for everyone else because investors outside of those jurisdictions will consistently increase their voting power by merging maturities. Do we really want a system that gives 25% rewards to 8-year stakers in countries where investors can merge without facing taxes consequences, but 18% rewards to 8-year stakers in the few countries where merging might be considered taxable? Seems inequitable to me--especially since its possible to change the system to fix that issue.
+
+-------------------------
+
+Forreal | 2022-02-24 22:28:40 UTC | #101
+
+Exactly. I agree with everything you said. The write-up was very confusing and does not do a good job at explaining this to a normal person. It sounds to me like the proposal might be a good idea but the explanation of it is quite the opposite. 
+
+
+Let's bring this back to the table for more discussion.
+
+-------------------------
+
+LightningLad91 | 2022-02-24 23:19:50 UTC | #102
+
+Which roadmap? Can you provide a link?
+
+-------------------------
+

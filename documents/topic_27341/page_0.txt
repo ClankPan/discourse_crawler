@@ -1,0 +1,117 @@
+domwoe | 2024-02-06 09:32:11 UTC | #1
+
+Hi,
+
+I'm finally trying PocketIC for the first time and I'm encountering an issue in my integration tests: Candid stuff :slight_smile: 
+
+I want to test the following function:
+
+```
+fn schnorr_public_key(arg: SchnorrPublicKey) -> SchnorrPublicKeyReply {}
+```
+
+and do the following in my test:
+
+```
+let reply: Result<SignWithSchnorrReply, String> = update(&pic, my_principal,  canister_id, "sign_with_schnorr", encode_one(&payload).unwrap());
+
+pub fn update<T: CandidType + for<'de> Deserialize<'de>>(
+    ic: &PocketIc,
+    sender: Principal,
+    receiver: Principal,
+    method: &str,
+    args: Vec<u8>,
+) -> Result<T, String> {
+    match ic.update_call(receiver, sender, method, args) {
+        Ok(WasmResult::Reply(data)) => decode_one(&data).unwrap(),
+        Ok(WasmResult::Reject(error_message)) => Err(error_message.to_string()),
+        Err(user_error) => Err(user_error.to_string()),
+    }
+}
+```
+
+However, the tests fail at decoding the reply:
+
+```
+Feb 06 09:12:28.662 WARN s:/n:/ic_state_manager/ic_state_manager No state available with certification.
+thread 'test_sign_with_schnorr' panicked at tests/tests.rs:60:58:
+called `Result::unwrap()` on an `Err` value: Custom(input: 4449444c026c01f8c5aeab01016d7b0100_40d0e65fdb6cb0baf7c3cd285d268910233a3c175f2ca9ffbd812fed5bd6d9411cca2541b337bc2d33787059e2958515af11cf600369bb5919d4b011282e9444ba
+table: type table0 = record { 359_375_608 : table1 }
+type table1 = vec nat8
+wire_type: record { 359_375_608 : table1 }, expect_type: variant { Ok : record { signature : vec nat8 }; Err : text }
+
+Caused by:
+    0: Fail to decode argument 0 from table0 to variant { Ok : record { signature : vec nat8 }; Err : text }
+    1: Subtyping error: Type mismatch at ...src/index.crates.io-6f17d22bba15001f/candid-0.9.11/src/de.rs:877)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_sign_with_schnorr ... FAILED
+```
+
+Complete code is here: https://github.com/domwoe/schnorr_canister
+
+-------------------------
+
+fxgst | 2024-02-06 09:55:06 UTC | #2
+
+Hi @domwoe, it looks like the bug does not come from PocketIC but rather from supplying a different candid format than what the function expects. In the error message, it looks like the canister expects a variant, but a record was supplied.
+
+-------------------------
+
+Severin | 2024-02-06 09:55:23 UTC | #3
+
+[quote="domwoe, post:1, topic:27341"]
+wire_type: record { 359_375_608 : table1 }
+expect_type: variant { Ok : record { signature : vec nat8 }; Err : text }`
+[/quote]
+
+(`signature` hashes to `359_375_608`, so they're equivalent)
+
+Basically the thing you're trying to decode `Ok(thing)` but you receive `thing`.
+
+Looking at your code you have 
+
+```rust
+pub struct SignWithSchnorrReply {
+    pub signature: Vec<u8>,
+}
+
+#[ic_cdk::update]
+fn sign_with_schnorr(arg: SignWithSchnorr) -> SignWithSchnorrReply {
+```
+
+So your function returns only `thing` while in your test you try to decode to `Ok(thing)`
+
+-------------------------
+
+domwoe | 2024-02-06 09:59:17 UTC | #4
+
+Ah, thanks @Severin !
+
+-------------------------
+
+fxgst | 2024-02-06 10:21:10 UTC | #5
+
+> (`signature` hashes to `359_375_608` , so they’re equivalent)
+
+How does one arrive at this value/what hash function are you using here? :)
+
+-------------------------
+
+Severin | 2024-02-06 10:21:51 UTC | #6
+
+I'm using `didc hash "signature"`. No clue what algorithm is behind that :slightly_smiling_face: You can download `didc` in the [candid repo](https://github.com/dfinity/candid/releases)
+
+-------------------------
+
+fxgst | 2024-02-06 10:23:57 UTC | #7
+
+Thanks! Somewhat unrelated, but I've always wondered why candid does not just tell you in plaintext what it wants. Why does it show these signatures only?
+
+-------------------------
+
+Severin | 2024-02-06 10:38:04 UTC | #8
+
+A string costs a lot more bytes than a hash. And if you have the interface definition it is easy to reverse
+
+-------------------------
+

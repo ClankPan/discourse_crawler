@@ -1,0 +1,207 @@
+infu | 2022-04-19 13:39:10 UTC | #1
+
+I tried to sign custom calls to my canisters with ledger-icp and got this error
+
+```
+Error: A ledger error happened during signature:
+Code: 27012
+Message: "Data is invalid : Unexpected data type"
+```
+
+As far as I understand, it only works with predefined transactions hardcoded inside the ledger app. This means trying to sign your own requests will result in error and IC developers can't use it at all for their own canisters.
+
+As far as I can tell, these are the allowed transactions (NNS ICP & Neurons) https://github.com/Zondax/ledger-icp/blob/13b3d07a62cf3767f46b71c5e3788bda84ea122a/app/src/parser_txdef.h
+
+Can someone confirm if that's correct ? Perhaps there is some flag or a hidden feature?
+If only ICP & Neuron transactions are allowed, then why?
+
+-------------------------
+
+infu | 2022-04-20 16:42:08 UTC | #2
+
+In this file, https://github.com/dfinity/nns-dapp/blob/55a89a9b5d5d4241277822197efc62f3d3e8d6ce/frontend/ts/src/canisters/ledger/Service.ts
+requests are sent in an unusual way. It also uses send_pb - protobuf and not candid.
+There is a demo in the repo, it also uses protobuf. 
+
+Perhaps the ledger app accepts only protobuf, which means only rust canisters can communicate with it?
+
+-------------------------
+
+peterparker | 2022-05-10 05:55:31 UTC | #3
+
+I actually faced the same issue `27012` while rewriting the ledger for nns-dapp in svelte yesterday. 
+My colleague @lmuntaner ultimately found out that the function that was transforming the request was not yet moved to my rewrite.
+
+Everything is now solved and my understanding of the issue is that the request has to be formatted differently if it uses the standard identity or the ledger identity - i.e. when it goes through the ledger 
+
+Here the differences:
+
+- agent-js standard identity [transformRequest](https://github.com/dfinity/agent-js/blob/2fe3dd99cddfcf45c6d9d5b7a199a86285ce9740/packages/identity/src/identity/delegation.ts#L303)
+
+- nns-dapp ledger identity [transformRequest](https://github.com/dfinity/nns-dapp/blob/977a114ed197511c78044d885981494935f22085/frontend/ts/src/ledger/identity.ts#L200)
+
+Notice how both returns differ a bit.
+
+Hope this helps, at least it solved my issue 😄
+
+-------------------------
+
+skilesare | 2022-05-13 15:17:32 UTC | #4
+
+So are you now able to sign arbitrary canister requests with a ledger device?
+
+-------------------------
+
+peterparker | 2022-05-13 15:22:09 UTC | #5
+
+No idea. 
+
+I re-implemented this week in Svelte the nns-dapp feature for the accounts ("attach new hardware wallet", "transfer icp from a hardware wallet" and "display principal on hardware wallet"). That's why I faced above error.
+
+-------------------------
+
+infu | 2022-05-14 11:21:59 UTC | #6
+
+I set this repo where we can check it out https://github.com/infu/signtest
+added it to the issue https://github.com/Zondax/ledger-icp/issues/157
+I see the different transformRequests now, will try that out
+
+-------------------------
+
+infu | 2022-05-14 11:25:02 UTC | #7
+
+as far as I understand it has to look like that (a slightly modified dfx boilerplate) (Doesn't work)
+```
+
+import { createActor } from "../../declarations/signtest";
+import { LedgerIdentity } from "@dfinity/identity-ledgerhq";
+
+document.querySelector("form").addEventListener("submit", async (e) => {
+  let identity = await LedgerIdentity.create();
+
+  const signtest = createActor(process.env.SIGNTEST_CANISTER_ID, {
+    agentOptions: { identity },
+  });
+
+  const count = await signtest.add(3);
+...
+```
+
+-------------------------
+
+peterparker | 2022-05-14 11:33:56 UTC | #8
+
+[quote="infu, post:7, topic:12277"]
+`"@dfinity/identity-ledgerhq"`
+[/quote]
+
+In nns-dapp we use a [custom implementation](https://github.com/dfinity/nns-dapp/blob/main/frontend/svelte/src/lib/identities/ledger.identity.ts) of the ledger identity. It's on my low-prio todo to clear why and if we stick to it. Anyway it might also explains why it did not work out with your sample repo and on the contrary it worked out for me this week. Spontaneous guessing though.
+
+-------------------------
+
+infu | 2022-05-14 11:35:48 UTC | #9
+
+Yeah, I am checking it out 
+https://github.com/dfinity/agent-js/blob/974c06a810d0869c1f09137429795f20eddf7108/packages/identity-ledgerhq/src/identity/ledger.ts#L89
+It doesn't look much different and uses the different `transformRequest`
+
+-------------------------
+
+infu | 2022-05-14 12:32:54 UTC | #10
+
+I took NNS dapp Identity and tried again, but I get the same error.
+Here is the second repository https://github.com/infu/signtest2
+It uses https://github.com/dfinity/nns-dapp/blob/977a114ed197511c78044d885981494935f22085/frontend/ts/src/ledger/identity.ts
+instead of `@dfinity/identity-ledgerhq`
+
+This error comes from the device.
+First repo error:
+```
+ledger.js:68 Uncaught (in promise) Error: A ledger error happened during signature:
+Code: 27012
+Message: "Data is invalid : Unexpected data type"
+
+    at LedgerIdentity.sign (ledger.js:68:1)
+    at async LedgerIdentity.transformRequest (ledger.js:79:1)
+    at async HttpAgent.call (index.js:172:1)
+    at async caller (actor.js:174:43)
+    at async HTMLFormElement.<anonymous> (index.js:17:1)
+```
+Second repo error 
+```
+nns_identity.ts:168 Uncaught (in promise) Error: A ledger error happened during signature:
+Code: 27012
+Message: "Data is invalid : Unexpected data type"
+
+    at nns_identity.ts:168:1
+    at async LedgerIdentity._executeWithApp (nns_identity.ts:205:1)
+    at async LedgerIdentity.sign (nns_identity.ts:162:1)
+    at async LedgerIdentity.transformRequest (nns_identity.ts:186:1)
+    at async HttpAgent.call (index.js:172:1)
+    at async caller (actor.js:174:43)
+    at async HTMLFormElement.<anonymous> (index.js:17:1)
+(anonymous) @ nns_identity.ts:168
+
+```
+
+-------------------------
+
+peterparker | 2022-05-15 09:29:27 UTC | #11
+
+Having a look at the [sample repo](https://github.com/Zondax/ledger-icp) you shared in your [issue](https://github.com/Zondax/ledger-icp) on zondax ledger-icp. If I get it right you get the error when you do query the actor `const count = await signtest.add(3);` right?
+
+If so I think we have the same limitation - i.e. when we do query with the ledger identity we have to go through queries that use protobuf at the moment (also still on my todo list). For example, in nns-js, when we query the list of neurons through the dedicated [function](https://github.com/dfinity/nns-js/blob/6ed0fa42bb3cc542240227642f8b4aed0d9c476a/src/governance.ts#L155), we follow different path if identiy or ledger identity.
+
+I know it does not solve your question directly but I guess it helps a bit.
+
+-------------------------
+
+infu | 2022-05-15 10:57:16 UTC | #12
+
+That confirms that the hardware Ledger app only works with protobuf functions, which can only be exposed by canisters in Rust, but not Motoko. I wonder if Zondax team are aware that they need to add Candid support?
+
+-------------------------
+
+peterparker | 2022-05-15 11:02:16 UTC | #13
+
+[quote="infu, post:12, topic:12277"]
+I wonder if Zondax team are aware that they need to add Candid support?
+[/quote]
+
+Don't know, good question. I'll keep you posted - will update the thread if I ever get more info.
+
+-------------------------
+
+ohsalmeron | 2022-05-16 16:36:38 UTC | #14
+
+looking forward to this, thank you!
+
+-------------------------
+
+ainhoa-a | 2023-09-14 08:46:50 UTC | #15
+
+Hi @infu, 
+
+sorry for the late response, we (zondax) are relatively new in this forum. 
+Do you still encounter this issue? There was a recent upgrade of the ICP ledger app that includes support for several candid functions. 
+
+If you (anyone on the icp community) encounter any issue in the future with the Ledger app please feel free to create a ticket in our repository https://github.com/Zondax/ledger-icp 
+
+I'd like to use the opportunity to communicate that in the next week another upgrade of the ICP ledger app will be available, and this will support even more candid functions.
+
+-------------------------
+
+skilesare | 2023-12-08 16:05:36 UTC | #16
+
+Any chance of getting general-purpose candid functions?
+
+-------------------------
+
+infu | 2023-12-08 16:10:05 UTC | #17
+
+I wonder if Ledger -> Metamask Snap -> Custom canisters will get it done
+or the new standards <https://github.com/dfinity/wg-identity-authentication>
+instead of Metamask Snap will allow us to 'convert' arbitrary calls to something well-defined Ledger hardware can understand.
+
+-------------------------
+

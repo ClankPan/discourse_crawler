@@ -1,0 +1,252 @@
+THLO | 2023-07-28 20:11:41 UTC | #1
+
+Hi everyone,
+
+I'd like to start a discussion about a new feature that is currently being worked on at DFINITY.
+
+While responses to update calls bear a subnet signature, query calls are handled by single replicas and their responses are not trustworthy. Certified data/variables can be embedded in responses to query calls but this approach requires extra work for developers and is not always feasible.
+
+The ultimate goal is to have "certified queries", which, as the name suggests, make it possible to verify the correctness of query responses.
+
+As a first step in this direction, we'd like to introduce *replica signatures in query responses*: every response to a query call will contain a signature, signing specific parts of the response using the replica's own private key. The recipient can validate the query response by first fetching the public keys of the replicas from the state tree of the corresponding subnet, reading out the public key of the signing replica, and then verifying the signature. Since subnet membership does not change frequently, the public keys of replicas in a subnet can (and should) be cached.
+
+In short, there will be two changes in this first step: The subnet state tree will expose the public keys of the replicas and query responses will contain a signature. The interface spec changes are still being drafted. We will post an update here once these changes are reflected in the interface spec.
+
+Obviously, having a single replica signature in the response *does not* solve the problem that query responses cannot be trusted. However, the addition of a signature does improve security because the recipient can verify that the response came from a replica on the correct subnet. Specifically, it wouldn't be possible for a malicious boundary node to return false data.
+
+The feature roll-out is tentatively planned for the end of Q3 2023. Once this feature is rolled out, developers of agents are advised to update their agents to verify the signatures. The DFINITY SDK team will update all of their agents accordingly.
+
+If you have any feedback or questions, please post them here!
+
+Cc: @quint @neeboo @rdobrik @Gekctek @levi @jleni @derlerd-dfinity1 @Shuo
+
+-------------------------
+
+icarus | 2023-07-29 00:51:45 UTC | #2
+
+Clearly this feature is essential to achieve the goal of decentralised trustless IC boundary nodes later this year.
+Given the response time of these query calls against a single replica are limited only by the one responding replica node and the and the boundary node serving the http request, is the additional response signing step expected to add any significant latency to the overall response time? Will any additional latency due to signing the responses depend on the size of the response body?
+
+-------------------------
+
+levi | 2023-07-30 19:38:04 UTC | #3
+
+Cool, thanks for the ping @THLO. 
+
+[quote="THLO, post:1, topic:21793"]
+it wouldn’t be possible for a malicious boundary node to return false data.
+[/quote]
+
+Good stuff!
+
+I will update the https://pub.dev/packages/ic_tools when the feature is live. :saluting_face:
+
+-------------------------
+
+Shuo | 2023-08-01 08:21:06 UTC | #4
+
+> Clearly this feature is essential to achieve the goal of decentralised trustless IC boundary nodes later this year.
+
+Yeah. This feature makes query response tamperproof against boundary nodes.
+
+> is the additional response signing step expected to add any significant latency to the overall response time?
+
+We don't expect any significant latency as our experiments show that the ed25519 signing only takes 48.2 µs.
+
+> Will any additional latency due to signing the responses depend on the size of the response body?
+
+We first compute the SHA-256 hash of relevant fields of the response and then sign the 32-byte hash. Given the maximum query response size (3MiB), hashing introduces several milliseconds of latency.
+
+The signature size is 64 bytes and we don't expect it adds significant latency in transmission.
+
+-------------------------
+
+Shuo | 2023-08-17 05:19:52 UTC | #5
+
+Hi folks. I’d like to give some heads-up about the feature deployment. We have made the first change of exposing the public keys of the replicas in the state tree. The proposal for the replica version containing the changes was accepted. So it will hit mainnet soon.
+
+We are now working the second change of adding a signature into query responses. This will introduce a new response type and thus I would like to keep you informed of the corresponding specification changes.
+
+**TL;DR: We expect the new response type will maintain backwards compatibility with existing agents because CBOR deserialization handles unknown fields well and agents can process the new responses as if they were the old ones.**
+
+Currently, the IC interface [specification](https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-query) defines the response type as below:
+If the query call resulted in a reply, the response is a CBOR map with the following fields:
+
+```
+status : "replied"
+reply:  the reply data
+```
+If a reject, then:
+
+```
+status : "rejected"
+reject_code 
+reject_message 
+error_code
+```
+
+This feature will introduce an additional field called `signatures` in the CBOR map above while keeping all the existing fields unchanged. 
+If the query call resulted in a reply, the response is a CBOR map with the following fields:
+
+```
+status : "replied"
+reply:  the reply data
+signatures
+```
+If a reject, then:
+
+```
+status : "rejected"
+reject_code 
+reject_message 
+error_code
+signatures
+```
+
+Compatibility insights:
+[Agent-rs](https://github.com/dfinity/agent-rs) uses [serde_cbor](https://docs.rs/serde_cbor/latest/serde_cbor/) and it automatically ignores unknown fields during deserialization.
+For [agent-js](https://github.com/dfinity/agent-js) using [node-cbor](https://www.npmjs.com/package/cbor), deserialization is schema-less and thus all fields are preserved. Additional fields are then ignored by simply not accessing it.
+
+We expect this change to be compatible with existing agents as in most cases CBOR handles unknown fields well, either automatically ignoring them or preserving them without errors.
+To be on the safe side, we recommend you reviewing the implementation of your agents and the CBOR library to make sure they can handle additional fields gracefully. In some rare cases,  it requires some configuration for CBOR library to ignore unknown fields.
+
+I will keep you updated about further progress. Thanks for your continued collaboration and support!
+Cc: @quint @neeboo @rdobrik @Gekctek @levi @jleni @derlerd-dfinity1 @THLO @mraszyk
+
+-------------------------
+
+Shuo | 2023-09-21 07:43:37 UTC | #6
+
+Hello everyone,
+I would like to bring you the latest developments on the replica-signed queries feature. We've successfully integrated signature support into query responses. The [proposal](https://dashboard.internetcomputer.org/proposal/124538) for the replica version with query response signature has been accepted and you may check the following subnet upgrade proposals for more details.
+The [specification](https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-query) of the replica-signed queries has also been made public. It formally describes the signature formats, response structures and verification logic.
+Currently, we're in the final part, focusing on enabling agent-js and agent-rs to retrieve node public keys and verify node signatures. 
+We'll continue to keep you in the loop as we make further progress. Thank you for your continued support and interest.
+
+-------------------------
+
+Gekctek | 2023-09-21 22:50:07 UTC | #7
+
+From what I understand this is not rolled out to all subnets as of now correct? I am not getting any from the governance canister.
+I am trying to do a real world test on my agent implementation, is there an example endpoint that will return the signatures that you could provide?
+
+-------------------------
+
+Shuo | 2023-09-22 01:58:30 UTC | #8
+
+Hi Gekctek. That's correct. Upgrade proposals may take days for all the subnets and usually NNS subnet is the last one. That's why we have not seen the signatures from the governance canister as it lives in the NNS.
+
+It is great to hear that you are going to test your agent implementation. [Here](https://dashboard.internetcomputer.org/releases) you can see the list of subnets which have already upgraded. You may check early next week to see if the NNS subnet has upgraded. If so, the signatures filed can be seen in the query response from the governance canister. Thanks for your interest.
+
+-------------------------
+
+rdobrik | 2023-09-28 20:57:30 UTC | #9
+
+Fixed in patch for Java ICP Agent (Version: 0.6.19.6).  Modified Java code to ignore all unknown properties.
+
+For now we ignore signatures property. I will do some research and do signature verification later.
+
+github.com/ic4j/ic4j-agent
+
+-------------------------
+
+Shuo | 2023-11-17 23:45:34 UTC | #10
+
+🚀 **Replica-Signed Queries Have Arrived!** 🚀
+
+Hello everyone!  The [replica-signed queries feature](https://internetcomputer.org/blog/features/replica-signed-queries) is now live! 🎉
+
+We just released agent-js [0.20.1](https://github.com/dfinity/agent-js/releases/tag/v0.20.1) and agent-rs [0.30.2](https://github.com/dfinity/agent-rs/releases/tag/ed0862a) which supports fetching node public keys and verifying signatures of query responses. 
+
+On the IC mainnet, the replica has already begun producing signatures on query responses. 
+* Plus, there's an update on response hashing, aligning with the clarification on hashing nested maps from the [interface specification](https://internetcomputer.org/docs/current/references/ic-interface-spec/#hash-of-map).
+
+**For the Developers:**
+
+* If you're crafting agents in other languages, you may test the implementation directly against the IC mainnet.
+* Developing dApps? dfx defaults to the `@latest` version of agent-js for new projects. For existing dApps, you can also upgrade them to agent-js 0.20.1 or newer to enable the feature.
+* For local development using dfx, you'll need dfx 0.15.2 or newer, which will bundle the new version of agent-rs and replica. We expect to release dfx 0.15.2 soon. For now, the beta version is available by running
+```
+DFX_VERSION=0.15.2-beta.2 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+```
+
+A huge shoutout to everyone who contributed to this feature release. 🌟 
+
+Let us know how you find the new feature. Thank you.
+
+-------------------------
+
+Gabriel | 2023-11-27 16:23:36 UTC | #11
+
+Hey, side question, with the replica signed queries can one use them insted of certified assets? 
+
+My main question is in what scenarios can we signed queries for asstets? it will be good to have a breakdown/side comparison.
+
+-------------------------
+
+Severin | 2023-11-28 08:08:06 UTC | #12
+
+Replica signed queries is not a replacement for certified assets, although it is a step towards it. But in the end I don't expect certified assets to go away entirely because certified assets is the only way to reach the best security:computation resources ratio we can get
+
+Here's an attempt at a comparison: 
+
+Certified Asset:
+- What is it?
+  - Puts response through consensus before request happens.
+  - Single replica can then serve a consensus-pre-approved response without waiting for consensus once more
+- What does it protect against?
+  - Replica forging a response
+  - Boundary node interference (except for not serving a response outright)
+- What does it _not_ protect against?
+  - Malicious/broken verification logic
+  - I think there is a chance to serve stale assets for a short while
+
+Replica-signed Query:
+- What is it?
+  - A query gets executed by a single replica, without going through consensus
+  - The replica that executes the query signs the response with its own key
+- What does it protect against?
+  - Boundary node modifying the response
+- What does it _not_ protect against?
+  - Forged/malicious response by the one replica that executes the query
+  - Malicious/broken verification logic
+  - Boundary node routing the request to a specific replica
+
+Certified queries (I'm guessing a few things here, especially about implementation details):
+- What is it?
+  - A query request gets routed to multiple replicas
+  - If enough replicas provide the same response then the query can be certified somehow (probably every response contains a signature by a key share that, with enough shares, can be combined into a full signature)
+- What does it protect against?
+  - Small amount of replicas forging a response. (IDK what 'small' means in this context)
+  - Boundary node modifying the response
+  - Boundary node maliciously routing the request, up to a certain threshold
+- What does it _not_ protect against?
+  - Malicious/broken verification logic
+  - Boundary node blocking the request entirely
+  - Depending on the amount of required shares some routing misbehaviour can be tolerated
+
+-------------------------
+
+THLO | 2023-11-28 09:09:40 UTC | #13
+
+@Severin provided a great summary.
+Here are some clarifications regarding certified queries:
+
+* The response to a certified query contains at least `n/3` replica signatures where `n` denotes the number of replicas in the subnet (for example, at least 5 signatures for a 13-node subnet).
+* If the subnet is healthy (that is, there are fewer than `n/3` broken/compromised replicas), the recipient can trust the query result because at least one signature must have come from a correct replica.
+
+-------------------------
+
+levi | 2023-12-04 18:42:49 UTC | #14
+
+Are certified-queries live yet?
+
+-------------------------
+
+THLO | 2023-12-05 08:22:36 UTC | #15
+
+No, not yet.
+As @Shuo announced a little over two weeks ago, the replica-signed query feature is now live, which is a prerequisite for certified queries. It will certainly take some time before the IC gets certified queries (I'm not aware of a concrete timeline).
+
+-------------------------
+

@@ -1,0 +1,205 @@
+qwertytrewq | 2023-05-17 13:38:17 UTC | #1
+
+In JavaScript there is `Promise.all` to wait at once for several futures. Is there (or can be implemented?) a similar thing in Motoko?
+
+I want to wait for `skExists` from several CanDB canisters to securely check whether a key exists in the CanDB DB. Is it possible?
+
+-------------------------
+
+claudio | 2023-05-17 17:10:27 UTC | #2
+
+There is no Promise.all in Motoko and it's currently not possible to author a fully generic one.
+
+However, you can do parallel waiting by issuing several sends and only awaiting the results later.
+
+'''
+let p1 = a1.send(); 
+let p2 = a2.send();
+let r1 = await p1; 
+let r2 = await p2;
+'''
+
+-------------------------
+
+qwertytrewq | 2023-05-17 18:32:47 UTC | #3
+
+No, @claudio , your code first blocks on `await p1` and only then moves to `await p2`.
+
+Probably, this will work:
+
+```
+let p1 = a1.send();
+let p2 = a2.send();
+let r = [await p1, await p2];
+```
+
+But I am unsure even on the last code.
+
+-------------------------
+
+quint | 2023-05-17 19:17:34 UTC | #4
+
+That is exactly how a `Promise.all` works.
+You will only be waiting as long as the longest call.
+
+Either `p1` takes longer, than you do not need to wait on `p2`.
+Or `p1` finishes and you will also have to wait for `p2`.
+
+There is no real difference between:
+[quote="claudio, post:2, topic:20058"]
+```
+let r1 = await p1;
+let r2 = await p2;
+```
+[/quote]
+
+[quote="qwertytrewq, post:3, topic:20058"]
+```
+let r = [await p1, await p2];
+```
+[/quote]
+
+-------------------------
+
+qwertytrewq | 2023-05-17 19:44:32 UTC | #5
+
+@claudio You seem to think that
+```
+let r1 = await p1;
+let r2 = await p2;
+```
+executes in parallel.
+
+That's not the case! `await` like any other language construct is executed sequentially.
+
+`await p1` blocks that is not allows to execute any more code in this thread of control until `p1` finished. Only then `await p2` is executed.
+
+I will present another example to illustrate my point:
+
+```
+let r1 = await p1;
+Debug.print("in the middle");
+let r2 = await p2;
+```
+
+If `await p2` executed in parallel with `await p1`, then `in the middle` would be printed after `await p2`, not before. That's not the case.
+
+-------------------------
+
+qwertytrewq | 2023-05-17 19:47:10 UTC | #6
+
+@claudio Oh, I misunderstood you:
+
+```
+await p1;
+await p2;
+```
+is really equivalent to `Promise.all` in JavaScript, because it finishes as soon as both `p1` and `p2` finish.
+
+-------------------------
+
+qwertytrewq | 2023-05-17 20:23:38 UTC | #7
+
+@claudio 
+
+However, no:
+
+`a1.send()` does not start execution of an async function `a1.send`, it just returns a future (if Motoko works the same as most asynchronous languages).
+
+So, in
+```
+let p1 = a1.send();
+let p2 = a2.send();
+let r1 = await p1;
+let r2 = await p2;
+```
+execution of `a2` starts only after execution of `a1` finishes.
+
+-------------------------
+
+claudio | 2023-05-17 21:22:11 UTC | #8
+
+Both messages are enqueued at send() and actually both sent at the first await. If destined at two different receivers, they can execute concurrently and, after the second await, will both have finished.
+
+Motoko futures are eager, not lazy. Even if you don't await a future, its effects still happen.
+
+-------------------------
+
+jeshli | 2024-01-06 19:04:47 UTC | #9
+
+Thanks for sharing this. It is extremely helpful. Can you confirm that Canisters written in Rust will behave the same way?
+
+-------------------------
+
+claudio | 2024-01-06 23:31:02 UTC | #10
+
+@mraszyk might be able to answer about the Rust cdk. I believe it originally used eager semantics, but may since changed to lazy. Don't trust my answer.
+
+-------------------------
+
+mraszyk | 2024-01-07 14:03:15 UTC | #11
+
+> I believe it originally used eager semantics, but may since changed to lazy.
+
+Indeed, inter-canister calls in Rust (using `ic_cdk::call`) won't be executed unless they're awaited (this is standard in Rust and the Rust compiler issues warnings if a future is not awaited). To execute multiple inter-canister calls in parallel in Rust, you can do the following:
+```
+        let mut futs = vec![];
+        for i in 0..4 {
+            futs.push(call(my_favorite_canister, "foo", ((i),)));
+        }
+        let res: Vec<Result<(u64,), _>> = join_all(futs).await;
+```
+
+-------------------------
+
+jeshli | 2024-01-07 20:46:51 UTC | #12
+
+Thank you very much for this example! I'm very excited to apply it to my work.
+
+It seems in your example that you push to `my_favorite_canister` each time. Since this is the same canister, would it prevent the process from being parallelized? Would I have to call a distinct canister for each pushed call for it to be parallelized? Would queries be parallelizable to the same canister because it could go to a different node, but updates not? TIA
+
+-------------------------
+
+Samer | 2024-01-07 23:49:35 UTC | #13
+
+This might also be helpful
+https://web3.motoko-book.dev/advanced-concepts/async-programming.html
+
+-------------------------
+
+mraszyk | 2024-01-08 09:29:50 UTC | #14
+
+> It seems in your example that you push to `my_favorite_canister` each time. Since this is the same canister, would it prevent the process from being parallelized? Would I have to call a distinct canister for each pushed call for it to be parallelized?
+
+Indeed, calls to the same canister are executed sequentially by the IC. Hence, you'd need to call distinct canisters to benefit from concurrent execution of the calls. But you might already get some speed up when calling the same canister as I showed above since the calls will (very likely) be executed in a batch on the same thread without other canisters being executed on that thread in between.
+
+> Would queries be parallelizable to the same canister because it could go to a different node, but updates not?
+
+No, to preserve the security guarantees of the IC, if you invoke a query method from an update call, then this query method is executed on all nodes just like an update call to an update method.
+
+-------------------------
+
+jeshli | 2024-01-08 14:56:04 UTC | #15
+
+Thank you very much for the detailed response. This has all been very helpful and I am eager to integrate it into my code. I have one last question to help me understand the best course for my architecture. 
+
+[quote="mraszyk, post:14, topic:20058"]
+No, to preserve the security guarantees of the IC, if you invoke a query method from an update call, then this query method is executed on all nodes just like an update call to an update method.
+[/quote]
+
+Would using Composite_Query to invoke Queries require the same "security guarantee"? Could a Composite Query have more than one Query concurrently executed by the same Canister on different nodes?
+
+-------------------------
+
+mraszyk | 2024-01-08 15:28:22 UTC | #16
+
+> Would using Composite_Query to invoke Queries require the same “security guarantee”?
+
+No, the security guarantees of both query calls and composite query calls are weaker than the security guarantees of update calls since both query calls and composite query calls are executed by only one node.
+
+> Could a Composite Query have more than one Query concurrently executed by the same Canister on different nodes?
+
+No, all individual queries executed as part of a composite query evaluation are evaluated on the same node that received the original composite query call.
+
+-------------------------
+

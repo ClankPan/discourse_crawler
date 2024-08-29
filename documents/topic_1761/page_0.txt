@@ -1,0 +1,228 @@
+richardartoul | 2021-01-10 05:53:45 UTC | #1
+
+I was experimenting with a simple Matoko program to do some benchmarking of the IC and see what its capable of:
+
+```
+import Array "mo:base/Array";
+import Iter "mo:base/Iter";
+
+actor {
+    var nums : [[Int]] = [];
+
+    public query func size(): async Int {
+        var sum = 0;
+        for (x in nums.vals()) {
+            sum += x.size();
+        };
+        return sum;
+    };
+
+    public query func sum(): async Int {
+        var sum : Int = 0;
+        for (x in nums.vals()) {
+            for (y in x.vals()) {
+                sum += y;
+            }
+        };
+        return sum;
+    };
+
+    public func append(size : Int) {
+        // TODO: Could pre-alloc this if i could figure out how to cast
+        // Int to Nat or make IDL parse a Nat.
+        var new : [Int] = [];
+        for (i in Iter.range(0, size)) {
+            new := Array.append<Int>(new, [i]);
+        };
+        nums := Array.append<[Int]>(nums, [new]);
+    };
+};
+```
+
+I found that if I ran a bunch of calls to `append` in parallel I would push my local replica into a bad state where it would no longer reply to any calls (btw the dfx client doesn't seem to have a default timeout which is a bit annoying). If I force-restarted my local replica it would recover.
+
+Eventually after doing this long enough I seem to have borked my local replica and it just spam this message when I turn it on:
+
+```
+Jan 10 05:52:00.405 WARN s:fscpm-uiaaa-aaaaa-aaaap-yai/n:fhkdv-npwzk-k6xia-pkinl-pzgfn-tifm2-stjfg-2udsp-v5ejo-zx4ud-nqe/ic_consensus/block_maker Cannot propose block as the locally available validation context is smaller than the parent validation context (locally available=ValidationContext { registry_version: 1, certified_height: 4104, time: Time(1610257920403552000) }, parent context=ValidationContext { registry_version: 1, certified_height: 4157, time: Time(1610256351441464000) })
+```
+
+Now any calls I make with the dfx cli return:
+
+```
+Could not reach the server
+```
+
+I assume I can just wipe my local replica (how do I do that?), but thought I'd bring it up as a bug
+
+-------------------------
+
+richardartoul | 2021-01-10 05:54:13 UTC | #2
+
+Sorry my DFX version is 0.6.16
+
+-------------------------
+
+Ori | 2021-01-10 09:11:31 UTC | #3
+
+Thanks Richard. The local replica state is local to each project, there’s a .dfx directory created when you first run dfx start within the project directory. 
+
+You can run `dfx start --clean` or manually delete this .dfx directory to reset the state for that project only.
+
+-------------------------
+
+Ori | 2021-01-10 09:34:17 UTC | #4
+
+Re the TODO, you could use Nat for the size parameter in your append function there, since Nat is a subtype of Int in Motoko. 
+
+For reference, to cast Int to Nat as an absolute value you could use Int.abs() from the base library: [https://github.com/dfinity/motoko-base/blob/master/src/Int.mo](https://github.com/dfinity/motoko-base/blob/master/src/Int.mo)
+
+-------------------------
+
+richardartoul | 2021-01-10 15:30:29 UTC | #5
+
+Thanks!
+
+Any idea why I’m struggling to make parallel calls? I’m hoping that the dfx CLI is just doing something non thread-safe in my local project and it’s not an issue with the replica itself.
+
+Any suggestions on the best way I can try and bulk load data? The consensus latency is kind of high and the cycle limit limits how much data I can load at once so I’m trying to figure out how I can get a few gibs of data in there quickly without waiting for a bunch of synchronous consensus round trips.
+
+-------------------------
+
+richardartoul | 2021-01-10 16:50:19 UTC | #6
+
+@Ori It seems *really* easy to break my local replica and get it into a bad state. Is this representative of how full nodes will behave? All it takes is making 10 concurrent update calls for about a minute or so and the whole thing becomes unresponsive and gets into a bad state.
+
+-------------------------
+
+chenyan | 2021-01-10 19:48:01 UTC | #7
+
+Can you share the dfx command you use? I cannot reproduce this locally.
+
+-------------------------
+
+richardartoul | 2021-01-10 19:52:48 UTC | #8
+
+Sure, initially I was doing stuff like this:
+
+```
+#!/bin/bash
+
+for i in {1..5}
+do
+	dfx canister call rno2w-sqaaa-aaaaa-aaacq-cai append '(10000)'
+done
+```
+
+then I switched to doing stuff like this using the front-end (please excuse my horrible javascript):
+
+```
+import cache from 'ic:canisters/cache';
+
+var numRunning = 0;
+var numIters = 0;
+
+function run() {
+  for (var i = 0; i < 10; i++) {
+    numRunning++;
+    cache.append(10000).then((response) => {
+        console.log(i + " -> " + response);
+        numRunning--;
+
+        if (numRunning == 0 && numIters < 100) {
+          run()
+        }
+    });
+  }
+  numIters++;
+}
+
+run();
+```
+
+-------------------------
+
+chenyan | 2021-01-10 20:15:29 UTC | #9
+
+So the bash works fine for me, with 10 iterations. I haven't tried the JS version, but it seems you are making 10 parallel calls for each append, that's 10^100 calls...
+
+-------------------------
+
+richardartoul | 2021-01-10 20:18:02 UTC | #10
+
+Try the bash thing with 100 or 1000 calls.
+
+The JS thing is confusing but what it’s doing is running 10 parallel calls, waiting for them to finish, then running 10 parallel calls etc
+
+-------------------------
+
+richardartoul | 2021-01-10 20:19:35 UTC | #11
+
+Either way though I should get some kind of back pressure response no?
+
+Anyone on the network could issue calls like this so the replicas need to be able to apply back pressure.
+
+-------------------------
+
+richardartoul | 2021-01-10 22:42:32 UTC | #12
+
+Hmm so interestingly, I tried deploying to the sodium ic and that seems to work much better. My script did not break the sodium IC and I get error now about my canister exceeding its memory allocation. I should be nowhere near the 4GiB limit but I assume the sodium test net has an artificially low limit since no one is paying for it?
+
+-------------------------
+
+nomeata | 2021-01-11 18:11:02 UTC | #13
+
+The _default_ allocation was reduced to a few dozen MB, but you can still request a higher allocation when you install your code.
+
+-------------------------
+
+richardartoul | 2021-01-12 03:07:38 UTC | #14
+
+How do I do that? Is it a command line argument to dfx? (I’m on mobile right now and can’t check)
+
+-------------------------
+
+nomeata | 2021-01-12 17:59:08 UTC | #15
+
+Yes, `dfx canister install` takes such arguments:
+
+```
+~ $ dfx canister install --help
+dfx-canister-install 
+Deploys compiled code as a canister on the Internet Computer
+
+USAGE:
+    dfx canister install [FLAGS] [OPTIONS] [canister-name]
+
+ARGS:
+    <canister-name>    Specifies the canister name to deploy. You must specify either canister
+                       name or the --all option
+
+FLAGS:
+        --all           Deploys all canisters configured in the project dfx.json files
+        --async-call    Specifies not to wait for the result of the call to be returned by polling
+                        the replica. Instead return a response ID
+    -h, --help          Prints help information
+    -V, --version       Prints version information
+
+OPTIONS:
+        --argument <argument>                        Specifies the argument to pass to the method
+        --argument-type <argument-type>
+            Specifies the data type for the argument when making the call using an argument
+            [possible values: idl, raw]
+
+    -c, --compute-allocation <compute-allocation>
+            Specifies the canister's compute allocation. This should be a percent in the range
+            [0..100]
+
+        --memory-allocation <memory-allocation>
+            Specifies how much memory the canister is allowed to use in total. This should be a
+            value in the range [0..256 TB]
+
+    -m, --mode <mode>
+            Specifies the type of deployment. You can set the canister deployment modes to install,
+            reinstall, or upgrade [default: install] [possible values: install, reinstall, upgrade]
+```
+
+-------------------------
+

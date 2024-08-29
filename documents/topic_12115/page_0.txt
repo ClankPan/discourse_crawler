@@ -1,0 +1,101 @@
+skilesare | 2022-04-13 04:14:03 UTC | #1
+
+I have a big gnarly test canister that pretty much just runs locally.  It's parent cansister that references it and the instantiates it recently stopped deploying because:
+
+```Reinstalling code for canister test_runner, with canister_id rno2w-sqaaa-aaaaa-aaacq-cai
+Error: The replica returned an HTTP Error: Http Error: status 400 Bad Request, content type "", content: Request 0x68a49033f9dc4cf268e37a5248e1497909406c2f3b12dc75fe8d7574b9dd89a5 is too large. Message bytes 3694912 is bigger than the max allowed 3670016.
+```
+
+First of all, is there some compiler function that I should be using to compact the wasm?  I know this is done for rust but not sure if we can do the same for motoko canisters.
+
+Second, is there a way I can force the local replica to let this run? It isn't ever going to get deployed to mainnet. I just need to run tests.
+
+Third. This seem big for what I'm doing so far.  Is there some 'base' size that we're building off of with all the system tools compiled in?
+
+-------------------------
+
+skilesare | 2022-04-13 04:20:51 UTC | #2
+
+Update: This took .1MB off...still to big
+
+```
+wasm2wat test_runner.wasm -o test_runner.wat
+wat2wasm test_runner.wat -o test_runner.min.wasm
+```
+
+-------------------------
+
+rossberg | 2022-04-13 10:49:13 UTC | #3
+
+Conversion to text format and back should be the identity and not change the Wasm code, up to some minor encoding details. I suspect the size reduction you are seeing is merely the loss of the meta data custom sections containing the Candid and stable interfaces, which you rather want to keep.
+
+That said, I don't know what causes this size, I agree it seems large. But depending on what features you are using, the compiler might have to include significant functionality into the runtime. For example, Unicode stuff can require megs of tables. Or math. @ggreif probably knows more.
+
+-------------------------
+
+skilesare | 2022-04-13 11:45:32 UTC | #4
+
+Interesting. Maybe it is @quint ’s fault. I’m using il his encoding library. 😜Quint, have you noticed any size issues with any of your libraries? I need to look through and see if Unicode is used.
+
+-------------------------
+
+quint | 2022-04-13 12:05:35 UTC | #5
+
+Anything is possible, my packages have not been reviewed by others. They are quite old by now... I am planning to add an extensive testing suite, if time allows it. Sadly, I am limited to my free time to do this.
+
+-------------------------
+
+skilesare | 2022-04-13 14:12:14 UTC | #6
+
+It’s all good. They’ve been a huge timesaver. If I find any culprits I’ll let you know.
+
+-------------------------
+
+skilesare | 2022-04-13 15:07:18 UTC | #7
+
+[quote="rossberg, post:3, topic:12115"]
+Unicode
+[/quote]
+
+Does basically anything that touches Char, and thus Text, bring in the Unicode stuff?  Or is the compiler smart enough to just include functions that are called?(in other words, does the entire library binary get loaded in if you import X;?)
+
+-------------------------
+
+skilesare | 2022-04-13 15:39:10 UTC | #8
+
+I did some analysis of the .wat file and the first 55k lines or so look like wasm assembly with pretty much one short command per line.  Then I see some big things
+
+(data (;113;) (i32.const 70988) "\11\00\00\00\d354\00\00asm\01\00\00\00\01\80\82\80\80\00...(5,947,246 total chars) - I see some stuff in this file that looks like the actor that this canister instantiates and uses.  I'm guessing that this is some kind of encoded wasm?  It would be great if this could be compressed somehow(maybe it is already).  It takes up half the file. If it could be compressed and then uncompressed when it is time to instantiate you could save a good bit of space in the file provided the zlib is small.  Edit: I see the wat file is way larger, so I'm guessing the wasm is already compressed to some extent.  I did the wat on the instantiated canister wasm and it all looked like normal wasm(one short command per line)...even though it also imports a actor and instantiates it.  What made the two leveled compiled script have a giant block but the one level reference didn't?
+
+(data (;1313;) (i32.const 3512896) "\008\fa\feB.\e6?0g\c7\93W\f3.=\00\.....(194,060 total chars) - I see some rust stuff in this. I'm guessing this is some system functions? example rc/print.rssrc/bigint.rspersist_bigint: dp == NULL?persist_bigint: alloc changed?byte read out of bufferword read out of bufferadvance out of buffersrc/char.rspeek_future_continuation: Continuation table not allocatedpeek_future_continuation: Continuation index out of rangepeek_future_continuation: Continuation index not in tablerecall_continuation: Continuation table not allocatedrecall_continuation: Continuation index out of rangerecall_continuation: Continuation index not in tableinvalid type argumentvariant or record tag out of orderskip_any: byte tag not 0 or 1skip_any: too deeply nested recordskip_any: unknown primskip_any: encountered emptyskip_any: skipping referencesskip_any: variant tag too largeskip_any: recursive recordleb128_decode: overflowsrc/leb128.rssleb128_decode: overflowCannot grow memorycompute_crc32.
+
+-------------------------
+
+rossberg | 2022-04-13 16:27:53 UTC | #9
+
+If you are using nested actor expressions, then yes, they are compiled into Wasm canister binaries themselves and put into the data section of the outer one. Note that each nested binary also needs to include all of the runtime system again (like GC, math/text libs, etc) in order to form a self-contained canister. So there is gonna be significant duplication in the overall canister. Unfortunately, there is no way to avoid that, short of the IC supporting something like on-chain linking and DLL-style module repositories.
+
+Some of the runtime system (e.g. the GC) is written in Rust, so that's why you may see error messages referring to Rust code.
+
+Unicode tables are only needed for specific operations, like Unicode comparison or case conversion. I don't know which of that we currently surface.
+
+-------------------------
+
+chenyan | 2022-04-13 16:42:19 UTC | #10
+
+You could try `wasm-opt --strip-debug -Oz` to reduce the wasm size. But if you have nested actors, then it can only shrink the top-level actor code.
+
+Also in the next dfx release, I think you will be able to upload `.wasm.gzip` for installing the wasm canister.
+
+-------------------------
+
+skilesare | 2022-04-13 18:28:42 UTC | #11
+
+[quote="chenyan, post:10, topic:12115"]
+Also in the next dfx release, I think you will be able to upload `.wasm.gzip` for installing the wasm canister.
+[/quote]
+
+:100: This would be awesome!  Goodbye sweet large canister deployer canister. Your life was too short.
+
+-------------------------
+

@@ -1,0 +1,208 @@
+icme | 2024-06-11 19:43:15 UTC | #1
+
+# NNS Proposal: Add Public and Restricted `canister_status` Visibility
+
+Note: Credit to @Fulco, the original proposer of a [public `canister_status`](https://forum.dfinity.org/t/nns-proposal-make-canister-status-public-to-anyone/15775) in October 2022, and thanks to @domwoe for helping push this proposal forward and to @dsarlis for revewing this proposal.
+
+## Summary
+
+There is a function on the Internet Computer management canister called [`canister_status`](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-canister_status) which returns information about the canister including but not limited to its controllers, wasm hash, cycle balance, and memory utilization. Currently this can only be called by the controllers of a canister.
+
+This goal of this proposal is to allow the controller(s) of a canister the (voluntary) option to make the canister_status API by third parties without requiring those parties be a controller of a canister, and to similarly provide the ability to revoke a canister’s public `canister_status` endpoint (make it private) at any time.
+
+## Background
+
+In late 2022, an Internet Computer developer [proposed several options for making a canister’s status public](https://forum.dfinity.org/t/nns-proposal-make-canister-status-public-to-anyone/15775). Many of the responding developers in the thread favored option D, “Make canister_status something that the controller can choose to expose or not with a flag which is set to private by default”
+
+In March 2024, a DFINITY team member opened up a poll of different options for making a canister’s status public, with the majority of respondents voting for the option to “Allow canister_status to be made public with the understanding this could expose secrets and could be extended to make all code & state of the canister public, i.e, public canister status == public canister.”
+
+https://forum.dfinity.org/t/nns-proposal-make-canister-status-public-to-anyone/15775/59
+
+All respondents favored adding a route for making canister status public, with none believing that the status quo is sufficient.
+
+Currently, the [management canister’s interface spec](https://github.com/dfinity/interface-spec/blob/master/spec/_attachments/ic.did) shows that `canister_status` includes the following information
+```
+type log_visibility = variant {
+  controllers;
+  public;
+};
+
+type definite_canister_settings = record {
+  controllers : vec principal;
+  compute_allocation : nat;
+  memory_allocation : nat;
+  freezing_threshold : nat;
+  reserved_cycles_limit : nat;
+  log_visibility : opt log_visibility;
+};
+
+type canister_status_result = record {
+  status : variant { running; stopping; stopped };
+  settings : definite_canister_settings;
+  module_hash : opt blob;
+  memory_size : nat;
+  cycles : nat;
+  reserved_cycles : nat;
+  idle_cycles_burned_per_day : nat;
+  query_stats: record {
+  num_calls_total: nat;
+  num_instructions_total: nat;
+  request_payload_bytes_total: nat;
+  response_payload_bytes_total: nat;
+};
+```
+
+The current ways to make a canister’s status public include:
+
+1. Add another canister as a controller that exposes the status metrics by calling the canister_status API. Examples of this include the [blackhole canister](https://github.com/ninegua/ic-blackhole/blob/main/src/blackhole.mo).
+2. Turn your canister over to an SNS, and monitor it through the `canister_status` API of that SNS’s root canister.
+3. Expose canister metric data through an API (although this data can easily be falsified the canister exposing the data).
+
+## Arguments for adding a public `canister_status` option
+
+* The easiest, most frictionless approach for publicly releasing trusted canister metrics
+* Canister smart contracts on the Internet Computer are private and opaque to external users of an application. A public canister status improves transparency for canister stakeholders (user), and allows the canister to seamlessly integrate with third party monitoring services without adding a single line of code (Internet Computer Superpower)
+* Adding another canister as a controller in order to expose canister status metrics is a high friction option that requires verifying the controllers and wasm hash of the canister in question. Canisters that are currently monitored via a blackhole canister are already opting-in to share this data with a third party, so the protocol can make this easier and require one less inter-canister call in doing so.
+* This proposal provides the option for developers to opt in to making their canister status public, while being aware of the potential drawbacks in doing so.
+
+## Caveats/Arguments against a public canister status
+
+* An attacker could use knowing the cycles balance to initiate a cycle drain attack right when it gets low.
+* An attacker could even exploit some of them to learn patterns about the canister’s usage or even force specific cycle drain attacks.
+* A canister with an open-sourced API containing an insecure form of authorization/authorization could potentially reveal data inside the canister by detecting a difference in cycle drain. However, canisters that user caller based authorization that doesn’t rely on input parameters does not have this same issue.
+
+## Proposed Mechanism for Adding `canister_status` Visibility
+
+### Updating the canister_status response type
+
+#### Add a status_visibility field to canister_settings in the canister_status response
+
+Given that the Internet Computer protocol already provides canister status metric information but restricts access of it to the controller(s) of a canister, I propose that a `status_visibility` variant property be added to the `canister_settings` returned by `canister_status`.
+
+This is similar to the `log_visibility` variant, extending this variant with an `allowed_viewers` option, bridging the gap between fully private and fully public canisters by allowing a short list (limit 5 principals) that are able to retrieve the canister status for that canister, without requiring that the status be publicly available, or only available to controllers. 
+
+Specifying the `allowed_viewers` variant would restrict `canister_status` access to both the list of `allowed_viewers` and any controllers of the canister.
+
+Note: Currently, there are [discussions around extending `log_visibility` to include this same `allowed_viewers` list](https://forum.dfinity.org/t/canister-logging-support-community-consideration/25571/38?u=icme)
+
+#### Proposed Interface Change
+
+```
+type status_visibility = variant {
+  controllers;
+  allowed_viewers : opt vec principal;
+  public;
+};
+
+type definite_canister_settings = record {
+  controllers : vec principal;
+  compute_allocation : nat;
+  memory_allocation : nat;
+  freezing_threshold : nat;
+  reserved_cycles_limit : nat;
+  log_visibility : opt log_visibility;
+  status_visibility : opt status_visibility; // new field (similar to log_visibility)
+};
+```
+
+### Update the canister’s `status_visibility` settings via API
+
+#### Use the current management canister’s [`update_settings`](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-update_settings) API to selectively update `status_visiblity` in the `canister_settings`
+
+By adding `status_visibility` to the `canister_settings`, one can update a canister's `status_visibility` via the `update_settings` endpoint on the management canister, as that API takes the same `canister_settings` as an argument.
+
+The controller of the canister can then call this API to update the public status of the canister, passing the specific setting. The API currently accepts optional arguments, such that if an argument is `None` the setting is not changed. Therefore, one can use this existing API to then selectively update the `status_visibility` setting.
+
+-------------------------
+
+icme | 2024-06-11 16:00:43 UTC | #2
+
+Tagging a few people who were active in the original discussion to provide feedback.
+
+@infu @saikatdas0790 @skilesare @ulan @rossberg @Gekctek @Manu
+
+-------------------------
+
+sat | 2024-06-11 18:13:14 UTC | #3
+
+[quote="icme, post:1, topic:31814"]
+revoke the ability to revoke a canister’s public canister_status endpoint
+[/quote]
+
+There's likely one revoke too many here.
+
+-------------------------
+
+icme | 2024-06-11 19:43:38 UTC | #4
+
+Updated - thanks for the finding that typo!
+
+-------------------------
+
+saikatdas0790 | 2024-06-12 08:43:24 UTC | #5
+
+Looks good to us. We would definitely use👍
+
+-------------------------
+
+dfxjesse | 2024-06-12 12:56:58 UTC | #6
+
+This is well researched and the solution provided makes sense to me. If developers want they can add an extra element of transparency to their canisters - I'd like to avail of this in the future!
+
+-------------------------
+
+sea-snake | 2024-06-12 15:19:27 UTC | #7
+
+The `allowed_viewers` option seems very nice for allowing specific canister monitoring tools without adding monitoring methods/SDK code into the canister or having to add them as controller.
+
+Rip blackhole canister 2024 🫡
+
+-------------------------
+
+Seb | 2024-06-12 15:56:14 UTC | #8
+
+I love these proposals the most, no brainer. Thanks for the context and pushing that functionality forward.
+
+-------------------------
+
+skilesare | 2024-06-15 19:59:25 UTC | #9
+
+I like `allowed_viewers`. Super helpful.
+
+My only comment is if it would be helpful to have it even more generalized to the point of `read_permissions`.  Such that those listed can do any read operation, including future features like snapshotting, state downloads, etc.
+
+-------------------------
+
+icme | 2024-06-15 20:17:15 UTC | #10
+
+Agreed. The only issue is that each of the features you mentioned have different levels of trust assumptions.
+
+* Canister Status data - low trust requirements, a team may want this data to be private for a variety of reasons
+
+* Logging data - medium to high trust, logs could expose user PII
+
+* State downloads - medium to high trust, similar to logging data
+
+* Snapshotting - not sure what about snapshotting that you're referring to here
+
+
+Each time a new protocol level dev tooling feature comes out, this list would need to apply to each feature, which may expose unwanted data if the dev team is not aware.
+
+For this reason, it might just be safest to keep the individual access lists separate.
+
+-------------------------
+
+skilesare | 2024-06-16 04:52:26 UTC | #11
+
+[quote="icme, post:10, topic:31814"]
+Each time a new protocol level dev tooling feature comes out, this list would need to apply to each feature, which may expose unwanted data if the dev team is not aware.
+[/quote]
+
+All good points!  At a certain point you may want a way to keep track of all of this and standardize it across the IC.
+
+![Pulp Fiction Christmas GIF by FaZe Clan](upload://zoZAnT3Z051tzv5fBFtDF771UWh.gif)
+
+A wild ICRC appears: https://github.com/icdevs/ICEventsWG/blob/main/Meetings/20240529/icrc75draft.md
+
+-------------------------
+

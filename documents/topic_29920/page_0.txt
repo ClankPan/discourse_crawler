@@ -1,0 +1,217 @@
+jaxopaxo | 2024-04-22 21:24:58 UTC | #1
+
+Hi!
+When I send a POST from my local replica, I get 201 Created with no issues.
+When I POST the same request with the same data from the main net, I can see in the backend logs 415 unsupported media type, and then  "Reject code: 4
+  Reject text: Canister http responses were different across replicas, and no consensus was reached"
+
+I use the correct UUID in both cases as "Idempotency-Key", see below:
+    let request_headers = [
+      { name = "Host"; value = host # ":443" },
+      { name = "User-Agent"; value = "http_post_sample" },
+      { name = "Content-Type"; value = "application/json" },
+      { name = "Idempotency-Key"; value = idempotency_key },
+      {
+        name = "X-API-KEY";
+        value = "....";
+      },
+    ];
+
+Same values in both cases local replica and on main net, 
+Some logs from google-cloud as below when I get the error:
+"httpRequest: {
+latency: "0.002051937s"
+protocol: "HTTP/1.1"
+remoteIp: "2607:ff70:3:2:6801:72ff:fe29:6904"
+requestMethod: "POST"
+requestSize: "729"
+requestUrl: "...token/1?api-version=1"
+responseSize: "849"
+serverIp: "2001:4860:4802:32::35"
+status: 415
+userAgent: "my-agent"
+}
+insertId: "6626d31d000..."
+labels: {
+instanceId: "...5e3371408eabe7294d0d62dedc881ad955ca654b1"
+}
+logName: ""
+receiveTimestamp: "2024-04-22T21:14:05.605443290Z"
+resource: {
+labels: {5}
+type: "cloud_run_revision"
+}
+severity: "WARNING"
+spanId: "177945"
+timestamp: "2024-04-22T21:14:05.278177Z"
+trace: "acc1fc32803"
+}"
+
+Please help, something happening when the call is sent from the main net, and I dont think it is because of multiple calls from nodes, I have alreade the "Idempotency-Key" set to for example : {CREATING_UUID: '2985840F-4120-FF87-A997D-59052459B67A'}
+
+-------------------------
+
+kristofer | 2024-04-22 21:46:38 UTC | #2
+
+😂 I was just about to write about the same issue. I have compared responses between the calls I am making. The only thing that differs is the received Date header. But that shouldn't be an issue I guess.
+
+I haven't tried making GET requests but the issue I am seeing is for POST reqeusts.
+
+-------------------------
+
+jaxopaxo | 2024-04-23 06:03:32 UTC | #3
+
+Now I managed to get 201, but still the problem with 
+“Reject code: 4
+Reject text: Canister http responses were different across replicas, and no consensus was reached”
+
+Hope someone will help.
+Does anybody successfully created a POST request with HTTP outcalls?
+I started to doubt about that.
+
+-------------------------
+
+peterparker | 2024-04-23 07:21:15 UTC | #4
+
+Long story short, my understanding is that when you make HTTP outcalls, the IC performs multiple calls and aggregates the responses to validate that they are similar. If you encounter an issue where no consensus is reached, it's because the responses for the endpoints you are calling contain something different for each identitcal request.
+
+API providers sometimes offer the ability to return "constant" responses using an idempotency key; sometimes they don’t. In that case, I think the solution is to build a custom proxy, although I'm not sure that makes sense for a real-life application.
+
+I faced a similar issue when I built a demo app; here's my thread: [https://forum.dfinity.org/t/http-request-error-rejectioncode-systransient-error-canister-http-responses-were-different-across-replicas-and-no-consensus-was-reached/28066.](https://forum.dfinity.org/t/http-request-error-rejectioncode-systransient-error-canister-http-responses-were-different-across-replicas-and-no-consensus-was-reached/28066.)
+
+In my case, I built a custom proxy, but I think @ilbert is also providing an off-chain generic solution (I don’t have the references right here, right now).
+
+But before jumping into building a proxy, I would recommend checking if your API supports something like an idempotency key.
+
+-------------------------
+
+kristofer | 2024-04-23 08:11:26 UTC | #5
+
+Hmm, yeah, maybe I'll try the solution from @ilbert. Now I have tried both GET and POST requests and also setup a proxy on Cloudflare and attempted to cache the responses (Enterprise feature, not possible).
+
+Proxy: https://github.com/c-atts/eas-graphql-proxy/blob/main/src/lib.rs
+
+These header changes should not be the issue, right?
+
+![image|690x364](upload://6EfZIcHj4Mt51ZW5dHZfBdYEAaw.jpeg)
+
+-------------------------
+
+kristofer | 2024-04-23 08:14:21 UTC | #6
+
+One issue that I guess could happen is that the API being called reacts to all the requests coming in and rate limits some of them, leading to some responses being different. That does not seem to happen in my case though but will look closer just to be sure. I could log the responses passing through the proxy.
+
+-------------------------
+
+kristofer | 2024-04-23 08:57:30 UTC | #7
+
+Uh, I now successfully cache the responses in the proxy, same issue still. I give up (for now 😀).
+
+-------------------------
+
+peterparker | 2024-04-23 09:10:13 UTC | #8
+
+[quote="kristofer, post:5, topic:29920"]
+These header changes should not be the issue, right?
+[/quote]
+
+That's probably the issue.
+
+You can transform the response to ignore some headers but, I'm not sure if it's executed before or after consensus, maybe you can give it a try?
+
+For example:
+
+```
+#[ic_cdk_macros::query]
+fn transform(
+    raw: ic_cdk::api::management_canister::http_request::TransformArgs,
+) -> ic_cdk::api::management_canister::http_request::HttpResponse {
+    transform_response(raw)
+}
+```
+
+Source: [here](https://github.com/peterpeterparker/juno-openai/blob/1eb3d4395397761059a0a59341f54865a2c69a1a/app/src/satellite/src/lib.rs#L97C1-L102C2) and [here](https://github.com/peterpeterparker/juno-openai/blob/1eb3d4395397761059a0a59341f54865a2c69a1a/app/src/satellite/src/request.rs#L119) for `transform_response(raw)`.
+
+-------------------------
+
+peterparker | 2024-04-23 09:11:50 UTC | #9
+
+Also note that there is a timeout of 30s (see [https://forum.dfinity.org/t/http-outcalls-http-request-error-rejectioncode-sysfatal-error-timeout-expired/28007/5?u=peterparker](https://forum.dfinity.org/t/http-outcalls-http-request-error-rejectioncode-sysfatal-error-timeout-expired/28007/5?u=peterparker))
+
+-------------------------
+
+kristofer | 2024-04-23 09:14:53 UTC | #10
+
+Thanks, I'll try that. Those Cloudflare headers are added on cached responses as well as it is mostly the body being cached.
+
+-------------------------
+
+kristofer | 2024-04-23 10:10:10 UTC | #11
+
+That works! The `transform()` function is run before consensus.
+
+For reference, this is what I added to my code from what I copied from Juno.
+
+A `transform()` function that throws away everything but the body and status code:
+
+```rust
+use ic_cdk::{
+    api::management_canister::http_request::{HttpResponse, TransformArgs},
+    query,
+};
+
+#[query]
+fn transform(raw: TransformArgs) -> HttpResponse {
+    let mut res = HttpResponse {
+        status: raw.response.status.clone(),
+        body: raw.response.body.clone(),
+        ..Default::default()
+    };
+
+    if i32::try_from(res.status.clone().0).unwrap() == 200 {
+        res.body = raw.response.body;
+    } else {
+        ic_cdk::api::print(format!("Received an error from proxy: err = {:?}", raw));
+    }
+
+    res
+}
+
+```
+
+Referencing this transform function when initializing the request:
+
+```
+    let request = CanisterHttpRequestArgument {
+        url,
+        method: HttpMethod::GET,
+        headers: http_headers,
+        body: Some(payload),
+        max_response_bytes: None,
+        transform: Some(TransformContext::from_name(
+            "transform".to_string(),
+            serde_json::to_vec(&Vec::<u8>::new()).unwrap(),
+        )),
+    };
+```
+
+-------------------------
+
+peterparker | 2024-04-23 10:29:03 UTC | #12
+
+Awesome :partying_face:.
+
+[quote="kristofer, post:11, topic:29920"]
+That works! The `transform()` function is run before consensus.
+[/quote]
+
+Thanks for the share!
+
+-------------------------
+
+jaxopaxo | 2024-04-24 05:04:54 UTC | #13
+
+Thanks everybody for the responses. My issue was solved, actually it was more or less my misstake, I did no make my BE idempotent, now everything is ok.
+
+-------------------------
+

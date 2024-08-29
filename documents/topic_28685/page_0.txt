@@ -1,0 +1,164 @@
+evanmcfarland | 2024-03-20 16:21:52 UTC | #1
+
+I need to allow users to privately store a key/value pair (cloud-service credentials) in my backend. This should be easy, but the right way to do this is not obvious to me while authentication is handled in the fronend (with @dfinity/auth-client NPM package).
+
+**Background:**
+
+Here's how I retrieve the keys: 
+![image|690x232](upload://d4kEvKr3FfVlMppennqDY5Ro0zg.png)
+
+They're stored with stable structures, and only accessible with the user principal. Full details in this file: https://github.com/UncensoredGreats/core/blob/master/src/ugd_backend/src/meilisearch.rs
+
+**The Problem:** 
+
+This is secure when accessed from the frontend because the principal is sent from the auth provider... but if someone knows someone else's principal they can get their secret information by using the backend canister directly.
+
+I don't want users to have to be secretive about their in-app principal, so what's the standard/better way of doing this? Could I make the function only accept calls from the frontend canister, or must I move authentication to the backend, or is there some other workaround?
+
+-------------------------
+
+domwoe | 2024-03-20 17:09:59 UTC | #2
+
+Hey @evanmcfarland 
+
+if you use  `@dfinity/auth-client` correctly, then the message to your canister will be signed by the private key corresponding to the principal. The replica will automatically verify this signature and you can access the authenticated principal with `ic_cdk::caller()`.
+
+-------------------------
+
+evanmcfarland | 2024-03-20 19:06:13 UTC | #3
+
+Thank Dom.
+
+So I take that to mean the 'caller' and 'principal' here are referencing frontend canister. That works I guess.
+
+If though you mean the caller/principal to be the user, please point me to a correct example of using `@dfinity/auth-client` with `ic_ckd::caller()`
+
+-------------------------
+
+domwoe | 2024-03-20 19:17:09 UTC | #4
+
+The frontend canister just holds static assets that the browser of the user downloads. All calls made to your backend are coming from agent-js in your browser. Hence, `ic_cdk::caller()` refers to the user principal. 
+
+https://github.com/domwoe/simple-reddit-clone
+
+
+And here a quick figure to explain the relation between frontend/asset canister and backend:
+
+![image|690x336](upload://zZPPPRnetg6WOETrjPqcylDjbiy.png)
+
+-------------------------
+
+evanmcfarland | 2024-03-22 14:05:33 UTC | #5
+
+I haven't quite figured out how to implement this. Auth doesn't work on your example in its current state for me.
+
+But I think you're right and I just need to overall my frontend-auth auth methodology, so I marked your reply as a solution and will respond here with the fix commit when I get it working for anyone who has the same problem.
+
+-------------------------
+
+domwoe | 2024-03-22 15:42:16 UTC | #6
+
+[quote="evanmcfarland, post:5, topic:28685"]
+Auth doesn’t work on your example in its current state for me.
+[/quote]
+
+Just tried it and also have the issue that the authorize page doesn't load.
+
+When I use `http://be2us-64aaa-aaaaa-qaabq-cai.localhost:4943/#authorize` then the page loads as expected, but with `http://localhost:4943/?canisterId=be2us-64aaa-aaaaa-qaabq-cai#authorize` I get 
+
+![image|690x25](upload://oeVUL1KKoIIoRoS9vEDheSyf61N.png)
+
+@frederikrothenberger Was there any change that could explain this?
+
+-------------------------
+
+frederikrothenberger | 2024-03-22 16:47:17 UTC | #7
+
+[quote="domwoe, post:6, topic:28685"]
+Just tried it and also have the issue that the authorize page doesn’t load.
+
+When I use `http://be2us-64aaa-aaaaa-qaabq-cai.localhost:4943/#authorize` then the page loads as expected, but with `http://localhost:4943/?canisterId=be2us-64aaa-aaaaa-qaabq-cai#authorize` I get
+
+![image](upload://oeVUL1KKoIIoRoS9vEDheSyf61N)
+
+@frederikrothenberger Was there any change that could explain this?
+[/quote]
+
+This is expected. Query parameter based routing is fundamentally broken as browsers will load transitive resources without it.
+
+---
+
+@evanmcfarland: I quickly checked out your repo. Currently the front-end always tries to authenticate against mainnet II (which won't work due to root of trust being different). You need to configure the auth client to use the local dev II like so:
+
+```
+authClient.login({
+      identityProvider: "http://rdmx6-jaaaa-aaaaa-aaadq-cai.localhost:4943",
+      maxTimeToLive: BigInt(7 * 24 * 60 * 60 * 1000 * 1000 * 1000),
+      onSuccess: () => handleAuthenticated(authClient),
+    });
+```
+---
+
+But regardless of how authentication works, please be careful about pursuing this current design without additional protection.
+
+Specifically:
+> I need to allow users to privately store a key/value pair (cloud-service credentials) in my backend.
+
+Depending on what the credentials can be used for, this might be **dangerous**.
+
+On the IC, the back-end must be considered *public*. Messages can be observed by both, boundary nodes and replicas. If even one of these is malicious, the credentials can be stolen.
+The proper way of doing this would be to use end-to-end encryption for the data [using vetKeys](https://internetcomputer.org/docs/current/references/vetkeys-overview). Note that vetKeys are not yet available in production. There is a dummy API for you to start developing against, but for the production ready API you need to wait for the proper release of the feature later this year (@domwoe that is still accurate right?).
+
+-------------------------
+
+evanmcfarland | 2024-03-23 12:36:04 UTC | #8
+
+[quote="frederikrothenberger, post:7, topic:28685"]
+Currently the front-end always tries to authenticate against mainnet II (which won’t work due to root of trust being different).
+[/quote]
+
+That makes sense. That has likely been the source of my problems, thank you.
+
+[quote="frederikrothenberger, post:7, topic:28685"]
+Depending on what the credentials can be used for, this might be **dangerous**.
+
+On the IC, the back-end must be considered *public*.
+[/quote]
+
+Thanks also for pointing this out. I'll consider some workarounds but will probably do it anyway with a user warning since the only incentive for such an attack would be running up the AWS bill of some anon. Just for my understanding though, is this correct: The data when stored in, e.g., a btree map is secure and private because it can only be deserialized by the caller/owner. The issue is that when it's deserialized and passed as a message the nodes can see it. Is that right? Curious how @massimoalbarello handles this when sending credentials for use in Akash.
+
+-------------------------
+
+massimoalbarello | 2024-03-23 23:24:49 UTC | #9
+
+[quote="evanmcfarland, post:8, topic:28685"]
+The data when stored in, e.g., a btree map is secure and private because it can only be deserialized by the caller/owner. The issue is that when it’s deserialized and passed as a message the nodes can see it. Is that right?
+[/quote]
+
+I'm not sure this is the case, the node provider can potentially read the serialized bytes and just deserialize them.
+
+[quote="evanmcfarland, post:8, topic:28685"]
+Curious how @massimoalbarello handles this when sending credentials for use in Akash.
+[/quote]
+We do not need to store any secret on the canister because authentication with the Akash network happens by signing messages with ECDSA. We use the canister tECDSA feature in order to get a signature without ever reconstructing the secret key and thus the "credential" is not leaked to any node
+
+-------------------------
+
+frederikrothenberger | 2024-03-25 08:09:20 UTC | #10
+
+[quote="evanmcfarland, post:8, topic:28685"]
+Just for my understanding though, is this correct: The data when stored in, e.g., a btree map is secure and private because it can only be deserialized by the caller/owner. The issue is that when it’s deserialized and passed as a message the nodes can see it. Is that right?
+[/quote]
+
+As @massimoalbarello has pointed out, a malicious node provider could read the canister state. SEV-SNP could potentially make this harder for node providers, but unfortunately this feature has been pushed back.
+
+The proper solution really is e2e encryption or asymmetric authentication (i.e. allow access to an API by having the canister sign something). However, this (usually) only works if you control the API access control mechanism since that is non-standard for Web 2.0 services.
+
+-------------------------
+
+evanmcfarland | 2024-03-25 15:18:16 UTC | #11
+
+Thank you all for the help. I will find another way!
+
+-------------------------
+

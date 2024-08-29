@@ -1,0 +1,169 @@
+ZenVoich | 2023-04-20 11:33:01 UTC | #1
+
+I want to backup/restore canister data using agent.js.
+Also I want to parse/generate `.did` file with canister init args.
+
+Is there way to parse candid data based on idlFactory?
+Is there way to convert js data fetched via agent.js to candid textual or binary format?
+
+-------------------------
+
+kpeacock | 2023-04-20 14:30:12 UTC | #2
+
+You have a few options. @infu was sharing on Discord about a JS parser they've been writing from scratch in the Discord channel. 
+
+We have some tools, like https://www.npmjs.com/package/ic0 and https://www.npmjs.com/package/@infu/icblast which currently compile the `didc` tool to run in webassembly, and they also have some simplified interfaces for making calls to those canisters after the fact. 
+
+If you want to stick with `agent-js`, here is a little snippet that makes a call to the Candid UI canister to do the conversion from `did` for you. This is how Candid UI and the [Candid UI web component](https://github.com/dfinity/dfn-components/tree/main/packages/candid-ui) parse did files into JS
+
+https://gist.github.com/krpeacock/698646d80a5b16afcac401839f8f869e
+
+-------------------------
+
+infu | 2023-04-20 16:09:18 UTC | #3
+
+Here is the .did parsing repo
+https://github.com/vvv-interactive/candid-js
+
+-------------------------
+
+ZenVoich | 2023-04-21 08:51:16 UTC | #4
+
+[quote="infu, post:3, topic:19526"]
+Here is the .did parsing repo
+
+https://github.com/vvv-interactive/candid-js
+[/quote]
+
+Unfortunately, it does not work with values, e.g. `record { name = "A"; };`
+
+-------------------------
+
+ZenVoich | 2023-04-21 08:54:18 UTC | #5
+
+[quote="kpeacock, post:2, topic:19526"]
+If you want to stick with `agent-js`, here is a little snippet that makes a call to the Candid UI canister to do the conversion from `did` for you. This is how Candid UI and the [Candid UI web component](https://github.com/dfinity/dfn-components/tree/main/packages/candid-ui) parse did files into JS
+[/quote]
+
+Always returns `undefined` no matter what data I send (even invalid ones)
+
+-------------------------
+
+infu | 2023-04-21 09:15:15 UTC | #6
+
+Can you throw here what you are trying to parse
+
+-------------------------
+
+ZenVoich | 2023-04-21 11:29:22 UTC | #7
+
+initArgs.did:
+```
+record { name = "A"; };
+```
+
+Run `npx candid-js@latest initArgs.did json`
+```
+/home/zen/.npm/_npx/959bee5921d90e41/node_modules/candid-js/src/index.js:29
+    throw parser.errors;
+    ^
+[
+  NotAllInputParsedException: Redundant input, expecting EOF but found: record
+      at RecognizerEngine.ruleFinallyStateUpdate (/home/zen/.npm/_npx/959bee5921d90e41/node_modules/chevrotain/lib/src/parse/parser/traits/recognizer_engine.js:439:29)
+      at CandidParser.invokeRuleWithTry [as candid] (/home/zen/.npm/_npx/959bee5921d90e41/node_modules/chevrotain/lib/src/parse/parser/traits/recognizer_engine.js:142:26)
+      at transpile (/home/zen/.npm/_npx/959bee5921d90e41/node_modules/candid-js/src/index.js:27:20)
+      at Object.<anonymous> (/home/zen/.npm/_npx/959bee5921d90e41/node_modules/candid-js/cli.js:17:16)
+      at Module._compile (node:internal/modules/cjs/loader:1254:14)
+      at Module._extensions..js (node:internal/modules/cjs/loader:1308:10)
+      at Module.load (node:internal/modules/cjs/loader:1117:32)
+      at Module._load (node:internal/modules/cjs/loader:958:12)
+      at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:81:12)
+      at node:internal/main/run_main_module:23:47 {
+    token: {
+      image: 'record',
+      startOffset: 0,
+      endOffset: 5,
+      startLine: 1,
+      endLine: 1,
+      startColumn: 1,
+      endColumn: 6,
+      tokenTypeIdx: 4,
+      tokenType: {
+        name: 'Record',
+        PATTERN: /\brecord\b/,
+        tokenTypeIdx: 4,
+        CATEGORIES: [],
+        categoryMatches: [],
+        categoryMatchesMap: {},
+        isParent: false
+      }
+    },
+    resyncedTokens: [],
+    context: { ruleStack: [], ruleOccurrenceStack: [] }
+  }
+]
+
+Node.js v18.16.0
+```
+
+Works with:
+```candid
+type A = nat;
+```
+
+-------------------------
+
+kpeacock | 2023-04-21 15:27:16 UTC | #8
+
+Oh, the candid UI endpoint is for a full service. It's not designed for partial translation of candid to JS.
+
+For example, this works:
+
+```
+import { IDL } from "@dfinity/candid";
+import fetch from "isomorphic-fetch";
+import { Actor, HttpAgent } from "@dfinity/agent";
+
+export const candidToJS = async (candid_source: string) => {
+  // call didjs canister
+  const didjs_interface: IDL.InterfaceFactory = ({ IDL }) =>
+    IDL.Service({
+      did_to_js: IDL.Func([IDL.Text], [IDL.Opt(IDL.Text)], ["query"]),
+    });
+
+  const candidCanister = `a4gq6-oaaaa-aaaab-qaa4q-cai`;
+
+  const agent = new HttpAgent({ host: "https://icp-api.io", fetch });
+
+  const didjs = Actor.createActor(didjs_interface, {
+    agent,
+    canisterId: candidCanister,
+  });
+  const js: any = await didjs.did_to_js(candid_source);
+  if (Array.isArray(js) && js.length === 0) {
+    return undefined;
+  }
+  return js[0];
+};
+
+const str = `service : {
+    whoami: () -> (principal) query;
+  }`
+
+candidToJS(str).then(console.log)
+```
+
+-------------------------
+
+infu | 2023-04-21 16:23:55 UTC | #9
+
+Candid is interface description language. What you want to parse isn't valid Candid. It seems you are trying to parse data. Unless "A" is another type identifier, but then it should probably be record : { name : "A" }
+
+You can use - didc check file.did to see if its valid first. You can dl it from the Candid github repo.
+
+The only time you will need candid-js is probably if you are making IC browser. If you just want to encode with a spec, then the rest of the tools like agentjs will get it done
+
+Ok after reading your initial post, there is textual data format used in dfx for example, but I am not sure where the encoders for it are. To covert obj to binary using candid you can use IDL.encode(jsIdl, data) also there is IDL.decode. You have to take the jsIdl out of the idlFactory function
+
+-------------------------
+

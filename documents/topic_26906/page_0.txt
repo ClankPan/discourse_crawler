@@ -1,0 +1,272 @@
+gravity_vi | 2024-01-23 04:39:35 UTC | #1
+
+We are trying to create canisters on a specific subnet using cycle minting canister. I am testing this scenario using pocket-ic. 
+
+Getting Error on creation of canisters using CMC canister:
+
+`Error:  value: Refunded { refund_amount: 99900000000, create_error: \"Creating canister in subnet fbysm-3acaa-aaaaa-aaaap-yai failed with code 3: Unable to route management canister request create_canister: AlreadyResolved(fbysm-3acaa-aaaaa-aaaap-yai)\" }' `
+
+```rust
+pub async fn provision_subnet_orchestrator_canister(subnet: Principal, user_index_wasm: Vec<u8>) -> Principal {
+
+    let create_canister_arg = CreateCanisterCmcArgument {
+        subnet_selection: Some(SubnetType::Subnet(Subnet {
+            subnet
+        })),
+        canister_settings: Some(CanisterSettings {
+            controllers: Some(vec![ api::id()]),
+            compute_allocation: None,
+            memory_allocation: None,
+            freezing_threshold: None,
+        }),
+        subnet_type: None
+    };
+
+  // Creates Canister using CMC Canister
+    let (res, ): (Result<Principal, CmcCreateCanisterError>, ) = call::call_with_payment(
+        Principal::from_str(NNS_CYCLE_MINTING_CANISTER).unwrap(), 
+        "create_canister",
+       (create_canister_arg,),
+       INDIVIDUAL_USER_CANISTER_RECHARGE_AMOUNT as u64
+    )
+    .await
+    .unwrap();
+
+    let subnet_orchestrator_canister_id = res.unwrap();
+
+   // ... Rest of the Code
+
+}
+
+```
+
+
+Test
+
+```rust
+ let pocket_ic = PocketIcBuilder::new()
+        .with_nns_subnet()
+        .with_application_subnet()
+        .with_system_subnet()
+        .build();
+
+   
+    let super_admin = get_global_super_admin_principal_id();
+
+    let application_subnets = pocket_ic.topology().get_app_subnets();
+
+    let platform_canister_id = pocket_ic.create_canister_with_settings(Some(super_admin), Some(CanisterSettings {controllers: Some(vec![super_admin]), compute_allocation: None, memory_allocation: None, freezing_threshold: None}));
+    pocket_ic.add_cycles(platform_canister_id, CANISTER_INITIAL_CYCLES_FOR_SPAWNING_CANISTERS);
+    let platform_orchestrator_wasm = include_bytes!("../../../../../target/wasm32-unknown-unknown/release/platform_orchestrator.wasm.gz");
+    let subnet_orchestrator_canister_wasm = include_bytes!("../../../../../target/wasm32-unknown-unknown/release/user_index.wasm.gz");
+    let platform_orchestrator_init_args = PlatformOrchestratorInitArgs {
+        version: "v1.0.0".into()
+    };
+    pocket_ic.install_canister(platform_canister_id, platform_orchestrator_wasm.into(), candid::encode_one(platform_orchestrator_init_args).unwrap(), Some(super_admin));
+    pocket_ic.add_cycles(platform_canister_id, CANISTER_INITIAL_CYCLES_FOR_SPAWNING_CANISTERS);
+
+
+
+    //Ledger Canister
+    let minting_account = AccountIdentifier::new(&super_admin, &DEFAULT_SUBACCOUNT);
+    let ledger_canister_wasm = include_bytes!("../../ledger-canister.wasm");
+    let ledger_canister_id = pocket_ic.create_canister_with_id(Some(super_admin), None, Principal::from_text(NNS_LEDGER_CANISTER_ID).unwrap()).unwrap();
+    let icp_ledger_init_args = NnsLedgerCanisterInitPayload {
+        minting_account: minting_account.to_string(),
+        initial_values: HashMap::new(),
+        send_whitelist: HashSet::new(),
+        transfer_fee: Some(Tokens::from_e8s(10_000)),
+    };
+    pocket_ic.install_canister(ledger_canister_id, ledger_canister_wasm.into(), candid::encode_one(icp_ledger_init_args).unwrap(), Some(super_admin));
+    
+
+    //Cycle Minting Canister
+    let cycle_minting_canister_wasm = include_bytes!("../../cycles-minting-canister.wasm");
+    let cycle_minting_canister_id = pocket_ic.create_canister_with_id(Some(super_admin), None, Principal::from_text(NNS_CYCLE_MINTING_CANISTER).unwrap()).unwrap();
+    pocket_ic.add_cycles(cycle_minting_canister_id, CANISTER_INITIAL_CYCLES_FOR_SPAWNING_CANISTERS);
+    let cycles_minting_canister_init_args = CyclesMintingCanisterInitPayload {
+        ledger_canister_id: ledger_canister_id,
+        governance_canister_id: CanisterId::anonymous(),
+        minting_account_id: Some(minting_account.to_string()),
+        last_purged_notification: Some(0),
+    };
+
+    pocket_ic.install_canister(
+        cycle_minting_canister_id,
+        cycle_minting_canister_wasm.into(),
+        candid::encode_one(cycles_minting_canister_init_args).unwrap(),
+        Some(super_admin)
+    );
+    
+
+    let authorized_subnetwork_list_args = AuthorizedSubnetWorks {
+        who: Some(platform_canister_id),
+        subnets: application_subnets.clone()
+    };
+    pocket_ic.update_call(
+        cycle_minting_canister_id,
+        CanisterId::anonymous(),
+        "set_authorized_subnetwork_list",
+        candid::encode_one(authorized_subnetwork_list_args).unwrap()
+    ).unwrap();
+
+    for i in 0..50 {
+        pocket_ic.tick();
+    }
+
+    let subnet_orchestrator_canister_id: Principal = pocket_ic.update_call(
+        platform_canister_id,
+        super_admin,
+        "provision_subnet_orchestrator_canister",
+        candid::encode_args((application_subnets[0], subnet_orchestrator_canister_wasm)).unwrap()
+    )
+    .map(|res| {
+        let canister_id: Principal = match res {
+            WasmResult::Reply(payload) => candid::decode_one(&payload).unwrap(),
+            _ => panic!("Canister call failed")
+        };
+        canister_id
+    })
+    .unwrap();
+```
+
+-------------------------
+
+Severin | 2024-01-23 07:52:00 UTC | #2
+
+I don't have a solution handy, but if you only use `create_canister` as a workaround I can offer a [CMC mock](https://github.com/dfinity/cycles-ledger/releases) we use for the cycles ledger. It has the same `create_canister` function as the real CMC, but it doesn't use the subnet targeting logic so this error would not appear. In addition, you can check that the call was properly made using `last_create_canister_args` or you can say that it should fail the next creation call using `fail_next_create_canister_with`
+
+-------------------------
+
+gravity_vi | 2024-01-23 09:07:44 UTC | #3
+
+Thanks @Severin. I think for now I will use the fake cmc mock for testing this scenario.
+
+-------------------------
+
+mraszyk | 2024-01-23 09:09:34 UTC | #4
+
+Did you deploy the CMC canister to the NNS subnet of PocketIC? The error suggests the canister was deployed to a non-NNS subnet.
+
+-------------------------
+
+gravity_vi | 2024-01-23 09:18:28 UTC | #5
+
+@mraszyk I just used pocketic method `create_canister_with_id` to create canister.
+
+```rust
+ let cycle_minting_canister_wasm = include_bytes!("../../cycles-minting-canister.wasm");
+    let cycle_minting_canister_id = pocket_ic.create_canister_with_id(Some(super_admin), None, Principal::from_text(NNS_CYCLE_MINTING_CANISTER).unwrap()).unwrap();
+    pocket_ic.add_cycles(cycle_minting_canister_id, CANISTER_INITIAL_CYCLES_FOR_SPAWNING_CANISTERS);
+    let cycles_minting_canister_init_args = CyclesMintingCanisterInitPayload {
+        ledger_canister_id: ledger_canister_id,
+        governance_canister_id: CanisterId::anonymous(),
+        minting_account_id: Some(minting_account.to_string()),
+        last_purged_notification: Some(0),
+    };
+```
+
+-------------------------
+
+michael-weigelt | 2024-01-23 09:22:08 UTC | #6
+
+But what is the constant NNS_CYCLE_MINTING_CANISTER? Is it exactly the mainnet CMC id?
+
+-------------------------
+
+gravity_vi | 2024-01-23 09:23:57 UTC | #7
+
+Yes. 
+` NNS_LEDGER_CANISTER_ID = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+`
+
+`NNS_CYCLE_MINTING_CANISTER = "rkp4c-7iaaa-aaaaa-aaaca-cai"`
+
+-------------------------
+
+michael-weigelt | 2024-01-23 17:03:34 UTC | #8
+
+We are investigating. Thanks for the report!
+
+-------------------------
+
+michael-weigelt | 2024-01-24 10:49:39 UTC | #9
+
+I was able to reproduce the problem using your exact setup. 
+
+Next, in order to debug, I made cargo.toml point to my local repo containing the pocket-ic library. This lead to many version incompatibilities in crates like candid, ic-cdk, serde etc. So I very dirtily changed most crates to use "*", because I just wanted to be able to compile and run the test. When it finally compiled, **your test succeeded** until the very last line. 
+
+This indicates that there is a dependency version mismatch between pocket-ic and your local dependencies. Can you try upgrading your dependencies starting with candid, ic-cdk, serde (one at a time) and report back?
+
+-------------------------
+
+gravity_vi | 2024-01-24 12:51:52 UTC | #10
+
+Thanks @michael-weigelt. One issue with upgrading candid and ic-cdk version is pocket-ic 2.0.1 (latest version) still relies on older versions of candid and ic-cdk.
+
+-------------------------
+
+michael-weigelt | 2024-01-24 13:42:35 UTC | #11
+
+I see. I looked into the git logs and I think the pocket-ic server 2.0.1 was built with candid 0.9.x, so perhaps _downgrading_ your candid might do the trick. Perhaps that's acceptable for now, considering that integration tests use dev-dependencies? 
+
+We plan to have a 2.1.0 version out soon, which hopefully addresses the problem fully.
+
+-------------------------
+
+gravity_vi | 2024-01-24 14:03:29 UTC | #12
+
+We were using candid version `0.9.3` even downgrading it to `v9.0.0` results into same error.
+
+-------------------------
+
+gravity_vi | 2024-01-24 14:04:54 UTC | #13
+
+I tried using older Wasm for cycle minting canister and ledger canister but no luck :slightly_frowning_face:
+
+-------------------------
+
+michael-weigelt | 2024-01-26 15:48:11 UTC | #14
+
+Hey gravity_vi, we have identified and fixed the bug that's causing this. Thank you for the report and helpful information! I will ping you when we have a release with the fix.
+
+-------------------------
+
+gravity_vi | 2024-01-28 05:08:53 UTC | #15
+
+Thank you @michael-weigelt for all the help here :slightly_smiling_face:
+
+-------------------------
+
+gravity_vi | 2024-02-05 07:18:41 UTC | #16
+
+@michael-weigelt any updates over here. We are kind of blocked from testing our features with multi subnet architecture.
+
+-------------------------
+
+michael-weigelt | 2024-02-05 07:33:39 UTC | #17
+
+I expect a release today.
+
+-------------------------
+
+gravity_vi | 2024-02-05 07:34:40 UTC | #18
+
+oh great :tada: . Thank you
+
+-------------------------
+
+michael-weigelt | 2024-02-07 17:28:33 UTC | #19
+
+Hi gravity_vi, please try out the PocketIC server v3.0.0
+https://github.com/dfinity/pocketic/releases
+Don't forget to also update your rust PocketIC library to version 2.1.0
+
+-------------------------
+
+gravity_vi | 2024-02-08 14:54:09 UTC | #20
+
+Thank you so much @michael-weigelt
+
+-------------------------
+

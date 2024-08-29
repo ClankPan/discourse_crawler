@@ -1,0 +1,100 @@
+roman-kashitsyn | 2023-01-19 22:51:52 UTC | #1
+
+TL;DR https://mmapped.blog/posts/14-stable-structures.html
+
+I'm happy to announce the new 0.4.0 release of the [stable-structures](https://github.com/dfinity/stable-structures/releases/tag/v0.4.0) library that is packed with improvements and optimizations.
+
+As a bonus (and a motivating driver!) for this release, I wrote a [tutorial](https://mmapped.blog/posts/14-stable-structures.html) explaining the philosophy behind the library and how to use it effectively. I hope you'll find it helpful!
+
+-------------------------
+
+justmythoughts | 2023-01-20 03:14:51 UTC | #2
+
+Great work!
+
+I’m curious, are there plans to build some sort of dynamic value allocator for these stable structures so that a developer can have a flexible columnar type of database associated with each key/composite key?
+
+I’d imagine that this would be quite a bit of work,   but it would hands down make stable memory the go-to memory for developers to use.
+
+Are there any dfx/sdk warnings ⚠️ around upgrading or changing the stable serialized types when using stable memory? I would hate to add a column or delete a field and then all of a sudden after an upgrade the data types my application expects are out of sync with my stable “database” underneath and I lose or corrupt my data.
+
+-------------------------
+
+ielashi | 2023-01-20 08:23:18 UTC | #3
+
+[quote="justmythoughts, post:2, topic:18079"]
+I’m curious, are there plans to build some sort of dynamic value allocator for these stable structures so that a developer can have a flexible columnar type of database associated with each key/composite key?
+
+I’d imagine that this would be quite a bit of work, but it would hands down make stable memory the go-to memory for developers to use.
+[/quote]
+
+There are no plans at the moment for building a full-blown dynamic memory allocator. However, for `StableBTreeMap` specifically, a simpler solution that I plan to experiment with is using overflow pages, which should then remove the maximum size restriction for the BTree's values that we currently impose. I'll share more updates on this in due time.
+
+[quote="justmythoughts, post:2, topic:18079"]
+Are there any dfx/sdk warnings :warning: around upgrading or changing the stable serialized types when using stable memory? I would hate to add a column or delete a field and then all of a sudden after an upgrade the data types my application expects are out of sync with my stable “database” underneath and I lose or corrupt my data.
+[/quote]
+
+There are some sanity checks within the library at the moment. For example, if you try to replace a type in a `StableBTreeMap` with another type that is larger in size, the library will panic and the upgrade will fail. But, ultimately, if there's a bug in how you're serializing your data (i.e. in your implementation of `Storable`), then I don't think there's a way to holistically detect this apart from you adding unit tests.
+
+Note that `stable-structures` is a Rust library, while the SDK is language agnostic, so whatever sanity checks we add will likely need to be in the library itself and not part of the SDK/dfx.
+
+-------------------------
+
+roman-kashitsyn | 2023-01-20 10:52:21 UTC | #4
+
+[quote="justmythoughts, post:2, topic:18079"]
+I’m curious, are there plans to build some sort of dynamic value allocator for these stable structures so that a developer can have a flexible columnar type of database associated with each key/composite key?
+[/quote]
+
+I'd prefer a dynamic memory allocator to be a separate "stable structure". This would allow us to integrate it seamlessly with all the existing data structures using foreign keys. We'll also have greater control over memory usage and data locality.
+
+Something like the following:
+
+```
+#[derive(Eq, Ord, Debug, ...)]
+pub struct Ref<UserData: Storable>(Pointer, AllocatorRef, PhantomData<UserData>);
+
+impl<UserData: Storable> Ref<UserData> {
+  pub fn deref(&self) -> T { ... }
+}
+
+pub struct StableAllocator<M: Memory>(...);
+
+impl StableAllocator {
+  pub fn allocate<T: Storable>() -> Ref<T> { ... }
+  pub fn free<T: Storable>(r: Ref<T>) { ... }
+}
+
+static ALLOC: StableAllocator<AllocMemory, AllocMemory> = ...;
+
+static USERS: StableBTreeMap<UserId, Ref<UserData>, UserMapMemory> = ...;
+```
+
+That might be an excellent addition to one of the newer versions of the library.
+
+[quote="justmythoughts, post:2, topic:18079"]
+Are there any dfx/sdk warnings :warning: around upgrading or changing the stable serialized types when using stable memory?
+[/quote]
+
+Unfortunately, no. Motoko tooling is much more high-level and safe in this regard at the moment.
+
+However, there is an initiative to explore a unified canister storage interface with its schema language and code generation capabilities that could make stable structures much safer to use and even migrate from Rust to Motoko and back without losing data. There is nothing specific to share at this point, however.
+
+-------------------------
+
+lastmjs | 2023-01-21 02:54:25 UTC | #5
+
+[quote="ielashi, post:3, topic:18079"]
+However, for `StableBTreeMap` specifically, a simpler solution that I plan to experiment with is using overflow pages, which should then remove the maximum size restriction for the BTree’s values that we currently impose. I’ll share more updates on this in due time.
+[/quote]
+
+I'm super excited for this! And this will fix the requirement to specify maximum key sizes as well, correct?
+
+-------------------------
+
+ielashi | 2023-01-21 08:20:56 UTC | #6
+
+The same solution should also work for keys, yes. Keys are a bit trickier than values though as splitting the keys across pages would have some performance implications, so we'll have to be more careful there.
+
+-------------------------
+

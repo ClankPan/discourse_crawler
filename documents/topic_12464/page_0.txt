@@ -1,0 +1,213 @@
+kevinli | 2022-04-27 10:24:58 UTC | #1
+
+I'm still a little confused in what cases does the catch block run in terms of trying an inter-canister call.
+
+Let's say I have code:
+```
+public func someFunc() {
+
+try {
+let result = await otherActor.otherFunc();
+}
+catch e {
+// perform some action if other canister traps
+doSomethingInCatch();
+};
+
+}
+```
+When does the catch block run? In which of the following cases (if any) does it run:
+- Canister I call with "otherActor" traps.
+- Canister I call with "otherActor" rejects call for some reason (message queue limit, etc.)
+
+-------------------------
+
+claudio | 2022-04-27 12:09:39 UTC | #2
+
+Both.
+
+But if the try block fails directly with a trap  (not in some async callee) the catch will not be executed and the enclosing method will, instead, immediately exit with the trap. The caller of the method will see this as a reject.
+
+Note that message sends can, in rare cases, trap synchronously, before the message body is even queued and executed, which falls into the case of the previous paragraph.
+
+Hope I got that right. Not caffeinated yet.
+
+-------------------------
+
+AnonymousCoder | 2022-04-27 13:11:57 UTC | #3
+
+[quote="kevinli, post:1, topic:12464"]
+When does the catch block run? In which of the following cases (if any) does it run:
+[/quote]
+
+Look at it this way: if any error happens for whatever reason in the try block, it should always go in the catch. At least that's how a try / catch should work
+
+-------------------------
+
+nomeata | 2022-04-28 19:32:47 UTC | #4
+
+That's how it _should_ work, but doesn’t.
+
+```
+try { 1/0 } catch { return 42; }
+```
+will _not_ be caught. Unfortunately. But
+```
+try { await async {1/0} } catch { return 42; }
+```
+will.
+
+So as Claudio says: It can only catch when the canister receives a _reject_ from another canister, or (I believe) if you `throw` explicitly.
+
+-------------------------
+
+timo | 2022-11-28 12:34:25 UTC | #5
+
+[quote="claudio, post:2, topic:12464"]
+Note that message sends can, in rare cases, trap synchronously, before the message body is even queued and executed, which falls into the case of the previous paragraph.
+[/quote]
+
+What are those rare cases?
+
+Looking at the interface spec https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-call , it says that `ic0.call_perform` can return an error code. So it appears that this system API call does not trap internally and that the Motoko runtime will catch any error it returns and not trap and hence execute that `catch` branch. However, `ic0.call_new` does not have a return value. So I believe that one could trap?
+
+Can we list out precisely the scenarios, related to inter-canister calls, in which a) system API calls would trap and b) the Motoko runtime would trap, if ever?
+
+-------------------------
+
+timo | 2022-11-28 12:39:12 UTC | #6
+
+I am also wondering how one can catch a synchronous trap in a message send. As a synchronous trap is rolled back, we will never know it happened.
+
+Can I wrap the message send into an asynchronous call?
+
+-------------------------
+
+Severin | 2022-11-28 13:02:32 UTC | #7
+
+[quote="timo, post:6, topic:12464"]
+Can I wrap the message send into an asynchronous call?
+[/quote]
+
+Yes, I do this in the cycles faucet in a few places so that I have to do less error handling. But I wouldn't put it anywhere where you are trying to squeeze everything out of your canister since the await may delay execution and I don't know how it interacts with the message queue
+
+-------------------------
+
+timo | 2022-11-28 14:37:02 UTC | #8
+
+[quote="Severin, post:7, topic:12464"]
+Yes, I do this in the cycles faucet in a few places so that I have to do less error handling
+[/quote]
+
+Do you a link to the code?
+
+-------------------------
+
+Mr_Burkes | 2022-11-28 19:40:59 UTC | #9
+
+Must we always try/catch on calls to other canisters?
+
+-------------------------
+
+Severin | 2022-11-29 07:41:48 UTC | #10
+
+[quote="timo, post:8, topic:12464"]
+Do you a link to the code?
+[/quote]
+
+Sorry, that one is not open sourced. But it's nothing spectacular and I'm not even sure this is the proper way to do it. I use it as the lazy way out of doing more error handling like this:
+``` motoko
+case (?coupon) {
+  let now = Time.now();
+  if (coupon.expiry < now) {
+    throw (Error.reject("Code is expired"));
+  };
+  try {
+    var cycle_to_add = coupon.cycle;
+    let deposited = await deposit_cycles_to(cycle_to_add, wallet);
+    return deposited;
+  } catch (e) {
+    // Put the coupon code back if there is any error
+    ignore Queue.pushFront(coupon, all_coupons);
+    throw (e);
+  };
+};
+```
+
+[quote="Mr_Burkes, post:9, topic:12464, full:true"]
+Must we always try/catch on calls to other canisters?
+[/quote]
+No, if you are ok with no error handling then you don't have to do it. But it's the way to add safety and prevent bugs. For example in the code above: If something fails during redeeming the faucet code I don't want to say the code was redeemed already so I put it back into the list of valid codes. I don't think there's a way to do this except for try/catch (at least if you call a different canister).
+
+-------------------------
+
+timo | 2022-11-29 07:52:06 UTC | #11
+
+[quote="Severin, post:10, topic:12464"]
+`let deposited = await deposit_cycles_to(cycle_to_add, wallet);`
+[/quote]
+
+What does the definition of `deposit_cycles_to` look like? I suppose it is a shared function of the same actor. Does `deposit_cycle_to` have to be public? And does this really lead to a self-call that is queued by the subnet and comes back from outside just as any externally originating call would?
+
+-------------------------
+
+timo | 2022-11-29 07:53:21 UTC | #12
+
+[quote="Mr_Burkes, post:9, topic:12464, full:true"]
+Must we always try/catch on calls to other canisters?
+[/quote]
+
+Your code will trap if there's an error and you don't catch it. If that's the desired behaviour then fine.
+
+-------------------------
+
+Severin | 2022-11-29 07:53:37 UTC | #13
+
+It looks like this:
+```motoko
+// Deposits `amount` cycles to `target`, returns amount of deposited cycles
+private func deposit_cycles_to(amount : Cycle, target : Principal) : async Cycle
+```
+
+[quote="timo, post:11, topic:12464"]
+And does this really lead to a self-call that is queued by the subnet and comes back from outside just as any externally originating call would?
+[/quote]
+That's my educated guess, but I'm not 100% sure
+
+-------------------------
+
+timo | 2022-11-29 11:30:10 UTC | #14
+
+[quote="Severin, post:13, topic:12464"]
+That’s my educated guess, but I’m not 100% sure
+[/quote]
+
+It is not even `shared`, so it probably doesn't. Now I am really wondering what happens if the outgoing call that happens inside `deposit_cycles_to` traps synchronously.
+
+EDIT: This thread seems to answer it: https://forum.dfinity.org/t/error-the-replica-returned-an-error-code-5-message-canister-trapped-explicitly-could-not-perform-self-call/
+There it says every await async { … } is its own message which could get executed in a different round. It doesn’t seem to matter if it is in a function or not. That’s consistent with what you said.
+
+-------------------------
+
+skilesare | 2022-11-29 13:32:09 UTC | #15
+
+A fast pass was added last year that let a canister continue execution if it was an await message to itself:
+
+https://forum.dfinity.org/t/how-are-awaits-handled-that-dont-call-an-async-function/7254/18?u=skilesare
+
+-------------------------
+
+Mr_Burkes | 2022-11-30 05:02:00 UTC | #16
+
+@Severin I guess what I'm asking is that can canister calls fail for a random reason? E.g. connection drops, not necessarily a bad canister? What guarantees for inter-canister calls are we working with?
+
+-------------------------
+
+Severin | 2022-11-30 07:09:40 UTC | #17
+
+AFAIK for canister calls there's only one thing that really can be unexpected, and that is when the output queue is full. See the thread linked by @timo above for more on that.
+
+Once the call is enqueued it will always get a response - either the success message or a response that the call trapped.
+
+-------------------------
+

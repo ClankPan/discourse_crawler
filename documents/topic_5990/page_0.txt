@@ -1,0 +1,152 @@
+ehsan6sha | 2021-07-19 18:15:47 UTC | #1
+
+Hi
+
+It seems there is an issue in agent.query in react native and I was able to narrow down the issue. wanted to see if anyone has a solution for it?
+
+In 'query(canisterId, fields, identity)' function inside agent library, it seems the fetch used does not support StreamReader in react native as it is used here and we need to think of a polyfill for it to be able to return correct value. any insight in much appreciated.
+
+-------------------------
+
+ehsan6sha | 2021-07-19 18:17:20 UTC | #2
+
+I can see the response when I use console.log(await response.text()), but response.arrayBuffer() is not returning anything. I believe it has something to do with StreamReader
+
+-------------------------
+
+jzxchiang | 2021-07-21 05:31:31 UTC | #3
+
+I think it's related to an issue I found where RN doesn't properly deal with binary response bodies. Basically I had to polyfill the default fetch. See [here](https://forum.dfinity.org/t/making-http-calls-from-mobile-apps/5192/14?u=jzxchiang) for details.
+
+-------------------------
+
+ehsan6sha | 2021-07-21 18:25:29 UTC | #4
+
+Can you please share a part of code showing how you used and configured react-native-fetch-api ?
+
+-------------------------
+
+jzxchiang | 2021-07-21 23:16:18 UTC | #5
+
+So the first step obviously is to apply the polyfill globally using:
+
+```
+import {polyfill as polyfillFetch} from 'react-native-polyfill-globals/src/fetch'
+polyfillFetch();
+```
+
+I put this in a `shim.js` that is imported by the top-level `index.js`.
+
+-----
+
+The second step is to patch `@dfinity/agent` to replace this [line](https://github.com/dfinity/agent-js/blob/579f8aa3fae946a9060bed39ff56c87151098c49/packages/agent/src/agent/http/index.ts#L204) with:
+
+```
+this._fetch('' + new URL(`/api/v2/canister/${ecid.toText()}/call`, this._host), Object.assign(Object.assign({reactNative: {textStreaming: true}}, transformedRequest.request), { body })),
+```
+
+Note that `{reactNative: {textStreaming: true}}` was added.
+
+-----
+
+The last step is to patch `react-native-fetch-api` and replace the "blob" in this [line](https://github.com/react-native-community/fetch/blob/74f6a96ba1d720e6effd42ee9a47655b44ec9e3b/src/Fetch.js#L34) with "base64".
+
+-----
+
+Let me know if this works.
+
+-------------------------
+
+jzxchiang | 2021-07-21 20:40:49 UTC | #6
+
+BTW I use `patch-package` to patch these libraries.
+
+-------------------------
+
+ehsan6sha | 2021-07-21 21:54:20 UTC | #7
+
+[quote="jzxchiang, post:5, topic:5990"]
+base64
+[/quote]
+
+Thank you for the great guide. It seems some errors are gone, but I run into a new error, which I am debugging in case if you have any insights on this one
+
+```
+Input too short
+at node_modules\borc\src\decoder.js:548:14 in Decoder#_decode
+at node_modules\borc\src\decoder.js:576:2 in Decoder#decodeFirst
+at node_modules\@dfinity\agent\lib\cjs\cbor.js:110:4 in decode
+at node_modules\@dfinity\agent\lib\cjs\agent\http\index.js:172:4 in HttpAgent#query
+```
+
+-------------------------
+
+ehsan6sha | 2021-07-21 23:14:56 UTC | #8
+
+So I can confirm my call is received by the canister(I see it in debug message)
+When my canister does not have a return everything is working, however, when my canister returns a Text (a simple one). and I query it using the agent library, it stops responding, and I cannot even call it using command line! any idea why?
+
+After the very first call from agent, it logs the message and stops responding even to calls from command line. If there is no return, it works fine.
+
+```
+import Debug "mo:base/Debug";
+actor HelloActor {
+   public query func hello() : async Text () {
+      Debug.print ("Hello, World from DFINITY \n");
+	  return "Hello, World from DFINITY";
+   }
+};
+```
+
+Is there a log somewhere that hows what is blocking the requests?
+
+-------------------------
+
+jzxchiang | 2021-07-21 23:19:17 UTC | #9
+
+You probably need to put a bunch of console.logs inside the agent-js library to see what part it's hanging up on. It could be the BigInt polyfill being too slow.
+
+Also, my (local) canister sometimes stops responding after it fills up with too much data, and after I restart it it works. Maybe try restarting your local dfx replica, delete and redeploy your canister, and make the request again? I've definitely gotten it working before with the Hello World example you put.
+
+-------------------------
+
+ehsan6sha | 2021-07-22 16:44:31 UTC | #10
+
+Again thank you for saving tons of time for me. It is working perfectly for me, however, for me it works if I do not put textStreaming: true, and does not work with it. But all looks good and much appreciated.
+
+-------------------------
+
+jzxchiang | 2021-07-22 21:46:42 UTC | #11
+
+Yeah you only want to put that for the call() method, not for the other ones that return binary data. If that doesn't work, then that's surprising.
+
+-------------------------
+
+ehsan6sha | 2021-07-22 22:10:33 UTC | #12
+
+Ah, now I see! I put it for query! So that was the issue. thank you for mentioning it
+
+-------------------------
+
+ehsan6sha | 2021-07-30 19:55:18 UTC | #13
+
+Did you find a workaround for WebAssembly?
+
+-------------------------
+
+jzxchiang | 2021-07-31 04:37:16 UTC | #14
+
+It's a pretty involved process. Basically, you can't use WebAssembly and need to do the BLS signature validation in JS instead.
+
+One way is to transpile the wasm bytecode in `@dfinity/agent` to JS using `wasm2js` and run that instead. It's pretty slow though. Another way is to use the JS code in this repo: https://github.com/miracl/core. It was ~3x faster than the `wasm2js` solution but still 3x faster than if you just comment out the BLS signature validation logic.
+
+@kpeacock mentioned that implementing it native-side could be another option, but it will definitely take more work.
+
+-------------------------
+
+kpeacock | 2021-08-01 18:00:06 UTC | #15
+
+@chenyan We should try to do a proof of concept by building the BLS validation to C and then importing it into a React Native app
+
+-------------------------
+

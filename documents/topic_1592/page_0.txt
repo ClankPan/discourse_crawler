@@ -1,0 +1,238 @@
+rckprtr | 2020-11-23 18:43:21 UTC | #1
+
+I've been experimenting with writing AssemblyScript on DFINITY and ran into some questions.
+
+First I grabbed the [reverse](https://github.com/dfinity/examples/tree/master/c/reverse) project from dfinity examples, compiled it and wasm2wat the results which gave me these definitions:
+
+      (import "ic0" "msg_arg_data_size" (func $dfn_ads (type $t0)))
+      (import "ic0" "msg_arg_data_copy" (func $dfn_adc (type $t1)))
+      (import "ic0" "debug_print" (func $dfn_print (type $t2)))
+      (import "ic0" "msg_reply_data_append" (func $dfn_reply_append (type $t2)))
+      (import "ic0" "msg_reply" (func $dfn_reply (type $t3)))
+      (func $canister_update_go (export "canister_update go") (type $t3)
+
+
+So I created this AssemblyScript Interface: (ic0.ts)
+
+    export declare function debug_print(msg : string, length: i32) : void;
+    export declare function msg_arg_data_size() : i32;
+    export declare function msg_arg_data_copy(x : i32, y: i32, z: i32) : void;
+    export declare function msg_reply_data_append(x : string, y: i32) : void;
+    export declare function msg_reply() : void;
+
+index.ts
+
+    function init() : void {
+      var text: string = "hello dfinity from assemblyscript";
+      IC.debug_print(text,String.UTF16.byteLength(text));
+    }
+
+    export {
+      init as canister_init,
+    }
+
+
+Results:
+`[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] hello dfinity from assemblyscript`
+
+Now I wanted to query a function with my canister being called tshello
+`dfx canister call tshello sayhello`
+
+so I added the function:
+
+    function sayhello() : void {
+      var text: string = "sayhello";
+      IC.debug_print(text,String.UTF16.byteLength(text));
+      var results: ArrayBuffer = String.UTF8.encode(`DIDL\00\00`);
+      IC.msg_reply_data_append(results, results.byteLength)
+      IC.msg_reply();
+    }
+
+    export {
+      init as canister_init,
+      sayhello as canister_update_sayhello,
+    }
+
+Which gives me the WAT
+ `(export "canister_update_sayhello" (func $assembly/index/sayhello))`
+
+Which gives me the results:
+`Replica error (code 3): IC0302: Canister rwlgt-iiaaa-aaaaa-aaaaa-cai has no update method 'sayhello'`
+
+I realized there needs to be a space between canister_update and sayhello, so if I go into the .wat file and add a space.
+
+` (export "canister_update sayhello" (func $assembly/index/sayhello))`
+
+Results are good with `--output raw`
+
+`[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] sayhello`
+`4449444c5c30305c3030`
+
+Without Raw
+`"Unsupported op_code 48 in type table",`
+
+Questions
+* Is the space required with canister_update and the function name?
+* Anyone familiar enough with AssemblyScript to properly define an export with a space in its name?
+* Whats the correct way to use an empty reply? `DIDL\00\00`
+
+I'm going to keep experimenting with this, but there are the initial results.
+
+btw I had a lot of problems submitting this post, something about the code.
+
+Thanks,
+Rick
+
+-------------------------
+
+chenyan | 2020-11-23 19:53:00 UTC | #2
+
+> * Is the space required with canister_update and the function name?
+
+Yes
+
+> * Whats the correct way to use an empty reply? `DIDL\00\00`
+
+Yes
+
+> Without Raw
+`"Unsupported op_code 48 in type table",`
+
+`sayhello` returns a string not an empty reply. So we need to encode the string in Candid.
+```
+var results: ArrayBuffer = String.UTF8.encode(`DIDL\00\01\71` + LEB128.encode(text.length) + UTF8.encode(text));
+```
+
+-------------------------
+
+dmd | 2020-11-23 20:24:33 UTC | #4
+
+I don't know AssemblyScript, but I think your exported name is wrong.
+
+You want "canister_update sayhello" not "canister_update_sayhello".
+
+Just some tips to help you with this.
+While the documentation isn't great, you'll get a lot of clues on how to implement this stuff in these places:
+The macro obscures the meaning of the code a bit, so cargo expand should make it a bit more intelligible. 
+https://github.com/dfinity/cdk-rs/blob/next/src/ic-cdk/src/api/ic0.rs
+And here's some uses of this
+https://github.com/dfinity/cdk-rs/blob/next/src/ic-cdk/src/api.rs
+
+If you run cargo expand on this you'll see how we actually bind endpoints:
+https://github.com/dfinity/cdk-rs/blob/next/examples/counter/src/counter_rs/lib.rs
+
+Finally, when you're getting started there's absolutely no reason to use candid as a serialization format. My advice is just to talk to the canisters using JSON because it's much easier to see where you've gone wrong and there's probably already a mature library for you to lean on.
+
+-------------------------
+
+enzo | 2020-11-24 00:53:52 UTC | #5
+
+I would strongly recommend checking out this post:
+https://forum.dfinity.org/t/how-to-write-a-minimal-cdk/1381/17
+And taking a look at this code:
+https://github.com/enzoh/counter
+Which makes use of the system API at:
+https://github.com/enzoh/counter/blob/master/src/ic0.h
+
+-------------------------
+
+rckprtr | 2020-11-24 21:45:36 UTC | #6
+
+Thanks Chenyan@,dmd@, enzo@
+
+I was able to produce the following that seems to work
+
+
+    import * as MSG from "./message";
+
+    var counter: number = 0;
+
+    function init(): void {
+      var text: string = "hello DFINITY from AssemblyScript";
+      MSG.printLine(text);
+    }
+
+    function printOnly(): void {
+      var text: string = "This just prints only :)";
+      MSG.printLine(text);
+      MSG.respondEmpty();
+    }
+
+    function echo(): void {
+      var param:string = MSG.recieveString();
+      MSG.printLine(param);
+      MSG.respondString(param);
+    }
+
+    function inc(): void {
+      MSG.recieveEmpty();
+      counter += 1;
+      MSG.respondString(counter.toString());
+    }
+
+    function dec(): void {
+      MSG.recieveEmpty();
+      counter -= 1;
+      MSG.respondString(counter.toString());
+    }
+
+    export {
+      init as canister_init,
+      echo as canister_update_echo,
+      dec as canister_update_dec,
+      inc as canister_update_inc, 
+    }
+
+I wrote a NodeJS script that goes through the WAT and removes the underscore between update and function name and then I run wat2wasm.
+
+Enzos C Counter example helped a lot as well as the Rust CDK.
+
+Its interesting how counter keeps its value, even after a DFX restart, I assumed that was a MOTOKO only feature. I think with decorators, the functions can be slimmed down and not require a 'receive' or 'respond'.  Really exciting to see how far DFINITY has come.
+
+Thank you,
+Rick
+
+-------------------------
+
+rckprtr | 2020-11-30 01:34:44 UTC | #7
+
+For anyone else curious, I moved my code into a repo.
+
+https://github.com/rckprtr/cdk-as/blob/102b702aee13d8a920116d099631c584f5b78ca0/assembly/counter.ts
+
+-------------------------
+
+coin_master | 2022-11-03 19:42:58 UTC | #8
+
+[quote="enzo, post:5, topic:1592"]
+I would strongly recommend checking out this post:
+https://forum.dfinity.org/t/how-to-write-a-minimal-cdk/1381/17
+And taking a look at this code:
+[/quote]
+
+I followed that post but looks like it’s private or deleted.
+Can we retrieve it somehow?
+
+-------------------------
+
+rckprtr | 2022-11-03 19:59:55 UTC | #9
+
+I can't remember what the post was, but I don't think it was that long.  
+
+I can't believe this was 2 years ago, but if you have questions Im sure people can answer them now.
+
+-------------------------
+
+coin_master | 2022-11-04 09:06:48 UTC | #10
+
+I was curious how to write a CDK given you have a language that compiles natively to Wasm.
+We have a few of those like Ruby, Move, Grain, Zig.
+
+-------------------------
+
+Severin | 2022-11-04 09:15:00 UTC | #11
+
+Not sure how useful, but here's a bit of (likely somewhat outdated) info on getting clang-supported languages into canisters: https://internetcomputer.org/docs/current/developer-docs/build/cdks/clang-supported-languages
+
+-------------------------
+

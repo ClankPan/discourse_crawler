@@ -1,0 +1,204 @@
+peterparker | 2022-12-02 11:09:04 UTC | #1
+
+I've got absolutely no experience with DeFi anything and got a bit a hard time understanding the verification flow of a payment using the ledger as displayed in the [documentation](https://internetcomputer.org/docs/current/developer-docs/integrations/ledger/interact-with-ledger).
+
+![image|459x278](upload://mKe2dhmkFghD3IUwRCY4ecwslaG.png)
+
+
+I managed to implement the `transfer` and understand I get a `block_number` pointing to the ledger in return.
+
+```
+pub async fn transfer_to_console(to: Principal) -> CallResult<TransferResult> {
+    // The ledger canisterId
+    let ledger = Principal::from_text(&LEDGER).unwrap();
+
+    // I do not use subaccount yet
+    let to_subaccount = DEFAULT_SUBACCOUNT;
+
+    let args = TransferArgs {
+        memo: Memo(0),
+        amount: Tokens::from_e8s(100),
+        fee: Tokens::from_e8s(10_000),
+        from_subaccount: Some(to_subaccount),
+        to: AccountIdentifier::new(&to, &to_subaccount),
+        created_at_time: None,
+    };
+
+    transfer(ledger, args).await
+}
+```
+
+Now that I got the `block_number`, I have to call the ledger `query_blocks` but have to provide also a `length` for the query to do so and here I get lost 🤷‍♂️.
+
+What's the length? How do I know which length of blocks I am interested in and which length matches the payment that has potentialy been made?
+
+-------------------------
+
+peterparker | 2022-12-02 08:03:57 UTC | #2
+
+I found in OC open source code a super handy function to read block which query the ledger, archive and returns the `Block` that contains the `Transaction`, `Operation` and other `Memo` so that gonna helps a lot but, still super unclear on what `length` of blocks should be queried 🤔.
+
+https://github.com/open-ic/transaction-notifier/blob/cf8c2deaaa2e90aac9dc1e39ecc3e67e94451c08/canister/impl/src/lifecycle/heartbeat.rs#L111
+
+-------------------------
+
+GLdev | 2022-12-02 10:06:07 UTC | #3
+
+Don't quote me on that, but I remember reading that this was the "old" method of getting transactions from the ledger. I believe a new method was added since, named "block_pb" that returns the raw block in protobuf that you ask for.
+
+If I read [this](https://github.com/dfinity/ic/blob/d90626d41a9f602ebf00b8c3d61b1f2de29db0b4/rs/nns/cmc/src/main.rs#L1053) correctly, this is how the CMC does it, and it should work since this canister handles all of the ICP -> new_canister / cycles_topup stuff from dfx. 
+
+I'd look there first, before (re)implementing the logic of getting, storing and parsing blocks on your own.
+
+-------------------------
+
+peterparker | 2022-12-02 11:41:23 UTC | #4
+
+Do you reckong where you read it?
+
+It's interesting but the Cmc example seems to use a `call_with_cleanup` with four arguments including `protobuf`. Not sure if that's possible with the `ic_cdk::call` that takes three params. I'm such a noob.
+
+That's maybe the reason why the function `block_pb` is not available in the [ic_ledger_types](https://docs.rs/ic-ledger-types/latest/ic_ledger_types/#) crate?
+
+Thanks to OpenChat code, (re)-implementing the logic of getting the blocks is alright, basically just stealing open source code (😅). It actually already works out, I can transfer and verify the transaction, just still does not understand what `length` should be use. Like I did not find any documentaiton about it, probably something obvious I just don't know.
+
+-------------------------
+
+GLdev | 2022-12-02 11:54:21 UTC | #5
+
+I managed to dig out [this](https://github.com/dfinity/cdk-rs/pull/269/files#diff-9ff80eb66703d98e652380601d35e1c6e3f5d577535b81d03086dd5b22b85e07R446-R465) example, and the length used is 1 (that is, you want one block starting at the provided index). That should work for what you need. 
+
+I don't remember where I read it, but I do remember reading something along the lines of "we're fetching all the blocks and store them on our canister until such functionality will be supported by the ledger". This was a while ago, and it seems that the ledger now can serve transactions starting with an index (basically what you need).
+
+-------------------------
+
+peterparker | 2022-12-02 13:05:49 UTC | #6
+
+Indeed you are right, a length of `1` works for me (at least locally). I also spotted this length in the crate [example](https://docs.rs/ic-ledger-types/latest/ic_ledger_types/fn.query_blocks.html) but since it is not particularly documented I though that `1` was just there as a dummy value.
+
+Thanks for the feedback, help and context about the new `block_pb`. I'll check what happens there, until I launch the new project I'm working on there are still things to do but if I hear anything, will change the implementation.
+
+Meanwhile, if it can help anyone here's what I implemented today related to this question - note that I'm a Rust newbie so my code is probably not the best and the it only checks that the source, from and amount of the transaction are matching - i.e. it doesn't not check if the payment has already been proceeded or not. In my canister I'll keep track of the block index that has been proceeded to do so.
+
+```
+use crate::env::LEDGER;
+use crate::utils::account_identifier_equal;
+use candid::{Func, Principal};
+use ic_cdk::api::call::CallResult;
+use ic_cdk::call;
+use ic_ledger_types::{query_blocks, AccountIdentifier, ArchivedBlockRange, Block, BlockIndex, GetBlocksArgs, GetBlocksResult, Operation, Transaction, DEFAULT_SUBACCOUNT, TransferResult, TransferArgs, Memo, Tokens, transfer, Subaccount};
+use futures::future::join_all;
+
+// We do not use subaccount, yet.
+static SUB_ACCOUNT: Subaccount = DEFAULT_SUBACCOUNT;
+
+pub fn principal_to_account_identifier(principal: &Principal) -> AccountIdentifier {
+    // We do not use subaccount, yet.
+    AccountIdentifier::new(principal, &SUB_ACCOUNT)
+}
+
+pub async fn transfer_payment(to: &Principal, amount: Tokens, fee: Tokens) -> CallResult<TransferResult> {
+    let args = TransferArgs {
+        memo: Memo(0),
+        amount,
+        fee,
+        from_subaccount: Some(SUB_ACCOUNT),
+        to: principal_to_account_identifier(&to),
+        created_at_time: None,
+    };
+
+    let ledger = Principal::from_text(&LEDGER).unwrap();
+
+    transfer(ledger, args).await
+}
+
+pub async fn verify_payment(
+    from: AccountIdentifier,
+    to: AccountIdentifier,
+    amount: Tokens,
+    block_index: BlockIndex,
+) -> bool {
+    let ledger = Principal::from_text(&LEDGER).unwrap();
+
+    // We can use a length of block of 1 to find the block we are interested in
+    // https://forum.dfinity.org/t/ledger-query-blocks-how-to/16996/4
+    let response = blocks_since(ledger, block_index, 1).await.unwrap();
+
+    fn payment_check(
+        transaction: &Transaction,
+        expected_from: AccountIdentifier,
+        expected_to: AccountIdentifier,
+        expected_amount: Tokens,
+    ) -> bool {
+        match &transaction.operation {
+            None => (),
+            Some(operation) => match operation {
+                Operation::Transfer {
+                    from, to, amount, ..
+                } => {
+                    return account_identifier_equal(expected_from, from.clone())
+                        && account_identifier_equal(expected_to, to.clone())
+                        && expected_amount.e8s() == amount.e8s();
+                }
+                Operation::Mint { .. } => (),
+                Operation::Burn { .. } => (),
+            },
+        }
+
+        false
+    }
+
+    response
+        .iter()
+        .any(|block| payment_check(&block.transaction, from, to, amount))
+}
+
+// Source: OpenChat
+// https://github.com/open-ic/transaction-notifier/blob/cf8c2deaaa2e90aac9dc1e39ecc3e67e94451c08/canister/impl/src/lifecycle/heartbeat.rs
+async fn blocks_since(
+    ledger_canister_id: Principal,
+    start: BlockIndex,
+    length: u64,
+) -> CallResult<Vec<Block>> {
+    let response = query_blocks(ledger_canister_id, GetBlocksArgs { start, length }).await?;
+
+    if response.archived_blocks.is_empty() {
+        Ok(response.blocks)
+    } else {
+        async fn get_blocks_from_archive(range: ArchivedBlockRange) -> CallResult<GetBlocksResult> {
+            let args = GetBlocksArgs {
+                start: range.start,
+                length: range.length,
+            };
+            let func: Func = range.callback.into();
+            let (response,) = call(func.principal, &func.method, (args,)).await?;
+            Ok(response)
+        }
+
+        // Adapt original code .archived_blocks.into_iter().sorted_by_key(|a| a.start)
+        let mut order_archived_blocks = response.archived_blocks;
+        order_archived_blocks.sort_by(|a, b| a.start.cmp(&b.start));
+
+        // Get the transactions from the archive canisters
+        let futures: Vec<_> = order_archived_blocks
+            .into_iter()
+            .map(get_blocks_from_archive)
+            .collect();
+
+        let archive_responses = join_all(futures).await;
+
+        let results = archive_responses
+            .into_iter()
+            .collect::<CallResult<Vec<_>>>()?;
+
+        Ok(results
+            .into_iter()
+            .flat_map(|r| r.unwrap().blocks)
+            .chain(response.blocks)
+            .collect())
+    }
+}
+```
+
+-------------------------
+

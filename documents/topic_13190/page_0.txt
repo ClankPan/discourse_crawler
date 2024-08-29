@@ -1,0 +1,115 @@
+jzxchiang | 2022-05-22 05:22:02 UTC | #1
+
+I just deployed a cycles wallet canister by 1) using the NNS UI to create a canister with some ICP, and 2) then running `dfx identity --network=ic deploy-wallet <canister-id>`.
+
+I then added my local dfx principal as a controller for that newly created wallet canister (by default, it has the NNS UI Internet Identity principal as its sole controller). I confirmed that `dfx wallet --network ic get-wallet` returns the ID of the wallet canister.
+
+Everything works... but for some reason, each time I call `dfx wallet --network ic balance` the # of cycles goes down. Not a lot but it definitely decreases.
+
+Does the cycles wallet canister run a heartbeat or something? What's draining the cycles? Querying for the balance of the cycles wallet shouldn't cost any cycles since it's a [query](https://github.com/dfinity/cycles-wallet/blob/89d3bb7cc7c1b84a28867987b6504c2cb7da93c3/wallet/src/lib.did#L232) and not an update method. To be clear, I just created this cycles wallet canister today so it's running 0.10.0.
+
+(As an aside, why are there two commands for creating a canister, i.e. `dfx ledger create-canister` and `dfx canister create`? Is the former just a more convenient way of doing the latter with the added benefit of converting ICP to cycles as well...?)
+
+-------------------------
+
+jzxchiang | 2022-05-22 05:28:49 UTC | #2
+
+BTW I also noticed that when I deposited 2 T cycles into the newly created cycles wallet canister (using the NNS UI), I didn't actually pay 1 T cycles to create a canister.
+
+I thought I would because I thought it cost 1 T cycles to create a canister, but apparently not. My cycles wallet canister has 1.89 T cycles, so I only paid ~0.11 T cycles.
+
+-------------------------
+
+jzxchiang | 2022-05-22 05:31:44 UTC | #3
+
+Random fix: https://github.com/dfinity/cycles-wallet/pull/143
+
+-------------------------
+
+jzxchiang | 2022-05-22 05:34:19 UTC | #4
+
+Another observation:
+
+`dfx wallet --network ic controllers` returns something different than the controller list in `dfx canister --network ic status <wallet-canister-id>`.
+
+To be specific, the former is missing the NNS UI Internet Identity principal, whereas the latter has it. (The former lists 1 principal, whereas the latter lists 2.)
+
+-------------------------
+
+GLdev | 2022-05-22 06:49:10 UTC | #5
+
+[quote="jzxchiang, post:2, topic:13190"]
+I didn’t actually pay 1 T cycles to create a canister.
+[/quote]
+
+I believe it's 0.1T to create a canister. This code works:
+
+```
+ let (create_result,): (CanisterIdRecord,) = match ic_cdk::api::call::call_with_payment(
+        Principal::management_canister(),
+        "create_canister",
+        (in_arg,),
+        canister_create_args.cycles,
+    )
+```
+
+where cycles is ```         cycles: 100_000_000_000, ```
+
+-------------------------
+
+domwoe | 2022-05-22 09:19:35 UTC | #6
+
+[quote="jzxchiang, post:1, topic:13190"]
+Everything works… but for some reason, each time I call `dfx wallet --network ic balance` the # of cycles goes down. Not a lot but it definitely decreases.
+[/quote]
+
+Isn't this how it should be? It's a canister that uses resources just by having its code and memory in the IC state.
+
+-------------------------
+
+diegop | 2022-05-23 20:29:45 UTC | #7
+
+[quote="domwoe, post:6, topic:13190"]
+It’s a canister that uses resources just by having its code and memory in the IC state.
+[/quote]
+
+This is correct. Cycles wallets are canisters... so they consume state and computation.
+
+-------------------------
+
+jzxchiang | 2022-05-24 00:46:34 UTC | #8
+
+Gotcha thanks. Any idea about why the controllers differ  between NNS and dfx? @Severin I wonder if you know.
+
+-------------------------
+
+Severin | 2022-05-24 06:30:44 UTC | #9
+
+I think there is a difference between the _wallet canister_ controllers and the list of principals authorised to use the wallet (confusingly also called controllers), which is controlled by the _wallet wasm_. So a principal can be the controller of the canister, but still not be able to use the wallet for its functionality.
+
+-------------------------
+
+jzxchiang | 2022-05-25 00:04:51 UTC | #10
+
+That is indeed puzzling. Is there any documentation on this distinction? I've never heard of it before. (I know there's controller vs custodian, but I didn't know the *wallet wasm* was involved???)
+
+-------------------------
+
+Severin | 2022-05-25 07:19:47 UTC | #11
+
+Looks like I failed to explain things well enough.
+
+There's two separate _controllers_:
+1. The controllers in the view of the IC (I'll call those _canister controllers_): What you actually think about when you hear the term 'controller'. A canister controller can request a canister's status, start/stop/delete the canister, install new wasm modules, and so on. `dfx canister info` returns the list of canister controllers.
+2. The controllers in the _internal_view of the wallet (I'll call those _wallet controllers_): Here is the definition of a wallet controller: [[wallet code](https://github.com/dfinity/cycles-wallet/blob/main/wallet/src/address.rs#L9-L22)]. This is what the code running inside the wallet canister (what I called _wallet wasm_ in my previous post) defines as its own notion of a controller. This is totally fine from a technical standpoint, but very confusing as shown by this thread. This wallet controller can NOT perform the tasks listed for the canister controller, but instead can transfer cycles, add/remove custodians, list the history of transactions in this wallet and so on. `dfx wallet controllers` returns the list of wallet controllers.
+
+In the end, it's just a name clash between two related, but distinct concepts, caused by an unfortunate name overlap. Does this clear up the confusion, @jzxchiang?
+
+-------------------------
+
+jzxchiang | 2022-05-25 15:51:36 UTC | #12
+
+I think that makes sense. I'm assuming the NNS website was showing the wallet-internal controller list, while dfx was of course showing the canister controller list.
+
+-------------------------
+

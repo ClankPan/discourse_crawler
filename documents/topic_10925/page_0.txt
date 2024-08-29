@@ -1,0 +1,161 @@
+bjoern | 2022-02-16 20:49:22 UTC | #1
+
+# Request for feedback: Query delegations
+
+A user that uses [Internet Identity (II)](https://identity.ic0.app/) to authenticate toward different dapps will be seen under different [principals](https://smartcontracts.org/docs/interface-spec/index.html#principal) when interacting with backend canisters. This behavior is an important security mechanism that isolates different dapps from each other: If different dapps were to interact with canisters under the same principal, then a malicious dapp could, e.g., steal users’ NFTs or tokens that they manage with other – by themselves secure – dapps. Yet, the mechanism has also been criticized for impeding interoperability between different dapps. For instance, if users use dapp *A* to manage their NFTs that are stored in some backend canister, then they will not be able to see those same NFTs from dapp *B*, even when using II for authentication toward both dapps. While we are working on a generic solution for enabling data sharing between dapps (details to be shared soon), we could implement a more limited feature first: **query delegations**.
+
+Query delegations would provide a “read-only” way for such data sharing, and could work as follows: In the above example, dapp *B* requests from II a delegation that allows *B* to interact with the NFT canister under the same principal that is generally used when the user uses dapp *A*, but that delegation would allow dapp *B* to call [only query methods on that canister, no update methods](https://smartcontracts.org/docs/interface-spec/index.html#_nomenclature). That is: Dapp *B* could show all the NFTs that the user manages with dapp *A*, but the dapp could not, for instance, transfer those NFTs. Another example is that a dapp *C* could get a query delegation for seeing the user’s ICP balance and neuron details managed through the NNS frontend dapp; again, the delegation would not allow sending ICP or managing the neurons.
+
+Would such a query-only mechanism for data sharing be useful for developers? What do you think?
+
+-------------------------
+
+GLdev | 2022-02-16 21:26:50 UTC | #2
+
+That would nullify the privacy features of having a delegation be hash(hostname+id+salt), right? What would the UI look like when signing in to an app with II? Would the user have to chose between a "clean" delegation with a new principal and full read/write, or link it with "the principal used on this app"? Would the UI list all possible options? Do we want / need this in the II? Are there really no other ways to sync two dapps or confirm that principal x is also principal y on a different dapp?
+
+In theory separating query delegations from "full" delegations sounds good, IMO. It would allow for more use-cases than now when choosing to login to a dapp. That's a good step forward. I guess my questions above are more towards an idea of not over-complicating the II and also choosing the right tool for the job. Are we sure the II is that tool?
+
+-------------------------
+
+nomeata | 2022-02-16 22:47:22 UTC | #3
+
+I am very skeptical. The query/update distinction started as an optimization, making it semantically relevant in such a strong way changes the design quite a bit. At the same time, only helps a (I assume) small number of use cases – not those where actual interaction needs to be authorized, or where a service changes their hostname.
+
+And it’s not really a cheap feature, is it? This affects authentication in the HTTP handler, likely has to extend the delegation format, requires extensions to the II protocol and a bunch of UI that ideally doesn’t confuse users on top… 
+
+So _unless_ this is really a strict subset of what will be possible with the full design that you are planning on, I’d just not bother with this detour.
+
+(I wonder whose idea it was, and who doesn’t like the idea, and who of these groups suggested to ask the community to get some arguing support … ;-))
+
+Oh, and obligatory comment: If only we had built the IC on top of capabilities… :-)
+
+-------------------------
+
+bjoern | 2022-02-18 12:59:42 UTC | #4
+
+[quote="GLdev, post:2, topic:10925"]
+That would nullify the privacy features of having a delegation be hash(hostname+id+salt), right? What would the UI look like when signing in to an app with II?
+[/quote]
+
+My assumption is that, to stick with my example, dapp *B* would need to request the query delegation from II, and the user would have to confirm explicitly. So the privacy would only be reduced in cases specifically chosen by the user.
+
+> Are there really no other ways to sync two dapps or confirm that principal x is also principal y on a different dapp?
+
+There are certainly multiple solutions. One is, as pointed out by @nomeata, to embrace capabilities. That would be a great and generic solution (and our longer-term plans revolve around that), but it is a significant effort to implement. One can also have the background canister be aware that the same "user" may be observed as multiple different principals, but that requires changes in the background canister and there is currently no unified way of handling that.
+
+[quote="nomeata, post:3, topic:10925, full:true"]
+And it’s not really a cheap feature, is it? This affects authentication in the HTTP handler, likely has to extend the delegation format, requires extensions to the II protocol and a bunch of UI that ideally doesn’t confuse users on top…
+
+So *unless* this is really a strict subset of what will be possible with the full design that you are planning on, I’d just not bother with this detour.
+
+(I wonder whose idea it was, and who doesn’t like the idea, and who of these groups suggested to ask the community to get some arguing support … ;-))
+[/quote]
+
+Well, this came up as follows. Several projects (e.g., [ME](https://63k2f-nyaaa-aaaah-aakla-cai.raw.ic0.app/login) and [IC Naming](https://icnaming.com)) integrate with II in a way that is fundamentally unsafe: Asking users to add the application as a "device" to the identity anchor. (This gives the application full control over the user's account, including deletion of all user devices or issuance of arbitrary delegations that may allow stealing the user's funds.) One reason for using this unsafe integration is the lack of a mechanism for data sharing between multiple dapps that use II for authentication. After some discussions with them, we understand that the query-delegation mechanism would have enabled their current use cases that they are now solving via the unsafe integration.
+
+The reason for this post is to understand whether the query-delegation mechanism helps solve other use cases that are considered in the community and are hard or impossible to do currently otherwise. Maybe it's worth spending the effort, maybe it isn't ...
+
+> Oh, and obligatory comment: If only we had built the IC on top of capabilities… :slight_smile:
+
+I am looking forward to opening the interface specification to public contributions!
+
+-------------------------
+
+nomeata | 2022-02-18 14:07:25 UTC | #5
+
+[quote="bjoern, post:4, topic:10925"]
+One reason for using this unsafe integration is the lack of a mechanism for data sharing between multiple dapps that use II for authentication.
+[/quote]
+
+Is it a bug? Is it a feature? It is the super-Internet-Identity! :slight_smile: 
+
+I guess they didn’t like to hear “just solve this in application land”?
+
+1. `https://app1.ic0.app/ has a button “Link with App2”. This opens up a new tab/window `https://app2.ic0.app/link-id`.
+2. App1 passes the user’s principal at app1 (abcde) to the other app (e.g. with `postMessage`)
+3. `https://app2.ic0.app/link-id` performs the usual app2-specific login mechanism (maybe using II, maybe not – this is not tied to it)
+4. `https://app2.ic0.app/link-id` asks “do you want to allow `https://app1.ic0.app` to do X, Y and Z on your behalf”. Maybe allowing the user to even select what’s allowed.
+6. `https://app2.ic0.app/link-id` performs an update call and App2’s backend stores that `abcde-ef` can now act in a restricted way on the user’s behalf.
+5. `https://app2.ic0.app/link-id` sends a message back and the window closes
+6. App1 can talk to App2’s canisters now, in a restricted way.
+
+Benefits:
+ * Independent of the II. So it works also with applications that use other identity providers or other means of authentication to log in.
+ * Can also be used to authenticate servers, physical devices, other serivces.
+ * The permission dialog is presented by App2, so can give the user a better idea of what they are allowing.
+* In step 2 App1’s frontend can even create a dedicated key for this interaction, preserving anonymity
+* App2 can offer the users a list of such linked access, and allow revocation.
+* Familiar work-flow, a bit like OAuth.
+* And, killer argument: Flexibel in _what_ the other app is allowed to do! Not just blunt “all query calls”, not even “this selection of methods”, but full application-specific authorization.
+
+I’d explore options like these before complicating the system more.
+
+-------------------------
+
+cryptoschindler | 2022-02-20 12:38:04 UTC | #6
+
+what are capabilities?
+
+-------------------------
+
+cryptoschindler | 2022-02-20 12:42:59 UTC | #7
+
+when using this flow, can we restrict the delegation to certain methods on a canister or the amount of calls that can be made instead of an expiration? or can we sign a message directly?
+
+-------------------------
+
+nomeata | 2022-02-20 13:09:16 UTC | #8
+
+Yes! That’s precisely the last “killer argument benefit”. In my flow, the authentication happens in App2’s canister’s code (not in the replica code), so there is a lot of flexibility: Restrict to certain methods, even certain parameters of messages, etc.
+
+-------------------------
+
+paulyoung | 2022-02-20 16:55:16 UTC | #9
+
+[quote="cryptoschindler, post:6, topic:10925, full:true"]
+what are capabilities?
+[/quote]
+
+https://en.wikipedia.org/wiki/Capability-based_security
+
+-------------------------
+
+skilesare | 2022-02-20 21:01:34 UTC | #10
+
+This model breaks down where you have large files you are accessing that may be stripped across canisters and that are gated by context elsewhere...or imagine a content network that hosts images across thousands of canisters and your view of those assets depends on who you are.
+
+We can let those severs kmow some secret and append a sig to a url, but we'd likely need js to modify urls I'm real time. There are solutions, but it would be great if it "just worked". 
+
+As an aside we are looking at how to best route some kind of auth info into https requests coming from a page where assets may be on different canisters and I'm thinking we are going to have to do something with the icpx proxy and put everything behind one url with routing to get it to push the auth headers. I don't know enough about how http works tonknow if that would do it, but I'm crossing my fingers.
+
+Maybe a pattern like https://app.mydomain.com/canisterid/other_path_info.  But this seems like I'm breaking something.
+
+-------------------------
+
+bjoern | 2022-02-28 10:01:49 UTC | #11
+
+[quote="nomeata, post:5, topic:10925"]
+I guess they didn’t like to hear “just solve this in application land”?
+[/quote]
+
+That is indeed a suitable answer if you think about an architecture where the frontend dapp and the canister inherently belong together. It does not work if the "App2" frontend is using a backend canister that does not support this form of authorization. Examples for such backend canisters include the main ledger and governance canisters.
+
+There are some backend canisters that support (some type of) this functionality, such as [DIP20](https://github.com/Psychedelic/DIP20/blob/main/spec.md) or [DIP721](https://rustrepo.com/repo/Psychedelic-DIP721). The (voting) hotkey functionality on the governance canister could actually also be seen as this pattern.
+
+-------------------------
+
+nomeata | 2022-02-28 10:19:52 UTC | #12
+
+You have a point there, of course. 
+
+Which I could, snarkily, rephrase as “as a guideline, the system stays simple and minimal and does nothing that could be done in use land, unless it’s _our_ apps, then we’ll happily put stuff into the system so that we don't have to change the apps” :stuck_out_tongue:
+
+-------------------------
+
+bjoern | 2022-02-28 12:17:59 UTC | #13
+
+I don't think this issue only applies to "our" canisters on the NNS, but I do agree that query delegations are a clearly imperfect solution and going for those now may even slow down getting to a full solution of the issue.
+
+-------------------------
+

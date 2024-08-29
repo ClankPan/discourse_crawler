@@ -1,0 +1,205 @@
+tiago89 | 2023-02-10 01:18:54 UTC | #1
+
+Hi,
+
+Have recently joined an IC project that has 4 canisters, two of them NFT "handlers", and am overwhelmed by the size of main.mo. All of them already have +1000 lines.
+
+Because only actors can hold mutable data, I am struggling on decomposing such large files. In react we usually have "components", or in ruby we have "include". In Motoko I am aware of actor import and function sharing (but none seem to be what I need).
+
+A good base example is something as simple as "injecting" the types from types.mo into the actor, why do I need to repeat:
+// Types
+type AccountIdentifier = Types.AccountIdentifier;
+type TokenIndex = Types.TokenIndex;
+type CommonError = Types.CommonError;
+type Metadata = Types.Metadata;
+...
+
+The configs or even data structures, all should be in purpose-specific files, no need to pollute the beginning of main.mo.
+
+I am aware that not having a "namespace" could be problematic, but maybe the compiler can double-check and assert no duplication has happened. Or maybe the practice of prefix in the naming.
+
+Looking forward to know how other developers have solved this problem, or any recommendation from Motoko Team.
+
+Thanks,
+Tiago
+
+-------------------------
+
+paulyoung | 2023-02-10 06:17:10 UTC | #2
+
+Without seeing the code you’re working with it’s hard to give advice, but I think you should be able to break up a large file into smaller modules and then `import` them.
+
+It seems like you may already be importing a `Types` module based on what you wrote here:
+
+[quote="tiago89, post:1, topic:18437"]
+why do I need to repeat:
+// Types
+type AccountIdentifier = Types.AccountIdentifier;
+type TokenIndex = Types.TokenIndex;
+type CommonError = Types.CommonError;
+type Metadata = Types.Metadata;
+[/quote]
+
+You don’t need to do that; you can use the qualified versions (`Types.AccountIdentifier`, etc) everywhere instead.
+
+Examples of importing modules and using qualified types can be seen here: https://github.com/paulyoung/motoko-type-classes/blob/main/Main.mo
+
+-------------------------
+
+tiago89 | 2023-02-10 08:46:00 UTC | #3
+
+Thanks Paul,
+
+Ok, I admit my base example was actually a bit dumb :sweat_smile:. Also have seen the use of shorting to keep it less impactful, like E.AccountIdentifier, etc. I might go with the Types.AccountIdentifier everywhere as I tend to prefer being explicit over being short.
+
+But still, not sure I would not have preferred an Include :slight_smile: 
+
+Ok, if you allow me, I will rephrase my question with a more advanced case.
+
+The main.mo has the big majority of it's code in "writing" to vars and calling "other canisters". We can "decompose" some public functions into private functions, but they are still in the same file, it's still big (+1000 lines long).
+
+Whenever using a function from a library, it will pass the variable by copy right? Let's imagine it's a stable var, it can't be passed by reference (and mutated in the library/module), right?
+
+Also it's not possible to pass the "whole" self, to a module right?
+I tried something like:
+```
+actor class SomeCoolActor() = this {
+    // call a library function and just pass "this"
+```
+But haven't figured out what Type would be and if it's at all possible.
+
+Pretty much, as complexity increases (but still within the same domain of the service), want to extract code to other files, so that a developer can go directly to the right file to change and not have to read the whole thing or scrolling all the time.
+
+Would much appreciate any solution that would solve this :pray: Thanks for your time.
+
+-------------------------
+
+rossberg | 2023-02-10 13:12:57 UTC | #4
+
+[quote="tiago89, post:3, topic:18437"]
+E.AccountIdentifier, etc. I might go with the Types.AccountIdentifier everywhere as I tend to prefer being explicit over being short.
+[/quote]
+
+I would point out here that `AccountIdentifier` via include would be even less explicit than `E.AccountIdentifier`. ;)
+
+[quote="tiago89, post:3, topic:18437"]
+Whenever using a function from a library, it will pass the variable by copy right?
+[/quote]
+
+As an aside, it is not variables that are passed, but _values_. And heap-allocated values are never copied implicitly when merely passing them around or assigning them to a variable or field. Everything is by reference. So don't fear the cost of passing stuff around.
+
+Copying (serialisation) only happens when calling shared functions, i.e., actor methods, because then the data is leaving the canister.
+
+[quote="tiago89, post:3, topic:18437"]
+Also it’s not possible to pass the “whole” self, to a module right?
+[/quote]
+
+It is, unless you try to use `this` outside any method (the self variable is not yet accessible when the main actor body runs). However, another module will of course not have private access to the actor.
+
+In general, it should be possible to factor everything out into separate modules that does not access any of the actor's variables or private methods.
+
+-------------------------
+
+icaten | 2023-02-11 04:41:40 UTC | #5
+
+Like the * import operator from Javascript could be useful (only importing only public declared fields). 
+
+Note that this much an improvement, but I've found redeclaring a submodule's public methods as the methods of a public "record literal" after that submodule (so in the outer enclosing module) makes for a simple way to easily compartmentalize namespacing. Eg:
+
+
+```
+// ./ModuleFile.mo
+module ModuleFile { // this outermost module name is not necessary 
+
+  module ContainingModule {
+    module FunctionalGroup {
+      public func foo(t : Text) : Text { t #t };
+      public func bar(n : Nat) : Nat { n + 1 };
+    };
+    public let lib = {
+      foo = FunctionalGroup.foo;
+      bar = FunctionalGroup.bar;
+    };
+  };
+  module ContainingModule2 {
+    module FunctionalGroup {
+      public func foo(t : Text) : Text { t #t };
+      public func bar(n : Nat) : Nat { n + 1 };
+    };
+    public let lib = {
+      foo = FunctionalGroup.foo;
+      bar = FunctionalGroup.bar;
+    };
+  };
+
+  // If used within this module...
+  let { lib = libAlpha } = ContainingModule;
+  let { lib = libBeta } = ContainingModule2;
+
+  // If used outside this module can redeclare here to make visible:
+  public let { lib = AlphaLib } = ContainingModule;
+  // and then import it elsewhere like import { AlphaLib } "./ModuleFile.mo"
+};
+```
+
+Plus if the underlying implementation need's changing it's easy to do without breaking everything.
+
+-------------------------
+
+tiago89 | 2023-02-11 08:38:12 UTC | #6
+
+Thanks rossberg!
+
+I did not think we could pass (or be efficient) to pass out stable memory variable to a module function, but it is! I've passed and tested it, and works.
+
+Now I can "factor" each canister route/function to a separate (and testable) module file, like this:
+
+```
+import CreateDaoService "./services/createDaoService"
+
+public shared ({ caller }) func createDao(codename : Text, ledgerCanister : Text, description : Text) : async Result.Result<Text, Text> {
+        let result = CreateDaoService.call(daos, codename, ledgerCanister, description, caller);
+
+        return #ok("DAO created with success");
+    };
+```
+
+Now this is scalable, maintainable and above all, testable! :sweat_smile: 
+
+Thank you so much! :slight_smile:
+
+-------------------------
+
+rossberg | 2023-02-11 09:07:56 UTC | #7
+
+@icaten, I think your code is overcomplicating things a lot. First, note that modules are already values, e.g. you can e.g. directly do
+```
+  module A {
+    public func f() {};
+    public func g() {};
+  };
+
+  // elsewhere
+  let {f, g} = A;
+```
+So your auxiliary `lib` declarations are completely unnecessary. Furthermore, nested modules can be public or private so you can use them directly. With all that, you can drastically simplify your code to just
+```
+// ./ModuleFile.mo
+module ModuleFile {
+
+  public module AlphaLib {
+    public func foo(t : Text) : Text { t #t };
+    public func bar(n : Nat) : Nat { n + 1 };
+  };
+  private module BetaLib {
+    public func foo(t : Text) : Text { t #t };
+    public func bar(n : Nat) : Nat { n + 1 };
+  };
+
+  // and then import it elsewhere like  import { AlphaLib } "./ModuleFile.mo"
+  // and then perhaps  let {foo, bar} = AlphaLib
+};
+```
+
+-------------------------
+

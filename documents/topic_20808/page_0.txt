@@ -1,0 +1,113 @@
+harshbaz | 2023-06-19 04:01:22 UTC | #1
+
+I'm testing a frontend deployment using the `sns-testing` repository. I've replaced the test asset canister with a simple webapp build output to test the deployment.
+
+Here are the steps I've taken:
+1. `./setup_locally.sh`
+2. Update assets entry in `dfx.json`:
+```
+ "assets": {
+      "frontend": {
+        "entrypoint": "./frontend/build/index.html"
+      },
+      "source": [
+        "./frontend/build"
+      ],
+      "type": "assets"
+    },
+```
+3. Run `./deploy_assets.sh` to deploy assets canister
+4. Run `./deploy_sns.sh sns-test.yml`
+5. Run `./prepare_assets.sh`
+6. Register asset canister: `./register_dapp.sh bnz7o-iuaaa-aaaaa-qaaaa-cai`
+7. Update permissions `./register_permission_assets.sh`
+8. Open sns sale using `./open_sns_swap.sh`
+9. Vote using NNS frontend dapp locally.
+10. And at last finalize the sale by running: `./finalize_sns_swap.sh`
+
+After all these steps the neurons get distributed and the sns swap becomes successfull. But I'm not then able to update the canister. Running the deploy assets script again deploys the canister. How do I update the frontend canister via a SNS proposal?
+
+-------------------------
+
+Severin | 2023-06-19 07:39:53 UTC | #2
+
+You can find detailed instructions and ready-to-use scripts [here](https://github.com/dfinity/sns-testing#asset-canister). Happy to answer questions if you run into problems :slightly_smiling_face:
+
+-------------------------
+
+harshbaz | 2023-06-19 08:02:42 UTC | #3
+
+The example used for asset canister in the repo uses a wasm and not individual assets which cause a little confusion.
+
+---
+
+The only part related to updating asset canister is point 6. I've tried using the `./commit_assets.sh` script, but did not find a way to create a SNS proposal out of the update.
+
+For eg, I update the `index.html` file,
+In that case I would run `./commit_assets.sh index.html ./frontend/build/index.html` to commit the updated asset. What is the next step here.
+
+Also, what if I have multiple files that have changed and I want to commit the changed files in the build folder. How would I do that?
+
+-------------------------
+
+Severin | 2023-06-19 09:13:02 UTC | #4
+
+Steps 4 and 5 are required, and I found some more WIP documentation on the next steps. Copy/pasting it here for reference:
+
+## New SNS GenericNervousSystemFunctions
+
+1. Submit a new `AddGenericNervouSystemFunction` SNS Proposal to support the `commit_proposed_batch` API. The target canister id should be the asset canister (that is upgraded in Upgrade Steps) and the target function is `commit_proposed_batch`. The validate function should be `validate_commit_proposed_batch`.
+2. Submit an `ExecuteNervousSystemFunction` SNS Proposal with the output from `dfx deploy <frontend canister name> --network ic --by-proposal`. (see Upgrade Steps)
+
+## Upgrade Steps
+
+1. Upgrade the asset canister (by proposal, as with any other canister) to the asset canister wasm bundled with dfx 0.14.1, available here: https://github.com/dfinity/sdk/blob/release-0.14.1/src/distributed/assetstorage.wasm.gz
+2. After upgrading the asset canister by proposal, have someone with Prepare permission run `dfx deploy <frontend canister name> --network ic --by-proposal`. The output will contain something like this:
+```
+Proposed commit of batch 2 with evidence e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855. Either commit it by proposal, or delete it.
+```
+3. Save the batch number and the evidence value for use with the asset canister API.
+4. To ensure that others would be able to verify the evidence in the proposal, have someone else clone the dapp repo and run `dfx deploy <frontend canister name> --network ic --compute-evidence`. The computed evidence should match the evidence from step (2).
+5. Submit a new proposal to commit the batch, using the ‘New Canister APIs’ above.
+
+-------------------------
+
+Mitch | 2023-07-21 02:42:27 UTC | #5
+
+I'm having trouble with the formatting of the commit_proposed_batch command, I gave myself prepare permissions to trouble shoot. Rather than calling the proposal, I'm just trying to get the command formatted correctly:
+
+First I encode the evidence:
+`
+didc encode '("255e5e9d4e2e4b29d336c7a975a03158a48986efa3d25f58dc17840d888e06ef")'  --format blob  
+`
+
+Next I call the command with the resulting blob:
+
+`dfx canister call <assets_canister> commit_proposed_batch '(record {batch_id=2:nat; evidence=blob "DIDL\00\01q@255e5e9d4e2e4b29d336c7a975a03158a48986efa3d25f58dc17840d888e06ef"})'`
+
+
+Then the call is rejected:
+`
+ The replica returned a replica error: Replica Error: reject code CanisterError, reject message Canister avqkn-guaaa-aaaaa-qaaea-cai trapped explicitly: batch computed evidence 255e5e9d4e2e4b29d336c7a975a03158a48986efa3d25f58dc17840d888e06ef does not match presented evidence 4449444c0001714032353565356539643465326534623239643333366337613937356130333135386134383938366566613364323566353864633137383430643838386530366566, error code None
+`
+
+-------------------------
+
+Severin | 2023-07-21 08:08:25 UTC | #6
+
+`compute_evidence` produces bytes. It looks like you then converted these bytes to a hex string. Then you take the hex string and pack it into a candid message. Last, you send the candid message blob in a candid message to the canister, as evidenced by the canister saying `presented evidence 4449444c0001<...>`, which you can recognise because `4449444c0001` is the beginning of a candid-encoded message (that's just something 'one knows' :slightly_smiling_face:)
+
+What you are supposed to do is to use the blob produced by `compute_evidence` directly as the `evidence` blob in `commit_proposed_batch` without converting it to a string so that the hex-encoded evidence (`255e5e9<...>`) is also what `commit_proposed_batch` would produce if it were to hex-encode the `evidence`
+
+-------------------------
+
+Mitch | 2023-07-21 17:28:15 UTC | #7
+
+Great, that helped me through..
+
+Maybe its an obvious point or there is another way to format the arg, but to get the blob from the evidence, it was just a matter of adding \\'s :
+`evidence = 255e5e9d4e2e4b29d336c7a975a03158a48986efa3d25f58dc17840d888e06ef`
+` blob = blob "\25\5e\5e\9d\4e\2e\4b\29\d3\36\c7\a9\75\a0\31\58\a4\89\86\ef\a3\d2\5f\58\dc\17\84\0d\88\8e\06\ef"`
+
+-------------------------
+

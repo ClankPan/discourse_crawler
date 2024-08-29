@@ -1,0 +1,168 @@
+infu | 2024-02-06 14:24:23 UTC | #1
+
+This might take a while to agree upon and implement, but let's start the discussion.
+
+**Motivation:**
+The goal is to establish uniform interfaces for accessing DEX exchange history. This standardization will facilitate third-party developers in creating applications and canisters for decentralized finance (DeFi) purposes. This will help the IC DeFi ecosystem to grow and increase its networking effect.
+
+Working group repo: https://github.com/Neutrinomic/wg_defi
+
+**Let's examine the current situation first**
+
+The following information about other DEXes is based on our research and there may be other canister methods that we don't know about. There are minor problems and we've put notes for each DEX. But the notes are mostly there to help us make a better standard.
+
+---
+
+**ICDex history**
+
+https://jglts-daaaa-aaaai-qnpma-cai.ic0.app/660.c39f97c630e76e3462961c75d4f624d1344e642eaf4f5d8cd0c96145
+Note: Traversing is not possible at scale. One call returns the whole log
+![image|237x500](upload://etfadaOdG8VlWd9vhQPGevO9eQ9.png)
+
+--- 
+**ICPSwap history**
+
+
+https://jglts-daaaa-aaaai-qnpma-cai.ic0.app/659.0759c1baa11580355f2c8f6a390f2c37f6df2aa02e0ead988fa2ced7
+
+Note: Hard to traverse. Transactions are in descending order and the requested window shifts when new transactions are added.
+![image|478x500](upload://ycmvLtqGBSK2E1cOGc0XwDrNJyC.png)
+
+---
+
+**Sonic history (CAP)**
+
+https://jglts-daaaa-aaaai-qnpma-cai.ic0.app/662.143b67a08487960e7f0a101bf2ad8d72a3ef09058bf694e76b9ec110
+Note: Amounts are sometimes given in #Text and sometimes in #U64
+![image|298x500](upload://z7Wjabq6HgSejMubkvcjXlwqZ6F.png)
+
+---
+
+**Conclusions** 
+
+These are 3 different DEX types, Order book, AMM, AMM with ranges (Concentrated Liquidity AMMs)
+The commonality here is that we always exchange one token for another. To cover future cases, we should also be able to exchange many for many tokens.
+
+These tokens can come from another order/user (ICDEX) or a pool. 
+To cover future cases, for each token there is a from address and to address. These addresses can be in different blockchain - locations. 
+
+Something like this could work to cover all cases:
+```
+type LocationId = Text; // Could also be a Nat
+// Example:
+// IC-legacy : old icp addresses
+// IC : icrc1.Account
+// IC inscription: ...
+// Ethereum: ...
+// Bitcoin: ...
+
+type LocationAddress = Blob;
+type Address = (LocationId, LocationAddress)
+
+type TokenLocationAddress = Blob;
+type TokenAddress = (LocationId, TokenLocationAddress)
+
+type Amount = Nat;
+type Token = (TokenAddress, Amount)  // Could also work for NFTs
+
+type Transfer = {
+   from: Account; // a pool or client address
+   to: Account;
+   token: Token
+};
+
+type Exchange = {
+  transfers: [Transfer]; // one or many
+  timestamp: Timestamp;
+  hash: Blob;
+  }
+
+// Similar to Archive canister get_transactions. 
+// Each exchange has index:Nat and indexes increase in sequential order.
+// Returned results are in ascending order
+icrc_40_get_exchanges : (record { start : nat; length : nat }) -> (record { exchanges : vec Exchange }) query;
+
+```
+
+You may notice the data provided by DEXes right now has a lot more info. Things like ticks, orders, liquidity changes, USD values, etc. All these are application-specific and can't really be a part of this standard. Additionally, they are mostly unusable if the 3rd party doesn't have the exact DEX algorithm. These algorithms also change and trying to replicate the state may be impossible. An infinite number of DEX algorithms will exist and each will have its own important tx fields.
+ 
+For DeFi 
+- the additional data could be useful for finding the market depth. But that will only work if someone manages to reduce the logs and replicate DEX algorithms and there are no errors and missing entries. There is another way to do that <https://forum.dfinity.org/t/icrc-38-live-dex-data/26417>
+- retrieving the Volume and Prices at any given moment can be done **without** the additional data.
+
+These app-specific fields are useful for the app - for forensics and to prove that something happened, but we are trying to create an interface useful for other DeFi apps that want to work with all DEXes. Perhaps each pool should have more than one log each with its own purpose. 
+
+What we have written so far will be compatible with current DEXes. We can have one token exchanged for another. 
+```motoko
+//Example swap ICP for ckBTC
+{ 
+transfers = [
+  {
+  from = ("IC", {owner="aaaaa-aa", subaccount=null}:blob);
+  to = ("IC, {owner="aaaaa-aa", subaccount=null}:blob);
+  token=(("IC", "ryjl3-tyaaa-aaaaa-aaaba-cai":blob), 1_0000_000);
+  },
+  {
+  from = ("IC", {owner="aaaaa-aa", subaccount=null}:blob);
+  to = ("IC, {owner="aaaaa-aa", subaccount=null}:blob);
+  token=(("IC", "mxzaz-hqaaa-aaaar-qaada-cai":blob), 30_000);
+  }
+]
+timestamp = 17321263812
+hash = d9d9f7a3647472656583018301830183024863616e6973746572
+}
+```
+When someone purchases from multiple small orders on ICDex they can place these as multiple Transfers inside one Exchange. 
+
+We can also cover more complicated scenarios where three or more different parties exchange A -> B | B -> C | C -> A  across multiple blockchains. All are facilitated by a DEX on the IC using chain-key crypto. 
+ ```motoko
+{ 
+transfers = [
+  {
+  from = ("IC", {owner="aaaaa-aa", subaccount=null}:blob);
+  to = ("IC, {owner="aaaaa-aa", subaccount=null}:blob);
+  token=(("IC", "ryjl3-tyaaa-aaaaa-aaaba-cai"), 1_0000_000);
+  },
+  {
+  from = ("Ethereum",  d9d9f7a3647472656583018301830 );
+  to = ("Ethereum, faf9f7a3647472656583018301830);
+  token=(("Ethereum, 3ff9f7a36474726565830183), 4_0000_000);
+  },
+  {
+  from = ("Bitcoin",  d9d9f7a3647472656583018301830 );
+  to = ("Bitcoin, faf9f7a3647472656583018301830);
+  token=(("Bitcoin, 3ff9f7a36474726565830183), 22_0000_000);
+  }
+]
+timestamp = 17321263812
+hash = d9d9f7a3647472656583018301830183024863616e6973746572
+}
+```
+
+Please let us know what you think. Everyone is welcome to join the effort.
+
+-------------------------
+
+infu | 2024-01-11 17:48:22 UTC | #2
+
+In AMMs and other DeFi contracts like Liquity. There are also transfers which aren't direct swaps. Someone could add liquidity to an AMM range and, once the price moves up, take it out, which could mean they have exchanged their tokens A for B. In order to add them to the log above, we could see it as the client sending token A to the pool and getting an NFT or a virtual ID in return. Later, when they remove liquidity, the transfer will be from the pool with the virtual ID to a destination address. 
+
+```
+transfers = [
+  {
+  from = ("IC", [alice]);
+  to = ("IC", [pool address]);
+  token=(("IC", "ryjl3-tyaaa-aaaaa-aaaba-cai":blob), 1_0000_000);
+  },
+  {
+  from = ("ICPSwap", [pool address]);
+  to = ("ICPSwap", [alice]);
+  token=(("ICPSwap", 'LP-participation-id-12312312'), 1);
+  }
+]
+```
+
+Another case: If someone makes orders in an order book DEX and tokens move between accounts they own, but nothing changes ownership, perhaps there should be no transfers for that in the log, even though there were many transactions.
+
+-------------------------
+

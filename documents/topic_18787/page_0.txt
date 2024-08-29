@@ -1,0 +1,48 @@
+JackLloyd | 2023-03-02 18:11:53 UTC | #1
+
+At DFINITY we recently have completed an effort to improve the security of the Internet Computer against side channel attacks. This post is an update of that project's results as the issues have now been completely addressed.
+
+I'd be happy to answer any questions you may have about the post or the work described.
+
+1. ## Background: Side Channels
+
+Side channels are a way of attacking cryptographic systems that does not require breaking the underlying cryptographic algorithms, but instead work by detecting information about secret data due to the fact the abstract computation is in the end executed on a physical computer. The two biggest side channels facing a software platform are timing and cache based side channels.
+
+Timing side channels arise when a piece of software performs conditional branches where the conditional depends in some way on secret information. By measuring the variability in how long an algorithm takes to execute, an attacker can make inferences about the secret key.
+
+Cache based side channels are even more powerful, but somewhat trickier to explain. The key insight is that when a process accesses memory in its address space, the CPU will bring that cache line into the local CPU cache, and this process may cause memory owned by another process to be evicted from the cache. An attacker can leverage this situation by allocating memory within its own process, and then repeatedly attempting to access its memory, timing how long each access takes. If the access is slow, then it knows that this cache line was evicted, and this allows it to make inferences about the cache lines that were or were not accessed by another piece of software running on the same processor.
+
+Typically these attacks are mounted by running software which is coresident on the processor with the cryptographic software being attacked. As a core purpose of the Internet Computer is to be able to execute arbitrary code on the replica (in the form of canisters), it is possible for someone to attempt such an attack. If the attacker were successful they might be able to recover a replica’s secret keys. Preventing attacks of this kind is a multilayered approach. Within the canister execution environment itself we have taken several countermeasures which increase the difficulty for the attacker, including [canister sandboxing](https://forum.dfinity.org/t/security-sandboxing/7438/3?u=andrea).
+
+A strong defense against these attacks calls for writing cryptographic code such that neither the execution flow nor the sequence of memory accesses depend in any way on secret information. This is often termed writing “constant time” code, but in fact variability in execution time is perfectly acceptable as long as that variability is not correlated with secret key material.
+
+2. ## Findings & actions from auditing the code
+
+Shortly after joining DFINITY I audited our codebase for possible side channel issues, with a particular eye towards attacks that could be executed by a malicious canister attacking the replica. The vast majority of the libraries we use and the code we wrote were already immune to known side channel attacks. However there were two major findings, both affecting the Non-Interactive Distributed Key Generation (NIDKG) which is a key algorithm of the consensus mechanism of the IC:
+
+1. A certain library we were using for various mathematical operations in the NIDKG had a large number of side channels. We responsibly disclosed the issues we found to the upstream library, who resolved them in good time. However further analysis concluded that it was likely that due to the basic design of the library, it would not be possible for all side channels to be resolved. As a result, we have rewritten a large portion of the NIDKG to use another library which has a firmer foundation with regards to side channels.
+
+2. A key element of the NIDKG relied on an algorithm called Baby-Step Giant-Step (BSGS) to recover discrete logarithms. This is used each time a node in the subnet decrypts a transcript, which allows them to continue to participate in the subnet. This algorithm seems to be very difficult to implement in a way that is immune to side channels. Fortunately we have been able to devise an alternative approach which can be implemented without risk of side channels. In the specific context of NIDKG, the discrete logarithms are always small, but also critical secrets (portions of the nodes threshold signature key share). It proved possible to implement the discrete logarithm search instead using a precomputed table and a linear search. Happily this is both immune to side channels and with a bit of tweaking proved to be even faster than BSGS.
+
+3. ## Opportunities Created: Optimizations
+
+In general, a side-channel protected implementation of any specific algorithm will be slower than an algorithm which is not so protected. Additionally, the NIDKG was already one of the computationally costly operations performed by the IC. Fortunately, in the course of rewriting the NIDKG to avoid side channels, we discovered additional opportunities for optimization by using better algorithms for various mathematical operations that the NIDKG needs. Our internal benchmarks show that the various critical NIDKG operations have improved, reducing the cost of various operations to just 22% to 42% of the previous costs. So as a result of this work, we have improved both the security and performance of the NIDKG.
+
+Here are some graphs from our internal benchmark system demonstrating speedups over time as the work progressed. For context on what these operations mean, during each NIDKG “round”, a dealing is created for each node in the subnet (green graph). Each node verifies all of the dealings (blue) so created, and subsequently the verified dealings are combined (orange) to form a transcript. Finally each node loads the transcript (red), which ratchets the threshold BLS signature key forward.
+
+Creating Dealings:
+![create_initial_dealing|690x238](upload://biyllY7FEohj7qVqUYh2IcBDEty.png)
+
+Verifying Dealings:
+![verify_dealing|690x236](upload://mUQH3wcOS6SVcDjpOjYJscmcp1L.png)
+
+Creating A Transcript:
+![create_transcript|690x238, 100%](upload://93o6oieL4VdwcLurFVeaMoaDGr.png)
+
+Loading Transcript:
+![load_transcript|690x237](upload://vrrJMjVeXfgc0gXA8HvIy1G7dYj.png)
+
+Thanks for reading!
+
+-------------------------
+

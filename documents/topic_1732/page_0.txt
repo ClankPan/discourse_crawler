@@ -1,0 +1,258 @@
+mymikemiller | 2021-01-07 07:30:13 UTC | #1
+
+I can import one canister's Actor class into another canister, but it seems I can't call any of that imported Actor's functions from my Actor's functions, even if they're query functions themselves. Shouldn't I be allowed to call query functions from other query functions, even if they live in different Actors?
+
+I see in [the docs](https://sdk.dfinity.org/docs/language-guide/actors-async.html) that "It is a compile-time error for a query method to call an actor function since this would violate dynamic restrictions imposed by the Internet Computer. Calls to ordinary functions are permitted."
+
+I understand why I can't call a normal Actor function from a Query function, as that normal function might modify state and that's not allowed from a query function. But shouldn't I be able to safely call into other Actors' *query* functions, since those also can't modify state?
+
+Here's an example that I think should work just fine:
+
+src/database/main.mo:
+```
+actor {
+    public query func query_something() : async Text {
+        return "Something";
+    };
+};
+```
+
+src/app/main.mo:
+```
+import Database "canister:database";
+
+actor {
+    public query func get_data() : async Text {
+        return Database.query_something();
+    }
+};
+```
+
+The build error I get says `type error, send capability required, but not available (need an enclosing async expression or function body)`
+
+I'm not sure what "send capability" means. I tried adding `await` to the `Database.query_something()` call (the line producing the above error), but that just results in `type error, misplaced await`.
+
+I'm at a loss. I have an Actor that I'm using as a sort of database and I would like to be able to quickly (and non-trustworthily) pull data out of it into another Actor for processing and, eventually, display.
+
+-------------------------
+
+enzo | 2021-01-07 13:13:35 UTC | #3
+
+One would think, however, and as far as I understand, there is no guarantee that the other canister exists on the same subnet, and specifically if it doesn't, then the subsequent query would need to go through XNet transfer.
+
+For now, your simplest solution would be to remove the `query` declaration from `get_data`. Though that would have performance implications, and so perhaps its best to query the database directory and avoid a reexport all together.
+
+-------------------------
+
+mymikemiller | 2021-01-07 20:48:42 UTC | #4
+
+@enzo what do you mean by “query the database directory”? My “database” is just local data structures living on the Internet Computer, like if the src/database/main.mo actor contained a hash map member variable, for instance. Query functions are how I’m supposed to get data out of canisters when edits aren’t necessary, right? 
+
+If “there is no guarantee that the other canister exists on the same subnet”, wouldn’t that mean that no canister could ever reliably import any other canister? And isn’t that supposed to be one of the main features of the IC?
+
+I’m not sure what “XNet transfer” means, and Googling that phrase isn’t proving very fruitful.
+
+-------------------------
+
+enzo | 2021-01-08 16:29:39 UTC | #5
+
+[quote="mymikemiller, post:4, topic:1732"]
+what do you mean by “query the database directly”?
+[/quote]
+By database, I mean the  `Database` actor that you defined in your code. Yes, the IC is orthogonality persistent and databases don't really exist in the traditional scene.
+[quote="mymikemiller, post:4, topic:1732"]
+Query functions are how I’m supposed to get data out of canisters when edits aren’t necessary, right?
+[/quote]
+Yes, query functions allow you retrieve data from a canister while discarding any modified state.
+[quote="mymikemiller, post:4, topic:1732"]
+If “there is no guarantee that the other canister exists on the same subnet”, wouldn’t that mean that no canister could ever reliably import any other canister?
+[/quote]
+No, messaging can still be reliable across subnets. This is one of the key features of the platform. The component within the replica that facilitates communication across subnets is called XNet Transfer. The design and implementation details for this component are some what complex and perhaps a topic for a new thread.
+
+-------------------------
+
+mymikemiller | 2021-01-08 07:34:29 UTC | #6
+
+What's the problem with XNet Transfer, then? Shouldn't that work for my needs? Why wouldn't that work for the query calls I'm trying to make? Because it would be slower due to having to transfer across the internet when it can't all be done on one server? I'm ok with that. It would still be faster than upgrading everything to non-query calls, right?
+
+Still a little confused by your "database directory" solution. What "directory" are you taking about? The source code directory where my actor code lives? Some directory on a server running my canister? Or do you mean something other than a "folder"?
+
+I'm also a little confused by your use of the word "reexport". What am I currently exporting twice that could be avoided by querying some folder somewhere? (er, directory... yeah, still confused by that one)
+
+-------------------------
+
+enzo | 2021-01-08 16:27:58 UTC | #7
+
+Oh sorry! That's a typo. I meant, *query the database directly!*
+
+-------------------------
+
+enzo | 2021-01-08 18:57:18 UTC | #8
+
+[quote="mymikemiller, post:6, topic:1732"]
+What’s the problem with XNet Transfer then?
+[/quote]
+Will have to get back to you on the specifics, but my strong suspicion here is that the implementation is not optimized. My guess would be that they don't do any message introspection to distinguish between updates and queries (since every query can be run as an update), and that manifesting itself in this limitation. I will mention this to their PM and see what the turnaround time could be for a fix. Thanks for raising this.
+
+-------------------------
+
+anthonymq | 2021-03-19 16:21:22 UTC | #9
+
+Any news on this problem ?
+
+-------------------------
+
+mymikemiller | 2021-03-19 19:36:07 UTC | #10
+
+I solved this for my immediate needs by combining all my canisters into one so everything could communicate via fast query calls. Not ideal, obviously. 
+
+Hopefully someone here has some info on when canisters will be able to communicate with each other without all the calls needing to be update calls.
+
+-------------------------
+
+anthonymq | 2021-03-19 20:52:15 UTC | #11
+
+That's what I did too. Hope there will be a proper solution.
+
+-------------------------
+
+claudio | 2021-03-19 23:15:28 UTC | #12
+
+For Motoko, the rules can be summarized like this
+
+* A user/frontend can call:
+   * a `shared` function (with consensus and state change),
+   * a `shared query` function (without consensus or state change).
+* A class constructor can call:
+   * any local function.
+* A shared function (or async expression) can call:
+   * any local function, and
+   * any `shared` function (with consensus and state change), and
+   * any `shared query` function (with consensus but no state change),
+   * and `await` the results of `shared` (`shared query`) functions. 
+* A `shared query` function can call:
+   * any local function.
+   * it cannot call any `shared` or `shared query` functions, nor `await` their results.
+
+These rules are enforced dynamically on the platform (causing runtime traps when violated) but are checked statically in Motoko, to prevent traps.
+
+On the  platform, there is ongoing work to allow shared query functions to call other shared query functions, but we probably won't expose that in Motoko until the implementation is done and, ideally, free of strange restrictions.
+
+-------------------------
+
+anthonymq | 2021-03-20 09:50:19 UTC | #13
+
+Thanks for the quick reminder 😉
+
+-------------------------
+
+skilesare | 2021-06-18 18:06:31 UTC | #14
+
+@claudio , @rossberg  
+
+So it looks like I can't pass an actor into a class and have that class call my actor?  How do we build reusable libraries if our classes can't call actors and actors have to be their own canisters?  I feel like I may be missing something here.
+
+From what you are saying, it looks like the below is impossible?  The class TestClass can't call the passed in actor's function because it itself isn't async and there is no way to declare an async function as an actor.
+
+```
+public type RemoteActor = actor {
+    process : () -> async Nat;
+};
+
+
+public class TestClass(_extensibleActor : RemoteActor){
+
+  //I'm passing by ref here but could have passed in a Principal and done actor.fromPrincipal as well
+  let myRemoteActor : RemoteActor = _extensibleActor; 
+
+  public func process() : Nat {
+    let result = await myRemoteActor.proceess();
+    return result
+  }
+
+
+};
+
+actor remoteActor {
+
+  public shared func process() : async Nat {
+    return 42;
+  }
+};
+
+//obviously this would have a constructor if it were an actor class
+actor processor{
+  let testClass = TestClass(remoteActor);
+
+  public shared func process(_request : PipelinifyTypes.ProcessRequest) : async Result<PipelinifyTypes.ProcessResponse, PipelinifyTypes.ProcessError> {
+    let aResult = testClass.process();
+    return aResult;
+  }
+};
+```
+
+-------------------------
+
+rossberg | 2021-06-18 18:44:30 UTC | #15
+
+You can only use `await` inside an async block or function. So the fix should be to make the class'es process method async, like:
+```
+public func process() : async Nat { ...
+```
+
+> there is no way to declare an async function as an actor.
+
+I'm not sure what you mean by that.
+
+-------------------------
+
+skilesare | 2021-06-18 21:59:35 UTC | #16
+
+I apologise. It was the runtime that doesn't support async or actors that was causing problems. I got an async function working in my class.
+
+-------------------------
+
+rgovindji | 2021-08-01 22:15:03 UTC | #17
+
+* A `shared query` function can call:
+  * any local function.
+  *** it cannot call any `shared` or `shared query` functions, nor `await` their results.**
+
+I'm running into this issue as well. Is there a timeframe when this functionality will be available?  
+
+I was considering sharding my state across multiple canister to bypass the 4GB limit but if shared query's can't call other shared query's do I have to change everything to regular shared functions? This sounds like it would be a huge performance impact on reads.
+
+-------------------------
+
+rossberg | 2021-08-02 06:01:28 UTC | #18
+
+@rgovindji, unfortunately, the lack of query-to-query calls is a current limitation of the IC itself, not just Motoko. They're planned, but difficult, and I don't know if there is a timeline.
+
+-------------------------
+
+claudio | 2021-08-02 08:39:42 UTC | #19
+
+See here for a possible workaround in front-end applications. 
+
+https://forum.dfinity.org/t/mini-bigmap-library/5794/8?u=claudio
+
+-------------------------
+
+Dustin | 2022-01-12 10:34:13 UTC | #20
+
+Is there any update on this; are query-to-query calls possible in the meantime?
+
+-------------------------
+
+mymikemiller | 2022-06-27 22:51:55 UTC | #21
+
+Bump. I'd love to get an update from this from someone at DFINITY since it's been a while. Are there plans to work on this? This has gotten in the way of properly architecting every project I've tried to build since I have to put most things into a single canister so they can quickly communicate with query calls to each other.
+
+-------------------------
+
+rossberg | 2022-06-28 12:24:58 UTC | #22
+
+There is a long and in-depth discussion of the technical problems with such a feature in [this thread](https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/22). See especially @ulan's excellent explanations.
+
+-------------------------
+

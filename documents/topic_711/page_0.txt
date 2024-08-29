@@ -1,0 +1,145 @@
+senior.joinu | 2020-05-28 19:53:51 UTC | #1
+
+Can you please help me to understand a couple of things?
+
+`candid/IDL.md`  section Serialisation -> Types says:
+
+> We assume that the fields in a record or function type are sorted by increasing id and the methods in a service are sorted by name.
+
+What is "sorted by increasing id" in these terms? Sorted in an order they appear in source  `.did`  file?
+
+How exactly does the type definition table works (one which assigns uint to a type)?
+Is this correct that expressions of kind  `type Example = opt record { nat; nat; }`  (in other words - type definition expressions) are added to the type definition table? And every other appearance of type "Example" (when used as datatype id) should be serialized as the index of "Example" in the type definition table?
+Is this correct that the type in expression like
+
+```
+service A {
+  foo : (vec opt text) -> () oneway;
+             ^------^ this complete type
+}
+```
+
+is also added to the type definition table if it didn't appear earlier? Even if there was no expression like  `type OptText = opt text;`  met before.
+
+After parse of a  `.did`  file one can end up having a "complete" type definition table - which contains every type that appear in a file. Should she use this type definition table when serializing a method call or she should somehow filter this table so it would contain only types that are really needed for the serialization of this method call? Is the order of types in the type definition table matters? How does one assert the correct order?
+
+-------------------------
+
+chenyan | 2020-05-28 21:37:00 UTC | #2
+
+> What is “sorted by increasing id” in these terms?
+
+Symbolic field names are hashed into an id. Refer to https://github.com/dfinity/candid/blob/master/IDL.md#shorthand-symbolic-field-ids.
+
+> How exactly does the type definition table works
+
+Your examples are all correct. All constructor types are added into the type table. See rule `T : <constype> -> i8*`, which all end up with `I(<datatype>)`. The motivation for having a type table is to transferring of recursive types.
+
+> After parse of a  `.did`  file one can end up having a “complete” type definition table - which contains every type that appear in a file.
+
+The binary format is used for sending/receiving messages (function parameters and return values). The type table contains the types needed in the message, not from the `.did` file. The spec doesn't enforce an ordering or a minimal representation of the type table, as long as the index is referred properly. Therefore, there can be multiple ways to encode a single message.
+
+-------------------------
+
+senior.joinu | 2020-06-04 17:16:54 UTC | #3
+
+[quote="senior.joinu, post:1, topic:711"]
+We assume that the fields in a record or ***function type*** are sorted by increasing id and the methods in a service are sorted by name.
+[/quote]
+
+[quote="chenyan, post:2, topic:711"]
+> What is “sorted by increasing id” in these terms?
+
+Symbolic field names are hashed into an id. Refer to [https://github.com/dfinity/candid/blob/master/IDL.md#shorthand-symbolic-field-ids ](https://github.com/dfinity/candid/blob/master/IDL.md#shorthand-symbolic-field-ids).
+[/quote]
+
+@chenyan 
+Can you please also expand on what is an ID for a function type? As I can understand from the spec, function type is serialized without names of arguments - only types of arguments in correct position.
+
+```
+T(func (<datatype1>*) -> (<datatype2>*) <funcann>*) =
+  sleb128(-22) T*(<datatype1>*) T*(<datatype2>*) T*(<funcann>*)
+```
+
+So, there is simply nothing to sort by.
+
+-------------------------
+
+chenyan | 2020-06-04 18:07:46 UTC | #4
+
+Ah, that was a typo. You are right, there's nothing to sort on function type. I will update the spec.
+
+-------------------------
+
+senior.joinu | 2020-06-06 13:47:47 UTC | #5
+
+I have one more related question. 
+Right now I'm working on a Kotlin code generator for the Internet Computer, which would allow everybody to create Android apps. It's like `web3j` for Ethereum.
+I've managed to implement translation (`.did` -> `.kt`) and (de)serialization (the spec for IDL is awesome). Now I need to send some requests to canisters and adjust previous work. For this I need to know how exactly should one encode a messages to canisters (and also, how one should sign it). I tried to inspect how generated `js-user-library` does this currently - this is possible, but kinda hard.
+
+Could you please provide some spec for this? Or at least some informal algorithm.
+
+Btw, https://github.com/seniorjoinu/candid-kt
+
+-------------------------
+
+cryptoschindler | 2020-06-06 18:15:52 UTC | #6
+
+wow very ambitious goal :O super excited to see the outcome
+
+-------------------------
+
+senior.joinu | 2020-06-21 23:31:16 UTC | #7
+
+@hansl could you please help me with it?
+
+My generated code now combines (beautifully) the next data:
+1. canister id
+2. method name
+3. some node endpoint to request to
+4. ed25519 keypair
+5. encoded into a single byte array arguments information (TMR triplet, but without R part for now)
+
+From `js-user-library` I now know that for each request I should:
+1. calculate `requestId`, then sign it and place the signature with my public key alongside the other stuff - the algorithm is clear, but some hints would help
+2. cbor.encode the next structure:
+```
+{
+    request_type: string;
+    canister_id: CanisterId;
+    method_name: string;
+    arg: Buffer;
+    sender: Buffer;
+}
+```
+using the encoding schema from `simple-cbor` package - algorithm is unclear to me; how can I recreate `simple-cbor` in my Kotlin code?
+3. then I should send this payload to the node - the part is clear
+4. looks like I also should periodically request the status of my transaction by calling the `request_status` API providing the `requestId` and then resolve the future with it - this part seems also clear to me
+
+Could you please provide some insights? I understand that you guys have NDA and other stuff, but I really need to make this library work ASAP - it is a part of our Tungsten-access project. After all, it is just a request encoding.
+
+-------------------------
+
+chenyan | 2020-06-22 00:12:58 UTC | #8
+
+I think `simple-cbor` is just a cbor serialization library, you can use any cbor library in Kotlin. One thing that may help is to run `dfx -vv start`. This displays all the messages in raw bytes.
+
+-------------------------
+
+senior.joinu | 2020-06-25 21:04:14 UTC | #9
+
+@chenyan
+Thanks a lot for your help!
+
+Why could I receive such a response?
+`Jun 25 21:00:55.022 INFO Failed to authenticate request 0xd33282fcebed304f5ac57a3172330b5b2c7c8a0fbcbc2b21d2813e591f469046, Application: Http Handler`
+Looks like I'm missing something, but I don't know what exactly.
+
+-------------------------
+
+chenyan | 2020-06-25 22:33:47 UTC | #10
+
+maybe you didn't authenticate the message? see the `_transform` function in the `http_agent.js`.
+
+-------------------------
+

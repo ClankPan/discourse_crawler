@@ -1,0 +1,98 @@
+ggreif | 2023-03-09 10:07:17 UTC | #1
+
+As you probably know, timers in Motoko give only a few guarantees (same applies to global replica timers, so we inherit this):
+- they expire at (or after) the specified delay
+- recurrent timers will stick to a regular expiration "grid"
+
+I'd like to describe and discuss an issue with recurring timers in the default mechanism that might be slightly surprising to you.
+
+When a recurring timer is added, the expiration grid is being defined as the current (round) time and the multiples of the specified delay (until upgrade). This is done to eliminate "wander", and takes care that expected expiration times are equidistant. There will still be perceived "jitter" (variation after the expected expiration time) due to the underlying replica's coarse temporal resolution.
+
+One consequence of this is that if you set up a recurring timer with zero delay, all expirations coincide, so we treat these as one-off timers.
+The other consequence is that you should not specify recurring timers with a small delay (less or comparable to the round time of the subnet) as the timer may lag the "grid" infinitely and never catch up.
+
+Then there is the question about stopped canisters with recurring timers. Stopping also causes the suspension of global timer callbacks to the canister, and thus introducing bad jitter. When the canister is started, the default mechanism will try to process the jobs of all missed expirations according to the grid and thus exhibit a heartbeat-like pattern until the timer has caught up.
+
+If this sounds like a behaviour negating the purpose of timers, you are probably right. The quick sequence of expirations causes unnecessary cycle burn and can probably not be amortised with useful work.
+
+So what I am proposing is to skip missed grid points and catch up instantly by always setting the next scheduled expiration into the future. This would also fix the "too short" delay problem, but potentially break "counting" jobs that rely on every grid point spawning a fresh job.
+
+What do you think?
+
+-------------------------
+
+ZhenyaUsenko | 2023-03-09 09:56:20 UTC | #2
+
+For some reason I thought current implementation already skips timers for stopped canisters. I would definitely prefer skipping over processing all missed timers on startup
+
+-------------------------
+
+skilesare | 2023-03-09 10:47:43 UTC | #3
+
+I actually thought that all timers were abandoned on upgrade and had to be rehydrates.
+
+Do non-recurring timers persist after upgrade?
+
+-------------------------
+
+icme | 2023-03-09 10:58:04 UTC | #4
+
+[quote="skilesare, post:3, topic:18873"]
+Do non-recurring timers persist after upgrade?
+[/quote]
+
+2 different behaviors with recurring timers.
+- upgrading a canister kills the timer
+- stopping and restarting a canister with the timer leads to the catch-up behavior @ggreif described above.
+
+I agree that a timer shouldn’t try to recoup lost execution on restart and should just pick up where it last left off.
+
+-------------------------
+
+ggreif | 2023-03-09 11:12:41 UTC | #5
+
+My message was about `stop_canister` and `start_canister` messages to the management canister. _Not_ about upgrades per se. (Timers — whatever ilk — won't survive an upgrade, you have to set new ones.)
+
+-------------------------
+
+skilesare | 2023-03-09 12:11:30 UTC | #6
+
+Ahhh...got it! Makes sense.
+
+-------------------------
+
+ggreif | 2023-04-12 09:11:51 UTC | #7
+
+I've put up the review for quite some time, https://github.com/dfinity/motoko/pull/3871.
+It is basically a one-liner change and I expect it being merged soon. Most probably it will end up in `moc` 0.8.7.
+
+(It is released now, and `dfx` 0.14-beta1 has picked it up.)
+
+-------------------------
+
+Iceypee | 2023-04-11 16:26:34 UTC | #8
+
+How about pre-upgrades. If I wanted to wait x seconds/blocks to allow all my functions await calls to settle, can I throw a ten second timer in the preupgrade that executes all the upgrades after 10 seconds?
+
+-------------------------
+
+ggreif | 2023-04-11 19:33:09 UTC | #9
+
+When control returns from the `pre_upgrade` hook, the IC will assume that all relevant data is written to stable memory and will thus activate the new binary. All information in the regular heap (where your new timers live) will be erased. So I doubt your idea will work, moreover you'll expose yourself to data loss.
+
+Please check with the canister lifecycle state machine that is compiled into the Motoko canisters, as it contains the necessary logic to only stop the canister when all outstanding messaging has come to an end.
+
+-------------------------
+
+cryptoschindler | 2023-04-27 08:27:30 UTC | #10
+
+Can we add some documentation around this behaviour to the docs [here](https://internetcomputer.org/docs/current/developer-docs/backend/periodic-tasks/) :innocent:
+
+-------------------------
+
+ggreif | 2023-04-27 19:06:11 UTC | #11
+
+The link you mentioned was about CDK (yes, it applies too there). Then there is [ Timers Library Limitations](https://internetcomputer.org/docs/current/developer-docs/backend/periodic-tasks/#timers-library-limitations), which could be a nice place to explain some of this.
+
+-------------------------
+

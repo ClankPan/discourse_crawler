@@ -1,0 +1,127 @@
+pramitgaha | 2023-03-29 08:31:37 UTC | #1
+
+I'm trying to instantiate canister:
+```
+use ic_cdk::api::management_canister::main::{
+    CreateCanisterArgument, CanisterIdRecord, CanisterSettings, CanisterInstallMode, InstallCodeArgument,
+};
+pub async fn get_an_address(caller: &Principal) -> Principal{
+    let canister_setting = CanisterSettings{
+        controllers: Some(vec![caller.clone()]),
+        compute_allocation: Some(Nat::from(0_u64)),
+        memory_allocation: Some(Nat::from(0_u64)),
+        freezing_threshold: Some(Nat::from(0_u64)),
+    };
+    let args = CreateCanisterArgument{
+        settings: Some(canister_setting)
+    };
+    let (canister_id,): (CanisterIdRecord,) = match ic_cdk::api::call::call_with_payment(Principal::management_canister(), "create_canister", (args,), 4_00_000_000_000).await
+    {
+        Ok(x) => x,
+        Err((_, _)) => (CanisterIdRecord{
+            canister_id: candid::Principal::anonymous()
+        },),
+    };
+    canister_id.canister_id
+}
+
+pub async fn install_wasm(wasm: Vec<u8>, canister_id: Principal, args: Vec<u8>,) -> bool{
+    let install_config = InstallCodeArgument{
+        mode: CanisterInstallMode::Install,
+        wasm_module: wasm,
+        canister_id,
+        arg: args
+    };
+    match ic_cdk::api::call::call(Principal::management_canister(), "install_code", (install_config,)).await
+    {
+        Ok(x) => x,
+        Err((_, _)) =>{
+            return false
+        }
+    }
+    true
+}
+#[update]
+#[candid_method(update)]
+pub async fn create_note_canister() -> CreateCanisterResponse{
+    let caller = ic_cdk::caller();
+    let note_init_data = NoteInitData{
+        authority: caller,
+        db_canister: _query_db_canister(),
+        dispute_management_canister: _query_dispute_management_canister(),
+        issuance_canister: ic_cdk::id(),
+        embark_commission: _query_commission()
+    };
+    let wasm = NOTE_WASM.to_vec();
+    if wasm.len() == 0{
+        return CreateCanisterResponse::WasmNotInstalled
+    }
+    let address = get_an_address(&caller).await;
+    if address == Principal::anonymous(){
+        return CreateCanisterResponse::FailedToGetAddress
+    }
+    let note_init_data = Encode!(&note_init_data).unwrap();
+    match install_wasm(wasm, address, note_init_data).await{
+        false => CreateCanisterResponse::FailedToInstallCode,
+        true => {
+            NOTE_STATE.with(|state|{
+                let state = &mut state.borrow_mut();
+                let note_data = NoteData{
+                    deployed_by: caller,
+                    note_canister: address,
+                };
+                match state.note_list.push(note_data){
+                    Ok(_) => CreateCanisterResponse::Success { canister: address },
+                    Err(_) => CreateCanisterResponse::FailedToAllocateMemory
+                }
+            })
+        }
+    }
+}
+```
+its failing at installing. what's wrong in the code? I'm consistently getting `CreateCanisterResponse::FailedToInstallCode`
+
+-------------------------
+
+Severin | 2023-03-29 08:47:59 UTC | #2
+
+Looks fine to me, at least on first glance. Could you maybe not swallow the error message and instead return something more useful? Even panicking with error.to_string() would be more helpful that just returning false.
+
+-------------------------
+
+pramitgaha | 2023-03-29 08:53:49 UTC | #3
+
+ahhm, thanks! reading the error. I solved it.
+here was the error message
+```CanisterError "Only the controllers of the canister renrk-eyaaa-aaaaa-aaada-cai can control it.\nCanister's controllers: 2vxsx-fae\nSender's ID: rrkah-fqaaa-aaaaa-aaaaq-cai"```
+
+-------------------------
+
+Severin | 2023-03-29 09:05:40 UTC | #4
+
+[quote="pramitgaha, post:3, topic:19131"]
+Canister's controllers: 2vxsx-fae
+[/quote]
+
+This is probably an issue. `2vxsx-fae` is the anonymous principal, which everyone can impersonate by definition. If it's a known TODO it's totally fine for now, of course
+
+-------------------------
+
+pramitgaha | 2023-03-29 11:51:39 UTC | #5
+
+hey, that's really strange. caller's value is generated using `ic_cdk::caller`. how can his address get changed to one of anonymous while passing it to function?
+
+-------------------------
+
+Severin | 2023-03-29 12:01:52 UTC | #6
+
+What identity are you using to make the call? Is it through a frontend using @dfinity/agent? Or are you using Rust with ic_agent? It sounds like you're not passing the identity to the agent
+
+-------------------------
+
+AdamS | 2023-03-29 21:54:44 UTC | #7
+
+It's the converse - the controller is set to the anonymous principal, and the only thing that can't impersonate as the anonymous principal is a canister, whose identity is *always* its own. `renrk-eyaaa-aaaaa-aaada-cai` is set up to be upgradable by any ingress caller, but to be upgradable by `rrkah-fqaaa-aaaaa-aaaaq-cai`, it must be configured as such directly.
+
+-------------------------
+

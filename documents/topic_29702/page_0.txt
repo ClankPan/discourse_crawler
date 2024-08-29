@@ -1,0 +1,250 @@
+jaesharma | 2024-04-15 14:00:15 UTC | #1
+
+Seeking guidance on obtaining the market cap of a token. After exploring the ledger and governance canisters, I couldn't locate a method providing the total circulating supply or related data. In the ledger canister, there's the `icrc1_total_supply` method, but it seems to provide the total number of tokens, not specifically the circulating supply. Is my understanding correct?
+and from where we can get marketcap?
+
+-------------------------
+
+jennifertran | 2024-04-16 05:33:00 UTC | #2
+
+Yes, [ICRC1_total_supply](https://internetcomputer.org/docs/current/references/icrc1-standard#icrc1_total_supply) returns the total number of tokens on all accounts except for the minting account. The easiest way to cross-reference on the IC Data Dashboard is by referencing the Total Supply chart on the main SNS page and then clicking on the Ledger Canister ID -> Run ICRC1_total_supply function.
+
+For example, for ELNA, check the [ELNA Total Supply chart](https://dashboard.internetcomputer.org/sns/gkoex-viaaa-aaaaq-aacmq-cai) on their SNS page and then click on their corresponding Ledger Canister under ELNA AI Canisters. On the [ELNA AI Ledger Canister page](https://dashboard.internetcomputer.org/canister/gemj7-oyaaa-aaaaq-aacnq-cai), click on `icrc1_total_supply`. It should be the same number listed in the Total Supply chart. 
+
+The easiest way to check the market cap of SNS tokens is to use [ICP Coins](https://icpcoins.com/) or [ICPSwap Token List](https://info.icpswap.com/token/list).
+
+These SNS tokens are also on CoinmarketCap:
+
+- [OpenChat (CHAT)](https://coinmarketcap.com/currencies/openchat/)
+- [Sonic (SONIC)](https://coinmarketcap.com/currencies/sonic-app/)
+- [Sneed (SNEED)](https://coinmarketcap.com/currencies/sneed/)
+
+-------------------------
+
+jaesharma | 2024-04-16 06:13:46 UTC | #3
+
+Thanks for the links and explaination but i was looking for the source of market supply. on dashboard i can see all the information but from where dashboard is getting the information. There must be some canister which have these information like treasury supply and how many tokens are in circulation etc.
+
+-------------------------
+
+jennifertran | 2024-04-16 18:40:50 UTC | #4
+
+An approach is to take the total supply minus tokens in wallets that tokens were initially minted to (before the first transfer. This includes treasury). 
+
+**Using the IC Data Dashboard**
+
+For the PANDA token of ICPandaDAO, you would take the [PANDA Total Supply](https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai) on their main page and then subtract it with the total amount of PANDA before the first "Transfer". 
+
+Looking at their [first transactions](https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai/transactions?p=13659&t=136581), the first `Transfer` was at index 15:
+
+* https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai/transactions?p=13659&t=136581
+* https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai/transactions?p=13658&t=136581
+* https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai/transactions?p=13657&t=136581
+
+Therefore, the number of tokens in wallets that were initially minted would include the current balances of these accounts listed from index 0 to 14. 
+
+You would then click on the current principal ID and check their current balance. For example, [principal dwv6s-6aaaa-aaaaq-aacta-cai with subaccount 0818a39651f7c9fa5c8af7241c7032a876f98f12a6fb5082bc34a1dae87d37ad](https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai/account/dwv6s-6aaaa-aaaaq-aacta-cai-wxjq23a.818a39651f7c9fa5c8af7241c7032a876f98f12a6fb5082bc34a1dae87d37ad) still has 5,000,000 PANDA.
+
+**Programmatically**: 
+
+* **Total Supply** - Call `icrc1_total_supply` (from the ledger canister)
+
+* **The Principals and subaccount before the first transfer**- Iterate through `get_blocks` (from the index canister) starting with `start: 0` until the result no longer lists ```record { "op"; variant { Text = "mint" } };```
+
+In the `to` section, you will get an array of the Principal and subaccounts as blob representations. There are ways to convert the blob representation to a Principal. For example, the [Motoko library Principal library](https://internetcomputer.org/docs/current/motoko/main/base/Principal#function-fromblob).
+
+* **Balance of Principals and subaccount before the first transfer** - Call ```icrc1_balance_of``` (from the index canister) passing in the principal and subaccount to get the current balance of these wallets
+
+-------------------------
+
+v1ctor | 2024-04-16 18:39:35 UTC | #5
+
+IcpCoins, for example, calculates the circulating supply as following:
+
+`circulating_supply = total_supply - treasury_balance`
+
+The total_supply comes from calling the `icrc1_total_supply()` method from a SNS Ledger canister.
+
+Now the treasury_balance is a bit more complex: 
+1. you have to calculate the sub-account of the treasury using the following JS code (untested):
+`const subAccount = new Uint8Array(sha256.create().update([0x12, ...new TextEncoder().encode("token-distribution"), ...SNS_governance_canister_principal.toUint8Array()]).array())`
+2. call the SNS Ledger canister `icrc1_balance_of()` method passing the SNS governance canister principal and the sub-account calculated at the step 1 above
+
+References:
+1. https://github.com/dfinity/ic/blob/69cd381ecf8c183759f256861e6a817b124af5b8/rs/nervous_system/common/src/ledger.rs#L235
+2. https://github.com/Neutrinomic/defi_aggregator/blob/4659c3592ababa5e8c94257e26161773e43090df/src/main.mo#L1162
+
+-------------------------
+
+jaesharma | 2024-04-18 19:05:09 UTC | #6
+
+thanks for detailed answer. i'm not able to reproduce it can you please help.
+this is the code i'm trying to execute:
+```
+import { Principal } from "@dfinity/principal";
+import { sha256 } from "js-sha256";
+
+// governance canister id of GOLD DAO
+const GOVERNANCE_CANISTER_ID = "tr3th-kiaaa-aaaaq-aab6q-cai";
+
+const subAccount = new Uint8Array(
+  sha256
+    .create()
+    .update([
+      0x12,
+      ...new TextEncoder().encode("token-distribution"),
+      ...Principal.fromText(GOVERNANCE_CANISTER_ID).toUint8Array(),
+    ])
+    .array()
+);
+
+console.log("sub account: ", Principal.fromUint8Array(subAccount).toHex());
+```
+
+testing for GoldDAO (random SNS from dashboard, it shows treasury amount on dashboard).
+this is the ledger canister of it: https://dashboard.internetcomputer.org/canister/tyyy3-4aaaa-aaaaq-aab7a-cai
+
+above function give me this subaccount id: "BA84E75F566A87AC0FCBB07AAC5518DFD36193C8050F34ED67B3F00123C4FD93" and this is the governance canister: tr3th-kiaaa-aaaaq-aab6q-cai
+
+why i'm getting balance as 0.
+i tried same with few other SNS also, same result getting 0 balance only.
+looks like i'm making some minor error but not able to identify, can you please help. thanks.
+
+-------------------------
+
+jennifertran | 2024-04-18 20:51:52 UTC | #7
+
+Ah, try adding the nonce. 
+
+Try this code:
+
+
+```
+import { Principal } from "@dfinity/principal";
+import { sha256 } from "js-sha256";
+
+const GOVERNANCE_CANISTER_ID = "tr3th-kiaaa-aaaaq-aab6q-cai";
+
+function toBytesUint64(num) {
+  const buffer = new ArrayBuffer(8);
+  const view = new DataView(buffer);
+  view.setBigUint64(0, BigInt(num));
+  return Array.from(new Uint8Array(buffer));
+}
+
+const subAccount = new Uint8Array(
+  sha256
+    .create()
+    .update([
+      0x12,
+      ...new TextEncoder().encode("token-distribution"),
+      ...Principal.fromText(GOVERNANCE_CANISTER_ID).toUint8Array(),
+      ...toBytesUint64(0)
+    ])
+    .array()
+);
+
+console.log("sub account: ", Principal.fromUint8Array(subAccount).toHex());
+```
+
+Here is a test link to confirm: https://replit.com/@jennifertran31/GoldDAO-Subaccount?v=1
+
+This returns subaccount `7776d299b4a804a14862b02bff7b74d1b956e431f5f832525d966d67ff3d7ce8` for canister `tr3th-kiaaa-aaaaq-aab6q-cai` (GoldDAO Governance Canister). 
+
+It should match the [GLDGov Treasury account](https://dashboard.internetcomputer.org/sns/tw2vt-hqaaa-aaaaq-aab6a-cai) linked from GLDGov Treasury to [here](https://dashboard.internetcomputer.org/sns/tw2vt-hqaaa-aaaaq-aab6a-cai/account/tr3th-kiaaa-aaaaq-aab6q-cai-nif4qry.7776d299b4a804a14862b02bff7b74d1b956e431f5f832525d966d67ff3d7ce8).
+
+Hope that helps!
+
+-------------------------
+
+jennifertran | 2024-04-27 03:13:26 UTC | #8
+
+@jaesharma FYI, we recommend that SNS projects use this formula to calculate circulating supply. This formula aligns with CMC’s[definition](https://support.coinmarketcap.com/hc/en-us/articles/360043396252-Supply-Circulating-Total-Max) and if using it, projects should have no problem verifying their circulating supply with CMC. Verifying circulating supply is critical to a project’s CMC ranking.
+
+Please let us know if you have any questions or help.
+
+-------------------------
+
+Gabriel | 2024-05-21 11:08:10 UTC | #9
+
+hey @jennifertran 
+
+Shouldn't it be: `circulating_supply = total_supply - treasury_balance - balance_in_neurons` where balance in neurons is the sum of all neurons with dissolve delay > 0 ?
+
+-------------------------
+
+jennifertran | 2024-05-21 17:19:05 UTC | #10
+
+In theory, you can use this formula as well. It does add additional complexity to the formula. 
+
+The formula that we proposed above is a simple definition that captures [CMC's definition](https://support.coinmarketcap.com/hc/en-us/articles/360043396252-Supply-Circulating-Total-Max).
+
+-------------------------
+
+Gabriel | 2024-05-22 08:48:57 UTC | #11
+
+Fair enough, but for Dragginz we can't use this as we've minted more tokens after the initial SNS.
+
+-------------------------
+
+jaesharma | 2024-07-02 13:43:15 UTC | #13
+
+where does this `nif4qry` came from? after governance canister id.
+https://dashboard.internetcomputer.org/sns/tw2vt-hqaaa-aaaaq-aab6a-cai/account/tr3th-kiaaa-aaaaq-aab6q-cai-nif4qry.7776d299b4a804a14862b02bff7b74d1b956e431f5f832525d966d67ff3d7ce8
+
+-------------------------
+
+jennifertran | 2024-07-02 16:23:35 UTC | #14
+
+Will confirm and get back to you
+
+-------------------------
+
+jennifertran | 2024-07-02 16:50:41 UTC | #15
+
+[quote="jaesharma, post:13, topic:29702"]
+where does this `nif4qry` came from?
+[/quote]
+
+You can reference the [docs](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/TextualEncoding.md#non-default-accounts) here.
+
+If it is not the default subaccount, there is a CRC-32 checksum of concatenated bytes of the principal (up to 29 bytes) and the subaccount (32 bytes), encoded in [Base 32 encoding] between the principal and before the `.` and the subaccount.
+
+-------------------------
+
+jaesharma | 2024-07-08 12:48:10 UTC | #16
+
+Thanks for the documentation reference; that clarifies things.
+
+Sorry to bother you again, but can anyone help me with fusion coins like ckBTC and ckETH? These tokens don't have a governance canister, so how do I calculate their circulating supply?
+
+For example, [icpcoins](https://icpcoins.com/) shows ckBTC's circulating supply as 277, which is not its total supply. Where does this number come from?
+
+-------------------------
+
+wpb | 2024-07-08 12:54:13 UTC | #17
+
+[quote="jaesharma, post:16, topic:29702"]
+For example, [icpcoins](https://icpcoins.com/) shows ckBTC’s circulating supply as 277, which is not its total supply. Where does this number come from?
+[/quote]
+
+That is the total supply.  ckBTC is minted when someone deposits BTC and ckBTC is burned when someone withdraws their BTC.  That how all the ck tokens work.  You can also find more information on the dashboard in the chain fusion section.  Here is an example.
+
+https://dashboard.internetcomputer.org/bitcoin
+
+-------------------------
+
+jaesharma | 2024-07-08 13:11:02 UTC | #18
+
+but ckBTC's ledger canister method `icrc1_total_supply` returns something else.
+from here: https://dashboard.internetcomputer.org/canister/mxzaz-hqaaa-aaaar-qaada-cai
+![Screenshot 2024-07-08 at 6.40.52 PM|690x282](upload://atVdgCsDR0Lt7NAYKa4nCuD1J9o.png)
+
+-------------------------
+
+jaesharma | 2024-07-08 13:13:30 UTC | #19
+
+ok got it. After applying decimal they floor the value. thanks @wpb
+
+-------------------------
+

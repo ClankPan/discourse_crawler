@@ -1,0 +1,318 @@
+senior.joinu | 2021-08-16 22:12:25 UTC | #1
+
+Ever wanted to make your canister work automagically, without triggering it from the outside? 
+Here you go.
+
+https://github.com/seniorjoinu/ic-cron
+
+This is a rust library which is intended to be used by canister developers to make their canisters proactive for a reasonable price.
+
+Check the readme and let me know what you think.
+
+Relates to https://forum.dfinity.org/t/cron-jobs-on-icp/1403
+
+-------------------------
+
+nomeata | 2021-08-17 12:46:31 UTC | #2
+
+Fun fact: The NNS itself was using the “hack” of self-calls at some point in the past. Yes, it seems to work, but I consider it hack because of the reasons you mention in the readme:
+
+ * You are consuming lots of cycles.
+ * Upgrades are prevented.
+ * If you the self-call ever fails (low on cycles, other trap), suddenly the cron stops.
+ * I expect a future version of the IC will handle update calls to canister on the same subnet (so yourself included) immediately. Once that long-awaited improvement comes, your code will suddenly consume lots and lots of cycles, up to the per-round cycle limit. Or, maybe even worse, your library will be popular and the IC will have to make pragmatic compromises such as detecting a cron-like self-calling and artificially deferring it to not burn your cycles fast.
+
+So please keep that in mind when using this.
+
+I also know that there are plans to expose the “heartbeat” mechanism used by the NNS on all subnets, which would allow a much safer and reliable implementation of cron.
+
+That said, the great think about a library like yours is that it hides the implementation from the user. So people who use your library to schedule events can, once the IC provides that feature and once your library use that feature instead of the self-call, upgrade your library and redeploy and benefit from the new system.
+
+-------------------------
+
+nomeata | 2021-08-17 12:51:53 UTC | #3
+
+Oh, and if I read
+
+```
+        #[allow(unused_must_use)]
+        fn _call_cron_pulse() {
+            if get_cron_state().is_running {
+                ic_cdk::block_on(async {
+                    ic_cdk::call::<(), ()>(ic_cdk::id(), "_cron_pulse", ())
+                        .await
+                        .unwrap();
+                });
+            };
+        }
+
+        #[ic_cdk_macros::update]
+        fn _cron_pulse() {
+            for task in get_cron_state().iterate(ic_cdk::api::time()) {
+                _cron_task_handler(task);
+            }
+
+            _call_cron_pulse();
+        }
+```
+correctly then you ran into the same mistake that others ran before: Your pulse function calls itself recursively. This means you are accumulating call contexts without bound, which will cause issues eventually.
+
+The better way to do this (in pseudo-code) is roughly
+```
+            ic_cdk::block_on(async {
+                while get_cron_state().is_running {
+                    ic_cdk::call::<(), ()>(ic_cdk::id(), "_cron_ping", ())
+                        .await
+                        .unwrap();
+                    for task in get_cron_state().iterate(ic_cdk::api::time()) {
+                        _cron_task_handler(task);
+                   }
+               }}
+```
+
+In other words: don’t use recursion, use loops, as otherwise the stack grows.
+
+-------------------------
+
+senior.joinu | 2021-08-17 13:13:27 UTC | #4
+
+Thanks for the response.
+
+There are three main goals of this library:
+1. As you said, it abstracts away the implementation, so devs could just think of it as of "task scheduler" and focus on their business logic entirely.
+2. Developers can use this new feature early, not relying on any estimates from the IC-team. Yes, it would be great, if one day we'll have out-of-the box support for such functionality, but right now there is none.
+3. I need this functionality for some of my other projects.
+
+About the code, you've mentioned. Hm... Thanks a lot!
+But now I'm confused. I asked this question specifically https://forum.dfinity.org/t/udp-like-flow-for-inter-canister-calls/5602 and the answer seemed to me like "use block_on when you want to send a request, but don't care for a response - the system will handle it automatically".
+UPD: since I don't care about the response (I don't need the continuation of this promise) and I tell the system exactly that, there should be no stored context and no stack overflow.
+
+It would be very cool to have some in-depth docs on this APIs.
+
+-------------------------
+
+nomeata | 2021-08-17 13:15:18 UTC | #5
+
+Maybe I was wrong, I don’t know the Rust CDK very well. It all depends on what “the system will handle it automatically” means. But I thin it only means “set things up to ignore there response message (reply or reject)”, then we have the problem that I described above, and there isn’t really anything the CDK can do here.
+
+We once had the plan for “proper” fire and forget messages on the platform level, but it wouldn’t have been trivial and less often asked for than expectd, so we never added them.
+
+I agree that in-depths docs are missing. But at least we have the forum :-) Maybe @roman-kashitsyn can double-check my analysis.
+
+-------------------------
+
+roman-kashitsyn | 2021-08-17 15:08:06 UTC | #6
+
+I believe @nomeata's analysis is correct, this pattern of self-calls opens new call contexts that will never be closed on each iteration. It's a very common mistake with self-calls, I made it myself a couple of times :slight_smile: 
+
+Self-calls are indeed very fragile and I'd not recommend using them in production.
+
+My colleagues from the Execution team informed me that canister heartbeat feature should now be available on all subnets. I'm not sure if the replica shipped with the latest DFX also supports this feature. You can add something like this to your canister to check:
+```rust
+#[export_name = "canister_heartbeat"]
+fn heartbeat() {
+  ic_cdk::api::print("Hello from the heartbeat handler!");
+}
+```
+This is how Governance uses it: https://github.com/dfinity/ic/blob/e362530172c44679313b1b7fca1e90d8967545d8/rs/nns/governance/canister/canister.rs#L656-L662
+
+-------------------------
+
+senior.joinu | 2021-08-17 15:23:40 UTC | #7
+
+Oh, that's very cool!
+I will update the library ASAP.
+
+Thanks a lot!
+
+-------------------------
+
+wang | 2021-08-17 16:03:22 UTC | #8
+
+This is great! Is there any documentation on this?
+
+-------------------------
+
+senior.joinu | 2021-08-17 16:27:04 UTC | #9
+
+I tried this locally with dfx 0.8.0 - it doesn't work yet.
+
+-------------------------
+
+skilesare | 2021-08-17 17:29:41 UTC | #10
+
+Does Motoko need func heartbeat() or func canister_heartbeat?  Does it need to be public?
+
+-------------------------
+
+nomeata | 2021-08-17 20:13:12 UTC | #11
+
+[quote="wang, post:8, topic:6506, full:true"]
+This is great! Is there any documentation on this?
+[/quote]
+
+Eventually, surely https://sdk.dfinity.org/docs/interface-spec/index.html will show it. I guess Roman leaked it before it is officially there :slight_smile: 
+
+[quote="skilesare, post:10, topic:6506, full:true"]
+Does Motoko need func heartbeat() or func canister_heartbeat? Does it need to be public?
+[/quote]
+
+This would likely become a `system func heartbeat()`, like [`preupgrade` and `postupgrade`](https://sdk.dfinity.org/docs/language-guide/upgrades.html#_preupgrade_and_postupgrade_system_methods).  But it needs [compiler support](https://github.com/dfinity/motoko/issues/2728) (just created an issue).
+
+-------------------------
+
+botch | 2021-08-27 19:03:30 UTC | #12
+
+Just do this in rust
+
+```
+#[export_name = "canister_heartbeat"]
+fn canister_heartbeat() {
+    ic_cdk::print("we are running cron");
+}
+```
+
+-------------------------
+
+senior.joinu | 2021-08-27 21:54:30 UTC | #13
+
+Hey there, @botch!
+Thanks for your response c:
+
+The code snipped you've provided is only 50% of what a cron implementation needs to do. To be useful for developers it needs a couple more things:
+1. Scheduling - you need to be able to do something not __each consensus tick__ , but, for example, __each month__ or __each minute__. 
+2. Tasks - you need a way to define subprograms that will be run by the scheduler, once their time has come.
+
+This is exactly what you can use this library for.
+
+Have a great day!
+
+-------------------------
+
+wang | 2021-09-01 18:43:21 UTC | #14
+
+I talked to the execution team earlier and got some more details on heartbeat:
+* Called at most once per consensus round
+* Cannot be customized
+* Is called first before other functions
+* No special restrictions - can do awaits, standard cycles limit
+
+-------------------------
+
+senior.joinu | 2021-09-02 14:44:38 UTC | #15
+
+What does `Cannot be customized` mean?
+
+-------------------------
+
+wang | 2021-09-02 14:55:43 UTC | #16
+
+Not possible to set an interval, I believe.
+
+-------------------------
+
+skilesare | 2021-09-02 15:10:44 UTC | #17
+
+[quote="wang, post:14, topic:6506"]
+Called at most once per consensus round
+[/quote]
+
+This is oddly vague. It either does run or doesn't run each round.  If it runs each round the check for if you need it to run or not could be a cycle sink.
+
+-------------------------
+
+rckprtr | 2021-09-02 16:16:05 UTC | #18
+
+Timer hashtables would have to be used similar to multiplayer games would use.  Each tick you see what subscriber needs to be triggered and trigger it.
+
+-------------------------
+
+senior.joinu | 2021-12-04 14:29:37 UTC | #19
+
+IC cron is now promoted to 0.4.0 adding `heartbeat` support.
+Please, consider helping with testing and provide feedback.
+
+https://github.com/seniorjoinu/ic-cron
+
+-------------------------
+
+mparikh | 2021-12-04 16:15:58 UTC | #20
+
+Thanks! Can you please add license to the library?
+
+-------------------------
+
+senior.joinu | 2021-12-04 16:21:38 UTC | #21
+
+Done.
+
+Adding more text to make the forum engine happy.
+
+-------------------------
+
+Motokoder | 2021-12-20 16:22:39 UTC | #22
+
+This is great, but how do we consume it with Motoko? (Not a Rust dev.)
+
+-------------------------
+
+senior.joinu | 2021-12-21 08:14:34 UTC | #23
+
+I believe there is no way for that rn.
+
+-------------------------
+
+Motokoder | 2021-12-23 21:15:26 UTC | #24
+
+Thank you for responding. It looks like we'll be getting a system function named heartbeat to implement cron jobs.
+
+-------------------------
+
+Icdev2dev | 2021-12-24 09:49:32 UTC | #25
+
+If there is more work than the interval between heartbeats ( ~2s), how will this work given that the underlying heartbeat function is sync (not async)?
+
+-------------------------
+
+senior.joinu | 2021-12-26 00:06:32 UTC | #26
+
+Async is just a wrapper around request-response. All your requests will be sent during the heartbeat function. All your responses will be processed at the block they come back to your canister.
+
+If you want to call an async function inside the heartbeat you could use 'ic_cdk::block_on()' (or something like this, I don't remember the name).
+
+-------------------------
+
+RikusWiehahn | 2022-02-12 21:33:02 UTC | #27
+
+Just adding to your answer @senior.joinu. Here's an ultra-basic async example that does automated inter-canister calls (just using heartbeat). It took me a little while to figure this out so hopefully it helps others 🚀
+
+```php
+use ic_cdk::export::Principal;
+use ic_cdk::api::time;
+use ic_cdk::api::call;
+
+static mut LAST_JOB_TIME: u64 = 0;
+
+#[export_name = "canister_heartbeat"]
+fn canister_heartbeat() {
+    let duration: u64  = 1_000_000_000 * 10; // 10 seconds
+    let t = time();
+    unsafe {
+        if t - duration > LAST_JOB_TIME {
+            LAST_JOB_TIME = t;
+            ic_cdk::block_on(test_api_call());
+        }
+    }
+}
+
+async fn test_api_call() {
+    let principal = Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").unwrap();
+    let res: Result<(String,), _> = call::call(principal, "ping", ()).await;
+    let res_string = format!("{:?}", res);
+    
+    ic_cdk::print(res_string); // -> Ok(("pong",))
+}
+```
+
+-------------------------
+

@@ -1,0 +1,954 @@
+lastmjs | 2022-08-03 19:38:20 UTC | #105
+
+So I've been working with http requests in the local replica, I have a question about cycle costs. It seems like you have to send a few hundred billion cycles with each http request call, why is that?
+
+```javascript
+    const http_result: CanisterResult<HttpResponse> = yield ManagementCanister.http_request({
+        url: ethereum_url,
+        max_response_bytes: null,
+        http_method: {
+            POST: null
+        },
+        headers: [],
+        body: utf8.fromString(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'eth_blockNumber',
+            params: [],
+            id: 83
+        })),
+        transform_method_name: 'eth_block_number_transform'
+    }).with_cycles(300_000_000_000n); // TODO why is it asking for this many cycles?
+```
+
+-------------------------
+
+dieter.sommer | 2022-08-03 19:41:57 UTC | #106
+
+Hi @lastmjs!
+Each HTTP request costs currently 400M cycles flat fee plus cycles per request and response byte. The max response size is taken as a parameter for charging and the default is 2MB which makes it really costly. You must set the max response size to something in the range you expect in order to not be charged insane amounts of cycles.
+
+Hope that helps.
+
+We are currently revising pricing, so the pricing for this feature may change. Currently it is rather conservatively (expensively) priced.
+
+-------------------------
+
+lastmjs | 2022-08-03 19:52:09 UTC | #107
+
+I see, thanks for the clarification. Another quick question, my `transform_method` doesn't seem to be necessary locally, requests are returning just fine even if the `transform_method` doesn't do anything. Is the local replica in dfx 0.11.0 working like it will in production? I just don't want to run into any nasty surprises :)
+
+-------------------------
+
+dieter.sommer | 2022-08-03 20:08:23 UTC | #108
+
+Yes, correct observation. :slight_smile: 
+Transform is there to ensure that when having >1 replicas, their respective responses are made the same. For example, responses often contain timestamps or other items that change between responses. This only becomes an issue in case you have more than 1 replica  because then it may lead to no consensus being reached on different responses.
+The behaviour between the dfx environment and IC deployment can vary a lot for this feature unfortunately, exactly because on IC mainnet all replicas of the subnet make the request and if the responses do differ in some parts you need a proper transform function to get the same responses and have the response go through consensus. There are some more pitfalls that I am currently writing up in the feature documentation to help folks not waste time things that we already know may cause problems.
+
+Stay tuned, we are very close to finalizing this and releasing the documentation.
+
+What are you working on if I may ask? Some form of Ethereum integration based on cloud nodes by any chance?
+
+-------------------------
+
+lastmjs | 2022-08-03 20:22:42 UTC | #109
+
+> What are you working on if I may ask? Some form of Ethereum integration based on cloud nodes by any chance?
+
+Exactly! I'm getting Azle ready for outgoing http requests, and as part of that I'm writing some Ethereum examples pulling data (and hopefully writing data using POST requests) to Ethereum using a Web2 service.
+
+So, I really think that the local replica needs to simulate the http consensus, otherwise it could be extremely difficult to figure out how to properly transform the data. It's strange that this isn't simulated, as my understanding is that the local replicas simulate the consensus delay for update calls so that developers aren't surprised by mainnet. Also dfx 0.10+ has a local cycle environment that more closely resembles production.
+
+Are there plans to get the local replica to work like production? All of the code I'm writing now, I doubt it will work once I deploy it.
+
+-------------------------
+
+dieter.sommer | 2022-08-03 20:27:06 UTC | #110
+
+Currently, the single replica in the dfx environment will behave differently (not causing the problems one may run on IC mainnet) and we currently do not have a plan to change this as this would essentially mean a completely different architecture with multiple replicas in the dfx environment or implementing this "simulation" by hand. What we are planning to do is to provide documentation that mentions the pitfalls we are aware of, either by theory of by having run into them when writing the sample dApp. This should help folks already a lot.
+
+You definitely need to analyze the responses by the service you are making requests to for variable response fields or just extract the data items you are interested in and throw away the remaining parts of the response. Pro tip: Also look at the response headers as they may contain timestamps.
+
+-------------------------
+
+lastmjs | 2022-08-03 20:34:57 UTC | #111
+
+So do I understand correctly that the best way to debug this right now locally is to create a transform function and just log the `HttpResponse` that is the parameter to that function, looking for non-determinism?
+
+-------------------------
+
+dieter.sommer | 2022-08-03 20:42:39 UTC | #112
+
+I would start by making the same request twice and diffing it to find the variable parts, both in body and headers. Then write the transform function based on the diff you observe. Then wait for the IC mainnet release and test it there. This should get you a solution that works immediately or get you close to that on mainnet if you proceed like this and work thoroughly.
+
+Our own engineers ran into some problems in that area as well when writing example code, so you really need to get used to it and know about the pitfalls. You (and others) should have a good starting point with the information I gave you in the last few posts. But think of it that way: That's the first time in history that a smart contract can make HTTP requests to Web 2.0 services. And you are one of the first people implementing such a smart contract. We are very much operating at the forefront of technology here. :-)
+
+-------------------------
+
+lastmjs | 2022-08-03 20:51:04 UTC | #113
+
+[quote="dieter.sommer, post:106, topic:9670"]
+Each HTTP request costs currently 400M cycles flat fee plus cycles per request and response byte. The max response size is taken as a parameter for charging and the default is 2MB which makes it really costly. You must set the max response size to something in the range you expect in order to not be charged insane amounts of cycles.
+[/quote]
+
+Let's say I send a lot of cycles, much more than required based on the response size, will the IC refund me the cycles? Or if I send a lot of cycles will the system just take them all from me?
+
+-------------------------
+
+lastmjs | 2022-08-03 20:55:37 UTC | #114
+
+I have a lot of questions actually, I don't want to spam this thread. Is this the best place to ask these? I think they will be useful to others as well.
+
+-------------------------
+
+dieter.sommer | 2022-08-04 06:19:33 UTC | #115
+
+[quote="lastmjs, post:113, topic:9670"]
+Let’s say I send a lot of cycles, much more than required based on the response size, will the IC refund me the cycles? Or if I send a lot of cycles will the system just take them all from me?
+[/quote]
+
+The system should refund the cycles, it only takes what it costs.
+
+[quote="lastmjs, post:114, topic:9670, full:true"]
+I have a lot of questions actually, I don’t want to spam this thread. Is this the best place to ask these? I think they will be useful to others as well.
+[/quote]
+
+Yes, this is the best place, please ask them. They will also be valuable for the documentation as others will have the same. I will answer as time permits me to.
+
+-------------------------
+
+lastmjs | 2022-08-04 16:07:22 UTC | #116
+
+Will POST requests be supported at launch along with GET requests?
+
+-------------------------
+
+dieter.sommer | 2022-08-04 19:02:18 UTC | #117
+
+Yes, POST support is implemented already. Please note that all replicas will make the same POST call, so there must be some way to prevent it to be made 13 times on the server. The standard solution for this are idempotency keys.
+
+-------------------------
+
+lastmjs | 2022-08-04 21:47:26 UTC | #118
+
+I'm running into some confusing behavior here. If I set `max_response_bytes` to null and I send `300_000_000_000` cycles with the http request, just to be sure, and my response ends up only being 200 bytes, will I get charged an outrageous amount, or will the system refund me everything that it didn't need to use? Because in my local testing, if I set `max_response_bytes` to null and send `300_000_000_000` cycles, even though my response bodies are around 100 bytes, I'm getting charged like 1T cycles for 6 http requests.
+
+I'm a little confused at why we even have to set the `max_response_bytes` and send cycles with the request. Can't the IC just charge the canister based on what it used? Why can't we get rid of these two requirements?
+
+-------------------------
+
+dieter.sommer | 2022-08-05 07:13:43 UTC | #119
+
+[quote="lastmjs, post:118, topic:9670"]
+Because in my local testing, if I set `max_response_bytes` to null and send `300_000_000_000` cycles, even though my response bodies are around 100 bytes, I’m getting **charged like 1T cycles** for 6 http requests.
+[/quote]
+
+If you do not specify max_response_size, the system takes the default of 2MB. This results in 2M * 100M cycles to be charged for the response. This is around 200B, which is in line with what you are observing. Always set max_response_bytes to not be charged for the maximum response size for the HTTP request.
+
+[quote="lastmjs, post:118, topic:9670"]
+I’m a little confused at why we even have to set the `max_response_bytes`
+[/quote]
+
+The reason we have the max_response_bytes is that it would be technically too much effort to charge what was actually going over the wire in terms of incoming responses (this information would also need to go through consensus). Thus, we decided to introduce the max_response_bytes parameter and always charge the max response size instead of the actual size. Thus it's important to set the parameter to a value close the real value to not be overcharged.
+
+[quote="lastmjs, post:118, topic:9670"]
+Can’t the IC just charge the canister based on what it used?
+[/quote]
+
+The default way of charging is to send cycles along, it would be theoretically possible also to directly deduct. We decided to not do that (can't recall the exact reason, but think it was compliance with the typical way of charging) and thus one has to send cycles. You can always send along the max and the system deducts what it costs and returns the rest, so it should be convenient enough.
+
+-------------------------
+
+skilesare | 2022-08-05 12:39:15 UTC | #120
+
+Is this api available from motoko yet?
+
+-------------------------
+
+lastmjs | 2022-08-05 13:17:02 UTC | #121
+
+It's just a new method on the management canister, so if you create the types I assume yes.
+
+-------------------------
+
+skilesare | 2022-08-05 13:37:05 UTC | #122
+
+oh...wow.  So you have to send a request to the management canister to have an HTTP request made?  Is that the final design?  It is literally just called http_request on the management canister with the signature above?
+
+-------------------------
+
+dieter.sommer | 2022-08-05 14:16:26 UTC | #123
+
+Yes!
+Depending on the response behaviour of the server, you need to write a transformation function that makes sure that the transformed responses of all replicas are equal.
+
+The interface specification of the method `http_request` is available here already:
+https://github.com/dfinity/interface-spec/blob/master/spec/index.adoc#ic-method-http_request
+
+-------------------------
+
+claudio | 2022-08-05 14:50:20 UTC | #124
+
+I think the link to the relevant Candid interface is broken in that documents but can be found here:
+
+https://github.com/dfinity/interface-spec/blob/master/spec/ic.did
+
+I believe this should be useable from Motoko already with some selective importing of IC ManagementCanister methods, but it would be nice if someone could translate the Rust example  Motoko.
+
+Rust example appears to live here:
+
+https://github.com/dfinity/examples/tree/master/rust/exchange_rate
+
+It would also make sense to wrap the functionality into a little Motoko library, as we do for IC randomness...
+
+-------------------------
+
+tonynguyen | 2022-08-08 07:51:22 UTC | #125
+
+HI,
+I deploy canister locally, got an error:
+![image|690x88](upload://m5LurJHSyhibprP2wCoWB4zN6wP.png)
+How to resolve this?
+Many thanks
+
+-------------------------
+
+claudio | 2022-08-08 09:18:50 UTC | #126
+
+The rust (and I guess Motoko) instructions indicate that you need to deploy with cycles. Maybe you didn't?
+
+See last section here https://github.com/dfinity/examples/tree/master/rust/exchange_rate#deploy-the-canister-locally
+
+-------------------------
+
+hhhhanhhh | 2022-08-09 10:32:19 UTC | #127
+
+Hello, I want to know which subnet supports this？
+
+-------------------------
+
+Severin | 2022-08-09 12:41:38 UTC | #128
+
+AFAIK no live subnets currently support it, only the local ones if you enable `canister_http`. Mainnet support should come soon :tm:
+
+-------------------------
+
+dieter.sommer | 2022-08-09 13:04:19 UTC | #129
+
+This is correct! We are currently working on the documentation and working on some remaining technical tasks.
+
+You can already work in your SDK environment as @lastmjs has been doing for some time, see some discussions on pitfalls and tips further above. The documentation attempts to capture the issue people have stumbled upon in the forum to help engineers get up to speed quickly.
+
+-------------------------
+
+lastmjs | 2022-08-09 16:18:06 UTC | #130
+
+So the base cost is 400_000_000, what is the cost per byte? And is it just the response bytes or the request and response bytes that add to the cost? Basically I'd like to know how to calculate the cost without trial and error, right now I'm just looking at what the error returns when I perform the call with too few cycles. I'm getting back different requested cycle amounts even though max_response_bytes is set to 200 for each call I'm making.
+
+-------------------------
+
+lastmjs | 2022-08-09 19:38:20 UTC | #131
+
+Here's the code I've been working on BTW. It's basically an oracle to the Chainlink oracle data on Ethereum or Binance Smart Chain. It will grab ETH/USD, BTC/USD, and ICP/USD prices from multiple Ethereum JSON RPC APIs, compare the results, and use a threshold of the results to come to consensus. It's been a pleasure to build this and I can't wait for outgoing HTTP requests to go live: https://github.com/demergent-labs/ic_chainlink_data_feeds
+
+-------------------------
+
+lastmjs | 2022-08-09 20:50:37 UTC | #132
+
+What happens if you set `max_response_bytes` too low?
+
+-------------------------
+
+dieter.sommer | 2022-08-12 15:22:11 UTC | #133
+
+Awesome, @lastmjs!
+Thanks for sharing your code, it will be an inspiration for many others!
+
+[quote="lastmjs, post:132, topic:9670, full:true"]
+What happens if you set `max_response_bytes` too low?
+[/quote]
+
+**Update:**
+According to what @tim1, our network engineer on the project, just told me:
+If you set it lower than the actual response size is, you receive an error.
+
+-------------------------
+
+dieter.sommer | 2022-08-12 13:35:04 UTC | #134
+
+Let me advertise an event by @lastmjs here where he will be looking into using canister HTTP requests for pulling market data from Ethereum. Jordan seems to be one of the first engineers seriously building on top of this soon-upcoming feature!
+
+https://twitter.com/lastmjs/status/1557526291347390464?s=20&t=vwuNStR77bu9QyLAMG1n0A
+
+-------------------------
+
+lastmjs | 2022-08-12 14:01:52 UTC | #135
+
+It already happened, but thanks for the shout-out! Code examples:
+
+* https://github.com/demergent-labs/ic_chainlink_data_feeds
+* https://github.com/demergent-labs/azle/tree/main/examples/ethereum_json_rpc
+* https://github.com/demergent-labs/azle/tree/main/examples/outgoing_http_requests
+
+-------------------------
+
+dieter.sommer | 2022-08-12 14:11:05 UTC | #136
+
+[quote="lastmjs, post:135, topic:9670"]
+It already happened
+[/quote]
+Oh no! Missed it!
+I interpreted "tomorrow" as today, Aug 12, for a tweet sent on Aug 11 my time. But when you sent it, it was still a day earlier for you, so "tomorrow" referred to a different day. Tricky! ;-)
+
+-------------------------
+
+lastmjs | 2022-08-12 14:28:43 UTC | #137
+
+Maybe once the feature goes live and I can deploy the example to production, I can do another presentation of some kind, with the live results side-by-side.
+
+-------------------------
+
+lastmjs | 2022-08-12 14:29:11 UTC | #138
+
+I don't think this happens locally...
+
+-------------------------
+
+h4rdcoder | 2022-08-14 03:42:58 UTC | #139
+
+HI I think I detected a bug in the code that validates the signers of the response, where can I create an issue, the github page doesn't have that section.
+Also are POST requests already allowed in a local replica? I'm using HttpMethod::POST in the call but the server receives a GET request. 
+Thanks
+
+-------------------------
+
+dieter.sommer | 2022-08-15 06:21:10 UTC | #140
+
+Thanks, could you post the bug here in the forum for now so our engineers can have a look at it? POST should be allowed, let me check back on this.
+
+-------------------------
+
+dieter.sommer | 2022-08-15 08:34:10 UTC | #141
+
+@tim1 has tried this out and it worked for him. So we suggest to try to update to the latest SDK version and see whether this fixes the problem with the POST not working.
+
+-------------------------
+
+dieter.sommer | 2022-08-15 19:47:09 UTC | #142
+
+**Update**
+
+We have 1 small MR with a small fix to merge into our master branch before we can do a soft launch on a first subnet on IC mainnet. I expect the merge to be in within days and a soft launch to happen early next week. Then we will do some more testing on mainnet. The feature integrates tightly with consensus and the whole IC stack, so we need to make sure it does not interfere with the regular functioning of the subnets.
+
+We also need to finish up the documentation which is currently an early draft and still need some effort to get it to where I want it to be. We think that good documentation is extremely important for this feature for the reason that it's not easy to use and one needs to get accustomed to the potential pitfalls that can cause errors with this feature.
+
+Once the documentation is done (~1 week) and testing with the soft-launched feature has been concluded, we can make a wider rollout of the feature to IC subnets. The NNS will be last as it is the most critical one and does currently not yet need the feature.
+
+-------------------------
+
+h4rdcoder | 2022-08-15 23:05:37 UTC | #143
+
+Well I may be wrong but it's on the line 592 (ic/rs/consensus/src/canister_http.rs) 
+
+Original code:
+```
+if ! invalid_signers.is_empty() {
+         return Err(CanisterHttpPayloadValidationError::Permanent(
+         CanisterHttpPermanentValidationError::SignersNotMembers(invalid_signers),
+   ));
+}
+```
+Patch: 
+```
+if invalid_signers.is_empty() {
+         return Err(CanisterHttpPayloadValidationError::Permanent(
+         CanisterHttpPermanentValidationError::SignersNotMembers(invalid_signers),
+   ));
+}
+```
+"invalid_signers" is filtered to only contain the nodes who belong to the http commitee so that code will actually throw an error if some nodes who belong to the commitee are found (vec is not empty), I guess we need some nodes to belong here so it should throw when the vec is empty, it was throwing me an error in the local replica when calling http_request
+
+-------------------------
+
+Maxfinity | 2022-08-16 07:11:10 UTC | #144
+
+[quote="dieter.sommer, post:142, topic:9670"]
+We have 1 small MR with a small fix to merge into our master branch before we can do a soft launch on a first subnet on IC mainnet. I expect the merge to be in within days and a soft launch to happen early next week. Then we will do some more testing on mainnet. The feature integrates tightly with consensus and the whole IC stack, so we need to make sure it does not interfere with the regular functioning of the subnets.
+[/quote]
+
+Hi Dieter, does the team have any plans  to enable API keys to be used with HTTP requests? It would be really useful if the IC could query paid for services like Binance or Coinbase, but I worry that without some form of metering or without having the nodes carry their own API keys, it will be difficult to query these services on the IC.
+
+-------------------------
+
+dieter.sommer | 2022-08-16 20:06:03 UTC | #145
+
+[quote="Maxfinity, post:144, topic:9670"]
+Hi Dieter, does the team have any plans to enable API keys to be used with HTTP requests?
+[/quote]
+
+There are no plans to enable this because it is already possible now. You can simple send the API key as a header or part of the query string, where the further is the recommended solution and the latter frowned upon in the Web security community.
+
+The only caveat is that the API key (a secret) is stored within the replicas. This risk needs to be taken and is manageable: in case of expose of an API key, the adversary can deplete your query quota. The situation is worse in case you use your API key to authorize for writing data to a server. This caveat cannot be avoided, though, in the current architecture.
+
+[quote="Maxfinity, post:144, topic:9670"]
+but I worry that without some form of metering or without having the nodes carry their own API keys, it will be difficult to query these services on the IC.
+[/quote]
+
+I share this worry after our investigations on rate limiting. But with the abovementioned way of using API keys you should be fine and have your own quota through the API key.
+
+-------------------------
+
+dieter.sommer | 2022-08-16 20:07:38 UTC | #146
+
+@h4rdcoder: Could you resolve your issue meanwhile, it seems to work for at least @lastmjs in the local environment. Can you share more details on the SDK version you are using, the call you are making and the error you receive? Maybe someone from the community our our engineering team can help you resolve the issue.
+
+-------------------------
+
+dieter.sommer | 2022-08-23 12:03:41 UTC | #147
+
+**Update**
+
+We need to currently address some inconsistencies between the [interface specification](https://github.com/dfinity/interface-spec/pull/75/files?diff=unified&w=0#diff-70cff681570b2d13b71fc3d69dcc691974aecfa665a77edc1f831f41c243b2c4R20-R24) and the implementation of the feature. Those have emerged during the implementation and need to be addressed now.
+
+Regarding how to model the transform function in the interface spec, a larger discussion has come up. The current way of modelling it as
+```
+    transform : opt variant {
+      function: func (http_response) -> (http_response) query
+    };
+```
+is seen to be inconsistent with the way we usually handle canister methods that the replica calls, namely [system calls](https://github.com/dfinity/interface-spec/blob/master/spec/index.adoc#entry-points).
+
+The discussion is ongoing, see the above PR for the interface spec, and depending on the outcome, we may need to update the interface spec and implementation to reflect the decisions, leading to some delay. Those inconsistencies are also the reason we could not yet make a mainnet deployment of the feature as originally envisioned.
+
+The main driver for a potential change is consistency within the interface spec which is considered highly important at DFINITY. Inconsistency is like a *broken window* in software engineering, for those who are familiar with this concept, as it invites for further inconsistency in the future, so should be avoided whereever possible. So we need to see where the discussion goes and whether this is perceived a major inconsistency and, in case, act accordingly and get it fixed.
+
+-------------------------
+
+mparikh | 2022-08-23 16:00:11 UTC | #148
+
+To a naive outsider, the higher level issue in the conversation mentioned in the PR, looks like using the particular construct (function reference) to drive certain other changes ( more library support for rust, a step towards function closures etc).
+
+While the change has to begin somewhere,  not sure whether this (http_request_method) is the appropriate place to have this battle(of ideas).
+
+-------------------------
+
+janosroden | 2022-08-23 16:55:34 UTC | #149
+
+[quote="dieter.sommer, post:94, topic:9670"]
+Going via boundary nodes, as initially planned, may be added at a later stage, but the main issue is that all subnets then share the rate limits of services as we only have 10-20 boundary nodes currently.
+[/quote]
+
+The original post mentioned requests made by replicas.
+
+What are the benefits of using boundary nodes here? Regarding rate limits of a service it sounds better to block a subnet (replicas) than the entire IC (random BN) or region (closest BN).
+
+-------------------------
+
+dieter.sommer | 2022-08-23 19:14:49 UTC | #150
+
+The benefits of using boundary nodes would be that only boundary nodes have IPv4 addresses. We do not have sufficiently many IPv4 addresses to equip all IC replicas with IPv4 addresses. Thus, using boundary nodes is one avenue towards enabling IPv4 connectivity for the HTTP feature.
+
+As you say, in terms of rate limiting, going via boundary nodes means that if a boundary node is blocked, it is not available for any replica to use as a proxy. But, as the number of boundary nodes would grow with the number of replicas, the problem would not be as pronounced as it seems.
+
+-------------------------
+
+dieter.sommer | 2022-08-23 19:16:53 UTC | #151
+
+[quote="mparikh, post:148, topic:9670"]
+looks like using the particular construct (function reference) to drive certain other changes
+[/quote]
+
+Knowing the involved people, I don't think this is the case, I think think this is really about getting the best possible solution in place for the IC. Driving certain other changes would be more a side effect of this.
+
+-------------------------
+
+dieter.sommer | 2022-08-31 14:41:31 UTC | #152
+
+Regarding the discussions on the interface specification we had further discussions. Many thanks here to @nomeata for giving a valuable perspective, @ielashi helping us to come to a decision, and finally @bjoern for making a decision on the information on the table!
+
+See here for the beginning of the discussion: https://github.com/dfinity/interface-spec/pull/75#discussion_r944467774
+
+Great discussion with the outcome that we leave the specification as is, modelling the transformation function as query calls and keeping the system API minimal. The Rust implementation is updated to finally match the specification.
+
+The final MR went into master yesterday and should make it into the Release Candidate for the upcoming release, starting rollout in the coming week. We will first enable the feature on a non-whitelisted subnet for further quality assurance, followed by a rollout throughout the IC.
+
+-------------------------
+
+Jamietier | 2022-09-07 15:29:25 UTC | #153
+
+Any updates on the rollout? Great to see it's all coming together!
+
+-------------------------
+
+dieter.sommer | 2022-09-09 14:56:46 UTC | #154
+
+The feature has been enabled on a first subnet of IC mainnet! :rocket:
+
+The HTTP feature has been rolled out to and enabled on a first subnet (fuqsr) that is now used for testing the feature on IC mainnet. An HTTPS request to the URL https://example.com/ has been the first direct request ever being successfully executed from a smart contract to a Web 2.0 HTTPS server. :tada:
+
+This was an important step to be executed before a full rollout of the feature on the IC. We will now perform further testing and, if everything works as expected, perform a larger rollout in the coming weeks. Note that the subnet the feature has been deployed on is not available to the public.
+
+-------------------------
+
+lastmjs | 2022-09-28 13:35:14 UTC | #155
+
+I'm confused, does the spec now require `transform` or `transform_method_name`?
+
+The current Rust example uses [transform_method_name](https://github.com/dfinity/examples/blob/master/rust/exchange_rate/src/main.rs#L255) but the current interface spec uses [transform](https://github.com/dfinity/interface-spec/blob/master/spec/ic.did#L118)
+
+-------------------------
+
+dieter.sommer | 2022-09-28 13:58:54 UTC | #156
+
+The spec is right, the code change to the sample dApp seems to not yet be in the repo.
+
+-------------------------
+
+qijing_yu | 2022-09-28 14:45:13 UTC | #157
+
+Correct, spec-aligning [pull request](https://github.com/dfinity/examples/pull/341) to the sample dapp is going through review.
+
+-------------------------
+
+lastmjs | 2022-09-28 16:58:43 UTC | #158
+
+What version of dfx will have the correct version being deployed then? dfx 0.11.0 is what we implemented in Azle and all of our tests pass. So I assume dfx 0.12.0 has the fully correct http_request interface?
+
+-------------------------
+
+Severin | 2022-09-28 17:10:29 UTC | #159
+
+@dieter.sommer do you know starting from which commit of the replica the correct version is included?
+
+-------------------------
+
+dieter.sommer | 2022-09-28 18:12:21 UTC | #160
+
+It is the most recent one, [0.12.0-beta.3](https://github.com/dfinity/sdk/releases/tag/0.12.0-beta.3), released earlier this week.
+
+-------------------------
+
+dieter.sommer | 2022-09-28 18:17:35 UTC | #161
+
+4bd164bbc600421a2e6f93feb41f3d1479bb8d0f
+
+-------------------------
+
+dieter.sommer | 2022-09-28 18:18:35 UTC | #162
+
+Stay tuned for more information tomorrow morning Swiss time!
+
+-------------------------
+
+Severin | 2022-09-29 16:07:42 UTC | #163
+
+[quote="dieter.sommer, post:161, topic:9670, full:true"]
+4bd164bbc600421a2e6f93feb41f3d1479bb8d0f
+[/quote]
+
+It's not morning yet, but I can say: Latest release (EDIT: that's SDK release) does NOT yet contain this commit. The next time we update the replica version the change will be included
+
+-------------------------
+
+dieter.sommer | 2022-09-28 20:20:40 UTC | #164
+
+@lastmjs, @Severin:
+The `0.12.0-beta.3` contains an earlier replica version (9173c5f1b28e140931060b90e9de65b923ee57e6) than the one being rolled out in mainnet (4bd164bbc600421a2e6f93feb41f3d1479bb8d0f), but it has everything we need regarding the latest changes for the feature.
+You need to install the beta.3 version, e.g., by using the following command:
+`DFX_VERSION=0.12.0-beta.3 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"`
+
+-------------------------
+
+dieter.sommer | 2022-09-29 04:59:23 UTC | #165
+
+Dear community!
+
+We are happy to announce that, after many months of hard engineering work, the public rollout of the HTTPS outcalls feature has been started and the feature has been rolled out to a subset of the IC's subnets already by now! This enables, for the first time in blockchain history, smart contracts to directly talk to Web 2.0 servers without the need for an oracle.
+
+Last week, we made the final implementation changes to the replica code base as required for the rollout of the HTTPS outcalls feature. The replica version `4bd164bb` containing those changes was elected this Monday, Sep 26, by [NNS proposal 82425](https://dashboard.internetcomputer.org/proposal/82425). This replica version has since started to be rolled out to the subnets of the IC using the standard process of updating the subnets one by one over the course of a week. The subnet `fuqsr` has been updated to the latest replica on Tuesday with [NNS proposal 83069](https://dashboard.internetcomputer.org/proposal/83069) for the purpose of smoke testing the HTTPS outcalls feature before the wider rollout, which has been successfully concluded on Tuesday.
+
+The team has meanwhile proposed activation of the HTTPS outcalls feature on multiple subnets of the IC as shown in the following NNS proposals, all of which have been accepted and executed already.
+
+* [NNS proposal 83275](https://dashboard.internetcomputer.org/proposal/83275), subnet io67a
+
+* [NNS proposal 83318](https://dashboard.internetcomputer.org/proposal/83318), subnet w4asl
+
+* [NNS proposal 83319](https://dashboard.internetcomputer.org/proposal/83319), subnet snjp4
+
+* [NNS proposal 83328](https://dashboard.internetcomputer.org/proposal/83328), subnet o3ow2
+
+* [NNS proposal 83342](https://dashboard.internetcomputer.org/proposal/83342), subnet 4ecnw
+
+* [NNS proposal 83343](https://dashboard.internetcomputer.org/proposal/83343), subnet lspz2
+
+* [NNS proposal 83344](https://dashboard.internetcomputer.org/proposal/83344), subnet lhg73
+
+Towards an IC-wide rollout, the feature will be progressively activated on further subnets of the IC that have been updated to the latest replica version.
+
+The feature is flagged as *experimental* initially until we have gained some operational experience with it in the wild (i.e., on IC mainnet). Also, we will release an API upgrade that simplifies the implementation of transformation functions for certain classes of APIs and allows for covering an even wider set of HTTP APIs in the near future. This change will be a breaking API change, which is another reason for flagging the feature as experimental for now.
+
+You can use the feature on subnets on which it has been activated already now. Soon, all application subnets of the IC will have the feature activated. You need to upgrade to the latest beta version of the development tools (dfx 0.12.0-beta.3) in order to code with the feature. As this is a beta version, please install using the following command:
+
+`DFX_VERSION=0.12.0-beta.3 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"`
+
+**Further information**
+
+Some links to informative information sources are provided next. For those among you who want to get started coding HTTPS outcalls right away, we recommend to dive into the [documentation](https://internetcomputer.org/docs/current/developer-docs/integrations/http_requests/http_requests-how-it-works) immediately.
+
+* [Web page](https://internetcomputer.org/https-outcalls)
+
+* [Wiki](https://wiki.internetcomputer.org/wiki/HTTPS_outcalls)
+
+* [Blog post](https://medium.com/dfinity/beyond-oracles-direct-https-outcalls-from-canister-smart-contracts-on-the-internet-computer-2e4a5bcbee43)
+
+* Documentation: [Overview](https://internetcomputer.org/docs/current/developer-docs/integrations/http_requests/) and [details](https://internetcomputer.org/docs/current/developer-docs/integrations/http_requests/http_requests-how-it-works)
+
+* [Sample dApp](https://internetcomputer.org/samples)
+
+* [Interface specification](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-http_request)
+
+Many thanks to the team working on the feature for their excellent work!
+
+*Happy coding!*
+
+-------------------------
+
+cryptoschindler | 2022-09-29 16:08:02 UTC | #166
+
+Congratulations on the launch and the amazing work done by the team! 🥹
+
+-------------------------
+
+heyuanxun | 2022-09-29 10:20:59 UTC | #167
+
+I deploy the sample code,but the [canister](https://jaxse-zaaaa-aaaan-qau5a-cai.ic0.app/) did not return any icp price. How can i to solve this probloem?
+
+-------------------------
+
+qijing_yu | 2022-09-29 14:11:26 UTC | #168
+
+Hi @heyuanxun , there are some [updates](https://github.com/dfinity/examples/pull/341) to the sample dapp that is going through review, and expect to be merged this week.  If you would like, please feel free to download from the branch and try.
+
+-------------------------
+
+apotheosis | 2022-09-30 00:04:41 UTC | #169
+
+I did all of the upgrades and pushed to the IC.. still not working. It works on local with DFX 0.12 and the transform in the updates.
+
+Is the change on all of the subnets?
+
+-------------------------
+
+apotheosis | 2022-09-30 00:41:21 UTC | #170
+
+Got it Error: "This API is not enabled on this subnet"
+
+-------------------------
+
+apotheosis | 2022-09-30 00:53:05 UTC | #171
+
+Please activate on pae4o-o6dxf-xki7q-ezclx-znyd6-fnk6w-vkv5z-5lfwh-xym2i-otrrw-fqe as there is no method to choose a subnet.
+
+-------------------------
+
+dieter.sommer | 2022-09-30 05:53:14 UTC | #172
+
+[quote="apotheosis, post:169, topic:9670"]
+Is the change on all of the subnets?
+[/quote]
+
+[quote="apotheosis, post:169, topic:9670"]
+Is the change on all of the subnets?
+[/quote]
+
+Not yet, it is being rolled out to all application subnets.
+
+[quote="apotheosis, post:171, topic:9670, full:true"]
+Please activate on pae4o-o6dxf-xki7q-ezclx-znyd6-fnk6w-vkv5z-5lfwh-xym2i-otrrw-fqe as there is no method to choose a subnet.
+[/quote]
+
+The rollout process of the feature will activate it on all subnets, please have some more patience or try a couple of times until you land on an already-activated subnet with your canister.
+
+-------------------------
+
+apotheosis | 2022-09-30 05:54:08 UTC | #173
+
+Thank you! How long is the rollout process?
+
+-------------------------
+
+Severin | 2022-09-30 06:36:56 UTC | #174
+
+[quote="qijing_yu, post:168, topic:9670"]
+there are some [updates ](https://github.com/dfinity/examples/pull/341) to the sample dapp that is going through review
+[/quote]
+
+updates are now merged
+
+-------------------------
+
+tomkoom | 2022-09-30 09:26:13 UTC | #175
+
+Hello, is there a Motoko HTTP outcall implementation example?
+
+-------------------------
+
+Severin | 2022-09-30 09:30:14 UTC | #176
+
+Here you go: [Motoko example for HTTPS Outcalls](https://github.com/dfinity/examples/tree/master/motoko/exchange_rate)
+
+-------------------------
+
+tomkoom | 2022-09-30 09:37:30 UTC | #177
+
+Perfect, thank you! 🫶
+
+-------------------------
+
+InsaneClownPosse | 2022-10-04 21:16:22 UTC | #178
+
+Is it possible to solve the oracle problem on ICP utilizing HTTPS requests? Linkies (ticker:LINK) say it's not possible, talking about verifying data truth and having decentralized data input. Can a replacement for Link be built on ICP? Or is there an inherent fault in IC's structure to handle precisely this?
+
+-------------------------
+
+InsaneClownPosse | 2022-10-04 22:07:35 UTC | #179
+
+Would it be possible to have a oracle specific subnet? I think chainlink pays nodes to verify the data.
+
+-------------------------
+
+JaMarco | 2022-10-05 00:00:13 UTC | #180
+
+Oracles built on ICP can probably replace the parts of Chainlink that just query nonpermissoned APIs, but I think it will be hard to replicate nodes querying permissioned APIs (which Chainlink does as well).
+
+-------------------------
+
+Zane | 2022-10-05 00:06:01 UTC | #181
+
+Why is that? Why can only link use permissioned APIs?
+
+-------------------------
+
+InsaneClownPosse | 2022-10-05 00:11:35 UTC | #182
+
+Hard, but not impossible? And how about ccip? Can cross chain communication be built on icp?
+
+-------------------------
+
+JaMarco | 2022-10-05 00:19:53 UTC | #183
+
+Permissioned private APIs would be really hard. A canister dev would have to get permission/access to an company's internal APIs which would probably involve giving out a password and saving it into nodes they dont control. On Chainlink the company controls the nodes that query their private APIs.
+
+-------------------------
+
+yotam | 2022-10-05 08:57:19 UTC | #185
+
+Hi all, I am writing to let you know that we are planning a breaking change to the interface of the HTTPS outcalls soon. I would like to remind you that this API is still experimental, and further breaking changes may still happen in the near future as we discover more issues and use cases.
+
+Specifically, the upcoming change will be around the `transform` function. We realized that the initial design of this function, expected it to operate on a response without any context or correlation with the request to which this response corresponds. This makes devs hard time if they issue multiple HTTP requests, especially if these go to the same remote server.
+
+The new API will let developers specify a `context` in their request, and this context will be passed as another argument to the transform function. The context is essentially a blob, and devs can encode anything into it. This helps devs to better filter the results already in the `transform` function.
+
+We will communicate the rollout of this breaking change here in this thread, so please follow in the upcoming ~2 weeks. Once the subnet on which your canister is running gets updated, canisters using the existing API may break.
+
+-------------------------
+
+ccyanxyz | 2022-10-06 15:03:57 UTC | #186
+
+Yeah, it's possible.
+In fact, we are already building it, called Omnic, starting from crosschain messaging between EVM chains.
+We'll release more info after the grant period ends.
+
+-------------------------
+
+dieter.sommer | 2022-10-12 11:15:54 UTC | #187
+
+**Update on rollout**
+
+Since the end of last week, the feature is enabled on all IC application subnets, with the following exceptions:
+* `yinp6-35cfo-wgcd2-oc4ty-2kqpf-t4dul-rfk33-fsq3r-mfmua-m2ngh-jqe`
+* `eq6en-6jqla-fbu5s-daskr-h6hx2-376n5-iqabl-qgrng-gfqmv-n3yjr-mqe`
+* `mpubz-g52jc-grhjo-5oze5-qcj74-sex34-omprz-ivnsm-qvvhr-rfzpv-vae`
+* `pjljw-kztyl-46ud4-ofrj6-nzkhm-3n4nt-wi3jt-ypmav-ijqkt-gjf66-uae`
+* `brlsh-zidhj-3yy3e-6vqbz-7xnih-xeq2l-as5oc-g32c4-i5pdn-2wwof-oae`
+* `qdvhd-os4o2-zzrdw-xrcv4-gljou-eztdp-bj326-e6jgr-tkhuc-ql6v2-yqe`
+
+The reason for those exceptions is that those subnets are either busy in terms of traffic, hold large state, or many canisters. We want to observe the behaviour of the feature on IC mainnet a little longer before rolling out to those subnets.
+
+-------------------------
+
+tomkoom | 2022-10-14 10:24:31 UTC | #188
+
+Waiting for the mpubz 👀
+
+-------------------------
+
+dieter.sommer | 2022-10-18 07:27:54 UTC | #189
+
+**Update on rollout**
+
+Yesterday, we have enabled the feature on the remaining application subnets.
+* `yinp6-35cfo-wgcd2-oc4ty-2kqpf-t4dul-rfk33-fsq3r-mfmua-m2ngh-jqe`
+* `eq6en-6jqla-fbu5s-daskr-h6hx2-376n5-iqabl-qgrng-gfqmv-n3yjr-mqe`
+* `mpubz-g52jc-grhjo-5oze5-qcj74-sex34-omprz-ivnsm-qvvhr-rfzpv-vae`
+* `pjljw-kztyl-46ud4-ofrj6-nzkhm-3n4nt-wi3jt-ypmav-ijqkt-gjf66-uae`
+* `brlsh-zidhj-3yy3e-6vqbz-7xnih-xeq2l-as5oc-g32c4-i5pdn-2wwof-oae`
+* `qdvhd-os4o2-zzrdw-xrcv4-gljou-eztdp-bj326-e6jgr-tkhuc-ql6v2-yqe`
+
+Now the feature is available on all the application subnets of the IC.
+
+-------------------------
+
+lastmjs | 2022-10-24 17:36:27 UTC | #190
+
+Is the final API live on all subnets, and is the documentation and are the examples up to date with that final API?
+
+-------------------------
+
+bitbruce | 2022-10-26 11:46:11 UTC | #191
+
+[quote="dieter.sommer, post:1, topic:9670"]
+Customizable quorum (“unsafe mode”), where only one replica or a specified number of replicas make(s) the request, with the inherent reduction in security. This maybe useful for less critical interactions and will easily allow for making state changing requests to the outside world in the case of a single replica making the request.
+[/quote]
+
+This is useful. Allowing the caller to specify how many nodes to send the call as parameters would improve efficiency and success rates.
+
+[quote="dieter.sommer, post:1, topic:9670"]
+Allowing for slightly different numerical values in responses, e.g., relevant for fast-changing data that are to be queried.
+[/quote]
+
+This is not necessary. Because the transformation function can achieve the same purpose.
+
+-------------------------
+
+paulyoung | 2022-10-26 13:45:28 UTC | #192
+
+[quote="JaMarco, post:183, topic:9670, full:true"]
+Permissioned private APIs would be really hard. A canister dev would have to get permission/access to an company’s internal APIs which would probably involve giving out a password and saving it into nodes they dont control. On Chainlink the company controls the nodes that query their private APIs.
+[/quote]
+
+I think this shares the same concerns as authenticating with other services, and could potentially share the same solutions as well.
+
+The solution I proposed for authenticating with push notification services (for example) was to use a threshold key pair (as in threshold ECDSA)
+
+The private key is split into shares so no one sees the fully assembled private key but canisters can sign outgoing requests. Only the public key is revealed in the request.
+
+https://forum.dfinity.org/t/discussing-a-standard-for-push-notifications-and-subscriptions-in-wallets/15795/8?u=paulyoung
+
+https://forum.dfinity.org/t/discussing-a-standard-for-push-notifications-and-subscriptions-in-wallets/15795/9?u=paulyoung
+
+-------------------------
+
+singularity | 2022-10-27 03:00:00 UTC | #193
+
+The ability to call web2 APIs directly should however be retained. You call proxy canisters for popular well known APIs if you wish to. The proxies wont keep up with all the APIs out there, and will add cost, while individual developers can.
+
+-------------------------
+
+bitbruce | 2022-10-28 11:55:11 UTC | #196
+
+The *api.binance.com* interface cannot now be called.
+Error returned.
+
+> The Replica returned an error: code 4, message: "Failed to connect: error trying to connect: tcp connect error: Network is unreachable (os error 101)"
+
+IC faces complex web2.
+
+-------------------------
+
+Severin | 2022-10-28 12:06:32 UTC | #197
+
+HTTPS outcalls only support IPv6 right now. I've seen this error happen before because a service was only available via IPv4. Could this be the problem?
+
+-------------------------
+
+bitbruce | 2022-10-29 02:42:07 UTC | #198
+
+Most of the interfaces in Web2 are still IPv4, I think.
+
+-------------------------
+
+skilesare | 2022-10-29 04:17:23 UTC | #199
+
+This is like getting your toys on Christmas morning but your parents forgot to buy batteries. 😂
+
+Small steps over time get us there! So excited this is rolling out. Super interested if there is a technical reason to only support v6?
+
+-------------------------
+
+yotam | 2022-10-29 10:55:22 UTC | #200
+
+The reason we are limited to IPv6 only is that IC nodes do not have IPv4 addresses assigned to them. This was a design decision as requiring IPv4 would have make it very difficult to scale the network.
+
+However, we are looking at some possible solutions. None of them unfortunately is going to be perfect. Some options we are discussing are, for example, having a few subnets with IPv4, or using the boundary nodes as SOCKS/NAT64 proxies, with the possibility that the community provides more such proxies for improved decentralization.
+
+-------------------------
+
+skilesare | 2022-10-29 11:03:31 UTC | #201
+
+Makes sense! Thanks for the detailed explanation.
+
+-------------------------
+
+tomkoom | 2022-10-31 12:23:53 UTC | #202
+
+Is there a more detailed documentation how to write transform functions? I am querying https://api.coinbase.com/v2/prices/BTC-USD/spot and sometimes get an "Canister http responses were different across replicas, and no consensus was reached" error. I would only like to get the price from this query
+
+-------------------------
+
+stefan.schneider | 2022-10-31 14:19:33 UTC | #203
+
+My guess would be that your queries arrive at slightly different times and therefore return different prices. Is there a similar API where you can provide a timestamp?
+
+-------------------------
+
+yotam | 2022-10-31 14:50:24 UTC | #204
+
+@tomkoom , the reply by @stefan.schneider is correct. Maybe see the [sample dapp](https://internetcomputer.org/samples/?term=https+outcalls) we published that queries Coinbase Pro API through the candles endpoint, where you can specify a timestamp (could be just a few seconds into the past to guarantee consensus).
+
+-------------------------
+
+dieter.sommer | 2022-11-05 10:45:29 UTC | #205
+
+**Breaking change upcoming**
+
+**tl;dr**: We intend to roll out a breaking change in the week of November 7 that will break every canister using the HTTPS Outcalls feature. Please retrofit the invocation of the HTTP Outcalls feature to match the new API to keep your canister working!
+
+
+Dear community!
+
+As mentioned by @yotam some time back, we have implemented a breaking change to the HTTPS Outcalls feature. This change seemed necessary to query some forex financial data APIs needed for the exchange rate canister that is being implemented by the Foundation. We think that everyone can benefit from the more general semantics of this and decided that the feature should be extended to support this new functionality.
+
+Concretely, the need for the change arose because not every API out there is as nicely behaved as the standard crypto market data APIs we all know, where one can nicely query data based on time ranges and every response contains the same data, so it is easy to reach consensus on the responses with the current transformation function approach. There are services out there that don't offer such a query interface and may return different values if calls arrive at (slightly) different times. Without this change, such APIs would essentially require a separate transformation function for each invocation, which is clearly not practical. The extension now allows essentially to parameterize the transformation function with arbitrary data, thereby essentially emulating the power of a function closure. (Note that function closures are not supported currently in Candid, so we need to make this workaround)
+
+The change allows you to parameterize the transformation function with arbitrary data in each invocation of the features. This allows for addressing a much larger space of APIs than with the transformation function alone.
+
+The update will be a breaking change and is planned to be voted on on Monday, November 7. Once / if voted on, the rollout to the subnets of the IC will be performed in the week of November 7 following our standard rollout schedule, where all the subnets of the IC are updated throughout the course of the week.
+
+If you are using the feature currently, you need to change the invocation of the HTTPS Outcalls feature to contain a transformation context. The change should be small and comprise to add an empty transformation context to be compliant with the API. Your canisters will break once the change is rolled out on your subnet during the rollout week.
+
+SDK support:
+* The first SDK version supporting the change is **dfx 0.12.0-beta.6**, there is already a new one, dfx 0.12.0-beta.7, available now. Install with
+`DFX_VERSION=0.12.0-beta.7 sh -ci "$(curl -fsSL https://smartcontracts.org/install.sh)"`
+* The first Rust CDK with the changes is **ic-cdk v0.6.5**, available at https://crates.io/crates/ic-cdk/0.6.5.
+
+@qijing_yu has written a [detailed document](https://docs.google.com/document/d/15d-6CzRJmXkfd1LEJo2r1B3XOYOT-9t_Dsyf-V389pE/edit#) to explain the change and how it is performed for Motoko, Rust with the CDK and Rust without the CDK. This should also give you a hint on how to implement the chang if you are using other languages, such as C.
+
+This is also a good opportunity to thank QJ for her work on the original release of the feature and implementing and driving the release of this feature! Thank you, @qijing_yu!
+
+We apologize for the resulting inconvenience caused by this breaking change!
+
+-------------------------
+
+apotheosis | 2022-11-06 07:14:32 UTC | #206
+
+Will the example code be updated before then?
+
+-------------------------
+
+Severin | 2022-11-07 09:45:11 UTC | #207
+
+Example code update hasn't hit yet, but the PR is here: https://github.com/dfinity/examples/pull/357
+
+-------------------------
+

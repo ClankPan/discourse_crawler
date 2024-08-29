@@ -1,0 +1,261 @@
+imponenm | 2021-08-22 05:15:24 UTC | #1
+
+Let's say I create hashmap where every key is assigned to another hashmap, and I populate this with some values:
+
+```
+var x1 = H.HashMap<Text, Nat>(2, Text.equal, Text.hash);
+var x2 = H.HashMap<Text, Nat>(2, Text.equal, Text.hash);
+var map = H.HashMap<Text, H.HashMap<Text, Nat>>(10, Text.equal, Text.hash);
+        
+x1.put("a1", 50);
+x2.put("a1", 100);
+map.put("2021-09-22", x1);
+map.put("2021-09-23", x2);
+```
+
+How do I go about maintaining the state of this variable? I understand that I'm not able to declare the map variable as stable, and I've taken a look at [pre-upgrade and post-upgrade](https://sdk.dfinity.org/docs/language-guide/upgrades.html#_declaring_stable_variables) functions, but I'm having trouble converting this hashmap into the correct kind of stable list.
+
+So far I've tried iterating through that map variable in an attempt to write it to a list of type [ (Text, [ (Text, Nat) ] ) ], but I haven't had any success so far. I'm not used to declaring list sizes in advance, so this is giving me some trouble. Is there an easy way to do this, or is there a different way I should be thinking about this?
+
+-------------------------
+
+peterparker | 2021-08-22 09:00:04 UTC | #2
+
+You can create a stable array with the same types as your hashmaps and indeed use pre-post upgrade.
+
+For example this [playground](https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=4031577968)
+
+```
+private var canisters: HashMap.HashMap<Principal, CanisterId> = HashMap.HashMap<Principal, CanisterId>(10, isPrincipalEqual, Principal.hash);
+
+private stable var upgradeCanisters : [(Principal, CanisterId)] = [];
+
+system func preupgrade() {
+        upgradeCanisters := Iter.toArray(canisters.entries());
+    };
+
+    system func postupgrade() {
+        canisters := HashMap.fromIter<Principal, CanisterId>(upgradeCanisters.vals(), 10, isPrincipalEqual, Principal.hash);
+        upgradeCanisters := [];
+    };
+```
+
+-------------------------
+
+peterparker | 2021-08-22 09:02:15 UTC | #3
+
+On `preupgrade` you call `Iter.toArray` to transform / populate the HashMap to the stable Array.
+
+On `postupgrade` you call the `HashMap.fromIter` to transform / populate the stable Array to HashMap.
+
+-------------------------
+
+imponenm | 2021-08-22 18:08:52 UTC | #4
+
+Hi @peterparker, I've tried something similar, but it doesn't work for the code sample I've posted above because the hashmap I'm converting to an array contains another hashmap. Going off the initial example I posted:
+
+
+```
+var map = H.HashMap<Text, H.HashMap<Text, Nat>>(10, Text.equal, Text.hash);
+stable var upgradeMap : [(Text, H.HashMap<Text, Nat>)] = [];
+// ...
+system func preupgrade() {
+    upgradeMap := Iter.toArray(map.entries());
+};
+```
+Would generate an error:
+
+```
+main.mo:21.16-21.28: type error [M0131], variable upgradeDates is declared stable but has non-stable type
+  [(Text, HashMap<Text, Nat>)]
+```
+I have also tried defining upgradeMap as follows:
+
+`stable var upgradeMap : [(Text, [(Text, Nat)])] = [];`
+
+But this still produces an error:
+
+
+```
+main.mo:38.23-38.50: type error [M0098], cannot implicitly instantiate function of type
+  <A>(Iter/1<A>) -> [A]
+to argument of type
+  Iter/1<(Text, HashMap<Text, Nat>)>
+to produce result of type
+  [(Text, [(Text, Nat)])]
+because implicit instantiation of type parameter A is over-constrained with
+  (Text, HashMap<Text, Nat>)  <:  A  <:  (Text, [(Text, Nat)])
+where
+  (Text, HashMap<Text, Nat>)  </:  (Text, [(Text, Nat)])
+so that no valid instantiation exists
+```
+I'm pretty sure I understand why the errors are occurring, I'm just not familiar with the proper syntax to apply Iter.toArray() in scenario like this, where I have a hashmap inside a hashmap
+
+-------------------------
+
+peterparker | 2021-08-22 18:49:21 UTC | #5
+
+[quote="imponenm, post:4, topic:6634"]
+the hashmap I’m converting to an array contains another hashmap.
+[/quote]
+
+Actually, I also have got such an example in my [repo](https://github.com/deckgo/deckdeckgo/blob/feat/internet-computer/studio/canisters/decks/decks.store.mo) 😉. Not sure that the best solution but, it works out for me.
+
+From my actor class functions pre/postupgrade I call another class that contains following functions:
+
+```
+public func preupgrade(): HashMap.HashMap<UserId, [(DeckId, OwnerDeckBucket)]> {
+            let entries : HashMap.HashMap<UserId, [(DeckId, OwnerDeckBucket)]> = HashMap.HashMap<UserId, [(DeckId, OwnerDeckBucket)]>(10, Utils.isPrincipalEqual, Principal.hash);
+
+            for ((key: UserId, value: HashMap.HashMap<DeckId, OwnerDeckBucket>) in decks.entries()) {
+                let ownerDecks : [(DeckId, OwnerDeckBucket)] = Iter.toArray<(DeckId, OwnerDeckBucket)>(value.entries());
+                entries.put(key, ownerDecks);
+            };
+
+            return entries;
+        };
+
+        public func postupgrade(entries: [(UserId, [(DeckId, OwnerDeckBucket)])]) {
+            for ((key: UserId, value: [(DeckId, OwnerDeckBucket)]) in entries.vals()) {
+                let ownerDecks: HashMap.HashMap<DeckId, OwnerDeckBucket> = HashMap.fromIter<DeckId, OwnerDeckBucket>(Iter.fromArray<(DeckId, OwnerDeckBucket)>(value), 10, Text.equal, Text.hash);
+
+                decks.put(key, ownerDecks);
+            };
+        };
+```
+
+My idea is to convert first the `HashMap<Something, Hashmap<Something, Something>>` to `HashMap<Something, [(Something, Something)])>` before converting it to the stable array on preupgrade and the reverse operation on postupgrade.
+
+Downside of the approach is that the upgrade might become slow over time as I iterate over the hashmap on upgrades to convert each sub-hashmaps to arrays but, like I said, does the job.
+
+Let me know if that would work for you?
+
+-------------------------
+
+imponenm | 2021-08-22 18:49:17 UTC | #6
+
+This is exactly what I was looking for, thank you! I was trying to do the same thing, but I'm still getting used to the Motoko syntax. This was very helpful
+
+-------------------------
+
+peterparker | 2021-08-22 18:56:08 UTC | #7
+
+[quote="imponenm, post:6, topic:6634"]
+I’m still getting used to the Motoko syntax
+[/quote]
+
+Me too!
+
+Happy to hear it helped and let me know if it works out.
+
+-------------------------
+
+imponenm | 2021-08-22 19:24:39 UTC | #8
+
+[quote="peterparker, post:5, topic:6634"]
+`HashMap.HashMap<UserId, [(DeckId, OwnerDeckBucket)]>`
+[/quote]
+
+It did wind up working out using similar syntax as your example. I can see this being slow if the hashmap gets too large, but for now, I don't expect to upgrading too frequently
+
+-------------------------
+
+peterparker | 2021-08-22 19:27:51 UTC | #9
+
+Cool thanks for the feedback
+
+-------------------------
+
+rossberg | 2021-08-23 07:36:42 UTC | #10
+
+I would recommend first converting the outer hashmap to an array and then map over that. That way, you only allocate one intermediate array instead of an intermediate hashmap, which is more expensive.
+
+You can also do it in one pass, by creating and initialising the target array manually instead of using toArray.
+
+-------------------------
+
+peterparker | 2021-08-23 08:50:58 UTC | #11
+
+Sounds super interesting! Don't you happen to have some sample code to display?
+
+-------------------------
+
+rossberg | 2021-08-23 09:22:35 UTC | #12
+
+Something along the lines of (untested):
+```
+var map = H.HashMap<Text, H.HashMap<Text, Nat>>(10, Text.equal, Text.hash);
+stable var upgradeMap : [var (Text, [(Text, Nat)])] = [var];
+
+system func preupgrade() {
+    upgradeMap := Array.init(map.size(), ("", []));
+    var i = 0;
+    for ((x, y) in map.entries()) {
+      upgradeMap[i] := (x, Iter.toArray(y.entries()));
+      i += 1;
+    };
+};
+```
+
+-------------------------
+
+peterparker | 2021-08-23 13:07:10 UTC | #13
+
+Nice! Thanks for the snippet, gotcha.
+
+-------------------------
+
+MCLYang | 2022-07-13 22:48:17 UTC | #14
+
+This works for me. I use nested loop and pattern match to approach it
+```
+private stable var currentSellOffersEntries : [(Nat,(Principal,(Price,Time.Time)))] = [];
+private type OfferInfo = HashMap.HashMap<Principal,(Price,Time.Time)>;
+private var currentSellOffers = HashMap.HashMap<Nat, OfferInfo>(currentSellOffersEntries.size(), Nat.equal, Hash.hash);
+system func preupgrade() {
+        // upgrade for nested hashmap
+        currentSellOffersEntries := [];
+        for (currentSellOffer in currentSellOffers.entries()){
+            // entry1: (Nat, OfferInfo)
+            let tokenId : Nat = currentSellOffer.0;
+            let offerInfo: OfferInfo = currentSellOffer.1;
+            for (offer in offerInfo.entries()){
+                // offer : (Principal,(Price,Time.Time))
+                let user : Principal = offer.0;
+                let price : Price = offer.1.0;
+                let timestamp : Time.Time = offer.1.1;
+                currentSellOffersEntries := Array_append(currentSellOffersEntries, [(tokenId,(user,(price,timestamp)))])
+            };
+        };
+};
+
+system func postupgrade() {
+        // currentSellOffersEntries : [(Nat,(Principal,(Price,Time.Time)))]
+        for (entry in currentSellOffersEntries.vals()){
+            // entry: (Nat,(Principal,(Price,Time.Time)))
+            let tokenId : Nat = entry.0;
+            let user : Principal = entry.1.0;
+            let price : Price = entry.1.1.0;
+            let timestamp : Time.Time = entry.1.1.1;
+
+            switch (currentBuyOffers.get(tokenId)){
+                case (?currentBuyOffer){
+                    // offer is a hashmap
+                    currentBuyOffer.put(user,(price,timestamp));
+                    currentBuyOffers.put(tokenId,currentBuyOffer);
+                };
+                case (_){
+                    let currentBuyOffer: OfferInfo = HashMap.HashMap<Principal,(Price,Time.Time)>(1, Principal.equal, Principal.hash);
+                    currentBuyOffer.put(user,(price,timestamp));
+                    currentBuyOffers.put(tokenId,currentBuyOffer);
+                };
+            };
+        };
+};
+
+```
+
+The key idea here is we must copy the nested hashmap to entries within `preupgrade()` so let our data safely pass the upgrading. When the upgrade completed, the nested hashmap is empty then iterate everything and copy back to hashmap in `postupgrade()` to complete the variables initiation.
+
+-------------------------
+

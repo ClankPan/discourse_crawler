@@ -1,0 +1,285 @@
+icme | 2022-04-26 18:51:19 UTC | #1
+
+Interface Spec reference - https://github.com/dfinity/interface-spec/blob/master/spec/ic.did
+
+As far I understand, to dynamically create an actor canister with code deployed and assign different controllers to that canister takes two calls.
+
+If I go directly through the `create_canister` function in the interface spec, I can do the creation and settings setup this in a single call, but this creates a blank canister and I then have to call `install_code` with my actor code in a subsequent call.
+
+If I have an actor canister that I have written, it takes one call to `create_canister` to create the actor canister, and a follow up call to `update_settings` to set up the controllers/canister settings for that actor canister.
+
+I would like to be able to do this in one step for the following reason. There is a slight chance that in both cases mentioned above the first call succeeds, but then the second call fails for whatever reason (subnet overloaded, etc.). I would like some assurances that after creation my canister is either completely ready and good to go, or failed - not some in between state.
+
+-------------------------
+
+skilesare | 2022-04-26 18:59:55 UTC | #2
+
+This is a great idea!  Dealing with the same thing here.  We have a vector of controllers that we want to have governance over the controller [lifeline, governance, governance_installer, admin, admin_backup]. It would be great to be able to pass these in Motoko somehow when creating an actor. We could seed them as part of the instantiation and then call an init function, but async can't run in the constructor so things could get 'lost' if something goes wrong.  Alternatively, from motoko it would be at least nice if the current canister's controller were copied to the new canister.
+
+-------------------------
+
+claudio | 2022-04-26 20:15:46 UTC | #3
+
+AFAIK, there's no (documented) System API call to get a canister's controllers, which makes this awkward. You need to make yet another async call to the ManagementCanister, assuming you are even allowed to access the list of your own controllers.
+
+It would be nice to surface more of the ManagementCanisters installation parameters to actor classes though - we might do this by adding another method the module of an actor class.
+
+-------------------------
+
+icme | 2022-04-26 20:32:26 UTC | #4
+
+The management canister exposes something like this.
+
+```
+create_canister : shared { 
+  settings : ?{
+    controllers : ?[Principal];
+    compute_allocation : Nat;
+    memory_allocation : ?Nat;
+    freezing_threshold : Nat;
+  }
+} -> async { canister_id : Principal };
+```
+
+Could this defintition be expanded to include the wasm_code
+```
+create_canister : shared { 
+  settings : ?{
+    controllers : ?[Principal];
+    compute_allocation : Nat;
+    memory_allocation : ?Nat;
+    freezing_threshold : Nat;
+    wasm_module : ?[Nat8];
+  }
+} -> async { canister_id : Principal };
+```
+
+And then expose some nifty Motoko magic that just allows us to pass the exported actor class like
+
+```
+import C "./ChildCanister";
+...
+...
+
+// (inside a canister actor)
+let child = await ExperimentalAwesomeMotokoBaseModule.create_canister({ 
+  settings : ?{
+    controllers = ?[owner, ...]
+    compute_allocation = 0;
+    memory_allocation = null;
+    freezing_threshold = ?...;
+    actor = C.ChildCanister;
+  }
+});
+```
+
+The key here would be that is call would do everything at once under the hood. Not just syntactic sugar for making two calls.
+
+[quote="claudio, post:3, topic:12455"]
+It would be nice to surface more of the ManagementCanisters installation parameters to actor classes though - we might do this by adding another method the module of an actor class.
+[/quote]
+
+What might this look like to play with from a developer's perspective?
+
+-------------------------
+
+claudio | 2022-04-26 20:48:08 UTC | #5
+
+https://github.com/dfinity/motoko/pull/2010 discussed some ways of exposing more configuration options (probably predating the controllers setting though)
+
+The second half of this comment sketched one option that might be reasonable to deliver:
+
+https://github.com/dfinity/motoko/pull/2010#issuecomment-712122694
+
+There is actually a reason canister creation is kept separate from code installation though, and that is to support the installation of *mutually recursive* actors, where you want to generate the ids first before installing the mutually dependent wasm modules.
+
+-------------------------
+
+icme | 2022-04-26 21:51:08 UTC | #6
+
+The main reason I'd like for this feature to happen would be to eliminate possible points of failure in my backend infrastructure, so ALL or NOTHING is ideal. Unless this can be done from a one-shot call, the only way I could feel 100% safe about my canister being spun up with both the correct settings & code is to build an intermediary queue like Kafka or SQS for the IC that will handle retries and if a subscriber downstream is unreachable for a period of time.
+
+Of course building such a queue would take time, so for the time being this will have to do - but I would feel nervous if I was spinning up canisters on the same subnet as Entrepot or DSCVR during an high volume event.
+
+It just feels awkward from an outside developers perspective that one piece of the puzzle (code installation) comes from using the actor API and the other piece (settings) comes through the Management Canister API. It would be nice if those could somehow be merged.
+
+
+[quote="claudio, post:5, topic:12455"]
+There is actually a reason canister creation is kept separate from code installation though, and that is to support the installation of *mutually recursive* actors, where you want to generate the ids first before installing the mutually dependent wasm modules.
+[/quote]
+
+So these would be two canister actors that both want to reference the same external canister (which has been created already)?
+
+Let me know if I'm understanding this correctly (which I'm probably missing something), because I don't see it conflicting with adding a one-shot operation.
+
+In the mutually dependent canisters case:
+
+```
+// Canister A and B depend on C
+// Pseudocode
+
+create canister C
+install canister A with the code/settings and a reference to C as an actor class initializer argument
+install canister B with the code/settings and a reference to C as an actor class initializer argument
+```
+
+If you're talking about the case where B depends on A and A depends on B, I'm having trouble picturing why someone would need this use case, and how one would deploy/set this up.
+
+You mention in the PR that
+> "Short of doing something more radical, like introducing a new sub-type of functions, I think the best solution would be for the compiler to inject a trio a functions into the actor class module itself, specialized to the actor type"
+
+and then follow that up with
+
+> "Of course, I'm fully aware this is unsafe, but sans lower-bounds and stable memory typing I don't really see how to improve on it an am trying to be pragmatic."
+
+Not to get into the weeds, but how is this unsafe?
+
+-------------------------
+
+chenyan | 2022-04-26 22:12:00 UTC | #7
+
+> If you’re talking about the case where B depends on A and A depends on B, I’m having trouble picturing why someone would need this use case, and how one would deploy/set this up.
+
+This is exactly why we need two calls to install a canister. 
+
+As an artificial example, canister A is the main canister, and canister B is a logging canister who receives log data from canister A. Canister B can also send messages to A when the log stats reach some threshold. 
+
+To install these two canisters, we need to first call `create_canister` twice to get the allocated canister ids, and then call `install_code`.
+
+If you want to make the whole installation process as a single step, you can catch the exception from `install_code`, and delete the canister id if installation fails.
+
+-------------------------
+
+claudio | 2022-04-27 00:21:38 UTC | #8
+
+[quote="icme, post:6, topic:12455, full:true"]
+The main reason I'd like for this feature to happen would be to eliminate possible points of failure in my backend infrastructure, so ALL or NOTHING is ideal. Unless this can be done from a one-shot call, the only way I could feel 100% safe about my canister being spun up with both the correct settings & code is to build an intermediary queue like Kafka or SQS for the IC that will handle retries and if a subscriber downstream is unreachable for a period of time.
+
+Of course building such a queue would take time, so for the time being this will have to do - but I would feel nervous if I was spinning up canisters on the same subnet as Entrepot or DSCVR during an high volume event.
+
+It just feels awkward from an outside developers perspective that one piece of the puzzle (code installation) comes from using the actor API and the other piece (settings) comes through the Management Canister API. It would be nice if those could somehow be merged.
+
+
+[/quote]
+
+Hmm, I'm actually sympathetic to this but I'm not sure how easy it would be to fix - it's more of an issue with the IC than Motoko, which fundamentally requires two (non-atomic) calls to create and install an actor. Perhaps that can be changed for single canister installs, but it's an IC issue, not a Motoko one.
+
+I can see that the Motoko actor class abstraction is poor because you can't tell if a call to class constructor has failed half-way between creating the canister and installing the code, which could be problematic if you want to reclaim the cycles devoted to the empty canister id.
+
+Without more structured errors returned from async return values, we can't cleanly report back the dangling canister id either, though I guess we could smuggle it into the textual error message at least, if that would help recover cycles.
+
+[quote="icme, post:6, topic:12455, full:true"]
+
+> "Of course, I'm fully aware this is unsafe, but sans lower-bounds and stable memory typing I don't really see how to improve on it an am trying to be pragmatic."
+
+Not to get into the weeds, but how is this unsafe?
+[/quote]
+So I think what I was referring to there is that if we try to support upgrade, not just fresh installation, then we ideally want a mechanism that statically ensures that the upgrade is compatible in the sense of presenting a compatible external API and declaring compatible stable variables. 
+Otherwise you could break clients and/or lose state. 
+
+I've recently thought of a way of implementing a dynamic check for compatibility, which we could implement to at least fail before a bad installation succeeds, which would lessen the onus on static type checking somewhat. But that's just an idea and not implemented yet (nor planned for implementation).
+
+-------------------------
+
+icme | 2022-04-26 23:47:20 UTC | #9
+
+[quote="chenyan, post:7, topic:12455"]
+As an artificial example, canister A is the main canister, and canister B is a logging canister who receives log data from canister A. Canister B can also send messages to A when the log stats reach some threshold.
+
+To install these two canisters, we need to first call `create_canister` twice to get the allocated canister ids, and then call `install_code` .
+[/quote]
+
+Instead of supporting cyclic canister dependencies when spinning up in the way you described, why not do something like this:
+
+
+**Pseudocode (steps)**
+
+1. Create and install canister A
+2. During initialization of canister A's actor class, create canister B (create and install) and pass the canisterID of canister A to canister B in its own actor class constructor.
+3. Still in the intialization of canister A, once canister B's constructor is complete assign the resulting canisterID to a stable variable in canisterA.
+
+Alternatively, one could:
+1. spin up the main canister A, 
+2. have a function that is called sometime after the creation of A that spins up canister B. Both canisters will have each others references, and can use public shared functions to interact with one another (I'm thinking like the [publisher/subscriber example](https://github.com/dfinity/examples/tree/master/motoko/pub-sub)). The logger canister B will still be able to call back to canister A after being spun up.
+
+Arguably, I haven't POC'd all of these scenarios locally, but it seems like all of this working would be plausible to me.
+
+It also seems a bit fragile from an application system design to allow for cycles in deployment and require that both canisters are deployed at the same time with those references to each other. I can imagine issues in the future when deploying via CI because canisters got deployed (created/installed/settings) in the wrong order or something like that.
+
+Does this make sense to you? Let me know if I'm missing something.
+
+-------------------------
+
+chenyan | 2022-04-27 00:52:14 UTC | #10
+
+The first approach doesn't work. You cannot make async calls (create and install) during canister init, and even if you can do that, upgrading the canister programmatically can be tricky. It also lacks the backward compatibility check that we usually perform when deployed from dfx. 
+
+The second approach would work, but it's safer and more convenient to embed the canister id in the Wasm directly. Also, this is an artificial example, there could be more compelling use cases that require services to call each other.
+
+> It also seems a bit fragile from an application system design to allow for cycles in deployment and require that both canisters are deployed at the same time with those references to each other. I can imagine issues in the future when deploying via CI because canisters got deployed (created/installed/settings) in the wrong order or something like that.
+
+This is not a unique problem in mutual calls. When you call any canister, it can be unavailable due to upgrade. The system guarantees that each call will get a response either from the canister or traps. As long as the code are defensive enough to handle traps, it should be okay.
+
+-------------------------
+
+icme | 2022-04-27 03:49:54 UTC | #11
+
+Thanks for the responses to both of my approaches - the explanations make sense. If the create canister happened during init, you could have some strange behavior if you don't make sure that you don't create a new logger canister on each upgrade.
+
+[quote="chenyan, post:7, topic:12455"]
+If you want to make the whole installation process as a single step, you can catch the exception from `install_code` , and delete the canister id if installation fails.
+[/quote]
+
+I understand how this is the current solution, but if the main canister is having trouble reaching the recently created canister due to subnet traffic to update its settings/controllers, wouldn't the management canister have a difficult time deleting the same canister as well? Does the management canister have a queue/retry built into it to handle canisters that aren't responsive for a period of time?
+
+-------------------------
+
+chenyan | 2022-04-27 04:07:14 UTC | #12
+
+> if the main canister is having trouble reaching the recently created canister due to subnet traffic to update its settings/controllers, wouldn’t the management canister have a difficult time deleting the same canister as well?
+
+Not sure I understand the scenario. Why can't the main canister reach the newly created canister? If the subnet is busy, it can take a while to get the callback message, but it will be delivered eventually.
+
+-------------------------
+
+icme | 2022-04-27 04:17:04 UTC | #13
+
+[quote="chenyan, post:12, topic:12455"]
+Why can’t the main canister reach the newly created canister? If the subnet is busy, it can take a while to get the callback message, but it will be delivered eventually
+[/quote]
+
+I'm thinking that we have a scenario like the subnet that Entrepot is on during a high traffic event like an NFT drop. There have been reports of unresponsive canisters during those times.
+
+As long as the `delete_canister` message is guaranteed to be delivered eventually, that works for me!
+
+-------------------------
+
+chenyan | 2022-04-27 04:31:53 UTC | #14
+
+I think in extreme traffic, it can take even a few hours to hear back, but as long as the message is successfully send out, it will be delivered. 
+
+`delete_canister` is not that critical, I think the more important thing is to reclaim the cycles used in `create_canister` when install fails.
+
+-------------------------
+
+icme | 2022-04-27 06:02:49 UTC | #15
+
+[quote="chenyan, post:14, topic:12455"]
+I think in extreme traffic, it can take even a few hours to hear back, but as long as the message is successfully send out, it will be delivered.
+[/quote]
+
+Going off topic for a second, because this really perked my attention…
+
+If a message is sent from an external client to the IC (i.e. frontend JS agent) in a fire-and-forget fashion, do these same eventual update guarantees of “the update will occur even a few hours in the future” apply, or is eventual consistency specific to the management canister (or inter-canister calls in general)?
+
+
+Is there a way to guarantee that a message being sent from a client is not dropped once it reaches a boundary node (the message is accepted into the IC and the canister will eventually receive it)?
+
+-------------------------
+
+chenyan | 2022-04-27 20:35:34 UTC | #16
+
+Once the request has a `processing` status, it is guaranteed to reach the target canister. See details here: https://smartcontracts.org/docs/interface-spec/index.html#http-call-overview
+
+-------------------------
+

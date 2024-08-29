@@ -1,0 +1,105 @@
+kayicp | 2024-03-24 23:52:29 UTC | #1
+
+Hi, I need this check so I can create a new canister to handle new/incoming data and to avoid relying on try/catch the canister_reject error due to insufficient storage during intercanistercall. (I'm currently using this method)
+
+Anyway, based on docs AI:
+![image|690x442, 100%](upload://5gjTrCg1WQloanHUe5dnbbVKaEh.png)
+
+since the maximum storage limit of canister keep on increasing over time due to improvement by DFINITY, do I have to hardcode the value for max limit each time there's an improvement? or should I just keep using my current method: keep sending data to archive canister, if there's a reject catch, create a new canister?
+
+I just want to learn what's the best practice around this. Thanks.
+
+-------------------------
+
+kayicp | 2024-03-25 00:12:25 UTC | #2
+
+Also, if I'm using functional (non-class) and stable datastructure like [Trie](https://internetcomputer.org/docs/current/motoko/main/base/Trie), does the max storage limit falls under Heap (4GiB) or Stable (400 GiB)?
+
+example: `stable var trie = Trie.empty()`
+
+-------------------------
+
+Severin | 2024-03-25 09:02:56 UTC | #3
+
+[quote="kayicp, post:1, topic:28835"]
+since the maximum storage limit of canister keep on increasing over time due to improvement by DFINITY, do I have to hardcode the value for max limit each time there’s an improvement?
+[/quote]
+
+I doubt we'll get a lot of increases in the near future. Hardcoding is probably the most pragmatic solution, even though it is not great
+
+[quote="kayicp, post:2, topic:28835"]
+Also, if I’m using functional (non-class) and stable datastructure like [Trie](https://internetcomputer.org/docs/current/motoko/main/base/Trie), does the max storage limit falls under Heap (4GiB) or Stable (400 GiB)?
+[/quote]
+
+The Trie you linked does not use stable storage. Stable can also refer to other thing, like in this case that the order of items is preserved. Unless a data structure explicitly mentions stable storage I would assume it uses the Heap
+
+-------------------------
+
+kayicp | 2024-03-25 10:33:27 UTC | #4
+
+[quote="Severin, post:3, topic:28835"]
+The Trie you linked does not use stable storage.
+[/quote]
+Does [this](https://github.com/canscale/StableRBTree/blob/main/src/StableRBTree.mo) also not use stable storage? Then I have misunderstood the term "stable". I thought whenever we use anything that can be declared with `stable var ...`, it will use the 400GiB stable storage. So it's using the 4GiB heap?
+
+So, in motoko, the datastructure that is stable storage is the ones that's using `ExperimentalStableMemory` or `Region` yes?
+
+[quote="Severin, post:3, topic:28835"]
+I doubt we’ll get a lot of increases in the near future. Hardcoding is probably the most pragmatic solution, even though it is not great
+[/quote]
+Alright thanks Severin. That's helpful
+
+-------------------------
+
+Severin | 2024-03-25 10:37:29 UTC | #5
+
+[quote="kayicp, post:4, topic:28835"]
+Does [this](https://github.com/canscale/StableRBTree/blob/main/src/StableRBTree.mo) also not use stable storage?
+[/quote]
+
+That one uses stable storage, but not the Trie you liked to in the previous post
+
+[quote="kayicp, post:4, topic:28835"]
+So, in motoko, the datastructure that is stable storage is the ones that’s using `ExperimentalStableMemory` or `Region` yes?
+[/quote]
+
+Correct
+
+-------------------------
+
+kayicp | 2024-03-25 10:47:05 UTC | #6
+
+[quote="Severin, post:5, topic:28835"]
+That one uses stable storage
+[/quote]
+Ok just want to confirm one last thing:
+So if any type that can be declared with `stable var` it will subscribe to the stable storage, which can use up to the 400 GiB, yes? (like the StableRedBlackTree.mo i linked)
+
+-------------------------
+
+Severin | 2024-03-25 10:52:28 UTC | #7
+
+There's two ways to use stable storage. Either with the `stable` keyword or explicitly with `ExperimentalStableMemory`. If a data structure manually uses the `ExperimentalStableMemory` API then it will support the full 400 GiB, like the StableRedBlackTree (AFAIK at least, I'm not that deep into Motoko). The `stable` keyword lets the compiler do the whole job. In theory it's supposed to support the full 400GiB, but I'm not sure where the implementation is. @luc-blaeser can you clarify, please?
+
+-------------------------
+
+luc-blaeser | 2024-03-25 11:31:32 UTC | #8
+
+Hi @kayicp,
+I just wanted to confirm what Severin wrote and provide some background information:
+In Motoko, there are two persistence models:
+* **Stable variables (aka orthogonal persistence)**: When you declare actor variables with the `stable` keyword, the objects live in the heap and any data structure of first-order type (i.e. stable types in Motoko) can be used. On a canister upgrade, all objects that are directly or indirectly reachable from such stable variables are automatically persisted and retained. This is currently implemented in the Motoko runtime system by serializing these objects from the the heap to the stable memory before the upgrade and deserializing them from the stable memory back to the heap after the upgrade. Because the objects live in the heap, the maximum amount of data that can be managed by stable variables is currently 4GB. However, the serialization mechanism has several limitations (it duplicates shared immutable objects, the serialization is expensive and may hit the instruction limit), such that the scalability is often much lower in practice, e.g. sometimes only a few hundred megabytes or even less. Therefore, it is very important to thoroughly test the upgrades and to determine the maximum amount of data that can be upgraded for a specific application. We have plans to drastically improve the scalability of `stable variables`, see below.
+* **Explicit stable memory**: This is when stable memory is explicitly used through `Region` (or no longer recommended `ExperimentalStableMemory`). There are certain stable data structures available for Motoko that directly read/write from/to stable memory. This approach currently supports up to 400 GB of persistent data. In contrast to the stable variables, only specific structures of data can be stored with this approach (i.e. the values must be explicitly serialized, no pointers are supported across data entries in a stable data structure etc.). There is also no check that the data stored in stable memory/stable data structures is compatible with the new upgraded program version of a canister, i.e. if a wrong data deserialization is used for existing data on stable memory, data corruption is possible.
+
+We are currently working on improving stable variables, called **Enhanced Orthogonal Persistence** with the aim to make stable variables as scalable as explicit stable memory, supporting very fast constant-time upgrades without serialization and allowing the same storage capacity like stable memory (by lifting the main memory/heap to 64-bit and supporting e.g. 400GB in the future). More information on this is available at: https://github.com/dfinity/motoko/pull/4225.
+
+Please do not hesitate to let me know if you have any questions and/or if I can provide more information.
+
+-------------------------
+
+kayicp | 2024-03-25 12:48:59 UTC | #9
+
+Thank you both @Severin @luc-blaeser for the detailed answer. All my confusion is gone now. I'll be looking forward to this upcoming Enhanced Orthogonal Persistence. :smiley:
+
+-------------------------
+

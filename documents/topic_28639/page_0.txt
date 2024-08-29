@@ -1,0 +1,344 @@
+peterparker | 2024-03-19 19:49:40 UTC | #1
+
+I get a `400 bad request` error when I try to query `fetch_canister_logs` on mainnet.
+
+> POST https://icp0.io/api/v2/canister/aaaaa-aa/query 400 (Bad Request)
+> vendor.k4coD-xg.js:29 Uncaught (in promise) Ue: Server returned an error:
+  Code: 400 ()
+  Body: subnet_not_found
+
+Why? Any idea?
+
+```
+export const canisterLogs = async ({
+	canisterId,
+	identity
+}: {
+	canisterId: Principal;
+	identity: Identity;
+}): Promise<canister_log_record[]> => {
+	const { fetch_canister_logs } = await getICActor({ identity, verifyQuerySignatures: false });
+
+	const { canister_log_records } = await fetch_canister_logs({
+		canister_id: canisterId
+	});
+
+	return canister_log_records;
+};
+
+export const getICActor = (params: GetAgentParams): Promise<ICActor> =>
+	createActor<ICActor>({
+		canisterId: MANAGEMENT_CANISTER_ID,
+		config: {
+			callTransform: transform,
+			queryTransform: transform
+		},
+		idlFactory: idlFactorIC,
+		...params
+	});
+
+const transform = (
+	_methodName: string,
+	args: unknown[],
+	_callConfig: CallConfig
+): { effectiveCanisterId: Principal } => {
+	const first = args[0] as any;
+	let effectiveCanisterId = MANAGEMENT_CANISTER_ID;
+	if (first && typeof first === 'object' && first.canister_id) {
+		effectiveCanisterId = Principal.from(first.canister_id as unknown);
+	}
+
+	return { effectiveCanisterId };
+};
+
+export const createActor = async <T = Record<string, ActorMethod>>({
+	canisterId,
+	idlFactory,
+	config = {},
+	...rest
+}: {
+	canisterId: string | Principal;
+	idlFactory: IDL.InterfaceFactory;
+	config?: Pick<ActorConfig, 'callTransform' | 'queryTransform'>;
+} & GetAgentParams): Promise<ActorSubclass<T>> => {
+	const agent = await getAgent(rest);
+
+	// Creates an actor with using the candid interface and the HttpAgent
+	return Actor.createActor(idlFactory, {
+		agent,
+		canisterId,
+		...config
+	});
+};
+
+const getAgent = async ({ identity, verifyQuerySignatures = true }: GetAgentParams) => {
+	const host = 'https://icp0.io';
+	return new HttpAgent({ identity, host, verifyQuerySignatures });
+};
+```
+
+-------------------------
+
+kpeacock | 2024-03-20 16:16:56 UTC | #2
+
+Sounds like we need to add an exception for `aaaaa-aa` in the query certification
+
+-------------------------
+
+levi | 2024-03-20 17:17:10 UTC | #3
+
+Looks like the effective-canister-id is being set to 'aaaaa-aa', the error message shows the 'aaaaa-aa' in the url. When calling the management-canister with an ingress-message, the effective-canister-id needs to be set to the canister being managed.
+
+-------------------------
+
+peterparker | 2024-03-20 17:23:21 UTC | #4
+
+[quote="levi, post:3, topic:28639"]
+the effective-canister-id needs to be set to the canister being managed.
+[/quote]
+
+It's what the `transform` function do. The issue is probably in the URL that is used.
+
+-------------------------
+
+peterparker | 2024-03-20 17:23:59 UTC | #5
+
+[quote="kpeacock, post:2, topic:28639, full:true"]
+Sounds like we need to add an exception for `aaaaa-aa` in the query certification
+[/quote]
+
+Anything I can do or it's stricly something to be solved within `@dfinity/agent`?
+
+-------------------------
+
+kpeacock | 2024-03-20 17:28:26 UTC | #6
+
+I'm trying to reproduce right now, and I have to reverse engineer a few functions and interfaces referenced but not included in the sample above. 
+
+Ordinarily I'd just say to use the `getManagementCanister` export but I need to figure out what `fetch_canister_logs` is
+
+-------------------------
+
+peterparker | 2024-03-20 17:30:02 UTC | #7
+
+[quote="kpeacock, post:6, topic:28639"]
+`getManagementCanister`
+[/quote]
+
+`getManagementCanister` unfortunatelly does not work neither, I tried it out as well.
+
+-------------------------
+
+levi | 2024-03-20 17:30:16 UTC | #8
+
+[quote="peterparker, post:1, topic:28639"]
+```
+    const first = args[0] as any;
+	let effectiveCanisterId = MANAGEMENT_CANISTER_ID;
+	if (first && typeof first === 'object' && first.canister_id) {
+		effectiveCanisterId = Principal.from(first.canister_id as unknown);
+	}
+```
+[/quote]
+The transform function by default sets the effectiveCanisterId to 'aaaaa-aa';
+
+Maybe this condition `if (first && typeof first === 'object' && first.canister_id)` is not being met?
+
+-------------------------
+
+peterparker | 2024-03-20 17:32:01 UTC | #9
+
+[quote="levi, post:8, topic:28639"]
+is not being met?
+[/quote]
+
+I was also doubtful about it but, double checked that `effectiveCanisterId` was effectivelly correctly set - i.e. I debugged it and can confirm it is set. `console.log` for the win :wink:.
+
+Also same code works fine for example for `canister_status`. So it's really scoped to that particular feature.
+
+-------------------------
+
+kpeacock | 2024-03-20 17:35:52 UTC | #10
+
+Do you mind sharing with me where `fetch_canister_logs` comes from? It doesn't exist in https://github.com/dfinity/ic/blob/master/hs/spec_compliance/ic.did
+
+-------------------------
+
+levi | 2024-03-20 17:37:56 UTC | #11
+
+[quote="peterparker, post:9, topic:28639"]
+double checked that `effectiveCanisterId` was effectivelly correctly set - i.e. I debugged it and can confirm it is set.
+[/quote]
+
+:+1: that's good. 
+
+The agent however is using 'aaaaa-aa' as the effective-canister-id in the url as shown in the error message.
+
+[quote="peterparker, post:1, topic:28639"]
+POST https://icp0.io/api/v2/canister/aaaaa-aa/query 400 (Bad Request)
+vendor.k4coD-xg.js:29 Uncaught (in promise) Ue: Server returned an error:
+[/quote]
+
+-------------------------
+
+peterparker | 2024-03-20 17:38:39 UTC | #12
+
+Sure in this [PR](https://github.com/dfinity/interface-spec/pull/263) for the specification which is in review but, the feature is effectively implemented in dfx therefore I assumed it's on mainnet as well. It also works fine locally or at least I don't get error but, an empty array or logs.
+
+Here also the did I used: [https://github.com/junobuild/juno/blob/feat/functions-logs/candid/ic.did](https://github.com/junobuild/juno/blob/feat/functions-logs/candid/ic.did)
+
+-------------------------
+
+peterparker | 2024-03-20 17:53:36 UTC | #13
+
+Note that I assume it's live on mainnet because I assume the feature in dfx is implemented to communicate with mainnet and not locally. Maybe that's a misinterpretation, I did not search in the proposals neither.
+
+-------------------------
+
+kpeacock | 2024-03-20 18:05:39 UTC | #14
+
+Okay, I've made the basic fix I anticipated and am still getting errors. Based on the 400 bad request response I'm getting back, I don't think this is available yet on mainnet. See here, and the new test in `mainnet.test.ts`
+
+```
+{ response: { ok: false, status: 400, statusText: 'Bad Request', headers: [ [ 'access-control-allow-headers', 'DNT,User-Agent,X-Requested-With,If-None-Match,If-Modified-Since,Cache-Control,Content-Type,Range,Cookie,X-Ic-Canister-Id' ], [ 'access-control-allow-methods', 'HEAD, POST' ], [ 'access-control-allow-origin', '*' ], [ 'access-control-expose-headers', 'Accept-Ranges,Content-Length,Content-Range,X-Request-Id,X-Ic-Canister-Id' ], [ 'access-control-max-age', '600' ], [ 'connection', 'keep-alive' ], [ 'content-length', '17' ], [ 'content-type', 'text/plain; charset=utf-8' ], [ 'date', 'Wed, 20 Mar 2024 18:03:30 GMT' ], [ 'server', 'nginx' ], [ 'x-ic-canister-id', 'aaaaa-aa' ], [ 'x-request-id', 'f640e12c-4218-66ac-3535-02b9b3fee56f' ] ] } }
+```
+
+https://github.com/dfinity/agent-js/tree/kai/SDK-1506-management-verify-defect
+
+-------------------------
+
+peterparker | 2024-03-20 18:08:43 UTC | #15
+
+[quote="kpeacock, post:14, topic:28639"]
+I don’t think this is available yet on mainnet
+[/quote]
+
+Weird, from dfx v0.18.0 [CHANGELOG](https://github.com/dfinity/sdk/releases/tag/0.18.0):
+
+> feat: add `dfx canister logs <canister_id>` for fetching canister's logs (preview)
+>
+> There is a new subcommand `logs` to fetch canister's logs.
+When printing the log entries it tries to guess if the content can be converted to UTF-8 text and prints an array of hex bytes if it fails.
+>
+>**Note**
+>
+>This feature is still in development. Changes may occur in following releases.
+
+But indeed, the logs does not mention if the feature is only for local environment or for mainnet but, given that is is never mentionned, I assumed it was for mainnet as well.
+
+-------------------------
+
+kpeacock | 2024-03-20 18:12:10 UTC | #16
+
+I'll still clean this up and get a local e2e test working for it, but it sounds like this isn't a p0 around existing functionality
+
+-------------------------
+
+peterparker | 2024-03-20 18:14:39 UTC | #17
+
+For sure, I don't need it tomorrow, but it's a nice feature to add to Juno as it can be really useful for developers. Therefore, for me, it's also not a P9999, if you know what I mean. Thanks for tracking it; keep me posted.
+
+-------------------------
+
+kpeacock | 2024-03-20 18:20:01 UTC | #18
+
+Oh definitely. I'm just glad I didn't drop the ball on this, lagging behind mainnet
+
+-------------------------
+
+kpeacock | 2024-03-20 21:22:00 UTC | #19
+
+Okay, got my proof of concept working. Some changes actually had to happen to the agent, since effective canister ID in queries hadn't come up before.
+
+![image|462x500](upload://vJeJUS514ro6zIlKnCQF623NW0o.png)
+
+-------------------------
+
+kpeacock | 2024-03-20 21:24:36 UTC | #20
+
+I can also now confirm that canister logs aren't available on mainnet (yet)
+
+![image|690x392](upload://mnV03rRzOiODrBonk0BkVQYSLGc.png)
+
+-------------------------
+
+peterparker | 2024-03-20 21:34:23 UTC | #21
+
+Looks great, thanks for the heads-up!
+
+-------------------------
+
+peterparker | 2024-03-21 05:52:16 UTC | #22
+
+[quote="kpeacock, post:20, topic:28639"]
+I can also now confirm that canister logs aren’t available on mainnet (yet)
+[/quote]
+
+Are you absolutely sure the feature is not on mainnet? The proposal [#127461](https://dashboard.internetcomputer.org/proposal/127461) contains the feature:
+
+ `Execution,Runtime: Add fetch_canister_logs stub to the management canister API`
+
+-------------------------
+
+kpeacock | 2024-03-22 20:09:58 UTC | #23
+
+it's not available on application subnets, even if the feature has been merged. Also, my fix is merged and will be in the next release.
+
+https://github.com/dfinity/agent-js/pull/863
+
+-------------------------
+
+peterparker | 2024-03-22 20:29:02 UTC | #24
+
+Thanks for the feedback and, looking forward to next release!
+
+-------------------------
+
+peterparker | 2024-03-26 19:33:43 UTC | #25
+
+Tried with last version of agent-js, the error message has been improved, which is clear now.
+
+> Cannot fetch logs. | Call failed: Canister: aaaaa-aa Method: fetch_canister_logs (query) "Status": "rejected" "Code": "CanisterError" "Message": "IC0504: fetch_canister_logs API is not enabled on this subnet"
+
+-------------------------
+
+maksym | 2024-03-27 12:58:09 UTC | #26
+
+[quote="peterparker, post:22, topic:28639"]
+fetch_canister_logs
+[/quote]
+
+this feature is not enabled for mainnet, see [flag](https://sourcegraph.com/github.com/dfinity/ic@bfbd6755bff274c2d0b97d6a33e0152dd9cbefcb/-/blob/rs/config/src/execution_environment.rs?L340) and is going to be available in DFX local run first.
+
+-------------------------
+
+peterparker | 2024-03-27 14:11:41 UTC | #27
+
+I assumed it was live on mainnet because the related proposal didn't specify that it wasn't active, and I also naively assumed it had little value being deployed only locally therefore assumed that it should had been proposed for mainnet.
+
+Thanks for pointing the flag; I should enable it in my [Docker image](https://github.com/junobuild/juno-docker).
+
+I guess no but, do we already have an ETA for proposing to activate this on mainnet?
+
+-------------------------
+
+maksym | 2024-03-27 14:27:50 UTC | #28
+
+> I guess no but, do we already have an ETA for proposing to activate this on mainnet?
+
+there's no specific ETA at the moment, some implementation work still have to be done and DFX integration. 
+
+we may also want to hear some dev feedback from local dfx usage experience and only then decide on enabling it on mainnet.
+
+-------------------------
+
+peterparker | 2024-03-27 14:45:34 UTC | #29
+
+It would be cool not only to tailor this for dfx users but also for developers on the IC in general. For example, I don't use dfx.
+
+However, I have implemented the feature in Juno. I'm happy to provide feedback or quickly implement any features if interested. Let me know.
+
+![Capture d’écran 2024-03-27 à 15.44.19|690x406](upload://iTxh17G91ckzlMrZpl6QjpJJyOI.jpeg)
+
+-------------------------
+

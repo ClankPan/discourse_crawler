@@ -1,0 +1,199 @@
+skilesare | 2022-10-22 17:13:02 UTC | #1
+
+I had some interesting behavior with a one shot call that didn't behave the way I expected and I wanted to confirm that the behavior is correct and see if there are workarounds.
+
+I have on shot call
+
+```func_x : (Text) -> async ()```
+
+When I try to use it I have the following
+
+```
+do_something_1();
+
+try{
+    let future = await func_x("test");
+} catch(err){}
+
+do_something_2();
+```
+
+When I do this, do_something_2 runs before func_x.  I'd expect this if I left the await off, but I was hoping that with the await there that execution would wait for a return. I guess it makes sense since the one shot basically hands a non-existent handle.  Just wanted to confirm that this is what I should expect.
+
+For testing this makes things a bit harder as I'm basically going to have to have func_x send something back to my test canister and try to hold off the test until it occurs. Anything else I can do?
+
+cc: @nomeata
+
+-------------------------
+
+claudio | 2022-10-24 10:47:27 UTC | #2
+
+That's not a one way/fire-and-forget function. 
+
+Only a shared function with implicit or explicit return type `()` (never `async ()`) is one way.
+
+If you call, but don't await the result, it will also complete asynchrously, but isn't as safe for upgrades.
+
+However, I'm still a little puzzled by that behaviour myself. What is the body of `func_x`?
+
+For example, I'm not seeing this behaviour in this program: 
+
+ https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=2705472426
+
+
+
+```
+actor {
+  var log : Text = "";
+
+  func do_something_1 () {
+    log #= "something_1;";
+  };
+
+  func do_something_2 () {
+    log #= "something_2;";
+  };
+
+
+  func func_x(t : Text) : async () {
+    log #= t # ";";
+  };
+
+  public shared func test () : async Text {
+    log := "";
+    do_something_1();
+
+    try {
+      let future = await func_x("test");
+    } catch(err){};
+
+    do_something_2();
+    log;
+  } 
+
+}
+```
+
+Calling test() returns:
+```
+("something_1;test;something_2;")
+```
+
+-------------------------
+
+skilesare | 2022-10-24 15:13:49 UTC | #3
+
+I put this together and it performs as expected: https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=2252590438
+
+I ran it on the local replica and it works as well.
+
+Of course, I can't reproduce the behavior I saw earlier so I'm going to chalk it up to a misconfig.
+
+I had the one shot wrong so I've learned something new...thanks!
+
+-------------------------
+
+cryptoschindler | 2022-10-25 09:28:34 UTC | #4
+
+[quote="claudio, post:2, topic:16086"]
+but isn’t as safe for upgrades.
+[/quote]
+
+Can you elaborate on that? What's the difference of calling a function with return type `()` that can't be awaited and `async ()` without awaiting?
+
+-------------------------
+
+claudio | 2022-10-25 11:34:35 UTC | #5
+
+[quote="cryptoschindler, post:4, topic:16086, full:true"]
+[quote="claudio, post:2, topic:16086"]
+but isn’t as safe for upgrades.
+[/quote]
+
+Can you elaborate on that? What's the difference of calling a function with return type `()` that can't be awaited and `async ()` without awaiting?
+[/quote]
+
+The (return type async ()) still registers two callbacks to update the async with a result (() or error) and those pending callbacks can prevent the upgrade from taking place. This is regardless of whether the async is awaited or not.
+
+The oneway version (return type ()), register a special pair of dummy callbacks that do nothing when invoked and won't prevent upgrades.
+
+Motoko prevents an upgrade taking place if there is some (proper) callback pending.
+
+-------------------------
+
+LightningLad91 | 2022-10-25 12:57:26 UTC | #6
+
+@claudio i was using ICPY the other day to experiment with different ways of uploading data chunks. At one point I wanted to see how the system would behave if I queued up a bunch of oneway messages and just sent a final update call that would verify they had all been received.
+
+What I found out is that it’s not possible to make oneway calls through the IC’s HTTP interface so ICPY performs an update call instead.
+
+Is there any chance that oneway calls could be supported through the HTTP interface in the future, or would that break the system somehow?
+
+Note: I just realized that this question has more to do with the HTTP interface and less to do with Motoko. Sorry about that. I will open a separate topic.
+
+-------------------------
+
+skilesare | 2022-10-25 13:10:29 UTC | #7
+
+All http ingress calls are kind of one way....you basically have to submit your request an then poll for the results...you don't HAVE to check for your result if you never use it...but you also won't know if it was processed or not.
+
+-------------------------
+
+LightningLad91 | 2022-10-25 15:19:46 UTC | #8
+
+Ah ok. Their code makes more sense now. 
+
+That’s really interesting. I might have to tamper with their code a bit and see if I can continue my experiment. Thanks Austin.
+
+-------------------------
+
+paulyoung | 2022-10-25 18:25:47 UTC | #9
+
+[quote="LightningLad91, post:6, topic:16086"]
+What I found out is that it’s not possible to make oneway calls through the IC’s HTTP interface so ICPY performs an update call instead.
+[/quote]
+
+I’ve done this with regular calls so I assume it would work with oneway calls as well.
+
+What I did was immediately return a response from `http_request` with `upgrade: true`, which calls `http_request_update`. If you make a call there it should be an update call, even if you call a `query` method.
+
+-------------------------
+
+cryptoschindler | 2022-10-26 08:40:11 UTC | #10
+
+[quote="claudio, post:5, topic:16086"]
+prevent the upgrade from taking place.
+[/quote]
+
+So apart from not being able to upgrade a canister, is this bad if we call canisters not under our control because they could "stall" the caller? Is there a limit for registered callbacks for a single canister? Like what happens if I call hundreds of canisters that never return a result or error, are the callbacks kept forever? What is the behaviour of the canister if the callback storage is full (I assume that's bounded)?
+
+-------------------------
+
+claudio | 2022-10-26 15:12:49 UTC | #11
+
+I'm on shaky ground here, but, I think, in principle, the callee could stall the caller for an unbounded amount of time. The cycle limit of the callee doesn't help since it can itself just issue another recursive call to reset the limit. The caller will be stalled, but other messages processed concurrently in the canister of the caller will not be stalled. Motoko provides an unbounded number of callbacks (limited only by canister memory) but the system may enforce other limits. If there's no space left for the Motoko callback, I'd expect to see an out-of-memory trap and a rollback. @nomeata might have more details.
+
+-------------------------
+
+nomeata | 2022-10-26 16:00:40 UTC | #12
+
+As Claudio says.
+
+> So apart from not being able to upgrade a canister, is this bad if we call canisters not under our control because they could “stall” the caller?
+
+Kinda
+
+> Is there a limit for registered callbacks for a single canister?
+
+The memory heap is the limit. If that’s full your canister will start trapping with out-of-memory errors (or maybe earlier with out-of-cycle traps during GC).)
+
+> Like what happens if I call hundreds of canisters that never return a result or error, are the callbacks kept forever?
+
+Yes
+
+> What is the behaviour of the canister if the callback storage is full (I assume that’s bounded)?
+
+It’s just part of memory, so the same as if memory storage is full.
+
+-------------------------
+

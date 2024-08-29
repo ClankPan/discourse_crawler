@@ -1,0 +1,230 @@
+infu | 2024-02-11 20:44:00 UTC | #1
+
+Very excited to share this library (changed to middleware later) with you.
+
+We extracted it from our latest project after noticing some mechanisms inside can be reused in a lot of the DeFi canisters - not only DeFi Vectors.
+
+It allows devs to use the library synchronously while it handles asynchronicity with icrc ledgers.
+
+**Example usage:**
+```
+import L "mo:devefi-icrc-ledger";
+import Principal "mo:base/Principal";
+
+
+actor class() = this {
+
+    stable let lmem = L.LMem(); 
+    let ledger = L.Ledger(lmem, "mxzaz-hqaaa-aaaar-qaada-cai");
+    public func start() : async () { ledger.start(this) };
+    ledger.onReceive(func (t) = ignore ledger.send({ to = t.from; amount = t.amount; from_subaccount = t.to.subaccount; }));
+
+}
+```
+
+Previously hard to achieve:
+
+**Getting notified automatically when there is a transfer to your canister (any subaccount)** 
+```
+ledger.onReceive(func (t : Ledger.Transfer) {
+ // handle incoming transfers to your canister
+});
+```
+To do that it follows ledger history using timers.
+
+**Sending tokens with certainty without worrying about async calls**
+```
+ignore ledger.send({ 
+  to = {owner; subaccount};
+  amount = t.amount; 
+  from_subaccount = t.to.subaccount; 
+}) // returns #ok(local_tx_id) or #err(#insufficient_funds)
+```
+This basically adds the transaction to a BTree queue and removes the amount from the local account's (in_transit) balance. Local accounts are a Hashmap with {balance: Nat, in_transit: Nat}. The library won't allow you to use the amount that is in transit.
+When transfers come and go to your canister they automatically update the balance and in_transit. When the transfer gets confirmed after finding the block inside the ledger log, the amount gets reduced from `in_transit`
+
+**Get the balance of canister accounts synchronously**
+```
+ledger.balance(subaccount) : Nat
+```
+This basically returns `balance` - `in_transit`. It keeps only accounts owned by the canister.
+
+**A bit more about how sending works**
+It's done with oneway calls and doesn't wait for a callback.
+Transactions are retried indefinitely every X minutes until they arrive and retrying relies on deduplication. 
+Once a transaction is sent, there is no need for the developer to handle confirmations manually. They should consider it done. The transaction will be retried forever. The funds for that transaction are locked and inaccessible through the library. If the canister is DAO governed or black-holed and audited, I believe that will provide near atomic transaction security.
+You could queue up to thousands of messages - as much as you can add inside a BTree in one call.
+
+If you want to use 30 different ledgers inside one canister, it's probably better if someone makes a ledger notification service that brings the info to this library.
+
+
+<https://mops.one/devefi-icrc-ledger>
+It uses <https://mops.one/devefi-icrc-sender> and <https://mops.one/devefi-icrc-reader>
+
+**Disclaimer!** This library is not audited and not ready for production use. It may change its interface a lot. Currently, it's a proof of concept. There is a lot of room for improvement and if someone wants to help with it let us know.
+
+-------------------------
+
+skilesare | 2024-02-04 13:20:27 UTC | #2
+
+Relevant from https://forum.dfinity.org/t/scalable-messaging-model/26920/6?u=skilesare :
+
+[quote="skilesare, post:6, topic:26920"]
+We have been solving for these issues at the application level and have an alpha of a system that isn’t really ‘best effort’, but that assumes an event-based programming including archiving, replay, etc. It is specifically designed let canister ‘publish’ events to a trusted canister and not have to worry about any of the ‘untrusted’ stuff. The Broadcasters do everything via one-shots to subscribers and don’t wait for responses. If a subscriber is off-line it can catch up later by checking the nonce of the event stream.
+
+The one thing it isn’t super good at for now is subnet awareness and/or optimizations, so it is possible to do something expensive like send an event to 100 subscribers on a different subnet instead of relaying to a broadcaster on the subnet and having it distribute to the 100 subscribers. I was hoping to get to that after the alpha.
+
+It lays the foundations of some other cool features like cycle-neutral messaging, tokenization of data streams, etc. Given all of that and some grand designs that I may never actually have time to build…I would have actually loved something like this at the protocol layer.
+
+Ethereum has events, but your contracts can’t respond to them. This event system fixes that glitch and lets you write programs in an event messaging style. When you do that you don’t have to stress about ‘what happens if I miss a message’ or ‘did the canister get it and do an update that I don’t have access to’ because you just assume that architecture from the beginning.
+
+```
+module {
+
+   let handleEvent = EventHandlerHelper([
+        ("icrc1.transfer", onTransfer),
+        ("icrc2.transfer", onApprove),
+        ...
+   ]);
+
+   var lastTransfer = 0;
+   var lastApprove = 0;
+
+public shared(msg) handleEvent(eventId: Nat, publisherId: Principal, eventName: Text, payload: Candy.CandyValue){ //oneshot
+    handleEvent(eventID, publisherID, eventName, payload);
+};
+
+   private func onTransfer(eventId: Nat, publisherId: Principal, eventName: Text, payload: Candy.CandyValue){
+     if(eventID != lastEvent+1){ //this won't work if you use a filter at the event system level
+        let missedEvents = eventSystem.catchUp(eventName, lastTransfer+1, eventID);
+        for(thisItem in missedEvents){
+          onTransfer(thisItem..);
+        }
+     };
+     //transfer logic
+ };
+
+///etc
+
+};
+
+It certainly adds some state requirements and probably isn’t conducive to implementation in the replica, but I’d much rather be able to do the following then to have to write a bunch of retry code inline with the classic async/await approach:
+
+```
+   public event({caller, msg}) some_namespace_schema{
+     //handle the event
+   }; //and even better if the replica/motoko took care of making sure I didn't miss messages somehow.
+```
+[/quote]
+
+-------------------------
+
+infu | 2024-02-04 14:57:34 UTC | #3
+
+Any idea how we can tell the library (inside the body) what is the actor's principal in Motoko?
+```
+system func postupgrade() { ledger.start(this) }; // starts timers as well
+```
+This works but doesn't trigger on install, only after an upgrade.
+Also trying to start more than 3-4 timers inside the body results in some not registering.
+
+-------------------------
+
+skilesare | 2024-02-04 15:15:00 UTC | #4
+
+I think you need to set a timer inside the main canister initialization with a time of zero, so it runs right after initialization. You'll have access to this inside of that timer function.
+
+-------------------------
+
+infu | 2024-02-04 15:40:35 UTC | #5
+
+I thought so too, but it's not working
+![image|690x175](upload://yEqXZcRjjVQIVau0WGnNTFczvQY.png)
+
+-------------------------
+
+skilesare | 2024-02-04 16:07:59 UTC | #6
+
+What if you put it in its own top level async function and then just reference the name function?
+
+-------------------------
+
+timo | 2024-02-04 16:10:40 UTC | #7
+
+[quote="infu, post:3, topic:27274"]
+Any idea how we can tell the library (inside the body) what is the actor’s principal in Motoko?
+[/quote]
+
+As a workaround, instead of computing the principal once and storing it, you can re-compute the actor's principal from `this` every time you need it.
+
+-------------------------
+
+infu | 2024-02-04 17:06:00 UTC | #8
+
+Do you mean something like this?
+![image|690x175](upload://nMXFf8XIOPVKxNQJc56b5RhjXyL.png)
+
+@timo Yes, that works when you have actors with public functions, which covered 100% of the cases until now. But in our case, we better not add another public function just to get things started.
+
+It's not that big of a problem tho, but will make the library harder to use if there is a special sequence one has to do to get it working. Like calling a function, passing canister_id through init params, or upgrading right after installing. .. Oh it can actually call a blackholed canister with whoami :rocket:
+
+-------------------------
+
+Vitaliy.Klepka | 2024-02-04 19:04:17 UTC | #9
+
+```
+ledger.start(this)
+```
+
+probably @timo meant something like this:
+```
+ledger.start(Principal.fromActor(this));
+```
+we're using such approach and have no issues
+
+-------------------------
+
+timo | 2024-02-04 19:56:53 UTC | #10
+
+I was thinking `ledger.start(this)` could be put in top-level actor code if we didn't call `Principal.fromActor()` right away on the argument. But I was wrong, it doesn't work. So please disregard my comment.
+
+-------------------------
+
+infu | 2024-02-05 15:12:55 UTC | #11
+
+New versions for all 3 libraries.
+
+Test scripts <https://github.com/Neutrinomic/devefi_icrc_ledger/tree/master/test>
+
+**Test results**
+
+**Throughput per ledger**
+Sending - to lib queue - unlimited
+Sending - from queue to ledger: 91tx/s
+Read - from ledger - 250tx/s
+
+**Test methodology** - We ran a locally deployed ledger canister (the last one from SNSW) 
+The test receives a large amount of tokens and splits that by sending 10,000 transactions to different accounts. These accounts resend the transactions to other accounts until the amount < fee. This way we could just send enough tokens for 20,000 transactions and check out how many were made at the end of the test.
+We were stopping and starting both the test canister with this library and the ledger multiple times. We also upgraded the test canister a few times in the middle of testing.
+Numerous trials were conducted, and **not a single transaction was missed** , whether during the sending or receiving of events.
+We also made the replica throw errors when sending and that didn't cause problems for the queue.
+
+**Notice:** This test was done with Dfinity's icrc ledger (ICP ledger excluded, it's tx log is different).  Other ledgers may not work. This library relies on deduplication and `get_transactions` soon to be replaced with ICRC-3. Both have to work impeccably.
+
+-------------------------
+
+infu | 2024-02-08 11:50:28 UTC | #12
+
+<https://mops.one/devefi-icrc-ledger>
+Version 1.1.1 is out. More tests have been added, and previously identified bugs within the balance function have now been fixed. Documentation in mops added. It's ready to get audited now.
+
+**Methodology:** Execute 20,000 transactions (the ledger is configured to split the archive after every 10,000 transactions). Obtain a hash from all account balances owned by the canister. Reinstall the canister and start from block 0 (removing hooks). Generate a second hash and compare it to the first; the two hashes should match. Additionally, retrieve all accounts using the new `accounts` function and directly check their balances by calling the ledger. Compare both sets of balances to ensure they match. The library has passed this test multiple times.
+
+-------------------------
+
+infu | 2024-02-08 18:15:20 UTC | #13
+
+**Version 1.1.2 is out.** After testing our NTN airdrop script in production (mainnet) we noticed the sending throughput was lower, so we reduced it to a max of 45tx/s also when an error occurs "could not perform oneway" it stops sending anything else during the current cycle (every ~2sec), and resumes the next one.
+
+-------------------------
+

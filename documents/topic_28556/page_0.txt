@@ -1,0 +1,193 @@
+lshoo | 2024-03-18 07:59:37 UTC | #1
+
+When I issue a RGB20 asset, and import that to a Stock, I got an error:
+
+```
+Error: Failed query call.
+Caused by: Failed query call.
+  The replica returned a replica error: reject code CanisterError, reject message IC0522: Canister aax3a-h4aaa-aaaaa-qaahq-cai exceeded the instruction limit for single message execution., error code Some("IC0522")
+```
+The code is very simple:
+```
+#[ic_cdk::update]
+fn greet(name: String) -> String {
+    let beneficiary_txid =
+        Txid::from_hex("d6afd1233f2c3a7228ae2f07d64b2091db0d66f2e8ef169cf01217617f51b8fb").unwrap();
+    let beneficiary = Outpoint::new(beneficiary_txid, 1);
+
+    let contract = NonInflatableAsset::testnet("TEST", "Test asset", None, Precision::CentiMicro)
+        .expect("invalid contract data")
+        .allocate(Method::TapretFirst, beneficiary, 100_000_000_000_u64.into())
+        .expect("invalid allocations")
+        .issue_contract()
+        .expect("invalid contract data");
+
+    let contract_id = contract.contract_id();
+
+    // Let's create some stock - an in-memory stash and inventory around it:
+    let mut stock = Stock::default();   
+    stock.import_iface(Rgb20::iface()).unwrap();
+    stock.import_schema(NonInflatableAsset::schema()).unwrap();
+    stock.import_iface_impl(NonInflatableAsset::issue_impl()).unwrap();     // this code will get IC5022 ERROR when running IC Canister
+
+    // stock.import_contract(contract, &mut DumbResolver).unwrap();
+
+    // // Reading contract state through the interface from the stock:
+    // let contract = stock.contract_iface_id(contract_id, Rgb20::iface().iface_id()).unwrap();
+    // let contract = Rgb20::from(contract);
+  
+
+    ic_cdk::api::print(format!("Hello from IC debugger, {}, {}", name, beneficiary));
+    println!("Hello from WASI: {}, {}", name, beneficiary);
+
+    format!("Hello, {}, {}!", name, beneficiary)
+    // format!("Hello, {}, {}, Total supply: {:?}", name, beneficiary, contract.total_supply())
+}
+```
+How can I increase the instruction limit to address this? or does someone have any suggestions? 
+
+[rgbonic code ](https://github.com/lshoo/rgbonic/blob/main/actors/rgb/src/lib.rs#L28)
+
+i found [another thread](https://forum.dfinity.org/t/i-just-hit-the-instruction-limit/27700) by [lastmjs](https://forum.dfinity.org/u/lastmjs) with `IC5022` problem too
+
+Thank you.
+
+-------------------------
+
+domwoe | 2024-03-18 09:10:16 UTC | #2
+
+Hi @lshoo,
+
+I'm a bit confused. The error stems from calling a `query` but the method you are citing is annotated as an `update`.  I assume that in your Candid file, the method is still annotated as a `query`. 
+
+Query calls have an instruction limit of 5B instructions, whereas update calls have a current instruction limit of 20B instructions, see the [resource limits page](https://internetcomputer.org/docs/current/developer-docs/smart-contracts/maintain/resource-limits) for details.
+
+This means your issue will most probably be solved by correctly annotating and calling the method as an update.
+
+-------------------------
+
+lshoo | 2024-03-18 09:37:49 UTC | #3
+
+Thanks @domwoe 
+
+It works after remove `query` in Candid file.
+
+If I issue 1000 assets in a canister, is it easy to hit the instruction limit?
+Can i increase the instructoin limit to 1000B?
+
+-------------------------
+
+lshoo | 2024-03-18 09:53:17 UTC | #4
+
+when i continue to issue 10 rgb20 assets, I got an error:
+```
+Error: Failed update call.
+Caused by: Failed update call.
+  The replica returned a replica error: reject code CanisterError, reject message Canister aax3a-h4aaa-aaaaa-qaahq-cai exceeded the instruction limit for single message execution., error code None
+```
+
+the code is below:
+```
+use std::convert::Infallible;
+
+use amplify::hex::FromHex;
+use bp::dbc::Method;
+use rgb_schemata::NonInflatableAsset;
+use rgbstd::{interface::{IfaceClass, IssuerClass, Rgb20}, invoice::Precision, persistence::{Inventory, Stock}, resolvers::ResolveHeight, validation::{ResolveWitness, WitnessResolverError}, Outpoint, Txid, WitnessAnchor, WitnessId, XAnchor, XPubWitness};
+use strict_types::StrictDumb;
+
+#[ic_cdk::update]
+fn greet(name: String) -> String {
+    let beneficiary_txid =
+        Txid::from_hex("d6afd1233f2c3a7228ae2f07d64b2091db0d66f2e8ef169cf01217617f51b8fb").unwrap();
+    let beneficiary = Outpoint::new(beneficiary_txid, 1);
+
+    let contract = NonInflatableAsset::testnet("TEST", "Test asset", None, Precision::CentiMicro)
+        .expect("invalid contract data")
+        .allocate(Method::TapretFirst, beneficiary, 100_000_000_000_u64.into())
+        .expect("invalid allocations")
+        .issue_contract()
+        .expect("invalid contract data");
+
+    let contract_id = contract.contract_id();
+
+    // Let's create some stock - an in-memory stash and inventory around it:
+    let mut stock = Stock::default();   
+    stock.import_iface(Rgb20::iface()).unwrap();
+    stock.import_schema(NonInflatableAsset::schema()).unwrap();
+    stock.import_iface_impl(NonInflatableAsset::issue_impl()).unwrap();    
+
+    stock.import_contract(contract, &mut DumbResolver).unwrap();
+
+    for i in 0..10 {
+        let contract = NonInflatableAsset::testnet(format!("TEST{i}").as_str(), format!("Test asset {i}").as_str(), None, Precision::CentiMicro)
+        .expect("invalid contract data")
+        .allocate(Method::TapretFirst, beneficiary, 100_000_000_000_u64.into())
+        .expect("invalid allocations")
+        .issue_contract()
+        .expect("invalid contract data");
+
+        stock.import_contract(contract, &mut DumbResolver).unwrap();
+    }
+  
+    // Reading contract state through the interface from the stock:
+    let contract = stock.contract_iface_id(contract_id, Rgb20::iface().iface_id()).unwrap();
+    let contract = Rgb20::from(contract);
+
+    
+
+    ic_cdk::api::print(format!("Hello from IC debugger, {}, {}", name, beneficiary));
+    println!("Hello from WASI: {}, {}", name, beneficiary);
+
+    // format!("Hello, {}, {}!", name, beneficiary)
+    format!("Hello, {}, {}, Total supply: {:?}", name, beneficiary, contract.total_supply())
+}
+
+
+#[ic_cdk::init]
+fn init() {
+    ic_wasi_polyfill::init(&[0u8; 32], &[]);
+}
+
+struct DumbResolver;
+
+impl ResolveWitness for DumbResolver {
+    fn resolve_pub_witness(&self, _: WitnessId) -> Result<XPubWitness, WitnessResolverError> {
+        Ok(XPubWitness::strict_dumb())
+    }
+}
+
+impl ResolveHeight for DumbResolver {
+    type Error = Infallible;
+    fn resolve_anchor(&mut self, _: &XAnchor) -> Result<WitnessAnchor, Self::Error> {
+        Ok(WitnessAnchor::strict_dumb())
+    }
+}
+```
+
+-------------------------
+
+domwoe | 2024-03-18 11:42:10 UTC | #5
+
+You should find out how many instructions the issuance of a single rgb20 asset consumes and then chunk the issuance accordingly.
+
+Note, that you can chunk the computation without user/client side involvement by doing self calls, since each this creates a new entry point which starts a fresh message execution.
+
+To measure the instruction count (of a single execution) you can use the [instruction counter API](https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.instruction_counter.html).
+
+-------------------------
+
+lastmjs | 2024-03-18 12:23:41 UTC | #6
+
+The instruction limits are fixed per version of the replica code, as a dev (at least on mainnet) there is no way for you to increase the instruction limit.
+
+As suggested you just work within the limits. 5 billion for query, 20 billion for update, 200 billion for init/post_upgrade.
+
+-------------------------
+
+domwoe | 2024-03-19 12:01:56 UTC | #7
+
+@lshoo FYI https://forum.dfinity.org/t/lets-solve-these-crucial-protocol-weaknesses/28329/119?u=domwoe
+
+-------------------------
+

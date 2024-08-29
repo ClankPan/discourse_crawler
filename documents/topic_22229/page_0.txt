@@ -1,0 +1,134 @@
+peterparker | 2023-08-17 16:15:39 UTC | #1
+
+In a Rust canister, is it possible to access the function's arguments in a guard?
+
+```
+pub fn caller_is_admin() -> Result<(), String> {
+    let caller = caller();
+    let hello: Hello = STATE.with(|state| state.borrow().heap.hello.clone());
+    
+   // Here accessing the args ???
+
+   if caller == hello.key && args.something == hello.something {
+      Ok(())
+   } else {
+        Err("Caller is not allowed.".to_string())
+    }
+}
+
+
+#[query(guard = "caller_is_admin")]
+fn get_something(args: MyArgs) {
+  ...
+}
+```
+
+-------------------------
+
+NathanosDev | 2023-08-17 17:25:45 UTC | #2
+
+It looks to me like this guard is not called with any arguments so there's no easy way to do this: https://github.com/dfinity/cdk-rs/blob/0f674bd5adfd5323ee3d1777acd5a850fa3cbd01/src/ic-cdk-macros/src/export.rs#L180-L197
+
+I think it should be possible to update the guard to receive the same arguments as the function its guarding: https://github.com/dfinity/cdk-rs/blob/0f674bd5adfd5323ee3d1777acd5a850fa3cbd01/src/ic-cdk-macros/src/export.rs#L153-L157, But then it would be difficult to use the same guard across multiple functions due to different argument types.
+
+For the case that you're encountering, I just call an assertion function manually at the start of my endpoint's function:
+```rust
+#[query]
+fn get_something(args: MyArgs) {
+  assert_caller_is_admin(args.something)?;
+  ...
+}
+```
+
+There's nothing really special about the "guard" function, it's just a function being called before your primary endpoint's function. So there's no meaningful difference between those two approaches except how you invoke them, but calling your function manually gives you more flexibility.
+
+-------------------------
+
+peterparker | 2023-08-17 18:15:48 UTC | #3
+
+Thanks Nathan!
+
+Indeed in my real use case I wrote an assertion function instead of using a guard but, I was curious about it anways. As there is a `caller()` function, I was wondering if maybe there is another function that deserialize the args and can be use anywhere, that way it would have been possible to access the args in a guard. I guess it doesn't exist then and it is not possible.
+
+Not an issue, was more a curiosity question.
+
+-------------------------
+
+levi | 2023-08-17 19:11:32 UTC | #4
+
+https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.arg_data.html.
+
+-------------------------
+
+AdamS | 2023-08-17 19:25:33 UTC | #5
+
+[quote="NathanosDev, post:2, topic:22229"]
+There’s nothing really special about the “guard” function,
+[/quote]
+
+Actually there is. A guard function is the only way that the 'reject' functionality is accessed. A canister function must either reply, reject, or trap. The macros unconditionally reply at the end of the function, because forcing the user to call reply would be annoying, but this then prevents the user from calling reject, because the auto-inserted reply will then cause a trap. A guard function is the only way to reject without trapping (using the CDK macros).
+
+And yes, to get the arguments, you can use `arg_data`. It's the same function that is used to produce the arguments for the canister method itself - the real symbol exported to wasm is `() -> ()`.
+
+-------------------------
+
+NathanosDev | 2023-08-17 20:10:45 UTC | #6
+
+Thanks for the added info Adam!
+
+>  A guard function is the only way that the ‘reject’ functionality is accessed
+
+I wasn't aware of that aspect of the guard function, that's good to know, thanks! Is there any advantage to rejecting over trapping?
+
+> And yes, to get the arguments, you can use `arg_data`
+
+Calling `arg_data` would deserialize the arguments again though, right? Is it worth paying the extra cycles for deserialization to be able to reject instead of trapping?
+
+-------------------------
+
+peterparker | 2023-08-17 20:14:58 UTC | #7
+
+Thanks @levi and @AdamS 👍
+
+[quote="NathanosDev, post:6, topic:22229"]
+Is it worth paying the extra cycles for deserialization to be able to reject instead of trapping?
+[/quote]
+
+That's a good point @NathanosDev, thanks. In the particular feature I'm building, beside cycles, speed matters so from a design perspective might be good to not add an extra deserialize.
+
+-------------------------
+
+levi | 2023-08-17 20:37:54 UTC | #8
+
+[quote="AdamS, post:5, topic:22229"]
+A guard function is the only way to reject without trapping (using the CDK macros).
+[/quote]
+
+Using the `manual_reply = true` parameter in the update or query macros turns off the automatic reply, letting either a manual [reply](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.reply.html) or a manual [reject](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.reject.html). So you can reject without trapping using the cdk macros. Be ware though that a `reply` or a `reject` must be called before the method returns.
+
+For those curious, `reject` and `trap` are different. For a `reject` the canister still commits the state changes of the current message. For a `trap` the system rolls back the state changes of the current message.
+
+-------------------------
+
+NathanosDev | 2023-08-17 20:41:48 UTC | #9
+
+[quote="levi, post:8, topic:22229"]
+For those curious, `reject` and `trap` are different. For a `reject` the canister still commits the state changes of the current message. For a `trap` the system rolls back the state changes of the current message.
+[/quote]
+
+Thanks! So when we're talking about guard functions we can probably safely assume that they're not going to alter state, so rejecting and trapping would essentially be the same if there's no other differences.
+
+-------------------------
+
+levi | 2023-08-17 20:52:30 UTC | #10
+
+Sure, glad to spread the good word.
+
+[quote="NathanosDev, post:9, topic:22229"]
+So when we’re talking about guard functions we can probably safely assume that they’re not going to alter state, so rejecting and trapping would essentially be the same if there’s no other differences.
+[/quote]
+
+I think that is an unsafe assumption, what if a canister puts a lock on the user in the guard function, or counts user calls for rate limiting or similar.
+
+-------------------------
+

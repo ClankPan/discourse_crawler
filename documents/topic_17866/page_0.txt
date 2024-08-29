@@ -1,0 +1,168 @@
+skilesare | 2023-01-08 22:23:22 UTC | #1
+
+Given the following, I'm guessing it is impossible to certify chunks if a browser sends range requests.
+
+We've been trying to set up our ICXProxy implementation to certify these chunks, but we are running into a situation where we think(know) we need to use an alternative certification scheme.
+
+The issue here is that https://prptl.io/-/collection_x/-/token_x/-/movie can only have one valid leaf in the tree according to the spec and we can't return different certs if the user request bytes 0-2047999 vs 2048000-4095999.
+
+Are there any pitfalls we should be looking out for in a custom scheme?
+
+We are also looking at certifying data-level variables in a JSON schema so that we can return leaf certificates for each end leaf and have the ICXProxy certify these.  This would allow the returning of dynamic JSON as long as all end leafs are certified.
+
+> Response certification[​](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-gateway-certification)
+> 
+> If the hostname was safe, the HTTP Gateway performs *certificate validation*:
+> 
+> 1. It searches for a response header called `Ic-Certificate` (case-insensitive).
+> 2. The value of the header must be a structured header according to RFC 8941 with fields `certificate` and `tree`, both being byte sequences.
+> 3. The `certificate` must be a valid certificate as per [Certification](https://internetcomputer.org/docs/current/references/ic-interface-spec#certification), signed by the root key. If the certificate contains a subnet delegation, the delegation must be valid for the given canister. The timestamp in `/time` must be recent. The subnet state tree in the certificate must reveal the canister's [certified data](https://internetcomputer.org/docs/current/references/ic-interface-spec#state-tree-certified-data).
+> 4. The `tree` must be a hash tree as per [Encoding of certificates](https://internetcomputer.org/docs/current/references/ic-interface-spec#certification-encoding).
+> 5. The root hash of that `tree` must match the canister's certified data.
+> 6. The path `["http_assets",<url>]`, where `url` is the utf8-encoded `url` from the `HttpRequest` must exist and be a leaf. Else, if it does not exist, `["http_assets","/index.html"]` must exist and be a leaf.
+> 7. That leaf must contain the SHA-256 hash of the *decoded* body. The decoded body is the body of the HTTP response (in particular, after assembling streaming chunks), decoded according to the `Content-Encoding` header, if present. Supported encodings for `Content-Encoding` are `gzip` and `deflate.`
+> 
+> :::warn The certification protocol only covers the mapping from request URL to response body. It completely ignores the request method and headers, and does not cover the response headers and status code. :::
+
+-------------------------
+
+NathanosDev | 2023-01-09 13:32:05 UTC | #2
+
+Hello @skilesare. It’s good to see that you’re looking into certifying chunks. This is a problem that hasn’t been solved yet and it’s something that we haven’t had capacity to spend much time on yet within Dfinity.
+
+You’re right that it’s currently not possible to certify individual chunks, this is why the Service Worker (and ICX Proxy) will stream every chunk and only perform certification on the concatenated result. This is not ideal though and it would be much better if each chunk was certified on the fly and passed along to the browser. To do this we would need to support multiple possible responses for the same path and as you mentioned, this requires an alternative certification scheme.
+
+We have been working on a new certification scheme internally. It hasn’t been shared yet because it’s still a work in progress, but the part that’s relevant for your question is it will support multiple response nodes per request path. The response nodes are differentiated by parameters of the request, defined by the developers, which in your case could be the `Range` header that determines which response hash is relevant for the request.
+
+So in the Merkle Tree, this might look something like the following (I’ve excluded many parts of the tree here to be succinct) :
+```
+fork(
+  labelled(
+    "http_expr",
+    fork(
+      labelled(
+        "/movies",
+        fork(
+          labelled(<request_hash_with_range_0_to_10>, labelled(<response_hash_with_range_0_to_10>, empty()),
+          fork(
+            labelled(<request_hash_with_range_10_to_20>, labelled(<response_hash_with_range_10_to_20>, empty()),
+            fork(
+              labelled(<request_hash_with_range_20_to_30>, labelled(<response_hash_with_range_20_to_30>, empty()),
+            )
+          )
+        )
+      )
+    )
+  )
+  pruned()
+)
+```
+
+This is still not fully thought out on our side specifically with regards to chunk certification, but I hope this is enough to illustrate a potential path forward that could be taken. We hope to release more details about this new certification method that we’re working on in the coming weeks.
+
+-------------------------
+
+skilesare | 2023-01-09 14:10:37 UTC | #3
+
+One thing to consider here is that you need to certify the returned chunks as opposed to the requested chunks.
+
+We are storing 2MB chunks and have the hashes for each(we may optimize to smaller chunks or let the user decide what they want as this really only applies to how browsers treat video.) Whichever chunk the browser requests, we always return the 2MB chunk around the start of the request.
+
+-------------------------
+
+NathanosDev | 2023-01-09 14:19:58 UTC | #4
+
+The certification won't have an opinion about the relationship between the request chunks and the returned chunks. So if the client requests chunks 1-10, but in reality you return chunks 1-30, then that won't matter as long as the hash for both the request and the response is in the tree.
+
+If that's not flexible enough, then it would be possible to extend the spec further to include some logic about the request. Maybe something like `requestChunkStart == 1 && requestChunkEnd <= 30` then treat the response hash with `requestChunkStart == 1 && requestChunkEnd == 30` is treated as valid. The version of the spec that we're working on now doesn't support this, but use cases like this were kept in mind so that it would be possible to extend it later on.
+
+-------------------------
+
+skilesare | 2023-01-09 16:09:59 UTC | #5
+
+I think the request is irrelevant and impossible(or rather impractical) to certify all possible header combinations. You have control over the response. Safari is crazy and gives you no control over the requested chunks..it is almost impossible to predict all possible requests.  I don't think you can certify the request side in any realistic way if you include headers. You do have control over the response, so I'd recommend allowing a pathway that allows you to only certify the response...or maybe you can certify the base request without headers.
+
+-------------------------
+
+NathanosDev | 2023-01-09 21:35:28 UTC | #6
+
+You can certify the response while ignoring all request headers and only include the path and (optionally) the query. But if you will have multiple responses for this particular hash (in the form of chunks), you won't be able to determine which hash is the appropriate one for that request. So I think we need to add an additional element "path" to be able to identify the correct response hash.
+
+I'm writing under the assumption that if a browser requests bytes 0-10 that the canister can respond with 0-30, then the browser will request bytes 30-40 and the canister can respond with bytes 30-60. So we could add a range of bytes as this extra element in the path. Then, the certifier can check that the 
+`Range` header has requested bytes within the range that's specified in the path for the response that the canister returned.
+
+```
+fork(
+  labelled(
+    "http_expr",
+    fork(
+      labelled(
+        "/movies",
+        fork(
+          labelled(<request_hash_without_range_header>,
+            fork(
+              labelled(<range_0_to_10>, labelled(<response_hash_with_range_0_to_10>, empty()),
+              fork(
+                labelled(<range_10_to_20>, labelled(<response_hash_with_range_10_to_20>, empty()),
+                fork(
+                  labelled(<range_20_to_30>, labelled(<response_hash_with_range_20_to_30>, empty()),
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  pruned()
+)
+```
+
+Do you think something like this could work for you?
+
+-------------------------
+
+skilesare | 2023-01-09 22:20:10 UTC | #7
+
+I think that works.  ................
+
+-------------------------
+
+NathanosDev | 2023-01-16 13:14:08 UTC | #8
+
+I thought more about your suggestion to not certify the request and I realized that this is actually possible as long as receiving a different range than the one that was requested would not cause any security issues.
+
+The tree might look something like this:
+```
+fork(
+  labelled(
+    "http_expr",
+    fork(
+      labelled(
+        "/movies",
+        fork(
+          labelled(<request_hash_without_range_header>,
+            fork(
+              labelled(<response_hash_with_range_0_to_10>, empty()),
+              fork(
+                labelled(<response_hash_with_range_10_to_20>, empty()),
+                fork(
+                  labelled(<response_hash_with_range_20_to_30>, empty()),
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  pruned()
+)
+```
+
+Going with this approach, a malicious replica would not be able to respond with a range that does not exist in the tree because this would fail certification. But, it could respond with any range from the tree regardless of what range was requested and it would still pass certification.
+
+I would imagine that this is safe for streaming video or audio, but may not be safe for cases where the streamed content is going to be executed, either in the browser or by the user after it has been downloaded to their computer.
+
+-------------------------
+

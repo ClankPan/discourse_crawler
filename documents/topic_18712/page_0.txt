@@ -1,0 +1,48 @@
+ilbert | 2023-02-26 23:04:20 UTC | #1
+
+For the project I'm working on, I need to know the public IP address (the one assigned to the client's router by its ISP) of the client that sends the request to the canister and authenticate the clients using their Internet Identity.
+
+On the documentation I didn't find the way to know the client's IP address in a normal canister call. Maybe the [canister_inspect_message](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-inspect-message) API function could help, but I didn't find any example and I guess that  it doesn't provide the IP address.
+
+The only way to do so is to use the [HTTP Gateway](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-gateway) and read the `X-Forwarded-For` or `X-Real-IP` header of the incoming HTTP request. I also built [whats_my_ip](https://github.com/Luca8991/whats_my_ip) to check if it works as expected and I can say it does (you can verify it at [https://q6z4b-sqaaa-aaaam-abefa-cai.raw.ic0.app/](https://q6z4b-sqaaa-aaaam-abefa-cai.raw.ic0.app/)).
+
+The **problem** with HTTP inbound calls is that the call is not signed with the client's Internet Identity and therefore I can't know its Principal when handling the request on the canister.
+As a solution, I was thinking of somehow make the client sign the HTTP call with its Internet Identity and then check the signature on the canister.
+
+Are there other ways to achieve this? Has anyone already encountered this problem?
+
+-------------------------
+
+Severin | 2023-02-27 10:28:49 UTC | #2
+
+If you have a look at the [identity integration sample](https://github.com/dfinity/examples/blob/master/motoko/internet_identity_integration/src/greet_frontend/src/index.js) you'll see how you can use the logged in II as the caller. [Here](https://github.com/dfinity/examples/blob/master/motoko/internet_identity_integration/src/greet_backend/main.mo) is how to get the identity of the caller.
+
+-------------------------
+
+ilbert | 2023-02-27 22:08:35 UTC | #3
+
+@Severin the problem is that when I handle the inbound HTTP call with the [http_request method](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-gateway-interface) provided by the [IC HTTP Gateway protocol](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-gateway), there's no way to know the Principal of the caller, as calls can be done from unauthenticated browsers and/or web2 services. The Gateway protocol is also the one that canisters use to serve web pages over HTTP, where there's no need to authenticate the request to retrieve the page. 
+
+Since I need to know the IP address of the caller, I have to send raw HTTP requests to the canister, but then on the canister I can't use `Principal.toText(message.caller)` to get the identity of the caller.
+
+For these reasons, should I make the caller sign in some way the raw HTTP request sent to the canister? Or am I missing something?
+
+-------------------------
+
+frederikrothenberger | 2023-02-28 08:44:52 UTC | #4
+
+Hi @ilbert 
+
+You could send some challenge signed with the session public key and the delegation as a payload with the request. From that you can derive the principal and verify that the delegation was indeed issued by II, matches the public key and is still valid.
+However, this requires to verify a canister signature _within_ the canister code, which is very expensive in terms of cycles.
+
+So another approach would be to keep a bit of state around to link a canister call to an unauthenticated HTTP request. This can be done by e.g. generating a nonce in the client, sending the hash of the nonce along with the HTTP request, and (only _after_ the HTTP request has completed) send the nonce itself using an authenticated canister call. Since nobody except the client that generated the nonce knows about it, being able to send hash(nonce) first and later reveal nonce links those two calls together.
+
+I.e. in the canister you would need to check, that for a given nonce, a HTTP request containing hash(nonce) was received recently. If so, you can link the IP of the HTTP request to the caller of the canister call.
+
+I hope this helps :-) 
+
+**Disclaimer:** These are general, high level ideas, that I just quickly wrote down. Please think critical about my suggestions. Additional safe-guards must be added (i.e. making sure the same nonce cannot be used multiple times, etc.).
+
+-------------------------
+

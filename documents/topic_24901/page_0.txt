@@ -1,0 +1,304 @@
+michael-weigelt | 2023-11-22 16:27:11 UTC | #1
+
+# PocketIC: Multi-Subnet Canister Testing
+
+Today, we released PocketIC v2.0.0, which enables canister developers to test in a **multi-subnet setting**. The new [server](https://github.com/dfinity/pocketic) version comes with matching updates to the [Rust library](https://crates.io/crates/pocket-ic) and the [Python library](https://pypi.org/project/pocket-ic/).
+
+Multi-subnet testing is a novelty in the ecosystem, so consider this feature slightly experimental. Your feedback will help it mature!
+
+## What is PocketIC?
+
+A fast and deterministic canister testing platform. Now with real cross-net calls!
+For more general info, see the [previous thread](https://forum.dfinity.org/t/pocketic-fast-and-versatile-canister-testing-in-rust-and-python/23793).
+
+## Multi-Subnet Testing: How?
+
+Here are the key features of multi-subnet PocketIC, as exposed by the PocketIC Rust library:
+### Create an IC instance with an NNS subnet and two application subnets:
+
+```rust
+let pic = PocketIcBuilder::new()
+    .with_nns_subnet()
+    .with_application_subnet()
+    .with_application_subnet()
+    .build();
+```
+### Target the NNS subnet specifically to create a canister:
+```rust
+let nns_sub = pic.topology().get_nns_subnet().unwrap();
+let nns_can_id = pic.create_canister_on_subnet(..., nns_sub);
+```
+### Target one of the app subnets specifically to install a canister:
+```rust
+let app_sub_2 = pic.topology().get_app_subnets()[1];
+let app_can_id = pic.create_canister_on_subnet(..., app_sub_2);
+```
+### Create a canister with a specific canister_id on a named subnet 
+I.e., the subnet with the corresponding canister_id range; in this example, the NNS subnet:
+```rust
+let ledger_canister_id = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+pic.create_canister_with_id(..., ledger_canister_id);
+pic.install_canister(ledger_canister_id, ...);
+```
+The subnet types include:
+- Generic system subnet
+- Generic application subnet
+- Named subnet with canister_id range like on mainnet: NNS, SNS, II, Fiduciary, Bitcoin. Only these can be targeted by `install_canister_with_id()`
+
+## What Breaking Changes Come With v2.0.0?
+
+Very few. 
+
+In the Rust client library API:
+- `create_canister()` takes no arguments; to specify a sender, use `create_canister_with_settings()`
+- `call_candid_as()` takes an additional argument `Option<EffectivePrincipal>`
+
+A notable difference is that by default, PocketIC used to contain a system subnet, and from v2.0.0 onwards, it defaults to containing an application subnet. Because the message size limits are now smaller by default, some calls with large payloads could now fail. Note, however, that this is more realistic, because on mainnet you install on an app subnet anyway.
+
+Calling `Tick` on an IC instance now attempts to make progress on all subnets. This is necessary because that is the only way potential cross-net messages can be processed. Therefore, be extra careful with timers/heartbeats, which are and always have been only tentatively supported by PocketIC.
+
+For details, see the changelogs of the PocketIC [server](https://github.com/dfinity/pocketic/blob/main/CHANGELOG.md) and of the [Rust library](https://github.com/dfinity/ic/blob/master/packages/pocket-ic/CHANGELOG.md).
+
+## Questions?
+
+Please reach out to us in this thread. We are happy to help with your setup, and are keen to learn about your bug reports and feature requests.
+
+-------------------------
+
+ufoscout | 2023-11-29 14:08:52 UTC | #2
+
+After upgrading from 1.0, many of our tests now fail with this error:
+
+    UserError(UserError { code: CanisterInstallCodeRateLimited, description: "Canister lxzze-o7777-77777-aaaaa-cai is rate limited because it executed too many instructions in the previous install_code messages. Please retry installation after several minutes." })
+
+any advice?
+
+-------------------------
+
+fxgst | 2023-11-29 16:29:14 UTC | #3
+
+Hi @ufoscout, thanks for reaching out.
+This seems to be related to the fact that version 2.0 defaults to an application subnet to more closely resemble the mainnet. Version 1.0 was using a system subnet by default. 
+On mainnet, your calls would likely also fail with that error message; may I ask why you're executing these calls?
+One way you can circumvent this is to call `pic.advance_time(X minutes)`, execute a few rounds with `pic.tick()` and retry.
+Does this help?
+
+-------------------------
+
+michael-weigelt | 2023-11-29 18:38:45 UTC | #4
+
+Adding to fxgst's reply, when installing large canisters, the canister can get into temporary instruction (think cycles) debit and refuse to accept new `install_code` messages. The debit from an `install_code` cannot exceed 200B instructions, and every empty round, 2B instructions will be taken from any debit. So a few empty `ticks`, at most 100, should suffice. 
+
+`advance_time` should not help.
+
+-------------------------
+
+ufoscout | 2023-11-29 20:15:43 UTC | #5
+
+Thanks, this solved the issue:
+
+        for _ in 0..100 {
+            pocket_ic.tick();
+        }
+
+-------------------------
+
+ufoscout | 2023-11-30 08:55:31 UTC | #6
+
+Another question: we have some integration tests that, through `reqwest`, make an HTTP call to the `http_request` endpoint and verify that the call is upgraded to an `http_request_update`. Is there a way to test this scenario with PocketIC?"
+
+-------------------------
+
+NathanosDev | 2023-11-30 10:16:09 UTC | #7
+
+Unfortunately making HTTP requests is not supported yet. For this to work, an HTTP Gateway needs to be integrated into PocketIC. We've already been discussing this week the best way to do this. There's no timeline yet, but there'll be an update here as soon as there's some progress there! In the meantime you'll need to continue testing these kinds of scenarios via DFX.
+
+EDIT: Alternatively, you can call `http_request` endpoint of your canister through the PocketIC interface instead of with `reqwest` and assert that the response has the `upgrade` flag set to true. If you do it this way, then you'll need to manually call the `http_request_update` endpoint if you want to continue.
+
+-------------------------
+
+ufoscout | 2023-11-30 10:24:08 UTC | #8
+
+@NathanosDev thanks for the clarification
+
+-------------------------
+
+ilbert | 2023-12-09 15:52:15 UTC | #9
+
+Is there a way to disable the canister logs (the ones generated by [print](https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.print.html))? On v1 they were disabled by default I think, while on v2 they are printed in the stdout of the terminal in which I run `cargo test`.
+
+Also, I'm wondering what's causing the following log, if I should solve it and how:
+```
+WARN s:/n:/ic_state_manager/ic_state_manager No state available with certification.
+```
+
+-------------------------
+
+ilbert | 2023-12-09 16:11:17 UTC | #10
+
+[quote="fxgst, post:3, topic:24901"]
+may I ask why you’re executing these calls?
+[/quote]
+
+In my case, I'm executing it at the start of most of the test functions in [ic-websocket-cdk-rs integration tests](https://github.com/omnia-network/ic-websocket-cdk-rs/tree/18d21bcace331469c0fc7df6b8e68baea6c64de8/src/ic-websocket-cdk/src/tests/integration_tests), so that I can test each method of the CDK separately. So, I basically use the `reinstall_canister` function as a way to _reset_ the canister's state.
+Is there a better (and faster, since adding the v2 `ticks` fix makes the tests last for long) way to do it? Should I change the way I test the CDK instead?
+
+-------------------------
+
+fxgst | 2023-12-11 09:21:19 UTC | #11
+
+Hi @ilbert, to mute all messages from the server, you can set the env variable `POCKET_IC_MUTE_SERVER=1`. 
+The "No state available with certification" can safely be ignored. It is printed by the state machine when executing the first round since we don't certify states for testing.
+
+-------------------------
+
+fxgst | 2023-12-11 09:46:59 UTC | #12
+
+I think you could also create a *new* canister in order to reset it's state. I believe this should be faster than deleting, ticking and reinstalling it, but I haven't tested it myself.
+
+-------------------------
+
+ilbert | 2023-12-15 10:05:34 UTC | #13
+
+[quote="fxgst, post:12, topic:24901"]
+create a *new* canister
+[/quote]
+This doesn't make much difference for my tests, so I opted to another solution: using a custom `wipe` method on the canister to reset its internal state. This way I use the the same canister across all tests and I don't have to install a new one each time.
+
+-------------------------
+
+fxgst | 2023-12-15 11:14:09 UTC | #14
+
+I'm glad you figured it out!
+
+-------------------------
+
+ilbert | 2023-12-15 11:16:50 UTC | #15
+
+[quote="michael-weigelt, post:1, topic:24901"]
+Therefore, be extra careful with timers/heartbeats, which are and always have been only tentatively supported by PocketIC.
+[/quote]
+
+Is there a reason why now timers are **not** working anymore **only** in a Motoko canister?
+
+Should I add more ticks?
+
+-------------------------
+
+michael-weigelt | 2023-12-15 13:32:10 UTC | #16
+
+Hi ilbert,
+
+Are you saying your timers have worked before and now don't?
+
+-------------------------
+
+ilbert | 2023-12-15 15:40:10 UTC | #17
+
+Yes, that's the behavior I've observed. Adding 100 `tick`s (instead of just 1 as I was doing with PocketIC v1) after `advance_time` seems to solve it.
+
+-------------------------
+
+michael-weigelt | 2023-12-15 16:38:01 UTC | #18
+
+If there are crossnet calls involved, I may have an explanation. 
+
+Think of a tick as a round of ticks for every subnet. The round always happens in the same order, so if you have an xnet call from a canister in subnet 2 to a canister in subnet 1, then the xnet call will take two rounds to be processed (whereas an xnet call from 1 to 2 only takes one round). We have some ideas on how to optimize this eventually. 
+
+Otherwise it may be due to the smaller default limits discussed above. 
+
+In any case, since PocketIC is deterministic, you may want to figure out how many ticks you really need here, because it could turn out to be just 3, 10 or so. The number must be stable across runs of the same wasm versions. A quick binary search could help.
+
+-------------------------
+
+ilbert | 2023-12-15 16:55:35 UTC | #19
+
+There are no crossnet calls involved, I just had to add the NNS subnet in order to be able to call the `root_key` method. The canister I'm testing is anyway deployed on an app subnet.
+
+[quote="michael-weigelt, post:18, topic:24901"]
+In any case, since PocketIC is deterministic, you may want to figure out how many ticks you really need here, because it could turn out to be just 3, 10 or so. The number must be stable across runs of the same wasm versions. A quick binary search could help.
+[/quote]
+Ok thanks! I'll stick to 100 for now as it seems to work and doesn't affect the total time it takes to run all tests, but I'll keep your suggestion in mind.
+
+-------------------------
+
+gravity_vi | 2024-01-23 04:43:59 UTC | #20
+
+@michael-weigelt I am facing this issue while testing multi-subnet using PocketIC. https://forum.dfinity.org/t/testing-creation-of-canister-on-a-subnet-using-cycle-minting-canister-with-pocketic/26906
+
+-------------------------
+
+massimoalbarello | 2024-02-07 16:45:56 UTC | #21
+
+Hello @michael-weigelt, how can I make tECDSA work when testing with pocket IC?
+
+I initially requested the public key with the name `dfx_test_key` as I normally do in DFX but I got errors suggesting a bunch of other keys named `master_ecdsa_public_key_*`, one for each subnet I added to the `PocketIcBuilder`. I tried making the request with each of them but I always get the error: `ecdsa_public_key failed InternalError(\"InvalidPoint\")`. I tried adding different subnets but the result was always the same.
+
+What am I doing wrong?
+
+-------------------------
+
+michael-weigelt | 2024-02-07 17:55:35 UTC | #22
+
+Hi Massimo
+Could you share a code snippet?
+
+-------------------------
+
+massimoalbarello | 2024-02-07 19:16:28 UTC | #23
+
+[This](https://github.com/omnia-network/ic_akash/blob/5ea724ecfc8a58b7e237b7ea42b9eb1689944f60/src/backend/src/tests/integration_tests/utils/test_env.rs#L33C9-L51C11) is how I setup PocketIC. The [should_get_address](https://github.com/omnia-network/ic_akash/blob/5ea724ecfc8a58b7e237b7ea42b9eb1689944f60/src/backend/src/tests/integration_tests/setup.rs#L7C1-L11C2) test panics with the error:
+
+```
+ecdsa_public_key failed InternalError(\"InvalidPoint\")
+```
+
+When running the integration tests with PocketIC, I use the `TestKeyLocalDevelopment` key, which is set to `master_ecdsa_public_key_yndj2-3ybaa-aaaaa-aaaap-yai` as you can see [here](https://github.com/omnia-network/ic_akash/blob/5ea724ecfc8a58b7e237b7ea42b9eb1689944f60/src/backend/src/helpers/ecdsa.rs#L21C9-L31C10).
+
+-------------------------
+
+massimoalbarello | 2024-02-11 10:15:49 UTC | #24
+
+Are there any examples around to test tECDSA with PocketIC?
+
+-------------------------
+
+michael-weigelt | 2024-02-12 08:40:20 UTC | #25
+
+No, but we are looking into the issue.
+
+-------------------------
+
+mraszyk | 2024-02-12 17:05:37 UTC | #26
+
+tECDSA calls are now be fixed on master (please see [here](https://github.com/dfinity/ic/commit/0ec0747d3bffeedc80b7fa89c04dd8755f3f09a7)) and the fix will be included in the next PocketIC release
+
+-------------------------
+
+michael-weigelt | 2024-02-14 17:21:10 UTC | #27
+
+Hi massimo
+
+Here is server version 3.0.1 with working ecdsa keys:
+https://github.com/dfinity/pocketic/releases/tag/3.0.1
+And the rust library is now on version 2.2.0: 
+https://crates.io/crates/pocket-ic
+
+-------------------------
+
+michael-weigelt | 2024-05-03 16:21:29 UTC | #28
+
+Check out the new version of PocketIC:
+
+https://forum.dfinity.org/t/pocketic-version-4-0-0-ic-http-interface-compatibility/30281
+
+-------------------------
+
+Gekctek | 2024-06-29 20:37:33 UTC | #29
+
+Wondering if you have any insight into 
+
+https://forum.dfinity.org/t/help-with-pocketic-intercanister-calls/32517
+
+-------------------------
+

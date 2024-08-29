@@ -1,0 +1,313 @@
+flyq | 2024-04-16 13:29:54 UTC | #1
+
+## background
+
+A zero-knowledge proof is a way of proving the validity of a statement without revealing the statement itself. The ‘prover’ is the party trying to prove a claim, while the ‘verifier’ is responsible for validating the claim. It provides core technical support in use cases such as private transactions, verifiable computing (Off-chain scaling solutions, aka Layer2).
+
+Thanks to the needs arising in the blockchain field, such as zkRollup, private transactions, etc., the theory and engineering in the ZKP field have developed rapidly in recent years. To use the power brought by ZKP, on-chain verifier are almost indispensable. For example, all Ethereum zkRollups has a Verifier implemented using Solidity running on Ethereum Layer1, and when withdrawing Tornado cash, you also need to verify the merkle proof you generated in the Tornado smart contract.
+
+On April 9th, the A16z crypto team released the fastest zkVM for prover: Jolt(Just One Lookup Table), including [code](https://github.com/a16z/jolt), [examples](https://github.com/a16z/jolt/tree/main/examples), [documents](https://jolt.a16zcrypto.com/), [blogs](https://a16zcrypto.com/posts/tags/lasso-jolt), and papers([Lasso](https://eprint.iacr.org/2023/1216.pdf) and [Jolt](https://eprint.iacr.org/2023/1217.pdf)).
+
+> Jolt is a zkVM (zero knowledge virtual machine) – a SNARK that lets the prover prove that it correctly ran a specified computer program, where the program is written in the assembly language of some simple CPU. zkVMs offer a fantastic developer experience: They make SNARKs usable by anyone who can write a computer program, eliminating the need for in-depth cryptographic knowledge. But usability comes at a steep price. Today’s zkVMs are remarkably complicated and offer terrible performance for the prover. Today, *proving* a computer program was run correctly is millions of times slower than simply *running* the program.
+>
+> from [A new era in SNARK design: Releasing Jolt](https://a16zcrypto.com/posts/article/a-new-era-in-snark-design-releasing-jolt)
+
+And the Jolt development team encourages the implementation of [on-chain Verifier](https://github.com/a16z/jolt/issues/209).
+
+[IC(Internet Computer)](https://internetcomputer.org/) is the most powerful smart contract platform I have ever seen. One of its smart contracts can run a complete EVM, including json rpc, processing signatures, and EVM execution and output. Or being able to run a database, a sequencer of Bitcoin inscriptions, etc.
+
+Putting zk's verifier on an IC can bring some benefits:
+1. IC is powerful enough and not so picky about the Verifier program. In fact, there is a balance between the prover and the verifier. Some SNARKs can obtain the smallest proof size and fast verification algorithm, but they are very unfriendly to the prover. Some SNARKs may have a larger proof size and a more complicated verification algorithm. But the performance of the proof program has been greatly improved. Due to the performance limitations of smart contracts, Ethereum can often only verify the former type of SNARK. But Sumcheck-based Jolt falls into the latter category.
+2. IC's smart contract has the most complete support for Rust and can use std, so it can directly reuse the implementation of ZK Library. and reduce potential implementation errors.
+3. IC's chain key ECDSA can directly call platforms such as Ethereum/BTC, and the verification results can also be used to notify Ethereum, etc.
+
+The whole project code: https://github.com/flyq/jolt_verifier_canister
+
+For implementation description, refer https://hackmd.io/@liquan/S1dybGcl0
+
+The canister is already running on the chain: https://p6xvw-7iaaa-aaaap-aaana-cai.raw.ic0.app
+
+## How
+
+For specific programs, Jolt generates their circuits as well as proofs. The circuit is contained in the huge `JoltPreprocessing`, which is about 48MB, and Proof is 500kb-10MB depending on the size of the program. We need to upload `JoltPreprocessing` and `Proof` in parts first, then assemble them in Canister, and then call verifier to verify them.
+
+For example, for the Fibonacci function, its `JoltPreprocessing` is certain, so when verifying `fib(10)` and `fib(50)`, use the same `JoltPreprocessing` and different `Proof`s to verify.
+
+
+## Requirement
+
+[ic-wasm](https://github.com/dfinity/ic-wasm)
+
+```sh
+cargo install ic-wasm -f
+```
+
+## Build
+
+```sh
+git clone https://github.com/flyq/jolt_verifier_canister
+
+cd jolt_verifier_canister
+
+cargo run --features "export-api" > build/jolt_verifier_canister.did
+
+cargo build --target wasm32-unknown-unknown --release --features "export-api"
+
+ic-wasm target/wasm32-unknown-unknown/release/jolt_verifier_canister.wasm -o build/jolt_verifier_canister.wasm shrink
+```
+
+## Deploy
+
+teminal 1:
+
+```sh
+dfx start --clean
+```
+
+teminal 2:
+
+```sh
+dfx canister create --no-wallet jolt_verifier_canister
+
+dfx build jolt_verifier_canister
+
+dfx canister install jolt_verifier_canister --argument "record { owner=principal \"$(dfx identity get-principal)\";}"
+
+dfx canister call jolt_verifier_canister get_owner
+```
+
+## Test
+
+genenrate proof:
+
+terminal 2:
+
+```sh
+cd ..
+
+git clone https://github.com/flyq/jolt
+
+cd jolt
+
+cargo run --release -p fibonacci
+
+cargo run --release -p sha2-chain
+
+cargo run --release -p sha2-ex
+
+cargo run --release -p sha3-chain
+
+cargo run --release -p sha3-ex
+```
+
+and we can get the proof files: fib10 and so on.
+
+copy the file to `./data/fib`, `./data/sha2`, `data/sha2_chain`, `data/sha3`, `data/sha3_chain`.
+
+also we get the risc-v compiled result under `ls /tmp/jolt-guest-*`.
+
+generate the data according proof:
+
+```sh
+cargo run --release -p helper generate_preprocess guest fib
+
+cargo run --release -p helper generate_preprocess sha2-chain-guest sha2_chain
+
+cargo run --release -p helper generate_preprocess sha2-guest sha2
+
+cargo run --release -p helper generate_preprocess sha3-chain-guest sha3_chain
+
+cargo run --release -p helper generate_preprocess sha3-guest sha3
+
+cargo run --release -p helper check_split
+```
+
+upload data
+
+```sh
+cargo run --release -p helper upload_preprocess
+
+dfx canister call jolt_verifier_canister get_buffer '(24:nat32)'
+
+# fibonacci(0), sha2_chain(1), sha2_ex(2), sha3_chain(3), sha3_ex(4)
+
+dfx canister call jolt_verifier_canister preprocessing '(24:nat32, 0:nat32)'
+
+dfx canister call jolt_verifier_canister get_buffer '(24:nat32)'
+
+# modify helper/src/main.rs's upload_preprocess to `let name = format!("data/sha2/p{}.bin", i);`
+
+cargo run --release -p helper upload_preprocess
+
+dfx canister call jolt_verifier_canister get_buffer '(24:nat32)'
+
+# sha2_ex(2)
+
+dfx canister call jolt_verifier_canister preprocessing '(24:nat32, 2:nat32)'
+
+dfx canister call jolt_verifier_canister get_buffer '(24:nat32)'
+
+# modify helper/src/main.rs's upload_preprocess to `let name = format!("data/sha2_chain/p{}.bin", i);`
+
+cargo run --release -p helper upload_preprocess
+
+# sha2_chain(1)
+
+dfx canister call jolt_verifier_canister preprocessing '(24:nat32, 1:nat32)'
+
+# modify helper/src/main.rs's upload_preprocess to `let name = format!("data/sha3_chain/p{}.bin", i);`
+
+cargo run --release -p helper upload_preprocess
+
+# sha3_chain(3)
+
+dfx canister call jolt_verifier_canister preprocessing '(24:nat32, 3:nat32)'
+
+# modify helper/src/main.rs's upload_preprocess to `let name = format!("data/sha3/p{}.bin", i);`
+
+cargo run --release -p helper upload_preprocess
+
+# sha3(4)
+
+dfx canister call jolt_verifier_canister preprocessing '(24:nat32, 4:nat32)'
+
+# let name = format!("data/fib/fib10.bin");
+
+cargo run --release -p helper upload_proof
+
+# fibonacci(0), sha2_chain(1), sha2_ex(2), sha3_chain(3), sha3_ex(4)
+
+dfx canister call jolt_verifier_canister update_proof '(0:nat32, 0:nat32)'
+
+# (variant { Ok = 0 : nat32 })
+
+# let name = format!("data/fib/fib50.bin");
+
+cargo run --release -p helper upload_proof
+
+# fibonacci(0), sha2_chain(1), sha2_ex(2), sha3_chain(3), sha3_ex(4)
+
+dfx canister call jolt_verifier_canister update_proof '(0:nat32, 0:nat32)'
+
+# (variant { Ok = 1 : nat32 })
+
+# let name = format!("data/sha2/sha2.bin");
+
+cargo run --release -p helper upload_proof
+
+# fibonacci(0), sha2_chain(1), sha2_ex(2), sha3_chain(3), sha3_ex(4)
+
+dfx canister call jolt_verifier_canister update_proof '(0:nat32, 2:nat32)'
+
+# (variant { Ok = 0 : nat32 })
+
+# let name = format!("data/sha3/sha3.bin");
+
+cargo run --release -p helper upload_proof
+
+# fibonacci(0), sha2_chain(1), sha2_ex(2), sha3_chain(3), sha3_ex(4)
+
+dfx canister call jolt_verifier_canister update_proof '(0:nat32, 4:nat32)'
+
+# (variant { Ok = 0 : nat32 })
+
+# fib(10)
+
+dfx canister call jolt_verifier_canister verify_jolt_proof '(0:nat32, 0:nat32)'
+
+(variant { Ok = true })
+
+# fib(50)
+
+dfx canister call jolt_verifier_canister verify_jolt_proof '(0:nat32, 1:nat32)'
+
+# sha2
+
+dfx canister call jolt_verifier_canister verify_jolt_proof '(2:nat32, 0:nat32)'
+
+Error: Failed update call.
+
+Caused by: Failed update call.
+
+The replica returned a rejection error: reject code CanisterError, reject message Canister bnz7o-iuaaa-aaaaa-qaaaa-cai exceeded the instruction limit for single message execution., error code None
+
+# sha3
+
+dfx canister call jolt_verifier_canister verify_jolt_proof '(4:nat32, 0:nat32)'
+
+Error: Failed update call.
+
+Caused by: Failed update call.
+
+The replica returned a rejection error: reject code CanisterError, reject message Canister bnz7o-iuaaa-aaaaa-qaaaa-cai exceeded the instruction limit for single message execution., error code None
+```
+
+It can be seen that the verification of sha2 and sha3 does need to wait for [the optimization of Verifier](https://github.com/a16z/jolt/issues/216)
+
+-------------------------
+
+domwoe | 2024-04-16 14:01:45 UTC | #2
+
+Awesome work @flyq. This is super exciting. 
+
+I'm looking forward to seeing some application of this. In particular in the privacy domain, i.e. using zk privacy and not just proving validity. 
+
+Just tagging a couple of people who might be interested in this cool experiment: @apotheosis @w3tester, @skilesare @lastmjs
+
+-------------------------
+
+w3tester | 2024-04-16 14:05:17 UTC | #3
+
+This is absolutely interesting work! Thanks @flyq for sharing this. We definitely look forward to seeing more zk systems built on the ICP.
+
+-------------------------
+
+apotheosis | 2024-04-16 15:10:13 UTC | #4
+
+Saw this as well and the write up. Not sure if this is good for privacy though as that assumes local execution. But it does demonstrate that JOLT does not need hours... of and days of dev time... in order to figure out how to get it into a wrapper for ETH. 
+
+They could use it on IC with tECSDA and call it a day :slight_smile:
+
+-------------------------
+
+domwoe | 2024-04-16 15:31:19 UTC | #5
+
+[quote="apotheosis, post:4, topic:29741"]
+Not sure if this is good for privacy though as that assumes local execution.
+[/quote]
+
+Yeah, proving times are still a bit intense :slight_smile:
+
+-------------------------
+
+flyq | 2024-04-17 02:45:28 UTC | #6
+
+[quote="domwoe, post:2, topic:29741"]
+In particular in the privacy domain, i.e. using zk privacy and not just proving validity.
+[/quote]
+
+> (More precisely, we’re currently using a stripped-down version of the [Hyrax-commitment](https://eprint.iacr.org/2017/1132.pdf) that is not zero-knowledge).
+> We can replace Hyrax with any other commitment scheme for multilinear polynomials. In particular, we’ll add support for [Zeromorph](https://eprint.iacr.org/2023/917) and [HyperKZG](https://github.com/microsoft/Nova/blob/main/src/provider/hyperkzg.rs), which are adaptations of KZG commitments to multilinear polynomials. They have constant commitment size and logarithmic size evaluation proofs, and verification involves logarithmically many *G* 1 operations and 3 pairing evaluations (The Zeromorph verifier has already been [implemented in Solidity](https://github.com/Maddiaa0/honk-verifier) for on-chain verification. A Rust implementation of its prover is [here](https://github.com/lurk-lab/arecibo/blob/dev/src/provider/non_hiding_zeromorph.rs)).
+
+In short, the current Jolt cannot provide zero-knowledge features, which is related to its use of [Hyrax](https://eprint.iacr.org/2017/1132.pdf) polynomial commitment scheme(PCS). But it developed quickly.  It will look for alternatives. Recently, it is Zeromorph and HyperKZG, which can obtain a smaller proof size and smaller verification costs without increasing the cost of the prover. The ultimate PCS is [Binius](https://a16zcrypto.com/posts/article/faqs-on-jolts-initial-implementation/#section--4), which can achieve 5x faster prover speed. I think Zeromorph and HyperKZG can achieve zero-knowledge features
+
+-------------------------
+
+domwoe | 2024-04-17 07:34:23 UTC | #7
+
+Alright, seems we are quite a bit away from privacy applications with this particular scheme.
+
+Another question. Given the relatively large proof size, how can this scheme be practical for applications on Ethereum or Rollups?
+
+-------------------------
+
+flyq | 2024-04-17 09:08:40 UTC | #8
+
+[quote="domwoe, post:7, topic:29741"]
+Another question. Given the relatively large proof size, how can this scheme be practical for applications on Ethereum or Rollups?
+[/quote]
+
+Generally use recursive snark: use another proof systems whose proof size is smaller, such as Groth16, proves the previous proof can correctly be verified the previous verifier.
+
+-------------------------
+

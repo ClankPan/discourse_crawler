@@ -1,0 +1,130 @@
+Mitch | 2023-03-30 03:06:31 UTC | #1
+
+Hey all, we're investigating a bug that only appears on our custom domain ([https://nuance.xyz/](https://nuance.xyz/)), and not our canister id URL ([https://exwqn-uaaaa-aaaaf-qaeaa-cai.ic0.app/](https://exwqn-uaaaa-aaaaf-qaeaa-cai.ic0.app/))
+
+If you look in the console at nuance.xyz you'll see this error:
+![Screen Shot 2023-03-29 at 11.00.06 PM|690x80](upload://bt11nVIYeyc5Rh7T5eyeax21DY.png)
+
+The error very well could be on our side but I wanted to check in and see if anyone else was experiencing a similar error with their custom domains, given that it works fine on the canister URL.
+
+-------------------------
+
+Kepler | 2023-03-30 09:15:53 UTC | #2
+
+Hi @Mitch, looks like you are trying to fetch the `rootKey` in `mainnet`, you shouldn't do this since it's already packaged into the agent. 
+
+It works in `https://exwqn-uaaaa-aaaaf-qaeaa-cai.ic0.app` because the agent will take `ic0.app` and use it as the api boundary node to fetch it with `ic0.app/api/v2/status` which succeeds, however, with `nuance.xyz` it can't infer the api boundary node and it tries to fetch it from `nuance.xyz/api/v2/status` that then fails. 
+
+For the custom domain you're getting the following response as expected since it's not an API Boundary Node: 
+
+![Screenshot 2023-03-30 at 11.11.21|690x117](upload://eWTntpHuBu1esjoFJ9Lv1TDFneD.png)
+
+-------------------------
+
+Mitch | 2023-03-30 12:45:05 UTC | #3
+
+For the time being we setup a redirect to the canister id url. 
+
+Are there additional steps beyond this guide: [https://internetcomputer.org/docs/current/developer-docs/production/custom-domain/#custom-domains-on-the-boundary-nodes](https://internetcomputer.org/docs/current/developer-docs/production/custom-domain/#custom-domains-on-the-boundary-nodes)
+
+or is this something we'll need to remove from a configuration somewhere?
+
+-------------------------
+
+Severin | 2023-03-30 14:06:20 UTC | #4
+
+This is something in your code that you need to disable in production. Have a look at the places where you create an agent, it should be very close to that line. I'd start by searching for `fetchRootKey` or `fetch_root_key` and figuring out under which conditions this call happens
+
+-------------------------
+
+Mitch | 2023-03-30 14:42:30 UTC | #5
+
+I'm debugging on one of our test environments to not interfere with our production any further:
+
+I've managed to clear the fetch root key error on our test environment [https://nuancedevs.xyz/](https://nuancedevs.xyz/) but the `failed to parse` error remains. However on the canisterID of the test environment it is functioning as expected [https://equ7v-uaaaa-aaaam-qbbcq-cai.ic0.app/](https://equ7v-uaaaa-aaaam-qbbcq-cai.ic0.app/)
+
+-------------------------
+
+NathanosDev | 2023-03-30 15:12:56 UTC | #6
+
+@Mitch, Are you setting a value as the host in `agent-js`?
+
+-------------------------
+
+NathanosDev | 2023-03-30 15:22:28 UTC | #7
+
+My hunch is that the `host` in `agent-js` is empty, so API calls are made to the current domain (`nuancedevs.xyz`) and this is not recognized as an API gateway by the service worker, so this is forwarded as a normal web2 call and then this results in the behavior that @Kepler described above.
+
+We should fix this on the Service Worker side, but in the meantime if you want a quicker fix then you can set the host of `agent-js` to `https://icp-api.io`.
+
+-------------------------
+
+Mitch | 2023-03-30 15:34:12 UTC | #8
+
+Our host was in fact empty, we've tried this `agentOptions: { identity, host: 'https://equ7v-uaaaa-aaaam-qbbcq-cai.ic0.app/' }` would it be better to use `https://icp-api.io.` as opposed to the canister id?
+
+-------------------------
+
+NathanosDev | 2023-03-30 15:37:22 UTC | #9
+
+Yes `https://icp-api.io` would be better, `host` is a bit confusing there to be fair but it refers to the host of the API gateway, not the host of your app.
+
+The service worker should redirect all the API requests to `icp-api.io` anyway, but it's failing in this case because of the custom domain, that's what we'll fix on our end.
+
+-------------------------
+
+kpeacock | 2023-03-30 16:28:09 UTC | #10
+
+This is a great chance for me to explain the specifics, in case someone else stumbles on this thread! Here's the logic that `agent-js` follows:
+
+- if `host` is set, then use the host
+  - if `host` is a subdomain of `ic0.app`, `icp0.io`, or `icp-api.io`, re-write the host to use the plain domain for API calls
+- if `host` is not set:
+  - if you are in the browser - attempt to make calls to `"/api/v2..."` on the same origin
+  - Otherwise, throw error and require a `host` to be set
+
+I agree the name `host` could possibly be more precise now with `gateway` or something, but the API predates a lot of the terminology we've settled on, and it would be a breaking change to rename at this point. I'll see if I can find a better way to document this though
+
+-------------------------
+
+karim | 2023-05-29 09:39:27 UTC | #11
+
+What would a solution to this same problem look like when importing from `/declarations/backend` and making anonymous calls in a React frontend:
+
+```
+import { marketplace_backend } from '../../../declarations/marketplace_backend';
+
+const loadUsers = async () => {
+    const response = await marketplace_backend.getUsers();
+    setUsers(response);
+};
+```
+
+My first thought was to set the host for the agent created in the `index.js` but I don't exactly know how to and the contents of the `/declarations` folder get recreated with every update. Or do I need to create the actor in my components like so maybe:
+
+```
+const ic_agent = new HttpAgent({ host: "https://icp-api.io" });
+
+const loadUsers = async () => {
+    const actor = Actor.createActor(idlFactory, {
+        agent: ic_agent,
+        canisterId: canisterId,
+    });
+    const response = await actor.getUsers();
+};
+```
+
+Also, I'd be interested in understanding why there are different API endpoints at all? I had previously used `https://boundary.ic0.app/` which worked fine in production. Should we now always use `https://icp-api.io` when creating an agent?
+
+-------------------------
+
+kpeacock | 2023-06-01 14:59:59 UTC | #12
+
+You're always welcome to use your own logic for creating an agent. The auto-generated entrypoint is for convenience, and you should skip it if it stops being convenient.
+
+> Should we now always use `https://icp-api.io` when creating an agent?
+
+`https://icp-api.io` is the new recommended, stable endpoint for the mainnet api. You can specify the localhost `host` or set `host` to `undefined` during local development. It was worth moving off of `ic0.app` just for safety, since the new `.io` domain will not be responsible for serving any http content that might get the domain added to spam registries
+
+-------------------------
+

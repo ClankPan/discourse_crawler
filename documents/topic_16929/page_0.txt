@@ -1,0 +1,133 @@
+dansteren | 2022-11-29 18:44:50 UTC | #1
+
+**TLDR;** Would a post-init hook that allows cross-canister calls be beneficial?
+
+---
+
+I have a need to make a cross-canister call one time, at canister initialization (see [this post](https://forum.dfinity.org/t/cant-do-cross-canister-call-in-init-function/5187)). However, neither the init method nor the post-upgrade method allow for cross-canister calls. As a result I have to find another way to kick this off.
+
+Current possible solutions include:
+- Using heartbeat
+- Exposing a separate dedicated canister method
+- Using the new [timer API](https://forum.dfinity.org/t/heartbeat-improvements-timers-community-consideration/14201/60)
+
+The heartbeat method would be too expensive. Having to expose a new method and manually call it is less than ideal. Which leaves the timer API as the current most promising path forward, and how intend to proceed for now.
+
+That being said, I can imagine other scenarios where data from other canisters is needed to initialize a canister. Having a post-init hook where you can make cross-canister calls would be the most intuitive way to support this (that I can think of). Either that or just allowing cross-canister calls in the init  method, but I'm sure there's technical reasons we aren't doing that.
+
+So, my question is two fold:
+
+- Is there a case for adding a post-init hook for this type of work?
+- Is there currently a better solution than the timer API for doing this?
+
+-------------------------
+
+paulyoung | 2022-11-29 19:31:09 UTC | #2
+
+I think this is needed as well.
+
+It was originally suggested well over a year ago but I haven’t heard of anything since then.
+
+https://forum.dfinity.org/t/cant-do-cross-canister-call-in-init-function/5187/8?u=paulyoung
+
+@domwoe do you think this is something that could be added to the spec?
+
+-------------------------
+
+icme | 2022-11-30 07:02:05 UTC | #3
+
+[quote="dansteren, post:1, topic:16929"]
+Exposing a separate dedicated canister method
+[/quote]
+
+What about using a "factory" canister to spin up this canister, and then calling a specific API on it that is gated by the principal of the factory that created it? This way you can await the completion of the canister being created and right after call the `postInit()` API on your canister.
+
+You can also include an instance variable to ensure this `postInit()` API called only once.
+
+-------------------------
+
+roman-kashitsyn | 2022-11-30 10:16:44 UTC | #4
+
+I saw many canisters that must do some initialization logic before answering update calls. For example:
+* The II canister needs to initialize its random seed before creating anchors.
+* The ckBTC minter canister must obtain its ECDSA pubkey before answering any calls.
+
+The common solution so far is to add an initialization guard to every update call:
+```rust
+#[update]
+async fn mint(args: Args) -> Result {
+  init().await;
+  // ...
+}
+```
+
+However, adding a proper post-init hook is technically tricky because it must complete before the first "real" message arrives. If we don't ensure this, the usefulness of the post-init hook is minimal: we must contaminate all update calls with checks in case the first message arrives before the initialization completes.
+
+One promising solution is introducing another canister state, "initializing". The replica could automatically reject (or buffer) all incoming messages until the initialization completes. This feature will be helpful, but it would be quite a chunk of work for the execution team.
+
+-------------------------
+
+ulan | 2022-11-30 10:25:33 UTC | #5
+
+> This feature will be helpful, but it would be quite a chunk of work for the execution team.
+
+For DTS we implemented a per-canister system task queue abstraction that guarantees execution of the tasks in the queue before execution of regular messages. I think that will make the implementation of the post-init hook easier.
+
+-------------------------
+
+lastmjs | 2022-11-30 16:30:11 UTC | #6
+
+Amazing. A question I have though is if setting a one-time timer for 0 seconds in the future from the init method would do the same thing as a post-init hook?
+
+-------------------------
+
+ulan | 2022-11-30 18:53:13 UTC | #7
+
+That depends on the implementation. The spec doesn't define any ordering between a timer with 0 seconds and other message of the canister. In our current implementation some messages may be executed before the timer with 0 second in the same round.
+
+-------------------------
+
+dansteren | 2022-12-01 17:32:18 UTC | #8
+
+This would be one solution for an end developer. At Demergent Labs we are building at the CDK level so we can't rely on having our users make this call. We need to make it for them. But it would be a valid approach for other devs.
+
+-------------------------
+
+dansteren | 2022-12-01 17:48:55 UTC | #9
+
+@roman-kashitsyn, adding an initialization guard sounds like the right way to go for now as it will guarantee that the initialization logic happens before anything else. I'll likely proceed this way while waiting on a post-init hook implementation.
+
+What you've proposed for the hook though sounds exactly like what I would really like. Having the guarantee that it completes before "real" messages arrive would be amazing. At this point I'm not sure if that means Dfinity is going to start work on this though, or you're just agreeing it would be useful. The transition from forum post to actual roadmap item is a little vague to me. Could you help get this into the roadmap and provide some way for the community to check the progress of it *(or get this in front of the right person)*?
+
+-------------------------
+
+icme | 2022-12-02 09:37:52 UTC | #10
+
+@dansteren ,
+
+Over the past week I’ve been communicating with @ulan regarding introducing canister lifecycle hooks/methods that developers can tie into.
+
+These would include `postInit()`, as well as `onLowCycles()`, `onLowMemory()`, and a few others.
+
+I’m planning on writing up a proposal this weekend, and will share it early next week.
+
+Also, check your DMs!
+
+-------------------------
+
+icme | 2022-12-05 20:17:29 UTC | #11
+
+I've included `canister_post_init()` as a canister lifecycle hook in this discussion.
+
+https://forum.dfinity.org/t/canister-lifecycle-hooks/17089
+
+-------------------------
+
+dansteren | 2022-12-07 18:27:05 UTC | #12
+
+Thanks! I think this post_init hook will likely fall into your broader discussion on canister lifecycle hooks so I'd suggest most of the discussion continues over there.
+
+For those looking for an answer the second part of my original question, I think [roman's suggestion](https://forum.dfinity.org/t/cross-canister-compatible-post-init-hook/16929/4) is the current correct approach.
+
+-------------------------
+

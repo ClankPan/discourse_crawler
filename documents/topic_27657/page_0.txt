@@ -1,0 +1,155 @@
+gravity_vi | 2024-02-18 13:27:27 UTC | #1
+
+I have a function that inserts wasm blob into stable memory as shown below:
+
+```rs
+async fn start_upgrades_for_individual_canisters(version: String, individual_user_wasm: Vec<u8>) -> String {
+    
+    if !is_controller(&caller()) {
+        panic!("Unauthorized caller");
+    }
+
+    CANISTER_DATA.with_borrow_mut(|canister_data| {
+        canister_data.allow_upgrades_for_individual_canisters = true;
+        canister_data.last_run_upgrade_status.version = version.clone();
+        let canister_wasm = CanisterWasm {
+            version: version.clone(),
+            wasm_blob: individual_user_wasm.clone()
+        };
+        canister_data.wasms.insert(WasmType::IndividualUserWasm, canister_wasm);
+    });
+    ic_cdk::spawn(update_user_index_upgrade_user_canisters_with_latest_wasm::upgrade_user_canisters_with_latest_wasm(version, individual_user_wasm));
+    "Success".to_string()
+}
+```
+
+```rs
+thread_local! {
+    static CANISTER_DATA: RefCell<CanisterData> = RefCell::default();
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CanisterData {
+    pub configuration: Configuration,
+    pub last_run_upgrade_status: UpgradeStatus,
+    pub allow_upgrades_for_individual_canisters: bool,
+    pub available_canisters: HashSet<Principal>,
+    pub user_principal_id_to_canister_id_map: BTreeMap<Principal, Principal>,
+    pub unique_user_name_to_user_principal_id_map: BTreeMap<String, Principal>,
+    #[serde(skip, default = "_empty_wasms")]
+    pub wasms: StableBTreeMap<WasmType,CanisterWasm, Memory>
+}
+
+impl Default for CanisterData {
+    fn default() -> Self {
+        Self { configuration: Default::default(), last_run_upgrade_status: Default::default(), allow_upgrades_for_individual_canisters: Default::default(), available_canisters: Default::default(), user_principal_id_to_canister_id_map: Default::default(), unique_user_name_to_user_principal_id_map: Default::default(), wasms: _empty_wasms() }
+    }
+}
+
+fn _empty_wasms() -> StableBTreeMap<WasmType, CanisterWasm, Memory> {
+    StableBTreeMap::init(get_wasm_memory())
+}
+```
+
+Stable memory initialisation 
+
+```rs
+use ic_stable_structures::{DefaultMemoryImpl, memory_manager::{MemoryId, VirtualMemory, MemoryManager}};
+use std::cell::RefCell;
+
+// A memory for upgrades, where data from the heap can be serialized/deserialized.
+const UPGRADES: MemoryId = MemoryId::new(0);
+
+// A memory for the StableVec for individual_user wasm. 
+const INDIVIDUAL_USER_WASM_MEMORY: MemoryId = MemoryId::new(1);
+
+
+
+pub type Memory = VirtualMemory<DefaultMemoryImpl>;
+
+thread_local! {
+    // The memory manager is used for simulating multiple memories. Given a `MemoryId` it can
+    // return a memory that can be used by stable structures.
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+}
+
+pub fn get_upgrades_memory() -> Memory {
+    MEMORY_MANAGER.with(|m| m.borrow_mut().get(UPGRADES))
+}
+
+pub fn get_wasm_memory() -> Memory {
+    MEMORY_MANAGER.with_borrow_mut(|m| m.get(INDIVIDUAL_USER_WASM_MEMORY))
+}
+```
+
+
+I am calling this function from another canister and it fails saying `Canister trapped: MemoryId(1): grow failed `. Interesting part is I have two such canisters in one of them the call passes and in other it fails. Both the canisters have same module hash
+
+-------------------------
+
+gravity_vi | 2024-02-19 08:56:29 UTC | #2
+
+@ielashi Do you have any suggestions around how to resolve this?
+
+-------------------------
+
+ielashi | 2024-02-19 14:35:31 UTC | #3
+
+So the code above is deployed on two different canisters, and one of them is reporting the "grow failed" error? Are you sure you're not hitting the canister's memory allocation?
+
+-------------------------
+
+gravity_vi | 2024-02-19 15:01:12 UTC | #4
+
+Yes the code is deployed on two different canisters and one of them is reporting "grow failed". I didn't get the part about memory allocation. I call this method from a top level canister (platform_orchestrator)
+
+-------------------------
+
+gravity_vi | 2024-02-19 15:04:16 UTC | #5
+
+This is the canister for which I am observing the error: https://dashboard.internetcomputer.org/canister/rimrc-piaaa-aaaao-aaljq-cai
+
+-------------------------
+
+jasonzhu | 2024-02-20 00:52:57 UTC | #6
+
+Hi @gravity_vi,
+
+Not sure what's the best way to check memory allocation, but here is one way (if it's a Dapp canister directly controlled by SNS Root, you can hit the canister_status endpoint on SNS Root, but this one doesn't seem to be):
+
+1. From the canister link you posted above, navigate to its subnet: https://dashboard.internetcomputer.org/subnet/o3ow2-2ipam-6fcjo-3j5vt-fzbge-2g7my-5fz2m-p4o2t-dwlc4-gt2q7-5ae
+2. Pick an active node machine (e.g. this one: https://dashboard.internetcomputer.org/node/23jbm-6z6mi-ki2ut-fkz5x-yy4uy-6llls-yyodh-xv537-2qonk-2iod3-jae), and get the IP address of the node machine
+3. Hit the replica dashboard using the IP address: http://[2403:f000:300:6:6801:e2ff:fe86:7bd0]:8080/_/dashboard
+4. Find the canister by searching its ID on the page
+
+For this canister, I'm seeing 1024MiB memory allocation and 28495226 memory usage (28MiB/1024MiB).
+
+I noticed that this canister used to be controlled by SNS Root (based on this [proposal](https://dashboard.internetcomputer.org/sns/67bll-riaaa-aaaaq-aaauq-cai/proposal/83)), and note that we recently found and fix an issue with SNS Root setting Dapp canister memory_allocation to 1GiB (see [here](https://forum.dfinity.org/t/openchat-proposal-to-temporarily-unregister-the-userindex-canister-from-the-sns/27087)). We also added a ManageDappCanisterSettings SNS proposal type for SNSes to change their memory_allocation so that those canisters with 1GiB memory allocation can now be changed.
+
+For this specific issue, the memory usage seems to be nowhere close to the memory allocation. However, the memory grow failure depends on both the remaining capacity (>900MiB) and the amount the canister tries to grow to. Therefore I tried to take a look at the Storable implementation of the Key/Value types in the StableBTreeMap you provided and found this: https://github.com/go-bazzinga/hot-or-not-backend-canister/blob/23d51473b4661d9b6fd27fcdd458a61123d8507c/src/lib/shared_utils/src/common/types/wasm.rs#L50-L53. If I understand correctly, the max_size is actually set to 200MB (is it intentional, given the comment saying it's 2MB?). I'm not an expert in stable structures, but in my understanding it can also try to allocate not just the node being inserted into but its children (with degree 6-11), which can easily hit the 1GiB limit (@ielashi could you comment on that?)
+
+-------------------------
+
+ielashi | 2024-02-20 09:03:16 UTC | #7
+
+[quote="jasonzhu, post:6, topic:27657"]
+If I understand correctly, the max_size is actually set to 200MB (is it intentional, given the comment saying it’s 2MB?). I’m not an expert in stable structures, but in my understanding it can also try to allocate not just the node being inserted into but its children (with degree 6-11), which can easily hit the 1GiB limit (@ielashi could you comment on that?)
+[/quote]
+
+First off, a 200MB max_size is very, very large. It'd be much better to set the size as `Unbounded` rather than a very large max size like this.
+
+How much memory we allocate depends on the version of stable structures. In stable structures <= 0.5, we'd allocate an entire node of 11 entries, so that'd be at least 200MB * 11 = 2200MB.
+
+In version 0.6+, we'd initially allocate 75% of the max value (i.e. 150MB), and grow the memory in increments of 150MB.
+
+In either case, fixing the bounds would be very important to not waste resources, and is very likely the cause of the error we're seeing here.
+
+-------------------------
+
+gravity_vi | 2024-02-20 13:54:19 UTC | #8
+
+Thanks a ton @ielashi and @jasonzhu for help and insights on the issue. I changed size to Unbounded and it worked fine.
+
+-------------------------
+

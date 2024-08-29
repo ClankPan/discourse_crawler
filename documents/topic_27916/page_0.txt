@@ -1,0 +1,561 @@
+borovan | 2024-02-26 22:54:23 UTC | #1
+
+Hey, so we've come across a weird, and hard to diagnose bug with the newest version of dfx.  I have no idea what to do other than just use an older version.  
+
+What we do is embed wasm into a root canister (now that the wasm limit has been lifted)
+
+```
+        "root": {
+            "type": "custom",
+            "candid": ".dfx/local/canisters/root/root.did",
+            "build": "bash -c './backend/scripts/build.sh root'",
+            "wasm": ".dfx/local/canisters/root/root.wasm",
+            "shrink": true,
+            "gzip": true,
+            "metadata": [
+              { 
+                "name": "candid:service"
+              }
+            ],
+            "dependencies": [
+                "asset",
+                "game_config",
+                "game_state",
+                "player_hub",
+                "world",
+                "world_builder"
+            ]
+        },
+```
+and then the code we call on root is
+```
+api::include_wasm!(ASSET_WASM, "asset");
+api::include_wasm!(GAME_CONFIG_WASM, "game_config");
+api::include_wasm!(GAME_STATE_WASM, "game_state");
+api::include_wasm!(PLAYER_HUB_WASM, "player_hub");
+api::include_wasm!(WORLD_WASM, "world");
+api::include_wasm!(WORLD_BUILDER_WASM, "world_builder");
+
+
+// create_canisters
+#[update]
+async fn create_canisters() -> Result<(), Error> {
+    api::guard_whitelist!(caller()).await?;
+
+    // temporary measure until we have a better system
+    const DB_CYCLES: u128 = 5_000_000_000_000;
+    const PLAYER_HUB_CYCLES: u128 = 50_000_000_000_000;
+
+    // install
+    let installations = vec![
+        (CanisterType::Asset, ASSET_WASM, DB_CYCLES),
+        (CanisterType::GameConfig, GAME_CONFIG_WASM, DB_CYCLES),
+        (CanisterType::GameState, GAME_STATE_WASM, DB_CYCLES),
+        (CanisterType::PlayerHub, PLAYER_HUB_WASM, PLAYER_HUB_CYCLES),
+        (CanisterType::World, WORLD_WASM, DB_CYCLES),
+        (CanisterType::WorldBuilder, WORLD_BUILDER_WASM, DB_CYCLES),
+    ];
+
+    for (canister_type, wasm, cycles) in installations {
+        if let Err(e) = ::api::root_canister_install!(canister_type, wasm, cycles).await {
+            ::lib_ic::println!("Error installing canister {:?}: {:?}", canister_type, e);
+            continue;
+        }
+    }
+
+    Ok(())
+}
+```
+On dfx 0.17.0, installing the canister gives us the following error :
+
+```
+Fabricated 9000000000000000 cycles, updated balance: 341_843_084_913_409_176 cycles
+Reinstalling code for canister root, with canister ID a4tbr-q4aaa-aaaaa-qaafq-cai
+Error: Failed to install wasm module to canister 'root'.
+Caused by: Failed to install wasm module to canister 'root'.
+  Failed during wasm installation call: Candid returned an error: input: 4449444c026d016d7b010005_2001ed7d50652029e5a37bc0287e8748e14f7ae152e36c9cdf23ee73362cc207ab205a20bb7bbc71a940a95504696d901f8cc70bfee74574f409992cc5c52225df532073bf9834c5ff674af647e93a442920247408f3b228e9ee95c0667d9b6af68a4a20dd0b15f25ee75ecb696e63e52b93002dc47ad5e0f68565cac355e62b5c89d37020ff042bd7a6f7f8bb523dc21b659271cb676f25fa51bdd9c83c9b9b8a1069d707
+table: type table0 = vec table1
+type table1 = vec nat8
+wire_type: vec nat8, expect_type: unknown
+```
+
+Thanks!
+
+-------------------------
+
+Severin | 2024-03-01 09:47:49 UTC | #2
+
+I would expect this when init types don't match up somehow. Does your candid file specify any init types? And do you have an `init` or `post_upgrade` function defined? If so, can you show the signature?
+
+-------------------------
+
+borovan | 2024-03-01 16:34:09 UTC | #3
+
+![image|592x377](upload://4ONGovKgKFZL4qlpkxoHaAfwh3g.png)
+
+Here we go.  Do the functions in the actor file need to be pub?  It didn't seem to matter if I removed the pub declaration.
+
+I'm having issues reproducing the bug but yeah, init seems like a good place to start because I was changing that very recently.
+
+-------------------------
+
+Severin | 2024-03-04 12:44:22 UTC | #4
+
+`init` does not need to be public, at least not in my test setup.
+
+If `init` takes no argument I don't think deserialization should ever fail. And I could not provoke a failure on purpose either. I suspect there's something more going on. From the error message I can see that the installation carries a `(vec blob)`. Why are you sending init args if the canister doesn't even take init args? And also, is it possible that you're accidentally using an old wasm? Can you try deleting `.dfx` and building cleanly again?
+
+-------------------------
+
+borovan | 2024-03-07 20:52:03 UTC | #5
+
+We've failed to recreate this, so I'll attribute it to a random corner case error where two separate computers each had cached files that ended up with this weird error.  I had deleted .dfx and then dfx stop / dfx start -- clean, plus cargo clean.
+
+Our root canister doesn't take any init args, but all other canisters take a Vec of various canister addresses and states.  Our aim is to create a hierarchy of canisters where each canister can know about every other canister on the subnet.
+
+Anyway not happening any more and I will update you if it comes back! Thanks.
+
+-------------------------
+
+lastmjs | 2024-03-29 18:05:15 UTC | #6
+
+Hey I think I'm getting this same error (or very similar), but on dfx 0.18.0.
+
+I'm upgrading Kybra (Python CDK) to now use the large Wasm binary feature instead of our own custom chunk uploading. We have a test that will trap during init, then deploy again to make sure that init succeeds. Init and post_upgrade both take a boolean argument.
+
+However if we trap, then we can't deploy again. I get this error on subsequent deploys:
+
+```
+Candid returned an error: input: 4449444c036d016c01cedfa0a804026d7b010018_20022d645d516c9c856674111a2927a6eb6c0fd3c7dca50a19dd4c6ace17ea5781201c74566d2edcfca3fad5e3b46cd904e9d0a54c599764e482f45a1f5fedea5c6e201ec258fad8668f0a39f20d1a5bff7ed68b6bff82d338f69c74afe3716e91320d2022f46d358afcfa5e2a98c0a9d9cf8dc9c6a9b3d61af75ef8cd7b3ca8f751ad4f2027241b5b79a2e9b453eca0017ea47b574bc975c5ce8f517233718c94dd7ec83e2039627547fa1ffd5f18719da042cd9b4ee0d225ad9dca4d50b77d2485cfb157cf2043f37d97eb8df208d76448db3bec47adddf50bfbb5a4198914a7836fc0e4e5ae206598f439750afcf690bef6749acac578ce08817f5d925c0087d33d607689c1bd207f3e4b00e80e291e8bfc28972424561f0809af4b9e2803facfd620607f06ed75208289886ae1c21086b1b24805ffa729fc647981a216e1b2e0ef0bdca13b8737ce209b0d26e420dd513becca246d04a7813c3e731c3d86cb223a25cc7c3782d2249820a0e0a8c7c714a1476db04d581df8f1f6adbfa3f3c0ae01825da360ad91c9c4fa20a4f118e8b2f61e9681892e11d180e5f4b4bfa572539d6ad903cbdbc6a4bed49920a548ffc17297c1134a5fce03d760bad5dfa994687c4805d96210ec5a7e9cb33220a8d189ac56396ddd4638eec1927390c00e747b564c71c4757ccbcb550434c6e420afbf728537d21971675c2ac3fcb31e0243a03ff76dae27ea01abe6b63de87b6520c05db00f467d96423e16764d4e2d8a70ade9bc48d9336574a8aacda36ff94c1e20c60729eccca1768320e5bda7880196ed8fb9d7bd612c85ff2024fa808d23a40320c82aa2db8dde40359372a4e4fe1036a34989daa6fbc013feef81d2ad7dd658e820cd3ac387b9a2cbd4f6aaeb29395fc940ace3eed6a5f42726f2a0d09adc5fc8ee20d4989bdc07d722a88517558d6ef490b12ad8b0259a754e4d98b03aca59a642c320d4be62d3efb834c2c10fc2aad29d428ed46c5459b5789d29233f35d43698661320e8f2b8cac2aac4d53a793a410f68a547edaa60fde6777a1e448efa5f931a1fe220feff23a7eee0bb35a29dabe68d55d29d098d1a9c7251a83d49f42d89536bdccb
+table: type table0 = vec table1
+type table1 = record { 1_158_164_430 : table2 }
+type table2 = vec nat8
+wire_type: record { 1_158_164_430 : table2 }, expect_type: unknown
+```
+
+Here's the candid:
+
+```
+service : (bool) -> {
+  does_interpreter_exist : () -> (bool) query;
+  get_message : () -> (text) query;
+}
+```
+
+We deploy like this: `dfx deploy init_and_post_upgrade_recovery --argument '(true)'` and we get a trap as expected, but then we deploy like this: `dfx deploy init_and_post_upgrade_recovery --argument '(false)'` and we get the error as above.
+
+The Python code looks like this:
+
+```python
+from kybra import (
+    ic,
+    init,
+    post_upgrade,
+    pre_upgrade,
+    query,
+    void,
+)
+
+message = ""
+
+
+@query
+def get_message() -> str:
+    return message
+
+
+@init
+def init_(should_trap: bool) -> void:
+    ic.print("init_")
+
+    global message
+    message = "init_"
+
+    if should_trap:
+        ic.trap("init_ trapped")
+
+
+@pre_upgrade
+def pre_upgrade_() -> void:
+    ic.print("pre_upgrade_")
+
+    global message
+    message = "pre_upgrade_"
+
+
+@post_upgrade
+def post_upgrade_(should_trap: bool) -> void:
+    ic.print("post_upgrade_")
+
+    global message
+    message = "post_upgrade_"
+
+    if should_trap:
+        ic.trap("post_upgrade_ trapped")
+```
+
+There's a lot of generated Rust code under-the-hood, but I haven't found any obvious reason for this to behave like this so far.
+
+-------------------------
+
+lastmjs | 2024-03-29 18:12:09 UTC | #7
+
+I suspect there is something wrong with the new chunk uploading Wasm feature on failure...seems very suspect, I wonder if this Candid has something to do with the chunk install Candid signature.
+
+I wonder if `table1` here:
+
+```
+table: type table0 = vec table1
+type table1 = record { 1_158_164_430 : table2 }
+type table2 = vec nat8
+wire_type: record { 1_158_164_430 : table2 }, expect_type: unknown
+```
+
+is referring to:
+
+```
+type install_chunked_code_args = record {
+    mode : variant {
+        install;
+        reinstall;
+        upgrade : opt record {
+            skip_pre_upgrade : opt bool;
+        };
+    };
+    target_canister : canister_id;
+    storage_canister : opt canister_id;
+    chunk_hashes_list : vec chunk_hash;
+    wasm_module_hash : blob;
+    arg : blob;
+    sender_canister_version : opt nat64;
+};
+```
+
+but just:
+
+```
+type install_chunked_code_args = record {
+    wasm_module_hash : blob;
+};
+```
+
+-------------------------
+
+borovan | 2024-03-29 21:13:51 UTC | #8
+
+We had it again today.  Just pushed a few changes to see if it's on our end.
+
+@Gabriel did this turn out to be that canister is a reserved word?  That did seem odd because I thought it would have been caught by the CandidType macro.
+
+-------------------------
+
+jamesbeadle | 2024-03-30 21:08:56 UTC | #9
+
+I've also just started getting this error:
+
+dfx 0.18.0
+
+![image|690x70](upload://eg2ohiklZy8lKsqR0UioVbQfWV9.png)
+
+-------------------------
+
+Gabriel | 2024-04-02 16:08:46 UTC | #10
+
+Hey @Severin 
+
+Correct me if I'm wrong but under the hood you split the wasm into 1mb chunks and upload them using `upload_chunk`, then `install_chunked_code`. 
+
+My question is this I noticed if I call `stored_chunks` I get all the hashes. So I called `clear_chunk_store` and now I get an empty vec as expected. 
+
+All of of the sudden upgrade works again. 
+
+My question is shouldn't `clear_chunk_store` be called once `install_chunked_code` is done? or I don't really understand how this should work.
+
+-------------------------
+
+AdamS | 2024-04-02 16:38:08 UTC | #11
+
+Can you check whether this issue still occurs on dfx 0.19.0? install_chunked_code has gone through some rocky API evolution and the error is likely related to this.
+
+-------------------------
+
+lastmjs | 2024-04-02 16:40:44 UTC | #12
+
+I will gladly check this and back to you here
+
+-------------------------
+
+lastmjs | 2024-04-02 16:50:26 UTC | #13
+
+Unfortunately the problem still remains. And I also get another error in the replica logs now:
+
+```
+Apr 02 16:47:17.868 ERRO s:cnr4t-7tmce-fpp6v-v54bw-vd77t-yvacv-6qg4b-jkgg4-y4qfl-3rfdh-nqe/n:dbxic-cazk4-kcd4l-d5lgn-shj7q-typre-ymhrj-p6wu2-xbu7b-zlsiu-mqe/ic_query_stats/state_machine Received duplicate query stats for canister bnz7o-iuaaa-aaaaa-qaaaa-cai from same proposer dbxic-cazk4-kcd4l-d5lgn-shj7q-typre-ymhrj-p6wu2-xbu7b-zlsiu-mqe.This is a bug, possibly in the payload builder.
+```
+
+I'm not sure when that was printed exactly, but it's there.
+
+-------------------------
+
+jamesbeadle | 2024-04-07 17:10:15 UTC | #14
+
+Just updated to dfx 0.19.0 and get the error
+
+![image|690x172](upload://b27UPd0eCLBCwHe8aB4liawvBO2.png)
+
+-------------------------
+
+skilesare | 2024-04-07 18:27:44 UTC | #15
+
+Was this via dfx nns install(or an SNS extension). It looks like one of the calls to install a wasm can't interpret the input params candid.
+
+-------------------------
+
+jamesbeadle | 2024-04-07 18:30:05 UTC | #16
+
+So I've just been trying to create a setup that is post SNS for me to carry on updating things. 
+
+This is the file I run to trigger everything (same as the sns-testing repo file)
+
+https://github.com/jamesbeadle/OpenFPL/blob/master/testing/deploy/run_local_setup.sh
+
+But you mentioned in the group earlier it could be input parameters, I did take the greet out of the input parameters on deploy of my frontend and backend in deploy_backend_canister.sh etc
+
+![image|690x63](upload://zGv8Dt6sEGNUlGTczz8nHFykaRx.png)
+
+-------------------------
+
+skilesare | 2024-04-07 18:54:38 UTC | #17
+
+Don you know which line in the script is failing?
+
+-------------------------
+
+jamesbeadle | 2024-04-07 19:00:17 UTC | #18
+
+See I saw I had an assert on the input variables that I removed from the canister input variables so I removed it and tried again.
+
+Now I get this after trying to build
+
+![image|690x150](upload://zPmSoNUfVi7SAafmp5x57ROgzrn.png)
+
+But say I then just try and run the script it tells me the canister isn't empty:
+
+![image|690x134](upload://u141dCcS9zbRynqZU9MA3wgU0fJ.png)
+
+but if I restart dfx with --clean then it tells me the wasm doesn't exist:
+
+![image|690x185](upload://lTzxQPjK6oig5ufxoxpqtjjRKHM.png)
+
+So I'm kind of going around in circles.
+
+-------------------------
+
+skilesare | 2024-04-07 21:04:00 UTC | #19
+
+Maybe dfx 0.19 gzips by default? It says there is no wasm where it expects one. Are you building?
+
+-------------------------
+
+jamesbeadle | 2024-04-08 05:02:52 UTC | #20
+
+I've tried building and not building first after clearing dfx.
+
+If I build first it says the canister is not empty but then if I don't it says canister can't be found. 
+
+But since we spoke last night, Dev's from OC has shown me how they setup their post sns system, so I'm trying to follow that:
+
+https://github.com/jamesbeadle/OpenFPL/blob/master/scripts/run_local_setup.sh
+
+-------------------------
+
+icme | 2024-04-09 01:07:21 UTC | #21
+
+Just hit this issue with `dfx 0.16.1`. Previous deploys (using this same version of dfx) have succeeded.
+
+Here were my steps (I'm using dfxvm):
+1. I briefly upgraded from dfx 0.16.1 to 0.18.0 in order to deploy a canister on the same subnet as another canister.
+2. I downgraded back to dfx 0.16.1, and attempted to deploy a new wasm for an existing canister. I received this error:
+
+> Failed during wasm installation call: The replica returned a replica error: reject code CanisterError, reject message Canister <canister_id> trapped explicitly: canister_pre_upgrade attempted with outstanding message callbacks (try stopping the canister before upgrade), error code None
+
+At first I freaked out thinking my canister had trapped in the pre upgrade hook, but I don't think this is the case based on the message. I also am using Motoko `stable` for all of my types, so serialization is being done in the background by the language. Finally, none of these `stable` types were changed in the upgrade...so no data was lost (I verified this)
+
+3. After ensuring nothing had been lost, I tried upgrading my canister again and received a different error this time (looks similar to others in this thread)
+> Failed during wasm installation call: Candid returned an error: input: 4449444c036d016c01cedfa0a804026d7b010003_204b7cb7e28621a6f1110913a33e11455d407f584d3cfe91edf6c12c75b6bd00a2204f7deaf907cea359eda7caa340b204e1558cf451da3fe7582a4cb010a57290d020f52735197797ef2a9e1d2b5d7ed8c13bcd1f41fc65a4731742c12b87f2346bc3
+table: type table0 = vec table1
+type table1 = record { 1_158_164_430 : table2 }
+type table2 = vec nat8
+wire_type: record { 1_158_164_430 : table2 }, expect_type: vec nat8
+
+Again, both of these deployment attempts come when using dfx 0.16.1 after downgrading from dfx 0.18.0 back to 0.16.1 using dfxvm.
+
+-------------------------
+
+Severin | 2024-04-09 07:46:24 UTC | #22
+
+[quote="icme, post:21, topic:27916"]
+Failed during wasm installation call: The replica returned a replica error: reject code CanisterError, reject message Canister <canister_id> trapped explicitly: canister_pre_upgrade attempted with outstanding message callbacks (try stopping the canister before upgrade), error code None
+[/quote]
+
+This error means that your canister is still `await`ing another call and can't be upgraded yet. This should not have something to do with the dfx version
+
+[quote="icme, post:21, topic:27916"]
+Failed during wasm installation call: Candid returned an error: input: 4449444c036d016c01cedfa0a804026d7b010003_204b7cb7e28621a6f1110913a33e11455d407f584d3cfe91edf6c12c75b6bd00a2204f7deaf907cea359eda7caa340b204e1558cf451da3fe7582a4cb010a57290d020f52735197797ef2a9e1d2b5d7ed8c13bcd1f41fc65a4731742c12b87f2346bc3
+table: type table0 = vec table1
+type table1 = record { 1_158_164_430 : table2 }
+type table2 = vec nat8
+wire_type: record { 1_158_164_430 : table2 }, expect_type: vec nat8
+[/quote]
+
+`1_158_164_430` is `didc encode hash`, so I think this is a problem with the install call and it seems to be trying to use the chunked installer. But if you downgrade to 0.16.1 this shouldn't happen. What does `dfx --version` report? Did the downgrade work?
+
+-------------------------
+
+lwshang | 2024-04-10 00:08:21 UTC | #23
+
+As Jordan and Severin pointed out, the candid decoding error `record { 1_158_164_430 : table2 }` should be about the `type chunk_hash = record { hash: blob;}` in the management canister API.
+
+## The Conjecture
+
+> Adam: `install_chunked_code` has gone through some rocky API evolution and the error is likely related to this.
+
+Let me elaborate a bit about the circumstance.
+
+At the time of dfx v0.16.0 release, IC replica implemented the new `install_chunked_code` API which didn't conform the specification. And dfx/agent-rs at that time added the support for such "wrong" replica implementation.
+
+To not break users who have been using the feature of large wasm module with dfx/agent-rs, we decided to keeping the support of both the "wrong" and "correct" `install_chunked_code` API on the replica side. 
+
+The replica fix has been [deployed](https://dashboard.internetcomputer.org/proposal/128876) to the mainnet on 04/05/2024. That was later than the release of `dfx` v0.19.0. So the `dfx` bundled `replica` has never had the fix (v0.16.0 ~ v0.19.0).
+
+So it is possible that some client side (agent/CDK) `install_chunked_code` calls conformed the specification but failed against the mainnet (before 04/05/2024) or local replica (dfx v0.16.0 ~ v0.19.0).
+
+## Action
+We, the SDK team, has already:
+* Updated the `dfx` bundled replica, which includes the fix as deployed on the mainnet.
+* Updated `dfx` and `agent-rs` to conform the specification.
+* Released Rust CDK (v0.13.2), which adds support for chunk uploads conforming to the specification (no `ic-cdk` version has the incorrect support).
+
+If building `dfx` from source code is feasible, you can try it now and see if the errors disappear.
+
+You may also choose to wait for the upcoming `dfx` release next week.
+
+-------------------------
+
+icme | 2024-04-10 04:26:38 UTC | #24
+
+[quote="lwshang, post:23, topic:27916"]
+To not break users who have been using the feature of large wasm module with dfx/agent-rs, we decided to keeping the support of both the “wrong” and “correct” `install_chunked_code` API on the replica side.
+[/quote]
+
+From our side, we were never using the chunked code uploads (our wasm has always been under 2MB). Maybe that changed during the last commit, but we never intentionally used any chunking functionality 🤷‍♂️ 
+
+[quote="lwshang, post:23, topic:27916"]
+You may also choose to wait for the upcoming `dfx` release next week.
+[/quote]
+
+Is there any way to downgrade dfx to get around this issue? I’d prefer not to need to upgrade dfx to the latest version unless necessary.
+
+-------------------------
+
+lwshang | 2024-04-10 21:15:35 UTC | #25
+
+We added the support for installing large wasm (over 2MiB) in `dfx` v0.16.0. Since then, `dfx` automatically using the chunked upload when the wasm module is greater than 1.85 MiB. So it might be the case that your wasm is larger than 1.85MiB that trigger the chunked upload.
+
+To completely avoid the chunked upload, you may have to downgrade to a version before `dfx` v0.16.0, e.g. v0.15.0.
+
+P.S. I strongly suggest to use the latest `dfx` as much as possible. If you need a new feature from a later release, it might be more difficult to upgrade from a very old version.
+
+-------------------------
+
+icme | 2024-04-10 21:41:56 UTC | #26
+
+[quote="lwshang, post:23, topic:27916"]
+To not break users who have been using the feature of large wasm module with dfx/agent-rs, we decided to keeping the support of both the “wrong” and “correct” `install_chunked_code` API on the replica side.
+[/quote]
+
+[quote="lwshang, post:25, topic:27916"]
+To completely avoid the chunked upload, you may have to downgrade to a version before `dfx` v0.16.0, e.g. v0.15.0.
+[/quote]
+
+:disappointed: I think the way this was fixed on the backend to protect large wasm module support then sort of invalidates using dfx 0.16.0-0.19.0 for us even though we weren't using the chunked wasm endpoint, as we can't deploy any updates to our canister when using these versions.
+
+-------------------------
+
+icme | 2024-04-10 23:09:36 UTC | #27
+
+It turned out that over the past few months our wasm has grown over 2MB and we didn't notice that it was using the chunked upload endpoint.
+
+Huge thanks to @lwshang that immediately reached out to me and hopped on a call to unblock us by suggesting we use the dfx wasm gzip option for lowering the size of the wasm. 
+
+That's rockstar :guitar: developer customer service!
+
+Although we're not sure what the exact source of the deployment bug is, with the gzipped wasm we just successfully deployed the canister upgrade and are unblocked :tada:
+
+-------------------------
+
+lwshang | 2024-04-11 04:26:00 UTC | #28
+
+I finally managed to reproduce the error locally. So I believe I found the real cause of the issue.
+
+## Bug
+
+In `ic-utils` crate, there was a bug in [`InstallBuilder::call_and_wait_with_progress()`](https://github.com/dfinity/agent-rs/blob/7840c34933fc509f443c3045c1c634201ad87e07/ic-utils/src/interfaces/management_canister/builders.rs#L724). It couldn't handle the case of non-empty chunk store.
+
+`dfx` v0.16.0 to v0.19.0 depended on this buggy `ic-utils` when install wasm larger than 1.85 MiB .
+
+So for the canister installation failures discussed in this forum thread, it's likely that the chunk store was not empty before the installation.
+
+## Fix
+
+The merged agent-rs [PR](https://github.com/dfinity/agent-rs/pull/545) and sdk [PR](https://github.com/dfinity/sdk/pull/3704) fixed the issue. I verified that the `dfx` built from sdk master branch can handle such cases properly.
+
+> #### EDITED:
+> I opened a [PR](https://github.com/dfinity/sdk/pull/3706) which adds a test to make sure that we fixed the real issue.
+> I reproduced **the error** in CI by downgrading agent-rs to a previous buggy version.
+
+The upcoming `dfx` release next week will certainly have the fix.
+
+Before that, there is an **easy remedy** to unblock your current work.
+
+---
+
+## Check
+
+You can check if your canister's chunk store is empty by this command (replace the canister id with yours):
+
+```sh
+dfx canister call --ic aaaaa-aa stored_chunks '(record { canister_id = principal "bkyz2-fmaaa-aaaaa-qaaaq-cai" })'
+```
+
+The result will be like:
+```
+(
+  vec {
+    record {
+      1_158_164_430 = blob "\96\a2\96\d2\24\f2\85\c6\7b\ee\93\c3\0f\8a\30\91\57\f0\da\a3\5d\c5\b8\7e\41\0b\78\63\0a\09\cf\c7";
+    };
+  },
+)
+```
+A non-empty `vec` means that the chunk store is non-empty.
+
+## Remedy
+
+If the check above turns out to be positive, it is easy to fix it.
+
+You only need to execute this command (replace the canister id with yours):
+
+```sh
+dfx canister call --ic aaaaa-aa clear_chunk_store '(record { canister_id = principal "bkyz2-fmaaa-aaaaa-qaaaq-cai" })'
+```
+
+Then you should be able to install your canister.
+
+---
+
+
+Thanks for all your patience!
+
+-------------------------
+

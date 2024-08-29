@@ -1,0 +1,142 @@
+skilesare | 2024-03-05 05:59:11 UTC | #1
+
+Apparently I figured this out at one point here: https://forum.dfinity.org/t/threshold-ecdsa-signatures/6152/191?u=skilesare But I don't really remember.  I'm working on something and the validation library expects a 65 byte signature. I get 64 from tecdsa. I think I'm supposed to add v.  Can I just pick it? Seems odd.  Is it not something the signers are picking?
+
+-------------------------
+
+domwoe | 2024-03-05 06:49:30 UTC | #2
+
+The parity (`v` value) allows recovering the address/public key from the signature. Hence you can try to recover and check which parity will give you the correct key.
+
+See for example the code in Oisy: https://github.com/dfinity/oisy-wallet/blob/main/src/backend/src/lib.rs#L458
+
+-------------------------
+
+skilesare | 2024-03-05 15:01:00 UTC | #3
+
+Isn't this pretty expensive to do on a canister? It seems odd that the Tecdsa canister doesn't give you this info when you ask for your address.
+
+-------------------------
+
+lastmjs | 2024-03-06 19:47:15 UTC | #4
+
+Hey I'm just running into this issue right now in Azle, trying to do tECDSA Ethereum transactions. The tECDSA signature only comes with r and s...now I'm trying to calculate v...
+
+-------------------------
+
+neeboo | 2024-03-06 20:28:38 UTC | #5
+
+might share a piece of old code here, hope it helps
+
+```
+pub async fn sign_recoverable(
+        &self,
+        message_hash: Vec<u8>,
+        _: Option<u32>,
+    ) -> Result<SignatureReply, String> {
+        assert_eq!(message_hash.len(), 32);
+        // let cid = chain_id.map_or_else(|| 0u32, |v| v);
+        let request = SignWithECDSA {
+            message_hash: message_hash.clone(),
+            derivation_path: self.get_derived_path(),
+            key_id: self.get_key_id(),
+        };
+        let (res,): (SignWithECDSAReply,) = ic_cdk::api::call::call_with_payment(
+            Principal::management_canister(),
+            "sign_with_ecdsa",
+            (request,),
+            self.get_cycles_signing(),
+        )
+        .await
+        .map_err(|e| format!("Failed to call sign_with_ecdsa {}", e.1))?;
+
+        let pub_key = self.public_key_res.clone().unwrap().public_key;
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(pub_key.as_slice()).unwrap();
+        let digest_bytes = FieldBytes::from_slice(message_hash.as_slice());
+        let try_sig = k256::ecdsa::Signature::from_bytes(res.signature.as_slice()).unwrap();
+
+        let ecdsa_sig = recoverable::Signature::from_digest_bytes_trial_recovery(
+            &verifying_key,
+            &digest_bytes,
+            &try_sig,
+        )
+        .expect("Cannot recover from signatrue");
+
+        let r = ecdsa_sig.r().as_ref().to_bytes();
+        let s = ecdsa_sig.s().as_ref().to_bytes();
+        let v = u8::from(ecdsa_sig.recovery_id());
+
+        let mut bytes = [0u8; 65];
+        if r.len() > 32 || s.len() > 32 {
+            return Err("Cannot create secp256k1 signature: malformed signature.".to_string());
+        }
+        bytes[0..32].clone_from_slice(&r);
+        bytes[32..64].clone_from_slice(&s);
+        bytes[64] = v;
+        ic_cdk::println!("signature byte length: {}", bytes.to_vec().len());
+        Ok(SignatureReply {
+            signature: bytes.to_vec(),
+        })
+    }
+```
+
+-------------------------
+
+lastmjs | 2024-03-06 22:40:00 UTC | #6
+
+Here's what I came up with in TypeScript/JavaScript for Azle:
+
+```typescript
+import { ethers } from 'ethers';
+
+import { chainId } from '../globals';
+
+export function calculateRsvForTEcdsa(
+    address: string,
+    digest: string,
+    signature: Uint8Array
+): { r: string; s: string; v: number } {
+    const r = ethers.hexlify(signature.slice(0, 32));
+    const s = ethers.hexlify(signature.slice(32, 64));
+
+    const vPartial = chainId * 2 + 35;
+    const v0 = vPartial;
+    const v1 = vPartial + 1;
+
+    const rsv0 = {
+        r,
+        s,
+        v: v0
+    };
+
+    if (address.toLowerCase() === ethers.recoverAddress(digest, rsv0)) {
+        return rsv0;
+    }
+
+    const rsv1 = {
+        r,
+        s,
+        v: v1
+    };
+
+    if (address.toLowerCase() === ethers.recoverAddress(digest, rsv1)) {
+        return rsv1;
+    }
+
+    throw new Error(`v could not be calculated correctly`);
+}
+```
+
+-------------------------
+
+domwoe | 2024-03-08 08:40:52 UTC | #7
+
+[quote="skilesare, post:3, topic:28118"]
+Isn’t this pretty expensive to do on a canister?
+[/quote]
+
+Did you measure the instructions? I'm curious as well.
+
+-------------------------
+

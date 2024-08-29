@@ -1,0 +1,133 @@
+rsubramaniyam | 2022-02-14 21:03:21 UTC | #1
+
+## Problem statement
+
+All replicas on a subnet gossip message to each other as part of creating the blockchain and reaching consensus. This becomes more work the larger the subnet is. We want to support much larger subnets than the internet computer uses today, and as part of experimenting with that, we observed that this subnet gossip becomes a bottleneck.
+
+The current gossip mechanism works as follows for a subnet of size N:
+
+1. Node A may have a message it wants to gossip to all its peers. It advertises the message to all the (N -1 ) peers in the subnet, which download the advertised message from Node_A. This requires O(N) messages.
+2. After downloading and validating, the peers in turn advertise the message to all their (N - 1) peers. This adds another O(N * N) messages. Thus an increase in subnet size results in a quadratic growth of message volume.
+
+## Proposed change
+
+This second step ensures that all replicas will obtain all valid messages. Currently, this gossip mechanism is used for all different types of messages, e.g., consensus blocks, notarization signatures, and ingress messages. However, this reliability of the broadcast is not equally important for the different artifact types.
+
+* For consensus blocks, it is very important that all replicas see the same blocks, and the “re-broadcast” of step 2 is required.
+* For ingress messages, however, any gossip is purely an optimization: it ensures that many replicas have the ingress message, such that whichever replica is the next block maker can include the ingress message, ensuring low latency.
+
+Since ingress messages account for the majority of the message on a subnet under load, and there is no direct security reason to reliably gossip these artifacts, we propose to change how gossip works for ingress messages. More precisely, we propose to omit step 2 for ingress messages. This means that whichever replica receives a user’s ingress message first will advertise it to all peers, but the other peers will not re-broadcast upon receiving the ingress message.
+
+## Performance gains
+
+The following charts compare the key metrics under load, before and after the change. These benchmark load tests were performed on a 56 node subnet, with the update rate of 300 requests per second (RPS). The target finalization rate for this subnet (under no load) was 0.35
+
+1. Finalization rate, achieved RPS
+
+![|624x334](upload://zJIy4vjI4EuFm3H2zcEuMpwNQ8b.png)
+
+||Baseline|With Improvements|
+| --- | --- | --- |
+|Finalization Rate|Drops from 0.35 to 0.26|Drops from 0.35 to 0.32|
+|Achieved rate (RPS)|250 / 300|295 / 300|
+
+As the table summarizes, we were able to achieve close to the requested 300 RPS with little degradation in the finalization rate. Also, these key metrics can be seen to be choppy before the improvements. After the proposed change, these hold steady with little variance.
+
+2. Advert volume
+
+![|624x302](upload://hHeO0L57kjVAy0cbqHu1I2LkMnH.jpeg)
+
+This chart illustrates the issue of quadratic growth in advertisement messages more clearly.
+
+* Before the change: we were exchanging about 18K adverts/sec, under the requested load of 300 RPS. Bulk of these result from the re-broadcast(step 2) described earlier.
+* After the change: we only exchange about 1500 adverts/sec on the same 56 node subnet. This directly results in the performance gains
+
+## Status
+
+The proposed changes have been merged, but not yet enabled. We plan to make a series of proposals to enable these improvements on the existing subnets
+
+-------------------------
+
+diegop | 2022-02-14 22:03:46 UTC | #2
+
+For context, Rahul (@rsubramaniyam) is a Senior Engineer at DFINITY for a few years. He has been working in the Consensus team, but also spent a year in the P2P/Networking team.
+
+He has been in R&D org for years, but first time posting publicly :slight_smile:
+
+-------------------------
+
+jzxchiang | 2022-02-15 07:35:58 UTC | #3
+
+I'm curious if notarization signatures will continue to be re-broadcasted to all peers, i.e. step 2?
+
+-------------------------
+
+Manu | 2022-02-15 09:13:00 UTC | #4
+
+Great question! Yes they will. Note that right now, all messages get re-broadcasted. We are only proposing to change that for ingress messages, because 
+- we don't need to re-broadcast them for any security properties
+- they constitute the majority of messages on a subnet under load, so optimizing here gives the biggest performance improvements
+
+-------------------------
+
+rsubramaniyam | 2022-02-15 16:34:55 UTC | #5
+
+[quote="Manu, post:4, topic:10888"]
+they constitute the majority of messages on a subnet under load, so optimizing here gives the biggest performance improvements
+[/quote]
+
+Thanks. Just to put this in perspective, from the advertisement metrics presented above:
+
+![adverts-comparison|690x277](upload://khB0wNybFhJUdFow2I1HI0mOkO6.jpeg)
+
+
+The reduction of adverts from 18K -> 1.5K was a result of just avoiding re-brodcast of the ingress messages, while still retaining re-broadcast of the consensus messages (notarization, finalization, random beacon, the associated shares, etc). This would give an idea of the volume of adverts resulting from ingress messages alone.
+
+-------------------------
+
+cryptoschindler | 2022-02-17 09:58:13 UTC | #6
+
+[quote="rsubramaniyam, post:1, topic:10888"]
+For ingress messages, however, any gossip is purely an optimization: it ensures that many replicas have the ingress message, such that whichever replica is the next block maker can include the ingress message, ensuring low latency.
+[/quote]
+
+So now when a replica is the next block maker and it wasn't a peer of the the replica that received the ingress message, how much overhead does getting the message add?
+
+-------------------------
+
+Manu | 2022-02-17 13:10:43 UTC | #7
+
+All replicas in a subnet talk to all other replicas in the subnet, so I think the scenario you describe is currently not possible. What can happen is that the block maker somehow did not manage to receive the ingress message, and then it simply will not include it in the block. Hopefully the next block maker does have the ingress message and will therefore include it.
+
+-------------------------
+
+cryptoschindler | 2022-02-18 07:34:14 UTC | #8
+
+Ahh thank you!
+
+[quote="rsubramaniyam, post:1, topic:10888"]
+After downloading and validating, the peers in turn advertise the message to all their (N - 1) peers. This adds another O(N * N) messages. Thus an increase in subnet size results in a quadratic growth of message volume.
+[/quote]
+
+Why is this necessary then if everyone talks to everyone already? Is this making up for potentially lost messages?
+
+
+And on another note, if one replica has an ingress message that somehow didn't reach 2/3 of the subnet and it becomes the next block maker, will the block including that message still make it through consensus?
+
+-------------------------
+
+rsubramaniyam | 2022-02-18 08:05:20 UTC | #9
+
+
+> Why is this necessary then if everyone talks to everyone already? Is this making up for potentially lost messages?
+
+Yes. Example: there could be transient connection issues between two nodes or two data centers. The step 2 adds an extra layer of redundancy for scenarios like these, so that other block makers can get the ingress messages sooner.
+
+> And on another note, if one replica has an ingress message that somehow didn’t reach 2/3 of the subnet and it becomes the next block maker, will the block including that message still make it through consensus?
+
+Yes. The replica that got the user message will include the ingress message in the proposed block. Since the blocks carry a full copy of the ingress message, other nodes can validate the proposed block successfully (independent of the gossip at the ingress layer, which would presumably be in progress at the same time, in your example scenario)
+
+Hope this helps!
+
+-------------------------
+

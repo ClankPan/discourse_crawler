@@ -1,0 +1,154 @@
+lastmjs | 2024-02-10 00:48:40 UTC | #1
+
+As I've begun to read the HTTP Gateway Protocol spec and in some private conversations, it seems like the HTTP Gateway Protocol has been designed with static assets in mind, not so much as being the way in which the canister API would be called.
+
+I think the protocol should be rethought with the idea that it could become a first-class way in which developers call into canisters on the IC. I would like to push for this work to start now, foreseeing major issues that might block functionality as more and more developers start to use HTTP as their main way of communicating with canisters.
+
+For context, Azle is moving towards a REST/HTTP-based paradigm, where developers build traditional web servers in canisters, using frameworks like Express, and call into them using regular http clients like fetch, curl, and postman. This paradigm is very simple and familiar to web developers, and I believe it is an excellent way to move forward when introducing people to the IC.
+
+If we can start the work now to ensure that the HTTP Gateway Protocol will serve developers needs, we can prevent a lot of pain and missed opportunity in the near future.
+
+-------------------------
+
+massimoalbarello | 2024-02-11 13:13:49 UTC | #2
+
+[quote="lastmjs, post:1, topic:27473"]
+Azle is moving towards a REST/HTTP-based paradigm, where developers build traditional web servers in canisters, using frameworks like Express, and call into them using regular http clients like fetch, curl, and postman.
+[/quote]
+
+But isn't it already like that? You can expose an `http_request` method in the canister that is called by the HTTP Gateway when it receives a traditional HTTP request. Do you want the HTTP Gateway to map the path specified by the client to canister methods?
+
+How do you handle authentication if the client only makes one HTTP request?
+You cannot authenticate users with API keys in the HTTP headers as these would be readable by the replicas. If you use the identity to sign the body in the first HTTP request, then you (as the client) also have to make all the other requests to the `read_state` endpoint. This basically means doing exactly what the IC agent does.
+
+Can you explain more in detail what are the problems that you see?
+
+-------------------------
+
+NathanosDev | 2024-02-12 11:02:42 UTC | #4
+
+That's a very good point regarding the `read_state` requests.
+
+@lastmjs and I were discussing some options for authentication over HTTP and I had overlooked this point about the `read_state` requests requiring the same principal to authenticate the request as the one that makes the original `call` request.
+
+Without trying to replicate what the IC agents do, the other option is keep HTTP requests anonymous as far as the IC protocol is concerned and then put authentication information into the HTTP request.
+
+This would mean that the protocol would have no insight into the authentication mechanism at all.
+
+All updates to canister state would be made by anonymous principals and this protection of the responses in the state tree would be gone. I'm unsure exactly what attacks could be performed with this information.
+
+Additionally the canister's will then need to verify the signature and extract the caller, rather than relying on the protocol to do this like we normally do. This would be expensive from a cycles consumption perspective.
+
+-------------------------
+
+domwoe | 2024-02-12 11:57:37 UTC | #5
+
+[quote="NathanosDev, post:4, topic:27473"]
+That’s a very good point regarding the `read_state` requests.
+
+@lastmjs and I were discussing some options for authentication over HTTP and I had overlooked this point about the `read_state` requests requiring the same principal to authenticate the request as the one that makes the original `call` request.
+[/quote]
+
+
+
+I haven't followed this, but it seems there's work on a synchronous HTTPS API: https://github.com/dfinity/interface-spec/pull/265 which wouldn't need to rely on `read_state` requests.
+
+[quote="NathanosDev, post:4, topic:27473"]
+Additionally the canister’s will then need to verify the signature and extract the caller, rather than relying on the protocol to do this like we normally do. This would be expensive from a cycles consumption perspective.
+[/quote]
+
+This would be costly in particular for verifying messages from II users, since this would involve BLS signature verification.
+
+-------------------------
+
+NathanosDev | 2024-02-12 12:44:46 UTC | #6
+
+[quote="domwoe, post:5, topic:27473"]
+I haven’t followed this, but it seems there’s work on a synchronous HTTPS API: [feat(sync-call): [IC-1666] Endpoint for synchronous call requests by DSharifi · Pull Request #265 · dfinity/interface-spec · GitHub ](https://github.com/dfinity/interface-spec/pull/265) which wouldn’t need to rely on `read_state` requests.
+[/quote]
+
+Thanks for bringing that up, that's super helpful.
+
+If we had this, then it would be more possible to somehow leverage native IC authentication support over HTTP.
+
+-------------------------
+
+NathanosDev | 2024-02-12 12:55:12 UTC | #7
+
+To leverage native IC authentication over HTTP, the caller would need to sign the [request id](https://internetcomputer.org/docs/current/references/ic-interface-spec/#request-id).
+
+This would mean:
+- create and serialize the candid-encoded request according to [the HTTP Gateway spec](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#canister-http-interface)
+- sign the request ID according to the [ICP spec](https://internetcomputer.org/docs/current/references/ic-interface-spec/#request-id)
+- serialize this signature into a JWT
+- add the JWT to an `Authentication` header
+- send the request to the HTTP Gateway
+
+Then the HTTP Gateway would need to extract the signature from the JWT and replay it with a candid-encoded request that matches what the client signed.
+
+The major problem here is using Candid and re-creating the entire candid-encoded request, which obviously defeats the whole purpose of trying to avoid using an agent in the first place. At that point you might as well just use the agent.
+
+So I think it's clear that if we are to make native IC authentication work over HTTP that it would require a change (or at least a fork) of the HTTP Gateway Protocol. Swapping Candid encoding for JSON encoding would be an obvious solution to me since JSON is natively supported by browsers. This would then require changes on the canister CDK side too, since CDKs are generally assuming a candid encoding for requests.
+
+-------------------------
+
+lastmjs | 2024-02-12 13:28:58 UTC | #8
+
+Let's get whatever is necessary going, I'm hoping to dive deep into authentication in Azle this week hopefully starting today. We must have a good authentication story to keep the HTTP-based paradigm going!
+
+On that note, I've been thinking about starting first with a variation of password-based authentication, passkeys, and/or OAuth.
+
+Obviously passwords or their hashes would have the node operator plain text issue, but I wonder if we could come up with a simple scheme here that would allow the user to generate or encrypt and store ephemeral keys that could be used to generate a principal.
+
+Anyway, assuming you have a signature of the request in a request header, can a canister right now verify that request? I assume so. Is the problem solvable now without protocol changes then, assuming the client and canister have to run their own verification code?
+
+-------------------------
+
+NathanosDev | 2024-02-12 15:37:13 UTC | #9
+
+> I’ve been thinking about starting first with a variation of password-based authentication, passkeys, and/or OAuth.
+
+So there's two separate issues here that I can see:
+- How to communiciate authentication signatures over HTTP
+- How to produce an authentication signature
+
+How we encode the signature (JWT), what header we put it into (Ex. `Authorization`), and how we encode the request body (Candid vs JSON) are all related to how we communicate authentication signatures over HTTP.
+
+Whether we use passwords or passkeys is about how we produce an authentication signature.
+
+In my opinion, whatever method we use to communicate signatures over HTTP should work with the existing authentication methods we have on the IC from Internet Identity, NFID and other wallets.
+
+If you're investigating passwords, passkeys, etc.., does that mean that you are intending to introduce a new form of signature production for use on the IC?
+
+> Obviously passwords or their hashes would have the node operator plain text issue, but I wonder if we could come up with a simple scheme here that would allow the user to generate or encrypt and store ephemeral keys that could be used to generate a principal.
+
+Taggr has implemented something like this btw, while maintaining compatibility with the existing authentication scheme on the IC: https://github.com/TaggrNetwork/taggr/blob/main/src/frontend/src/logins.tsx#L70-L71.
+
+> assuming you have a signature of the request in a request header, can a canister right now verify that request? I assume so. Is the problem solvable now without protocol changes then, assuming the client and canister have to run their own verification code?
+
+Yes, with these caveats:
+- signature verification is expensive
+- all state changes of the canister will be persisted in the state tree under the anonymous principal
+- this will need to be implemented for every language/CDK that will be supported on the IC
+- the ecosystem may become fragmented with various authentication mechanisms
+
+-------------------------
+
+lastmjs | 2024-02-12 17:13:00 UTC | #10
+
+[quote="NathanosDev, post:9, topic:27473"]
+all state changes of the canister will be persisted in the state tree under the anonymous principal
+[/quote]
+
+This one seems the most concerning at the moment, can you explain the risks a little bit more?
+
+-------------------------
+
+NathanosDev | 2024-02-13 12:23:18 UTC | #11
+
+All of the responses that the canister returns will be publically available for anyone to see.
+
+You could get around this by not returning a response in update calls, but instead storing them in canister memory, certifying them and putting your own access control on retrieving them. These responses would need to be verified locally then and wouldn't be verified by the HTTP Gateway Protocol anymore.
+
+-------------------------
+

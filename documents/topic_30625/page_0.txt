@@ -1,0 +1,271 @@
+cken | 2024-05-10 19:16:18 UTC | #1
+
+I'm not actually using the SDK but I wasn't sure of a more appropriate category.
+
+I'm trying to work directly with the WASM System API. I'm trying to construct the IC-Certificate header for a single /index.html asset. Assuming I'm getting that header correct, I need to also pass the root hash to the `certified_data_set` system function. Would the root hash in this case just be the SHA256 hash of the index.html body hash, so, sha256(sha256(index_html_body))?
+
+Additionally for the hash tree for http_assets, does it expect a list of asset even for a single asset such that the CBOR is [1, [1, [2, '/index.html', [3, ...]]]] versus [1, [2, '/index.html', [3, ...]]]?
+
+-------------------------
+
+Samer | 2024-05-10 21:29:04 UTC | #2
+
+Not totally sure, but good exercise in certification!
+
+Assuming you are using v1, the relevant part of docs is
+
+
+![Screenshot_20240510_232413_Brave|342x500](upload://bOxi1Xm00BjK7endoMvBOxnqtXG.png)
+
+https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#legacy-response-verification
+
+-------------------------
+
+cken | 2024-05-12 19:39:14 UTC | #3
+
+Here's part of the puzzle I was missing. The root hash seems to be computed using specific prefixes to label the tree.
+
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#certificate
+
+Relevant excerpt from the above link:
+```text
+verify_cert(cert) =
+  let root_hash = reconstruct(cert.tree)
+  // see section Delegations below
+  if check_delegation(cert.delegation) = false then return false
+  let bls_key = delegation_key(cert.delegation)
+  verify_bls_signature(bls_key, cert.signature, domain_sep("ic-state-root") · root_hash)
+
+reconstruct(Empty)       = H(domain_sep("ic-hashtree-empty"))
+reconstruct(Fork t1 t2)  = H(domain_sep("ic-hashtree-fork") · reconstruct(t1) · reconstruct(t2))
+reconstruct(Labeled l t) = H(domain_sep("ic-hashtree-labeled") · l · reconstruct(t))
+reconstruct(Leaf v)      = H(domain_sep("ic-hashtree-leaf") · v)
+reconstruct(Pruned h)    = h
+
+domain_sep(s) = byte(|s|) · s
+```
+
+Under the `verify_cert(cert)` logic example, it reveals that they're prepending the leaf values of the tree with the label strings:
+
+```text
+ic-hashtree-empty
+ic-hashtree-fork
+ic-hashtree-labeled
+ic-hashtree-leaf
+```
+
+Which are also prepended with their length, so in their following example where the labeled leaf `b` has the value "good", the actual hashed value is `\x10ic-hashtree-leafgood` encoded as utf-8 where `\x10` is 16 which is the length of the string `ic-hashtree-leaf`.
+
+Calculating the SHA256 in Python with `hashlib.sha256(b'\x10ic-hashtree-leafgood').hexdigest()` yields the expected `7b32ac0c6ba8ce35ac82c255fc7906f7fc130dab2a090f80fe12f9c2cae83ba6` which is provided as the expected hash for that leaf further down in this example:
+
+ https://internetcomputer.org/docs/current/references/ic-interface-spec/#example
+
+Relevant excerpt:
+```text
+─┬─┬╴"a" ─┬─ 1B4FEFF9BEF8131788B0C9DC6DBAD6E81E524249C879E9F10F71CE3749F5A638
+ │ │      └╴ "y" ─╴"world"
+ │ └╴"b" ──╴7B32AC0C6BA8CE35AC82C255FC7906F7FC130DAB2A090F80FE12F9C2CAE83BA6
+ └─┬╴EC8324B8A1F1AC16BD2E806EDBA78006479C9877FED4EB464A25485465AF601D
+   └╴"d" ──╴"morning"
+```
+
+-------------------------
+
+NathanosDev | 2024-05-13 11:27:10 UTC | #4
+
+I'm glad to see someone looking at implementing HTTP certification on the Python side. How far are you looking to take this? Would you be interested in building a library for others to use too?
+
+It's good to start with v1 because it's the simpler version, but I would like to start moving away from this as a community and towards v2.
+
+-------------------------
+
+cken | 2024-05-13 15:48:15 UTC | #5
+
+I've actually been working on the other side of it, properly encoding certified data directly in the wasm canister. At the moment, I'm generating a WAT file and compiling it with wasmer to deploy as a "custom" type canister that embeds the http_assets and hash tree as data. I know the Rust asset canister exists, but I'm doing some size experiments working directly in WAT/WASM.
+
+I'm not fluent in Rust though, so I've been working on proving out the examples in the docs using Python to understand the certification process.
+
+Is there a good way to test against the HTTP Gateway locally? Maybe [https://github.com/dfinity/http-proxy](https://github.com/dfinity/http-proxy)?
+
+As I make progress, I'll consider publishing a Python package or at least contributing the certification code to [https://github.com/rocklabs-io/ic-py](https://github.com/rocklabs-io/ic-py).
+
+-------------------------
+
+NathanosDev | 2024-05-13 16:01:14 UTC | #6
+
+> Is there a good way to test against the HTTP Gateway locally?
+
+There's already an HTTP gateway running in DFX, so if you make an HTTP request through DFX then it will be validated by the gateway. There's no need to run an additional HTTP proxy. Just note that if you do not send the `IC-Certificate` header in your response, then DFX will consider this a "pass". The validation only runs if the header is present.
+
+Otherwise, you can also use the standalone package for the verification of the responses and make some automation tests with it, for example in TypeScript using [PicJS](https://github.com/dfinity/response-verification/blob/main/examples/http-certification/json-api/src/tests/src/todos.spec.ts#L76-L84). You can also do the same with Rust, but unfortunately not with Python.
+
+-------------------------
+
+Samer | 2024-05-15 20:52:07 UTC | #7
+
+[quote="cken, post:5, topic:30625"]
+I’m doing some size experiments working directly in WAT/WASM
+[/quote]
+
+Interesting. Curious to learn how much of a difference ot makes.
+
+So you are serving a single `index.html` from a canister written directly in WAT?
+
+-------------------------
+
+cken | 2024-05-15 22:33:04 UTC | #8
+
+Yeah, that's what I'm working on at the moment but still fighting with the certification.. getting close though I think.
+
+TL;DR the runtime/stdlib size for Rust and Motoko seem to be:
+```text
+Rust     400KB
+Motoko    55KB
+```
+
+
+Preliminary results, the `dfx` Motoko demo that just has one function that returns "Hello, World" produces a WASM file with `moc --release main.mo` that is about 55K after minify with wasm-opt and gzip:
+
+```text
+107,612 main.min.wasm
+ 55,772 main.min.wasm.gz
+    110 main.mo
+206,158 main.wasm
+```
+
+My WAT generated wasm file that includes Base64 encode/decode, LEB encode/decode, and the HttpRequest and Certificate handling is about 1.1K after minify and gzip, 400 bytes of which is the embedded index.html, root hash, and response headers:
+
+```text
+ 1,674 compiled.min.wasm
+ 1,114 compiled.min.wasm.gz
+ 2,817 compiled.wasm
+28,348 compiled.wat
+```
+
+The Rust demo which is also just a single hello function, produces are 400KB wasm file after minify and gzip with `cargo build --target wasm32-unknown-unknown --release`:
+
+```text
+1,558,488 icpdemo2_backend.min.wasm
+  409,131 icpdemo2_backend.min.wasm.gz
+1,934,744 icpdemo2_backend.wasm
+```
+
+There may be ways to shrink those further with Motoko and Rust. I'm no expert there.
+
+I think all of the gzipped assets for my demo frontend are about 16KB, so the size quickly becomes dominated by the frontend assets, given they are text based source code.
+
+-------------------------
+
+Samer | 2024-05-16 12:51:36 UTC | #9
+
+Just curious (learning this for first time)
+
+Are you directly writing in WAT? So you implemented base64 in WAT for instance? Or was there library you used?
+
+Wrapping my head around working with wasm IC system API directly in WAT as you are doing
+
+-------------------------
+
+Samer | 2024-05-16 12:53:22 UTC | #10
+
+[quote="cken, post:5, topic:30625"]
+I’m generating a WAT file and compiling it with wasmer
+[/quote]
+
+With what are you generating the WAT file?
+
+-------------------------
+
+cken | 2024-05-16 14:34:10 UTC | #11
+
+I wrote it by hand from scratch, like writing assembly instead of C. It’s not too bad once you get the hang of it.
+
+The system API is just imports, exports, and calls. So an import:
+`(import "ic0" "debug_print" (func $ic0::debug_print (param $src i32) (param $size i32)))`
+
+and a call:
+`(call $ic0::debug_print (i32.const 1000) (i32.const 32))`
+
+and an export where $CanisterInit is defined in the WAT and "canister_init" is expected by the ICP runtime:
+`(export "canister_init"               (func $CanisterInit))`
+
+WASM itself is a stack machine so instead of reading from memory and temporarily storing it in registers like a regular CPU, you just push and pull things from a stack. I'm using wat2wasm from the [WABT toolkit](https://github.com/WebAssembly/wabt) to convert the WAT to WASM, and a Python wrapper for [Wasmer](https://github.com/wasmerio/wasmer) to run it for testing.
+
+
+A Base64 encoder for a single 6-bit chunk looks like this:
+```
+func $ToBase64 (param $six i32) (result i32)
+        (block $exit (result i32)
+            (if (result i32)
+              (i32.and
+                (i32.ge_u (local.get $six) (i32.const @BOTTOM_A_Z))
+                (i32.le_u (local.get $six) (i32.const @TOP_A_Z)))
+            (then
+              (br $exit 
+                (i32.add (local.get $six) (i32.const @CHR_A))))
+            (else
+              (if (result i32)
+                (i32.and
+                  (i32.ge_u (local.get $six) (i32.const @BOTTOM_a_z))
+                  (i32.le_u (local.get $six) (i32.const @TOP_a_z)))
+              (then
+                (br $exit
+                  (i32.add
+                    (i32.const @CHR_a)
+                    (i32.sub (local.get $six) (i32.const 26)))))
+              (else
+                (if (result i32)
+                  (i32.and
+                    (i32.ge_u (local.get $six) (i32.const @BOTTOM_0_9))
+                    (i32.le_u (local.get $six) (i32.const @TOP_0_9)))
+                (then
+                  (br $exit 
+                      (i32.add
+                        (i32.const @CHR_0)
+                        (i32.sub (local.get $six) (i32.const 52)))))
+                (else 
+                  (if (result i32)
+                    (i32.eq (local.get $six) (i32.const 62))
+                  (then
+                    (br $exit (i32.const @CHR_PLUS)))
+                  (else
+                    (if (result i32)
+                      (i32.eq (local.get $six) (i32.const 63))
+                    (then (br $exit (i32.const @CHR_SLASH)))
+                    (else (br $exit (i32.const 0)))) ;; some non-base64 character
+                  ))
+                ))
+              ))
+            ))
+        )
+    )
+```
+
+The symbols that start with @ like `@CHR_SLASH` are a smaller C-preprocessor like extension I added to have named constants.
+
+-------------------------
+
+Samer | 2024-05-16 14:38:57 UTC | #12
+
+Thnx a lot for sharing this. I'm always eager to learn this stuff. Even though I don't need it, it's very insightful.
+
+This one is for the late evening coach sessions :nerd_face:
+
+-------------------------
+
+Samer | 2024-06-03 19:09:11 UTC | #13
+
+[quote="NathanosDev, post:6, topic:30625"]
+There’s already an HTTP gateway running in DFX, so if you make an HTTP request through DFX then it will be validated by the gateway.
+[/quote]
+
+It would be really nice to have a more informative errror message when validation fails.
+
+-------------------------
+
+NathanosDev | 2024-06-04 08:29:13 UTC | #14
+
+I agree completely. We do have some work in progress that will help a lot, but it will take some time for it to propagate downstream to DFX. In the meantime, the best thing you can do is setup an automation test to use the `@dfinity/response-verification` package for TypeScript, or the `ic-response-verification` crate for Rust. This will give you a much more specific error message that you can use for debugging.
+
+-------------------------
+

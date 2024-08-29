@@ -1,0 +1,104 @@
+skilesare | 2023-10-28 12:08:37 UTC | #1
+
+@matthewhammer @claudio 
+
+Given:
+
+```
+/// Memory is allocated, using `grow(region, pages)`, sequentially and on demand, in units of 64KiB logical pages, starting with 0 allocated pages.
+/// New pages are zero initialized.
+/// Growth is capped by a soft limit on physical page count controlled by compile-time flag
+/// `--max-stable-pages <n>` (the default is 65536, or 4GiB).
+```
+
+If I want a write-once stream of blob data(I don't ever delete anything), I want to do a sanity check on my math for when I need to call grow.
+
+```
+let myblob = to_candid(my_obj);
+let blob_size = myblob.size();
+
+let current_size = Region.size(storage_region);
+
+if(current_offset + blob_size > current_size * 65536){
+   //assume no object will ever be greater than 65536;
+   Region.grow(storage_region, 1);
+};
+
+Region.storeBlob(storage_region, currrent_offset, myblob);
+current_offset += blob_size;
+```
+
+And then I can load the object using from_candid later? 
+
+Adding sizeInBytes might be a good addition ... a naive programmer(probably me) might assume 64000 per page, but I think it is 65536 after some research.
+
+Also, If I'm using Mops, where do I put the --max-stable-pages <n> argument?
+
+Last Question:  If the canister managing regions is actually as sub canister, I'm assuming this max stable pages is cascaded down to when that is deployed programmatically?
+
+-------------------------
+
+claudio | 2023-10-28 13:28:26 UTC | #2
+
+The code looks ok assuming the limit on the blob size. But I do suffer from off by one errors.
+
+I think the example in the R&D talk uses a helper to ensure an offset is in range. Maybe check and use that.
+
+The page size is indeed 2^16 bytes = 65536. 
+
+Not sure about mops, but perhaps someone else knows how to pass moc flags via mops.
+
+In general, in code involving actor classes, the compiler flags apply uniformly to main actor (class) and imported actor classes. More flexibility might be nice but perhaps awkward to specify.
+
+BTW, you'll need to know the size of the blob to loadBlob it, so may want to prefix each blob with its size.
+
+-------------------------
+
+claudio | 2023-10-28 13:38:37 UTC | #3
+
+@skilesare BTW I'm working on a feature that would let you use stable memory and regions on wasmtime for unit testing stable data structures outside the IC. Would that be useful to you? At the moment it only supports up to 4GB of stable memory, but we could probably up that limit too. 
+The downside is that you need to enable some additional flags on wasmtime (bulk-memory, multi-memory and possibly 64-bit in future) for the code to run.
+
+-------------------------
+
+skilesare | 2023-10-29 12:10:35 UTC | #4
+
+Well, here is a philosophical (and slightly technical) question about motoko and stable memory. If I stick 96GB into stable memory and then at some point need to upgrade the object to a new candid type, I pretty mush have to have a manual process for this right?  I can't do that much data in an upgrade round right?
+
+I'm wondering that if I'm using a possibly upgradeable object, if I should ever even try to use more than 4 GB.
+
+I can certainly see unit testing stable memory being useful!
+
+-------------------------
+
+claudio | 2023-10-29 21:32:39 UTC | #5
+
+
+>Well, here is a philosophical (and slightly technical) question about motoko and stable memory. If I stick 96GB into stable memory and then at some point need to upgrade the object to a new candid type, I pretty mush have to have a manual process for this right?  I can't do that much data in an upgrade round right?
+
+Yes, I think you'd have to do something manual over several rounds, or lazily.
+
+> I'm wondering that if I'm using a possibly upgradeable object, if I should ever even try to use more than 4 GB.
+
+If you are using to_candid and from_candid, the blob can never exceed 4GB at the moment anyway, since it has to fit into main memory at some point. You could store lots of smaller, self-contained candid blob in a larger stable data structure, of course. But I'd be slightly wary of using candid for these purposes anyway.
+
+> I can certainly see unit testing stable memory being useful!
+Good to know, thanks! I was particularly asking about being able to (unit) test stable data structures outside of the IC, using plain old wasmtime.
+
+-------------------------
+
+skilesare | 2023-10-29 21:35:14 UTC | #6
+
+Are you concerned that at some point the deserialization of serialized candid will lose backwards comparability?
+
+Wouldn't we know that beforehand and be able to find an upgrade path?
+
+-------------------------
+
+claudio | 2023-10-30 17:59:46 UTC | #7
+
+No, it's more the issue that candid doesn't really provide you with a navigable data structure - there's no random access to the data in a candid blob: you need to deserialize the whole blob to get access to its parts. Might be fine for many use cases, but probably not all. Also, the size of a candid blob varies with the data since Candid does some value-based compression.
+Having said that, I know that II at some point was using an array of bounded-size candid blobs to encode its data in stable memory, so perhaps it's fine. I don't know if it still does that, but early versions did.
+
+-------------------------
+

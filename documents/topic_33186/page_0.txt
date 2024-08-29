@@ -1,0 +1,126 @@
+malteish | 2024-07-14 09:37:55 UTC | #1
+
+Hi everyone,
+
+I'm developing [ReTransICP](https://github.com/malteish/ReTransICP) and experiencing some trouble with the rpc canister:
+```
+[30467. 2024-07-09T09:55:30.780289441Z]: Timer has finished, running job 4 now.
+[30468. 2024-07-09T09:55:40.790182797Z]: [TRAP]: Error: HttpOutcallError(IcError { code: SysTransient, message: "No consensus could be reached. Replicas had different responses. Details: request_id: 2881434, timeout: 1720519234770006900, hashes: [5087cf729dad3a200cda8acdfbe7e07a6822d082a82ec22ae9868a01704a5ce3: 14], [edd83ffbf69636a42b1698bcb4cf8e77c1b3fc170d4be70ab8f848019ef85610: 12]" })
+[30469. 2024-07-09T10:10:50.751649035Z]: Failed to get the latest finalized block number: HttpOutcallError(IcError { code: SysTransient, message: "No consensus could be reached. Replicas had different responses. Details: request_id: 2881916, timeout: 1720520144606440478, hashes: [7fc6ca4c17c49614128f8a4bc1e5c45a0672a796d8e2da00de41f1d3ab432df9: 17], [98111562d863c9a00a2a62738f46b694c4c3e9f4a9de546d5c008287b09f43b8: 10]" })
+[30470. 2024-07-09T10:41:53.430189118Z]: Failed to get the latest finalized block number: HttpOutcallError(IcError { code: SysTransient, message: "Canister http request timed out" })
+```
+
+Currently struggling to understand what causes this error and where it originates so I can catch and handle it. Any hints on that?
+
+-------------------------
+
+rvanasa | 2024-07-15 16:06:04 UTC | #2
+
+```text
+No consensus could be reached. Replicas had different responses.
+```
+
+This error message occurs when calling the same RPC endpoint from different subnet nodes return different results. The most common reason for `eth_getBlockNumber` is that the block number changes partway through the HTTP request. It's also possible to encounter this error due to rate limits during high canister traffic.
+
+```text
+Canister http request timed out
+```
+
+This also seems like a temporary error as a result of high canister traffic on the fiduciary subnet. 
+
+In both of these cases, it's sometimes necessary to wait for a few minutes and then retry the request.
+
+-------------------------
+
+kristofer | 2024-08-20 14:26:08 UTC | #3
+
+I am also seeing this. "Waiting a few minutes" does not seem to change anything, the issue is quite persistent. I am using one rpc service only, on Arbitrum.
+
+```
+Ok((Consistent(Err(HttpOutcallError(IcError { code: SysTransient, message: "No consensus could be reached. Replicas had different responses. Details: request_id: 4020601, timeout: 1724163283271565462, hashes: [55b8b966a9d5d1cfd98d19d8ddceac5a9a6b5276d5fd5fa966a04fdb6e264bf1: 16], [6866bf29556e2638aa0c51ffa31c8811e4ec68a5340332fba34b4cf347ed9030: 5], [c45cdc7563848760da98df0f5ce3184cf527839eda5ac96d40bd5204602b3229: 4], [bdf01813346c43a5a39dbf2027930946372a1339c0fe688b4e6d33d7cd4cd7e6: 1], [62e48a5a1ffb7273ddba7644a091d013610c3998b5898efc88139bc4967c0075: 1]" }))),))
+```
+
+A consistent response saying no consensus was reached 🤔 😀
+
+Shouldn't an inconsistent response be returned instead? So app can proceed if it is fine with the inconsistency.
+
+Most other eth functions you can tie to a block number to decrease this risk. But to establish a "starting point" to be used in coming calls you need to be able to get the latest block (or there around) reliably.
+
+-------------------------
+
+rvanasa | 2024-08-20 15:33:30 UTC | #4
+
+Which RPC service and method(s) are you using? I'll see if we can fix this if it's possible for us to repro the issue. 
+
+The reason we (currently) can't return an inconsistent error message here is that HTTPS outcall consensus happens at the protocol level of the Internet Computer. Essentially, each of the 28 fiduciary subnet nodes makes the HTTP request, and the IC compares all of the results. After post-processing the response, we receive either a consistent response or an error code indicating inconsistent results. It may be possible to further customize this behaviour in the future given enough community interest.
+
+> A consistent response saying no consensus was reached :thinking: :grinning:
+
+This indicates that the results are consistent with each other between RPC providers (which is always consistent when calling just one provider). I see what you're saying though! :grin:
+
+-------------------------
+
+kristofer | 2024-08-20 17:35:16 UTC | #5
+
+[quote="rvanasa, post:4, topic:33186"]
+Which RPC service and method(s) are you using? I’ll see if we can fix this if it’s possible for us to repro the issue.
+[/quote]
+
+Thanks! I had this issue today with the following configs:
+- Arbitrum: BlockPi
+- Base: Ankr/BlockPi
+
+Method used was `eth_getBlockByNumber`. Code is mostly copied from the EVM_RPC examples app.
+
+https://github.com/c-atts/catts-app/blob/0295f6a9ac61836af2400a0a639021db8a5dfba9/packages/catts_engine/src/evm/rpc.rs#L375
+
+[quote="rvanasa, post:4, topic:33186"]
+After post-processing the response, we receive either a consistent response or an error code indicating inconsistent results.
+[/quote]
+
+The RPC responses are consistent but the nodes did not reach consensus. That would mean some of the nodes did not get any responses, right? So, a timeout issue or overload issue?
+
+Canister is live btw, error can be reproduced by logging in and running a recipe, this one for instance: https://77ydd-naaaa-aaaal-qi2ja-cai.icp0.io/recipe/eth-positive-balance
+
+-------------------------
+
+rvanasa | 2024-08-20 23:35:19 UTC | #6
+
+[quote="kristofer, post:5, topic:33186"]
+The RPC responses are consistent but the nodes did not reach consensus. That would mean some of the nodes did not get any responses, right? So, a timeout issue or overload issue?
+[/quote]
+
+This is usually caused by timeouts or rate limits on the individual JSON-RPC services. It's also possible that a provider is returning a nonce or random number in each response, which can break the HTTPS outcall consensus. 
+
+In this case, it could be a temporary issue with the provider's JSON-RPC API; otherwise, we might be able to to adjust the EVM RPC canister to ignore or patch the problematic data. For `eth_getBlockByNumber`, we've addressed this by filtering unknown response fields, but during high traffic, the latest block returned for L2 chains might change quickly enough that the third-party API responds with a different block between the start and end of the HTTP outcalls.
+
+[quote="kristofer, post:5, topic:33186"]
+Canister is live btw, error can be reproduced by logging in and running a recipe, this one for instance: [https://77ydd-naaaa-aaaal-qi2ja-cai.icp0.io/recipe/eth-positive-balance ](https://77ydd-naaaa-aaaal-qi2ja-cai.icp0.io/recipe/eth-positive-balance)
+[/quote]
+
+Very cool project by the way! I was able to create a custom "Eth Zero Balance" recipe to try it out (since my wallet didn't have any Eth) and managed to recreate the error. This will be useful for narrowing down and hopefully resolving the issue.
+
+-------------------------
+
+kristofer | 2024-08-21 06:54:03 UTC | #7
+
+Thanks for looking into this, it is the last blocker preventing me from launching. 
+
+I am .. almost .. certain though that when I first saw this error it happened a bit further down in the flow of the `run_create` canister function. Here, when I run the queries in the recipe to estimate gas usage for creating the attestation:
+
+https://github.com/c-atts/catts-app/blob/f0ff0789de4c7c7614126de397254593bf5ac793/packages/catts_engine/src/eas.rs#L203
+
+These outcalls run through a caching proxy that ensures only one request is made to whichever API is being queried. It also ensures all the responses the nodes get are the same.
+
+-------------------------
+
+kristofer | 2024-08-21 07:52:46 UTC | #8
+
+ps. I do some in canister logging that can be accessed in the `logs()` function here:
+
+https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=7w3i7-3iaaa-aaaal-qi2iq-cai
+
+.. and with the help of those can confirm that the issue happens for regular `http_request` outcalls also.
+
+-------------------------
+

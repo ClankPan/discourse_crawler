@@ -1,0 +1,209 @@
+Steve | 2021-02-20 16:22:34 UTC | #1
+
+Does anyone know how to use the Rust CDK call function? 
+
+https://github.com/dfinity/cdk-rs/blob/ee145313fa9feae4ae0ab7602d8fca39374c3fb8/src/ic-cdk/src/api/call.rs#L140
+
+I'm trying to call the management canister to create a new canister from wasm. It looks like I just need to implement the ArgumentEncoder trait on my struct, but it feels a bit laborious to do that for all my types. 
+
+https://github.com/dfinity/candid/blob/ea2c72f57e4b1cde99fad3b61308c0e979a65e3a/rust/candid/src/ser.rs#L399
+
+-------------------------
+
+chenyan | 2021-02-20 17:58:20 UTC | #2
+
+`ArgumentEncoder` is implemented for all tuple types `(T1, T2, ...)`, where `Ti: CandidType`. If you have a custom struct, you only need to `#[derive(CandidType, Deserialize)]`, then pass in `args` as a tuple, for example `(your_struct, 42, "Text")`.
+
+-------------------------
+
+Steve | 2021-02-22 15:59:30 UTC | #3
+
+Hey @chenyan - I'm having issues with `ArgumentDecoder` now. If its not too much hassle, could share an example of just calling a canister, and getting the result?
+
+-------------------------
+
+chenyan | 2021-02-22 17:41:53 UTC | #4
+
+```rust
+let (first_result, second_result) : (first_result_type, second_result_type) = 
+  api::call::call(canister_id, "method", (first_arg, second_arg)).await?;
+```
+Both argument and return types are tuples. The type annotation on return type is required, as it cannot be inferred by Rust.
+
+-------------------------
+
+Steve | 2021-02-22 18:32:22 UTC | #5
+
+Thanks, let me give that a shot! Just so I make sure I understand 
+
+`(first_result_type, second_result_type) ` -> `(candid::Nat, candid::Principle)`
+
+-------------------------
+
+chenyan | 2021-02-22 19:15:49 UTC | #6
+
+That's the return type of your method. If you are not sure, can you post the did file for that method?
+
+-------------------------
+
+Steve | 2021-02-22 22:47:52 UTC | #7
+
+@chenyan - sorry for the confusion here is a full example
+
+```
+let canister : (candid::Principal) = ic_cdk::api::call(candid::Principal::management_canister(), "create_canister", ()).await?;
+
+```
+
+Yields the following error:
+
+```
+the trait `for<'a> ArgumentDecoder<'a>` is not implemented for `ic_types::Principal`
+```
+
+-------------------------
+
+chenyan | 2021-02-22 23:26:40 UTC | #8
+
+The return type is a tuple, even if it has only one value, so this will work:
+`let (canister,) : (candid::Principal,)`
+
+-------------------------
+
+Steve | 2021-02-23 00:00:10 UTC | #9
+
+:man_facepalming: DOH! Yes its working now. Thank you!!
+
+-------------------------
+
+senior.joinu | 2021-05-27 00:17:49 UTC | #10
+
+Hey there!
+
+I want to call canister methods without knowing their interface at compile time and I have a code like this
+```rust
+fn do_call(idl_args: IDLArgs, canister_id: Principal, method: &str) {
+  let bytes = idl_args.to_bytes()?;
+
+  let result = call_raw(
+    canister_id,
+    method,
+    bytes,
+    0,
+  )
+    .await;
+}
+```
+
+It successfully executes inside a canister but the actual `call` is not performed. What am I doing wrong?
+
+UPD: `canister_id`, `method` and `idl_args` are 100% fit in the remote interface.
+
+-------------------------
+
+senior.joinu | 2021-05-27 09:05:51 UTC | #11
+
+@chenyan Please help me :(
+
+-------------------------
+
+chenyan | 2021-05-27 16:48:02 UTC | #12
+
+
+`call_raw` returns `Future<Result<...>>`, so you will need `.await?`.
+
+-------------------------
+
+senior.joinu | 2021-05-27 16:50:53 UTC | #13
+
+Yes, it's there. I did not include it into the snippet, sorry. There is also a check if `result` is `Err` and it is not.
+
+-------------------------
+
+chenyan | 2021-05-27 16:53:05 UTC | #14
+
+I don't understand the question here. What do you mean by "successfully executes, but the actual call is not performed"? Are you getting the return blob from `call_raw`?
+
+-------------------------
+
+senior.joinu | 2021-05-27 17:01:08 UTC | #15
+
+The canister I'm calling to is logging every request it receives and my example request should also change its state (it is an update call). 
+
+When the second canister executes a code from the snippet, the first canister does not log a request and does not change its state as well. The response the second canister receives from that call is not `Err`, so it looks like everything should be all right, but it's not.
+
+I was thinking, am I encoding arguments correctly?
+Or another possible issue: maybe the response is not `Err` but it returns an encoded error in the `Ok` variant?
+
+-------------------------
+
+senior.joinu | 2021-05-27 17:02:24 UTC | #16
+
+Sorry, I just don't know how to demonstrate that issue, since there is no error code or something.
+
+Thank you for your patience.
+
+-------------------------
+
+chenyan | 2021-05-27 17:13:01 UTC | #17
+
+You can use `didc decode` to inspect the return blob. Or if you know how many values the function returns, you can decode in Rust via `Decode!(&result, IDLValue, IDLValue, ...)?`
+
+`call_raw` looks good to me, I think the problem might be on the other canister, where it doesn't actually log every requests. So looking at the return result might help.
+
+-------------------------
+
+senior.joinu | 2021-05-27 17:13:37 UTC | #18
+
+Thanks for the help!
+
+-------------------------
+
+senior.joinu | 2021-05-30 14:02:44 UTC | #20
+
+How do you spawn a new canister in rust?
+
+-------------------------
+
+lastmjs | 2021-06-18 19:24:24 UTC | #21
+
+Here is my function in Motoko:
+
+```
+public query func test(number: Nat): async Nat {
+        return number;
+    };
+```
+
+Here is my function in Rust:
+
+```rust
+async fn test(number: i32) -> Result<i32, sudograph::async_graphql::Error> {
+    let call_result: Result<(i32,), _> = ic_cdk::api::call::call(ic_cdk::export::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(), "customGet", (number)).await;
+    return Ok(call_result.unwrap().0);
+}
+```
+I keep getting:
+
+```bash
+error[E0277]: the trait bound `i32: ArgumentEncoder` is not satisfied
+   --> canisters/graphql/src/graphql.rs:24:157
+    |
+24  | ...aaba-cai").unwrap(), "customGet", (number)).await;
+    |                                      ^^^^^^^^ the trait `ArgumentEncoder` is not implemented for `i32`
+    | 
+   ::: /home/lastmjs/.cargo/registry/src/github.com-1ecc6299db9ec823/ic-cdk-0.3.0/src/api/call.rs:260:22
+    |
+260 | pub async fn call<T: ArgumentEncoder, R: for<'a> ArgumentDecoder<'a>>(
+    |                      --------------- required by this bound in `sudograph::ic_cdk::call`
+```
+If I try just text or numbers as arguments to the call, nothing works. Is there some import I am missing?
+
+-------------------------
+
+lastmjs | 2021-06-18 19:40:55 UTC | #22
+
+I wasn't using a typle, needs to be `(number,)` haha
+
+-------------------------
+

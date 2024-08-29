@@ -1,0 +1,137 @@
+lastmjs | 2023-05-22 21:00:47 UTC | #1
+
+dfx generate seems to assume everyone is using webpack which is not the case. I am having to do add custom hacks into my workflow to get around the assumption of webpack, as I am using vite.
+
+Look at this code: 
+
+```javascript
+import { Actor, HttpAgent } from "@dfinity/agent";
+
+// Imports and re-exports candid interface
+import { idlFactory } from "./wallet_backend.did.js";
+export { idlFactory } from "./wallet_backend.did.js";
+
+/* CANISTER_ID is replaced by webpack based on node environment
+ * Note: canister environment variable will be standardized as
+ * process.env.CANISTER_ID_<CANISTER_NAME_UPPERCASE>
+ * beginning in dfx 0.15.0
+ */
+export const canisterId =
+  process.env.CANISTER_ID_WALLET_BACKEND ||
+  process.env.WALLET_BACKEND_CANISTER_ID;
+
+export const createActor = (canisterId, options = {}) => {
+  const agent = options.agent || new HttpAgent({ ...options.agentOptions });
+
+  if (options.agent && options.agentOptions) {
+    console.warn(
+      "Detected both agent and agentOptions passed to createActor. Ignoring agentOptions and proceeding with the provided agent."
+    );
+  }
+
+  // Fetch root key for certificate validation during development
+  if (process.env.DFX_NETWORK !== "ic") {
+    agent.fetchRootKey().catch((err) => {
+      console.warn(
+        "Unable to fetch root key. Check to ensure that your local replica is running"
+      );
+      console.error(err);
+    });
+  }
+
+  // Creates an actor with using the candid interface and the HttpAgent
+  return Actor.createActor(idlFactory, {
+    agent,
+    canisterId,
+    ...options.actorOptions,
+  });
+};
+
+export const wallet_backend = createActor(canisterId);
+```
+
+Notice this:
+
+```
+  process.env.CANISTER_ID_WALLET_BACKEND ||
+  process.env.WALLET_BACKEND_CANISTER_ID;
+```
+
+Regular browser code does not have `process.env` defined, thus I am forced to define it. And the only reason it exists is for `export const wallet_backend = createActor(canisterId);`. This side-effect in the loading of this file has caused problems before in Node.js, thus the node_compatilibity flag was set. Now I am forced to use this flag even for my front-end code.
+
+I think the side-effect in the loading of the file and a heavy dependence on webpack-specific code should be avoided.
+
+-------------------------
+
+lastmjs | 2023-05-22 21:18:22 UTC | #2
+
+Actually I still haven't gotten this to work yet, here's a related issue: https://forum.dfinity.org/t/global-is-not-defined/20173
+
+-------------------------
+
+diegop | 2023-05-22 21:50:49 UTC | #3
+
+Fair feedback, let me pass to SDK folks
+
+-------------------------
+
+lastmjs | 2023-05-22 22:00:46 UTC | #4
+
+Another potentially related issue: https://forum.dfinity.org/t/dfx-generate-fetchrootkey-broken-with-vite/20175
+
+-------------------------
+
+dfx-json | 2023-05-22 23:52:41 UTC | #5
+
+we've been slowly trying to remove the webpack tentacles from dfx. we discussed some possible options as a team earlier. here is what we're thinking:
+
+1. we will provide a configuration that dfx generate will use to determine how to define / insert canister IDs at build time. this may be called `env_convention` and the valid values will be `none, process.env, import.meta`
+2. depending on the selected configuration, dfx will either use `process.env` (supported by webpack) or `import.meta` (an emerging web standard, supported by vite). 
+3. dfx will also generate a JS file that exports canister IDs as constants. this can be used when `none` is chosen as the selected option for `env_convention`
+
+we will discuss this as a team and refine further, and possibly make changes to what i'm describing, but this is where we're at right now as a start
+
+-------------------------
+
+lastmjs | 2023-05-23 15:55:11 UTC | #6
+
+You could consider creating the process object if it doesn't exist, that was the main problem I had. Also the global object could not be found, you could consider creating that if it doesn't exist.
+
+These have been simple enough for me to polyfill, but it's sad that it just breaks in esoteric ways that would be hard for a newcomer to understand.
+
+My main problem now is that the agent simply won't work because of issues with fetching the root key and/or message verification. I'm trying to run my frontend from my own server and from the canister, and it simply won't work. I am still facing this issue right now, discussion here: https://forum.dfinity.org/t/dfx-generate-fetchrootkey-broken-with-vite/20175
+
+-------------------------
+
+lastmjs | 2023-05-23 16:05:39 UTC | #7
+
+There's a problem in the non-node-compatible generated code, which is that it calls createActor during initialization of the module. This means that the developer cannot insert their own settings into the agent, meaning that if a browser app wants to serve from a different domain then they can't use the default generated code, they would have to turn on node compatibility, but they aren't even running their app in node.
+
+-------------------------
+
+lastmjs | 2023-05-23 16:11:48 UTC | #8
+
+It seems that no combination of URLs in the browser, in the HttpAgent settings for the client, deploying to a canister or running a standalone server, etc that I've tried can give me a consistent working agent.
+
+-------------------------
+
+peterparker | 2023-05-23 16:51:53 UTC | #9
+
+In Juno, which uses Vite, I set the `"node_compatibility": true` in dfx.json and then use a script ([https://github.com/buildwithjuno/juno/blob/main/scripts/update.types.mjs](https://github.com/buildwithjuno/juno/blob/main/scripts/update.types.mjs)) to clean the types that are automatically generated. That way I keep only what's needed, what compiles and I create my own factories.
+
+-------------------------
+
+lastmjs | 2023-05-23 22:30:28 UTC | #10
+
+I found a solution to my problems as described more here: https://forum.dfinity.org/t/dfx-generate-fetchrootkey-broken-with-vite/20175/25?u=lastmjs
+
+-------------------------
+
+lastmjs | 2023-05-23 22:31:52 UTC | #11
+
+That being said, I have decided to simply deploy my frontend as a frontend canister. Trying to run a separate frontend server seemed to be causing lots of issues, and I would love to see those addressed, but I've moved on from that problem for now.
+
+Ideally a frontend deployed to a canister and running as a static web server would both work equally well with no extra configuration necessary. Especially in a local environment I don't see why this shouldn't be possible.
+
+-------------------------
+

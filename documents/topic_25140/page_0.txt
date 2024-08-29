@@ -1,0 +1,116 @@
+infu | 2023-11-29 15:56:03 UTC | #1
+
+If a proposal is made to upgrade an SNS dapp canister, will it work when there are outstanding callbacks?
+Outside of SNS, to upgrade one of our canisters we have to first stop it, then upgrade it, then start it. Outwise it errors "Can't upgrade because of outstanding callbacks"
+
+It uses timers and makes a lot of calls, so the chances there won't be any outstanding callbacks are near zero. 
+We are going to test that out if someone doesn't have an answer already.
+There is also this in Dfinity's roadmap
+
+>  **Safe canister upgrades:** Currently, canisters cannot be upgraded safely without stopping them to ensure there are no outstanding calls. By introducing named callbacks, canisters can be upgraded without stopping, ensuring that canisters can always be upgraded
+
+Not sure if that's already done and implemented in Motoko, nor how to name callbacks.
+The code causing this looks like this:
+```
+Timer.setRecurring( #second 5, func () : async () {
+ // make cross canister calls
+});
+```
+
+-------------------------
+
+domwoe | 2023-11-29 16:27:46 UTC | #2
+
+[quote="infu, post:1, topic:25140"]
+If a proposal is made to upgrade an SNS dapp canister, will it work when there are outstanding callbacks?
+[/quote]
+
+I'll forward it to the team, but I don't think it will work.
+
+[quote="infu, post:1, topic:25140"]
+Not sure if that’s already done and implemented in Motoko, nor how to name callbacks.
+[/quote]
+
+This hasn't been implemented yet (on platform level).
+
+-------------------------
+
+infu | 2023-11-29 16:34:53 UTC | #3
+
+Thanks. In this case, I think creating a shell canister that installs our canister (as an actor class) with a custom script. This way we still upgrade one canister.
+I believe actor classes don't have candid meta and won't show in the dashboard, that's a minus.
+
+-------------------------
+
+infu | 2023-11-29 18:14:55 UTC | #4
+
+Ok I've made this playground: <https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=44537010>
+Looks like Motoko has everything that's needed for this workaround. 
+'Bucket' is the sub canister.
+'Map' is the shell.
+These lines will stop, upgrade, start:
+```
+    await ic.stop_canister({canister_id = Principal.fromActor(sa)});
+    subactor := ?(await B(#upgrade(sa))()); 
+    await ic.start_canister({canister_id = Principal.fromActor(sa)});
+```
+How to try:
+1. Deploy 'Map'.
+2. call get_subactor_principal
+3. Open that canister in the dashboard.internetcomputer.org
+4. Call get_version
+5. Modify the version in 'Bucket'
+6. Upgrade 'Map'
+7. Call get_version again in a few seconds. It should be different.
+
+The sub actor has candid meta, which is great.
+
+-------------------------
+
+hpeebles | 2023-11-29 22:48:37 UTC | #5
+
+Whenever a proposal to upgrade an SNS controlled canister is executed, the canister being upgraded is first stopped, then upgraded, then started.
+
+This ensures that all outstanding callbacks are processed before the canister is upgraded.
+
+See the code here - https://github.com/dfinity/ic/blob/087190165198a9dc7b3c9cf80e0812c0c03964c6/rs/sns/governance/src/governance.rs#L2495
+
+When a canister is instructed to stop, it will enter the 'Stopping' status which means that it will no longer start processing new requests but will continue to process callbacks until they are all complete.
+
+-------------------------
+
+lara | 2023-11-30 10:55:07 UTC | #6
+
+Agree with what has been said here already. 
+One thing to maybe explicitly point out: this means indeed if the dapp canister has some callbacks that are never returned, then it cannot be upgraded (as it never reaches the "stopped" state after the "stopping" state. 
+
+There is a section [here](https://internetcomputer.org/docs/current/developer-docs/integrations/sns/managing/making-proposals#security-considerations-when-designing-generic-proposals) that describes a few of those risks in the context of generic proposals (so calls that the SNS governance canister would make). I think many of them also apply for dapp canisters, so maybe it would be interesting to consdier them? 
+Also let us know if we missed something in this section!
+
+-------------------------
+
+icme | 2024-01-02 03:16:22 UTC | #7
+
+Is there any plan to work on the named callbacks feature for the IC in 2024, as well as a timeout with each call + with timeout functionality?
+
+Right now this can be used to [stage an attack](https://forum.dfinity.org/t/ic-barrier-withhold-responses-for-testing-etc/9351) against a third party service, rendering it upgradeable. Therefore, safely communicating with a canister you do not own requires two one-shot (fire and forget) calls, and collaboration from both parties.
+
+Given the latency of inter-canister communication, named callbacks would be much more efficient (just requires one call instead of two).
+
+-------------------------
+
+free | 2024-01-03 17:25:55 UTC | #8
+
+I cannot speak to named callbacks (although I do believe there is no active work going on in that area right now).
+
+But we are putting together a proposal for best-effort messaging with built in timeouts. We should have more information and will be asking for community feedback soon (as in weeks).
+
+-------------------------
+
+infu | 2024-01-03 19:16:30 UTC | #9
+
+Architecture like this will prevent that. If a 3rd party canister attacks a service, it will only take down its own adapter canister and nothing else. Slows down communication, but has other benefits - the two parties involved can customise it and agree on it.
+![Screenshot 2024-01-03 at 21.04.45|690x456, 75%](upload://hJb7k6KRdzAmyGh6IJbOWuvvko.png)
+
+-------------------------
+

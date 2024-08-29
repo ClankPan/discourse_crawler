@@ -1,0 +1,550 @@
+derlerd-dfinity1 | 2022-12-07 17:37:18 UTC | #1
+
+Given that there were quite some questions regarding messaging guarantees on the IC in the global R&D today, I'm starting this thread which will provide more details (I hope by tomorrow) and can then be used as a basis for further discussion.
+
+-------------------------
+
+skilesare | 2022-12-08 02:04:29 UTC | #3
+
+I'm trying to decide if I think this is a feature or a bug with regards to one shots. I was relying on a high probability of delivery and expecting failure only in a small number of instances, most of which were predictable like upgrades or stopped canisters where I could check for missed messages in start up. Typically the one shots were confirming themselves via other one shots back to the broadcaster. If I keep this pattern then I guess I will now be able to guarantee that failure has occurred after 5 minutes and mark the item as undelivered.  
+
+This works for instances where I'm waiting for confirmation, but I can see how it is sub optimal for true fire and forget use cases as they will now fail under heavy load as opposed to only extreme and prolonged heavy load.
+
+-------------------------
+
+icme | 2022-12-08 02:33:32 UTC | #4
+
+
+
+Thanks for kicking this off @derlerd-dfinity1, and my apologies if this comes off as a bit of a rant - I was just a bit taken off guard by the request lifetime/deadlines announcement in the R&D, and it seems that several other developers had a different interpretation of the inter-canister transactional guarantees the IC has been providing.
+
+<br/>
+<br/>
+
+If a developer wants to interact with a 3rd party canister on the IC, the safest way to do so is through a one-shot call. There are several security issues with inter-canister calls if the canister you are communicating with is not blackholed, DAO controlled, or owned by you.
+https://forum.dfinity.org/t/the-biggest-problem-with-the-ic-intercanister-calls/11598
+
+An example of setting up a canister to lock out any canister that calls it was shown in this simple example 
+https://github.com/nomeata/ic-barrier 
+by @nomeata for which he then proposes one-shot or "fire-and-forget" calls as a good workaround in this blog post 
+https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters
+
+@JensGroth brought up the security issues related to inter-canister calls in this comment, saying that for this reason (non-responsive canisters) it is recommended to only talk to "trustworthy" canisters
+https://forum.dfinity.org/t/the-biggest-problem-with-the-ic-intercanister-calls/11598/8
+
+For this reason, many developers over the past year reading the forums have decided to use one-shot calls in their applications to relay messages to other canisters, as they thought that even if backed-up, there was a high probability or guarantee that they would eventually be delivered (only wouldn't be delivered if the receiving canister was deleted or the API was changed).
+
+This all changes if outgoing message are dropped after 5 minutes. That regularly happens when a canister is under heavy load or a subnet gets backed up. Just this past week, I spoke with a developer who filled up their output queue, so then they started batching transactions and built a canister load balancer to deal with the traffic and get around these output queue limitations. What seemed at the time like a good way to balance load and jump over the output queue limits, seems like it may have just ended up being a clever way to overwhelm the downstream consuming canister and drop messages just as fast (after 5 minutes of waiting in queue).
+
+However, saying that one-shot calls are unreliable and should not be used means that developers have to trust the canisters they interact with. 99% of the canisters on the IC are mutable and are not DAO controlled. Therefore, any sort of interoperability based on trust is unreasonable, and if developers are unable to rely on one-shot calls, then they have to choose between the security risk of using 3rd party canisters and the change that their one-shot call will fail/time out.
+
+<br/>
+<br/>
+
+
+It also just so happens that last week I was looking through the IC's queue code when further looking into queue limitations and found this:
+
+https://forum.dfinity.org/t/canister-output-message-queue-limits-and-ic-management-canister-throttling-limits/15972/48
+
+It looks like the queue deadline (message dropping) feature was [introduced 4 months ago](https://github.com/dfinity/ic/blame/a52bb83dd6fc99072db070ccc905478f5ce4bee4/rs/replicated_state/src/canister_state/queues.rs#L32)
+https://forum.dfinity.org/t/voting-is-open-for-a-new-ic-release-bf81563/14839
+
+At the time, I wasn't as up to speed regarding what input and output queues are, but right now this seems like a **breaking change** that should have gotten more attention. For most smaller applications, this isn't a huge deal - but most larger applications that interact with many different services (i.e. DSCVR) or process a lot of load (i.e. SNS sales) this means if the canister queues get behind or the subnet slows down not just ingress messages, but inter-canister messages can and will be lost. 
+
+It's extremely difficult to think about transactional guarantees and to implement any sort of async transactional workflow across multiple canisters, and with a lack of transactional guarantees one needs to fully flush out a [SAGA type transaction design](https://www.baeldung.com/cs/saga-pattern-microservices) in order to be able to revert distributed transactions that failed. All of a sudden, building reliable, resilient applications on the IC gets a lot harder :sweat_smile: 
+
+## Next steps?
+
+### Securing inter-canister calls without requiring trust
+It might sense to first think about how the IC can make inter-canister calls with 3rd party services safe for canisters. If there's a timeout on messages in the output queue, what about a timeout on messages being executed by a canister? We already have DTS which allows messages to span several rounds of consensus, so maybe a reasonable message should be expected to execute within 2 minutes (threshold)?
+
+### Identifying best practices and patterns for applications for handling high throughput 
+In 2023 there's a good chance that we're going to see the first IC applications go "viral". This means a lot of traffic, and hopefully dev teams are prepared (know the limitations and boundaries of the IC's scalability). 
+
+There are definitely ways to get around message dropping (implementing distributed queues for example), but this then involves adding more canisters into the architecture, more latency, more chances for failure, and more complexity. Ideally if these problems can be solved at the protocol level or certain SLA guarantees can be given about uptime/message delivery (i.e. 5 9s+), then developers can focus on building their app instead of having to worry about message delivery.
+
+-------------------------
+
+free | 2022-12-08 09:03:05 UTC | #5
+
+Thanks a lot for your posts. We hope to be able to clarify all the questions above – in particular why the introduction of timeouts is not a breaking change – with the explanation below. Also, thanks a lot for your suggestions on next steps to discuss. We like the suggestions but would propose to discuss them in separate threads.
+
+## Canister messaging guarantees
+
+The IC protocol provides two guarantees for canister-to-canister messages:
+
+1. Request ordering: Successfully delivered requests are received in the order in which they were sent. In particular, if a canister `A` sends `m1` and `m2` to canister `B` in that order, then, if both are accepted, `m1` is executed before `m2`.
+2. Guaranteed responses: Every request is guaranteed a response (either from the canister, or synthetically produced by the protocol).
+
+## (No) Guaranteed request delivery
+
+There are no guarantees regarding successful request delivery: a request may fail synchronously (e.g. if the sender’s output queue is full; or when trying to enqueue an output request when the sender subnet is at memory limit) or asynchronously (if the receiver’s input queue is full; or the receiver is stopped; or frozen; or the receiver subnet is at memory limit). If the receiving canister panics when handling the request (which may also happen in the absence of canister code bugs, e.g. canister exceeding the instruction limit or running out of memory), the effect is similar to the request never having been delivered in the first place: an asynchronous reject response.
+
+One additional potential source of request delivery failure is being added in the form of request timeouts (enabled in the release elected [this week](https://dashboard.internetcomputer.org/proposal/94953)). Apart from the exact error message, this will look the same to the caller as a full input queue at the receiving end (or the receiver having trapped; or rejected the request; or being stopped/frozen; or the receiving subnet being at limit in terms of memory). Before timeouts one would have seen errors in these cases; the only difference now is that backlogs are cleared sooner. Nothing changes from the perspective of the canisters – these failure modes needed to be handled before and they need to be handled now.
+
+There was a [blog post](https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters) introducing the concept of one-way messages, which essentially suggests ways to enable ignoring a response. This post also explicitly mentions that one-way calls can only be used if one does not care about potential failures:
+
+> “A one-way call is a call where you don’t care about the response; neither the replied data, nor possible failure conditions.”
+
+So again, in cases where one cares about potential failure modes, one needs to implement an explicit confirmation measure for such calls on the other side. Timeouts do not change anything to that. The blog post also suggests that in an example:
+
+> “Maybe you want to add archiving functionality, where the ledger canister streams its data to an archive canister. There, again, instead of using successful responses to confirm receipt, the archive canister can ping the ledger canister with the latest received index directly.”
+
+Going back to basics, we also want to note that guaranteed message delivery is impractical for a few reasons:
+
+1. It requires infinite resources at the receiving end.
+2. Even if infinite memory were available, it would lead to arbitrarily high latency.
+3. Even if a canister would be OK trading off arbitrarily high latency for guaranteed message delivery, there is no way of insulating other canisters sharing the same XNet stream from similarly high latency.
+
+-------------------------
+
+Manu | 2022-12-08 09:55:35 UTC | #6
+
+[quote="icme, post:4, topic:17154"]
+and my apologies if this comes off as a bit of a rant - I was just a bit taken off guard by the request lifetime/deadlines announcement in the R&D, and it seems that several other developers had a different interpretation of the inter-canister transactional guarantees the IC has been providing.
+[/quote]
+
+Definitely did not come across as a rant to me, I think we're all happy with your feedback and it highlighted that we need more discussion, so thanks for raising this. 
+
+So as @free explained one-way calls were never reliable. We are thinking about a solution to both get reliability and ensure that you can always update your canister, with named-callbacks. You would still upgrade your canister without stopping (like Joachim also suggests with one-way calls), so upgrading always works. But now that you have valid (named) callbacks, you can actually make things reliable, eg by retrying in the callback if you get an error back. Note that this allows you to build reliable communication, because there is a guarantee that the callback will always be called for every call.
+
+-------------------------
+
+skilesare | 2022-12-08 13:58:07 UTC | #7
+
+[quote="Manu, post:6, topic:17154"]
+So as @free explained one-way calls were never reliable. We are thinking about a solution to both get reliability and ensure that you can always update your canister, with named-callbacks. You would still upgrade your canister without stopping (like Joachim also suggests with one-way calls), so upgrading always works. But now that you have valid (named) callbacks, you can actually make things reliable, eg by retrying in the callback if you get an error back. Note that this allows you to build reliable communication, because there is a guarantee that the callback will always be called for every call.
+[/quote]
+
+I think it is important to distinguish between reliable and probable.  In the past, it was more probable that a one-shot message would be delivered under a high load. Now it will for sure die after 5 minutes.  That changes the texture of applications that are written using the methodology.
+
+It seems to me that it also creates a potential bandwidth snowball as messages are retried.  I'd be interested in an interpretation of how the network will respond here if all those cleared messages are instantly retried after the timeouts...will congestion spawn in other areas?  If those calls got backed up because they are 2MB messages, how will the network handle that load?  Is clearing out the messages quickly productive if they all just show up again?
+
+Could we request a retry without rebroadcasting all the data in the message again?
+
+How do these timed-out messages get their cycle cost calculated?  Who ends up paying for them? Is there any cycle cost?
+
+Just some random questions as I think through this.
+
+-------------------------
+
+icme | 2022-12-08 14:09:16 UTC | #8
+
+[quote="free, post:5, topic:17154"]
+Going back to basics, we also want to note that guaranteed message delivery is impractical for a few reasons:
+
+1. It requires infinite resources at the receiving end.
+2. Even if infinite memory were available, it would lead to arbitrarily high latency.
+3. Even if a canister would be OK trading off arbitrarily high latency for guaranteed message delivery, there is no way of insulating other canisters sharing the same XNet stream from similarly high latency.
+[/quote]
+
+This makes perfect sense. 100% guaranteed message delivery does feel impractical from an engineering standpoint, and would definitely end up bogging down the network - either through one-shots or awaited calls. However, it's common for applications to handle brief spikes in traffic where a queue or the network will temporarily get behind - while it's convenient for the network to throw away requests, developers who are focused on a top-tier end user experience need to build in excess capacity to handle "reasonably expected" spikes in traffic and to hold onto backlog for a certain amount of time.
+
+
+Awaiting calls then imposes its own throughput constraints via [canister output queue limitations](https://forum.dfinity.org/t/canister-output-message-queue-limits-and-ic-management-canister-throttling-limits/15972).
+
+[quote="Manu, post:6, topic:17154"]
+But now that you have valid (named) callbacks, you can actually make things reliable, eg by retrying in the callback if you get an error back.
+[/quote]
+
+Is this live? Are there any implementation examples in Rust or Motoko?
+
+What about the case where awaiting on a call from a 3rd party canister that is stalled?
+
+-------------------------
+
+free | 2022-12-08 14:31:58 UTC | #9
+
+[quote="skilesare, post:7, topic:17154"]
+It seems to me that it also creates a potential bandwidth snowball as messages are retried. I’d be interested in an interpretation of how the network will respond here if all those cleared messages are instantly retried after the timeouts…will congestion spawn in other areas? If those calls got backed up because they are 2MB messages, how will the network handle that load? Is clearing out the messages quickly productive if they all just show up again?
+[/quote]
+
+What is currently implemented is timing out of requests in canister output queues. These messages never made it out of the canister state, so there cannot be any effect on the network.
+
+The worst possible outcome of canisters naively retrying said requests is the canister ending up in the exact same situation: the same messages, with different deadlines, enqueued in the output queue.
+
+[quote="skilesare, post:7, topic:17154"]
+Could we request a retry without rebroadcasting all the data in the message again?
+[/quote]
+
+Per the above, the payload never left the canister (much less been broadcast). Retrying the request would mean making the exact same request again, with the same payload.
+
+[quote="skilesare, post:7, topic:17154"]
+How do these timed-out messages get their cycle cost calculated? Who ends up paying for them? Is there any cycle cost?
+[/quote]
+
+The sender already paid for the request. This could make naive retries very costly.
+
+-------------------------
+
+derlerd-dfinity1 | 2022-12-08 15:30:10 UTC | #10
+
+[quote="icme, post:8, topic:17154"]
+Awaiting calls then imposes its own throughput constraints via [canister output queue limitations ](https://forum.dfinity.org/t/canister-output-message-queue-limits-and-ic-management-canister-throttling-limits/15972).
+[/quote]
+
+Note that if you are doing one-shot messages as described in the blog post linked above, then this will result in exactly the same constraints on output queues as with awaiting. This is because for every request, when put into an output queue, there is a slot reserved in the corresponding input queue. This slot can not be used until the reply arrives and is then consumed once the reply arrives. So--if I understand correctly--the approach to one-shot messages from the blog essentially allows canisters to tell the IC they don't care about the reply but the protocol still waits for the reply and then delivers it. The only difference is that the canister will panic and therefore not change its state when the reply arrives because an invalid callback id is passed upon making the call. 
+
+[quote="icme, post:8, topic:17154"]
+Is this live? Are there any implementation examples in Rust or Motoko?
+[/quote]
+
+As far as I know there were some rough discussions about this, but nothing close to an implementation.
+
+[quote="icme, post:8, topic:17154"]
+What about the case where awaiting on a call from a 3rd party canister that is stalled?
+[/quote]
+
+If one does one-shot messages and the 3rd party canister sends back one-shot ack messages this would still work (as also suggested in the blog post). When awaiting I can currently not think of any solution.
+
+-------------------------
+
+skilesare | 2022-12-08 15:32:48 UTC | #11
+
+Does this solve upgrades since everything will time out after 5 minutes?  Or at least if you put an if(halt ==true){asset(false)} at the top of all your update functions that allows you to quick return, would it at least eventually time out all outstanding requests even if a malicious canister were holding you hostage?
+
+I guess another way, is the limit for being held hostage now 5 minutes per request?
+
+-------------------------
+
+derlerd-dfinity1 | 2022-12-08 15:45:01 UTC | #12
+
+Unfortunately not. Only requests in output queues that didn't make it into the subnet-to-subnet streams are timed out. This is because as soon as a message is in a stream others have seen it and we don't know whether they have started processing it at the destination or not. Responses don't time out at all. Would be an interesting direction to further explore, though.
+
+
+Another idea that once came up to solve the upgrade problem was to limit the depth of the call graph -- so similar to the limit on the number of hops a message can take when being routed through the internet -- a request could also define how many "hops" it can make (i.e., how deep the call graph can become). This would prevent a malicious canister from going into an endless loop using self calls as the "hop" limit would be exceeded at some point. One would, however, also have to think very carefully about whether this really solves all problems. But this is also an interesting direction to explore.
+
+-------------------------
+
+skilesare | 2022-12-08 16:59:43 UTC | #13
+
+Does this intersect with time slicing at all? I'm guessing from the previous response that the answer is no...but wanted to double-check. If the message is accessed then it gets processed even if we get to Nx time-slicing even if Nx is greater than 5 minutes.
+
+-------------------------
+
+skilesare | 2022-12-08 23:04:43 UTC | #14
+
+Is this an example of this:
+Server returned an error:
+
+Code: 400 ()
+Body: Specified ingress_expiry not within expected range:
+Minimum allowed expiry: 2022-12-08 22:44:43.809049592 UTC
+Maximum allowed expiry: 2022-12-08 22:50:13.809049592 UTC
+Provided expiry: 2022-12-08 22:44:01.591 UTC
+Local replica time: 2022-12-08 22:44:43.809050223 UTC
+
+Run the say function with "45" and wait a good long while:
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=2873682518
+
+I was trying to experiment with trying to do some awaits in parallel with futures and figuring out how many I could batch together. With the following code I could do 30 but not 45:
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3936143898
+
+So I tried the first one expecting it to take a long time, but not to fail...maybe this is just the response being rejected by the boundary node for being to slow?
+
+I'm surprised I haven't seen this before...maybe the proxy only lets requests take a certain amount of time?  likely the update function actually would have run?
+
+Update: I ran it with DFX and it eventually ran...I added a tracker var to confirm that the state was being updated:  https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3491669831
+
+So maybe this is just a strange thing with the playground? I have confirmed that even thought the playground gives the above error that the updated did run and increment the tracking variable.
+
+-------------------------
+
+levi | 2022-12-08 23:54:20 UTC | #15
+
+@derlerd-dfinity1 
+The complete solution is this:
+[quote="Manu, post:6, topic:17154"]
+a solution to both get reliability and ensure that you can always update your canister, with named-callbacks.
+[/quote]
+@Manu @free 
+Is there someone specific that can make the name-callbacks feature happen?
+I am building a system where each user gets a smart contract that can talk with other smart-contracts using the system's communication-standard. One of the points, is that anyone/company/other-services can write their own smart-contract that implements the communication-standard and be compatible with all of the user-smart-contracts in the original-service, and that user-smart-contracts can be owned and controlled by the users with opt-in upgrades. For now, when calling other canisters, the user-smart-contracts go through a special safe-caller canister that first replies to the user-canister, then awaits the call, then calls a "callback"-method on the user-canister. This makes sure that the user-canister is always upgrade-able, but the final callee in this way does not know the original caller. We don't want the callee to have to trust the safe-caller(for who the original-caller is) because that would make inconsistencies for who the original caller is, where some canisters trust the safe-caller and some don't, and some go through it to call other canisters and some don't. Conclusion: let's get the name-callbacks feature moving so canisters can make direct calls to each other in a safe way.
+
+-------------------------
+
+skilesare | 2022-12-09 00:01:13 UTC | #16
+
+As I've programmed with one shots it has occurred to me that there is a version of the IC in an alternate universe that ONLY allows one shots and that forces much simpler, safer, and well thought out code.
+
+If we had gotten the panacea of orthogonal persistence that we thought we were going to get then the headaches of managing async message would have been unthinkable, but given that IC development is as difficult as it is, I'm not sure that asking users to manage their message flow would have been a heavy lift.
+
+-------------------------
+
+derlerd-dfinity1 | 2022-12-09 07:16:39 UTC | #17
+
+[quote="skilesare, post:13, topic:17154"]
+Does this intersect with time slicing at all?
+[/quote]
+
+No. As soon as a message leaves an output queue it can no longer time out. 
+
+[quote="skilesare, post:14, topic:17154"]
+Is this an example of this:
+Server returned an error:
+
+Code: 400 ()
+Body: Specified ingress_expiry not within expected range:
+Minimum allowed expiry: 2022-12-08 22:44:43.809049592 UTC
+Maximum allowed expiry: 2022-12-08 22:50:13.809049592 UTC
+Provided expiry: 2022-12-08 22:44:01.591 UTC
+Local replica time: 2022-12-08 22:44:43.809050223 UTC
+[/quote]
+
+No, this is unrelated. What the error seems to say is that an ingress expiry smaller than the minimum ingress expiry was provided. @chenyan do you know how the error above could happen in the playground?
+
+-------------------------
+
+Manu | 2022-12-09 08:20:04 UTC | #18
+
+[quote="levi, post:15, topic:17154"]
+Conclusion: let’s get the name-callbacks feature moving so canisters can make direct calls to each other in a safe way.
+[/quote]
+
+Yes, this is high on our list. The relevant team for this spent a lot of time on the Bitcoin integration, and we're about to open up a higher replication subnet to the public (with cost scaled linearly). Other things we're working on is ensuring good subnet performance with many (say 100k) canisters, and then we have some heavily requested features that we want to pick up next, like the ability to install larger wasms and the named callbacks for safe upgrades. So it will take some time, but i hope you agree that all the things the team is working on are useful :).
+
+-------------------------
+
+GLdev | 2022-12-09 09:15:07 UTC | #19
+
+[quote="derlerd-dfinity1, post:17, topic:17154"]
+No. As soon as a message leaves an output queue it can no longer time out.
+[/quote]
+
+Is it possible to "simply" check the timestamp at the canister level? From what I understand the undefined behavior only happens when the canister receives a response that might call into a function that's no longer there after the upgrade, and thus calling into some random memory. 
+
+Could this not be prevented by checking a timestamp on the response and drop it if it's 5min+ old? 
+
+This way canister operators could put their canister in "maintenance mode" where outgoing calls are no longer possible, wait 5min (or whatever timeout gets implemented) and then upgrade safely.
+
+edit: alternatively, as a "slot" on the incoming queue is reserved for every outgoing message, could this logic be applied on the queue as well? Check if the reservation was made 5min+ ago, if so drop. 
+
+(I'm just asking, I'm not really aware of what such an approach would entail on the technical side)
+
+-------------------------
+
+derlerd-dfinity1 | 2022-12-09 10:50:57 UTC | #20
+
+Note that one can never be sure that a message will time out after 5 minutes. Timeouts are (currently) only applied while a message is in the output queue. However, as long as there is space in the respective subnet-to-subnet stream, messages will be routed into the stream at the end of each execution round and from then on no longer time out.
+
+-------------------------
+
+GLdev | 2022-12-09 11:30:15 UTC | #21
+
+Right. I guess a better question would have been "is this technically possible / feasible"? Additionally, would it help, or would it break other promises that the protocol is based on?
+
+-------------------------
+
+free | 2022-12-09 15:11:39 UTC | #22
+
+It would definitely be possible technically to time out responses. Problem is, it would break canister messaging guarantee #2:
+
+[quote="free, post:5, topic:17154"]
+Guaranteed responses: Every request is guaranteed a response (either from the canister, or synthetically produced by the protocol).
+[/quote]
+
+In the current implementation (and specification) this is interpreted as "exactly one response is produced for any request (whether by the destination canister if possible, or else by the protocol) and that exact response is delivered to the originator.
+
+End-to-end message timeouts would mean the possibility of delivering a different response from the one produced by the callee. And that is a much bigger nut to crack than just timing out requests that never left the canister. Among other things, there are applications that depend on this behavior for correctness: a reject response of any kind is a guarantee that the callee did not process the request, whether that is because it was never delivered, or because the callee trapped while processing it.
+
+Do note though that this is not as solid a guarantee as it may look like: if the callee does a downstream call of its own; then the callee processes two independent messages (the original request and the downstream response); if it then panics while handling the latter, only the mutations made by that are rolled back; any mutations made as part of handling the first message are persisted. And regardless of how careful one is with how they code their canister, the system may cause a canister to panic for something as minor as failing to allocate one byte of heap.
+
+-------------------------
+
+chenyan | 2022-12-10 04:52:33 UTC | #23
+
+I suspect it's the status polling message from `agent-js`. We keep sending the request status message until we get the response from IC. We probably never update the timestamp for the request status. When the call takes longer than 5min to finish, we get this error. But the call is still progressing.
+
+-------------------------
+
+bitbruce | 2022-12-10 14:18:04 UTC | #24
+
+As a developer, it is acceptable to not have full messaging guarantee (if it is difficult to achieve 100%).
+
+However, it is important to explicitly list the cases in which the messaging guarantee will not be met. Also, make sure that try... . catch catches all errors.
+
+We are developing ICTC by accepting that the system has no messaging guarantee and introducing the Saga model again at the business layer so that it can be handled by the manager/DAO in case of an exception.
+Now the issue encountered is that try... .catch cannot catch all errors, so ICTC will fall into invalidation in special cases.
+
+-------------------------
+
+derlerd-dfinity1 | 2022-12-11 07:23:04 UTC | #25
+
+Thanks for bringing this up, @bitbruce. I think the issue you are mentioning is related to Motoko's handling of synchronous (not caught by try/catch) vs. asynchronous (caught by try/catch) errors. IIUC there was some discussion in the Motoko team around this issue but I'm not aware of any conclusions. Could you maybe comment @claudio?
+
+-------------------------
+
+claudio | 2022-12-11 15:07:58 UTC | #26
+
+We've shipped the new 'async*'/'await*' feature in Motoko 0.7.4 to reduce the pressure on the self-send queue when abstracting out asynchronous code.
+
+I'm now actively working on turning synchronous send failures into catchable errors (exceptions) but that's trickier than I expected so will take another week or so.
+
+If I can't make that work, some fallbacks would be to set an internal  flag and allow the user to test the flag with a primitive and/or record the failure in the async value (thrown eagerly on await), though the latter is no use for one way messages and blurs the commit point.
+
+-------------------------
+
+icme | 2023-02-05 20:31:26 UTC | #27
+
+I wanted to pick up the priority of this named callbacks feature now that the Bitcoin integration work seems to be winding down.
+
+Enable this will further incentivize project teams to collaborate with one another and more easily trust communication with 3rd party canister services on the IC.
+
+A lack of this is bogging down applications and requiring them to devise temporary inefficient and wasteful syn-ack style protocols on top of the IC.
+
+I see the named callbacks feature creeped back onto the roadmap at some point (correct me if I’m wrong here), but it would be great to get a sense of the urgency and prioritization at DFINITY around its delivery.
+
+-------------------------
+
+dsarlis | 2023-02-06 09:12:48 UTC | #28
+
+@icme Thank you for bringing this up again and reinforcing its importance.
+
+I'd like to make clear that we're quite aware of the issues this problem creates when integrating with 3rd party canisters and we understand it's blocking certain use cases -- this is why we have indeed bumped it up our priority list (if you check out Sam's [last roadmap update](https://forum.dfinity.org/t/update-on-the-ic-roadmap-december-2022-summary/17415), you'll see it there, it's listed as "Safe canister upgrades").
+
+As you mentioned, I expect that now that the BTC integration tail work is wrapping up, the execution team will have the cycles to pick this up soon.
+
+-------------------------
+
+timo | 2023-02-27 08:53:15 UTC | #29
+
+[quote="free, post:5, topic:17154"]
+The IC protocol provides two guarantees for canister-to-canister messages:
+
+1. Request ordering: Successfully delivered requests are received in the order in which they were sent. In particular, if a canister `A` sends `m1` and `m2` to canister `B` in that order, then, if both are accepted, `m1` is executed before `m2`.
+2. Guaranteed responses: Every request is guaranteed a response (either from the canister, or synthetically produced by the protocol).
+[/quote]
+
+Does the order guarantee extend to the responses as well?
+
+I am looking at the following situation: Canister `A` sends `m1` and `m2` to canister `B` in that order. Both are delivered and executed. Let's assume `B` responds during the execution of each them (instead of waiting and responding later). Is it then guaranteed that `A` receives and executes on the response to `m1` before the response to `m2`?
+
+In general, `B` could make subsequent inter-canister calls to different canisters while executing `m1` and `m2`, then suspend execution, await the responses of the subsequent calls, and then respond to `A` only during the continuation. In that case, the responses to `m1` and `m2` could be generated (scheduled) out of order. But for the sake of this question I am assuming that does not happen. I am assuming that the responses are _generated_ in order. The question is if the responses are then also guaranteed to be _delivered_ in order, just like the calls were.
+
+A second question is if there are any other scenarios than the one given above, which involves subsequent inter-canister calls, that could lead to responses being scheduled out of order.
+
+-------------------------
+
+free | 2023-02-27 09:54:00 UTC | #30
+
+In practice (and in most situations) responses will be delivered in the order in which they were produced. So in particular, your first example, of two requests, `m1` and `m2`, that each produce responses before triggering any downstream canister calls, the responses will be delivered in the same order. What the implementation does, is that for every successful message execution, all downstream requests and any response are enqueued onto per destination FIFO queues. And since canisters are single threaded actors, messages to a given canister (requests and responses) will be enqueued in the order in which they were produced (not sure about the ordering of requests and the response generated within one message execution).
+
+However: the spec only guarantees in-order delivery of requests, not of responses. So while the implementation currently retains the ordering of both requests and responses, we only provide a guarantee that this will not change for requests. E.g. as part of subnet splitting, which we're currently working on, we are going to great lengths (and paying a significant price both in terms of complexity and latency) to ensure that requests will still be delivered in order even if the original subnet still has a backlog of requests to deliver while the canisters have already started up on the new subnet. This will not be the case for responses.
+
+Also, in the future, we may consider having separate streams for requests and responses, meaning that the response for `m2` may be delivered before a request triggered by `m1`. Or the other way around. We may choose to deliver responses entirely out of order (e.g. optimize for throughput and deliver smaller responses first). So I would definitely not rely on response ordering for correct functioning of your application.
+
+Honestly, if it were up to me, I would also drop request ordering guarantees. Message ordering (request and/or response) can be trivially implemented by a library and, as said, it imposes significant opportunity costs on the protocol implementation. And I seriously doubt that most canisters require it for correctness. E.g. IIRC the ICP ledger currently relies on it, but it would work just as well with unordered, unique transaction identifiers instead.
+
+Out of curiosity, what's the use case that would require in-order delivery of responses? I cannot really think of one.
+
+-------------------------
+
+timo | 2023-02-27 10:54:35 UTC | #31
+
+Ok, understood that I can't rely on response ordering. Might be good to explicitly say it in the spec because some readers may be wondering.
+
+[quote="free, post:30, topic:17154"]
+Honestly, if it were up to me, I would also drop request ordering guarantees.
+[/quote]
+
+From the perspective of the application programmer (not the one having to implement the protocol) I strongly disagree. We already have very limited guarantees, only the two that you mentioned. And getting asynchronous communication right with only those two is already incredibly hard. I would expect that most ad-hoc written protocols will end up being buggy unless they are formally verified or at least have a proof written down, just because it is so easy to make mistakes. Or, all that has to be hidden in libraries.
+
+I find the ordering guarantee extremely helpful. It reduces the space of designs and edge cases from completely open (like IP) to something ordered (like TCP). I often like to think about canisters as embedded systems (for other reasons, simply because of the resource constraints and the need to think about provable memory bounds). But staying in that picture, the communication between two canisters is then like a wire/serial interface between two chips. The kind of protocols that you write in that context can rely on ordering. Bytes may get lost/skipped but not re-ordered. 
+
+[quote="free, post:30, topic:17154"]
+Out of curiosity, what’s the use case that would require in-order delivery of responses? I cannot really think of one.
+[/quote]
+
+I am programming against the ICRC1 interface. My canister is a client of the ICRC1 ledger. Users can make deposits into dedicated subaccounts of my canister at any point in time. My canister calls `transfer` to transfer out of those subaccounts and then `balance` in that order. If I have ordering of responses then I can trivially detect user deposits even if they came in concurrently. Without ordering of responses it seems at least more complicated. I will see. I am trying to avoid more rounds of calls (expensive) or waiting with locks (latency, risky).
+
+-------------------------
+
+free | 2023-02-27 11:53:12 UTC | #32
+
+Do note that if you don't have full control over the canister that produces the responses, any response ordering guarantees provided by the protocol could be meaningless. That canister may make arbitrary downstream calls of its own (or start doing so following an upgrade) and produce a response arbitrarily late. So it is only in the very limited case of two tightly controlled canisters that you would be able to meaningfully rely on response ordering.
+
+As with guaranteed response delivery, the actual usefulness of message ordering guarantees is limited to a very, very constrained design space. And there are pitfalls aplenty. E.g. even if a `transfer` request is guaranteed to be delivered before a `balance` request, in the presence of downstream canister (or system API) calls, it may well be that the latter request is executed before (most of) the former. This would be very much visible if the CDK forced canister developers to use explicit callbacks to handle canister responses. But an `await` buried deep within some library function is much too easy to miss. AFAICT, these guarantees are more of a footgun to the average developer than anything.
+
+-------------------------
+
+Maxfinity | 2023-02-27 17:07:11 UTC | #33
+
+[quote="timo, post:31, topic:17154"]
+I find the ordering guarantee extremely helpful. It reduces the space of designs and edge cases from completely open (like IP) to something ordered (like TCP). I often like to think about canisters as embedded systems (for other reasons, simply because of the resource constraints and the need to think about provable memory bounds). But staying in that picture, the communication between two canisters is then like a wire/serial interface between two chips. The kind of protocols that you write in that context can rely on ordering. Bytes may get lost/skipped but not re-ordered.
+[/quote]
+
+May be worth mentioning Timo, that we are implementing a protocol for withdrawals and deposits. Canisters can inherit this protocol freely using the canister_sdk. We would welcome your feedback. Seems similar to what you are working on. 
+
+https://github.com/infinity-swap/canister-sdk/compare/main...maxim/CPROD-1541
+
+-------------------------
+
+lshoo | 2023-05-08 08:41:49 UTC | #34
+
+I got similar error when I redeploy my old project with Rust recently
+```
+Installing canisters...
+Error: The replica returned an HTTP Error: Http Error: status 400 Bad Request, content type "text/plain", content: Specified ingress_expiry not within expected range:
+Minimum allowed expiry: 2023-05-08 08:38:29.045786880 UTC
+Maximum allowed expiry: 2023-05-08 08:43:59.045786880 UTC
+Provided expiry:        2023-05-08 04:22:21.415577847 UTC
+Local replica time:     2023-05-08 08:38:29.045787761 UTC
+```
+How to fix that？
+
+-------------------------
+
+Severin | 2023-05-08 09:05:52 UTC | #35
+
+This means your system's time is not in sync with the IC's time. If you rest your system's time to something close to correct you should be good to go
+
+-------------------------
+
+icme | 2023-05-30 21:48:19 UTC | #36
+
+[quote="Manu, post:6, topic:17154"]
+We are thinking about a solution to both get reliability and ensure that you can always update your canister, with named-callbacks. You would still upgrade your canister without stopping (like Joachim also suggests with one-way calls), so upgrading always works. But now that you have valid (named) callbacks, you can actually make things reliable, eg by retrying in the callback if you get an error back. Note that this allows you to build reliable communication, because there is a guarantee that the callback will always be called for every call.
+[/quote]
+
+:wave: Just wanted to bump this up, as I currently want to integrate with a 3rd party canister but am wary of the risks involved. It's resulting in me designing a double-oneshot proxy canister, which is a bit overkill when just a simple inter-canister call request timeout would suffice.
+
+Any progress or timeline on the named callbacks feature?
+
+-------------------------
+
+dsarlis | 2023-06-02 07:01:13 UTC | #37
+
+@icme I've been meaning to start a forum thread where we can discuss named callbacks and a few other alternatives we've been pondering that can address the problem of integrating with a 3rd party canister safely (spoiler alert: I believe the named callbacks is the right step now but I want to make sure we have buy in from the community and that we are not missing another approach that would be more preferable). Unfortunately, I've been working on this on and off due to other responsibilities but I'll try to get it going by the end of next week.
+
+As for timeline: I'm not sure if we can commit to strict estimates given other work that's on the team and has also been requested highly by the community, but I expect that it'll be O(months) to get support in the replica (assuming we're talking about the named callbacks solution here) not O(weeks) so I would suggest to plan accordingly.
+
+-------------------------
+
+domwoe | 2023-05-31 08:07:24 UTC | #38
+
+Tagging @levi because I know you've been eagerly waiting as well :)
+
+-------------------------
+
+skilesare | 2023-05-31 12:09:00 UTC | #39
+
+We have this built in motoko: https://forum.dfinity.org/t/assigned-icdevs-org-bounty-39-async-flow-one-shot-motoko-6-000/17901
+
+It is also being ported to rust at the moment.
+
+I think this pattern is much safer when building with third party canisters as it segments where your state changes and forces you to think in an async manner. It also provides an economic lever for managing cycles as an ack can come loaded with cycles to pay for the op.(this is nice in some use cases)
+
+I'm not saying we don't need names callbacks, but hopefully in the meantime this can simplify and standardized development.
+
+Sample: https://github.com/fury02/example-async-data-deliveries
+
+-------------------------
+
+levi | 2023-06-01 17:14:08 UTC | #40
+
+@domwoe "eagerly waiting" are the wrong words for what I’m doing. 
+
+When this feature comes I will use it in the CYCLES-TRANSFER-STATION.
+
+-------------------------
+

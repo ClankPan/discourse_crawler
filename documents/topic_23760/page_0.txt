@@ -1,0 +1,396 @@
+lastmjs | 2023-10-15 00:37:02 UTC | #1
+
+## TLDR
+
+I would like to propose that the Internet Computer System API be changed to enable better support for interpreted languages.
+
+The protocol should be upgraded with System APIs that do the following:
+
+1. Dynamic registration of canister methods
+2. Reading of the custom Wasm metadata section
+
+This would allow interpreted language CDKs to forego shipping a Rust/C++/etc environment to the end-developer's machine, as canister methods could be registered at runtime and the interpreted source code could be read during init/post_upgrade from the custom metadata section.
+
+All of this is to avoid having to compile a Wasm binary on the end-developer's machine, which is the source of many complications for the end-developer and the CDK team.
+
+## Background Information
+
+Demergent Labs is developing Azle (TypeScript and JavaScript CDK) and Kybra (Python CDK). Because these languages are generally enabled by interpreters, a lot of our work is dealing with enabling interpreters to function on the IC. The IC is lacking certain functionality to enable interpreted language CDKs to run at their simplest.
+
+Two of the biggest problems we are facing with Azle and Kybra are long compile times and complicated automated environment setups.
+
+The current architectures of Azle and Kybra essentially take an existing JavaScript or Python interpreter and compile them into Wasm, currently using a Rust canister to enable this. Shipping a Rust environment to the developers' computers is thus necessary. This causes a large amount of complication and headache for developers and ourselves, as we must deal with the complexities of installing Rust across various operating systems and OS architectures.
+
+Unfortunately there is no way that I know of to get around shipping this Rust environment to the developers' machines. And Rust is not the important piece, it's the fact that the Wasm binary requires the canister methods to be exported in the binary. This requires a Wasm compilation.
+
+There are a few things I've tried to get around this. I've tried manipulating the binary with tooling to add the exported methods after the binary has been compiled. This is complicated, inelegant, and error-prone. I've thought about sending the source code in the init/post_upgrade params, but the code could easily be bigger than 2MiB (I suppose gzipping could help), and we would also be permanently changing the init/post_upgrade params for developers, possibly causing confusion and making deployments difficult.
+
+We could also consider not using init/post_upgrade and using some kind of custom initialization process (just a canister update method), but this is not desirable as then Azle/Kybra deploy semantics would deviate from all other CDKs. Kybra already does something similar to chunk-upload its Wasm binaries, and we have to explain to devs these differences, which doesn't seem desirable.
+
+The goal is to be able to ship an already-compiled Wasm binary with the interpreter and all necessary initialization code in it. Then we would allow the JavaScript or Python code to dynamically register its methods during init/post_upgrade. We also need a way to load the static JavaScript and Python code during the init and post_upgrade method execution, as that's where the interpreters are initialized and the source code executed.
+
+I would like to propose a solution to this problem at a high level, and I would like to solicit feedback. I would love to know if anyone can think of a simpler way to accomplish this, because there is none that I know of. The Wasm binary must be compiled to get the canister methods exported. This requires a compiler toolchain like Rust/C++. This is to be avoided because of the complications it brings.
+
+The protocol should be upgraded with System APIs that do the following:
+
+1. Dynamic registration of canister methods
+2. Reading of the custom Wasm metadata section
+
+For example, imagine methods such as `ic0.register_query_method`, `ic0.register_update_method`, `ic0.register_heartbeat_method`, `ic0.custom_metadata_read`.
+
+If we had access to these System APIs, we could ship a pre-compiled Wasm binary. This wouldn't require shipping a Rust environment to the developers' machines, and compilation should become extremely fast. In Azle's case, we would only need to transpile their TypeScript/JavaScript, write to the custom metadata section, and deploy the binary again. For Kybra this would be even faster.
+
+After implementing these new System APIs interpreted language CDKs should be much simpler for developers to install, and compilation would be almost instant...perhaps we could even then enable hot module swapping.
+
+@ulan @roman-kashitsyn @ielashi @Manu @dsarlis @skilesare @bogwar
+
+-------------------------
+
+Sormarler | 2023-10-15 01:26:20 UTC | #2
+
+Dfinity should definitely support anything that improve DEVex.
+
+-------------------------
+
+dsickles | 2023-10-15 05:18:10 UTC | #3
+
++1. A story: The first bytecode added to the JVM after initial release was called invokedynamic (Java 7). It was added to enable better performance for, and simplify the implementation of, dynamic languages on the JVM. https://www.baeldung.com/java-invoke-dynamic 
+Something roughly analogous, with the same aim at the IC level as Jordan has proposed would be valuable even beyond what Demergent Labs is doing. Invokedynamic has turned out to be useful to statically typed JVM languages including Java.
+
+-------------------------
+
+rossberg | 2023-10-15 07:49:33 UTC | #4
+
+How do you envision reliably checking backwards compatibility of public interfaces under this approach? Not breaking clients is a central promise of the IC ecosystem.
+
+> we would only need to transpile their TypeScript/JavaScript, write to the custom metadata section, and deploy the binary again
+
+Wow, that would be the ultimate abuse of custom sections. It's absolutely not what they are meant for. What you have is _data_, not metadata.
+
+It sounds like that part of your request is merely about updating a program as data. So why can't you _store_ it as regular data in the canister, or some asset canister, and update it by regular means, i.e., messages?
+
+-------------------------
+
+sea-snake | 2023-10-15 11:24:11 UTC | #5
+
+So as far as I'm able to understand, you'd like to have a single wasm binary that doesn't need to be recompiled to add additional methods.
+
+First thing that comes to mind would be writing a very basic hello world Rust dapp with a few methods, compiling it to wasm and then converting it to wat to see how the query/call methods are defined in wasm. 
+
+After that it might be possible to implement a single Rust method without query/call annotation within the dapp as entry for all query/call methods that will be added to the binary wasm by the canister code itself.
+
+The canister would basically hold the wasm bytes in memory, modify it to add instructions (concat some bytes for each method at position X)  and then install it to itself.
+
+I'm not sure if a canister can also update its own did definition in the metadata section, to make sure external canisters know about the changed/added/removed methods.
+
+Edit:
+
+After reading the OP again, in whole, seems you already tried this 😅
+
+-------------------------
+
+skilesare | 2023-10-15 20:19:33 UTC | #6
+
+[quote="rossberg, post:4, topic:23760"]
+How do you envision reliably checking backwards compatibility of public interfaces under this approach? Not breaking clients is a central promise of the IC ecosystem.
+[/quote]
+
+It could be append only. 😬 Wouldn't this kind of model an EVM on top of a canister? Maybe @Maxfinity can comment on how they are doing this kind of thing(I'd guess rpc calls sent to the http_request endpoint?)
+
+In fact maybe this is a way to do this now that we have vetkeys? I thought I saw something about being able to use it as a kind of signing key....since it would be used for short term auth it may be sufficient security. Just push everything though http and route it where you want. Provided you can confirm a signature to an issued key to a path (principal) with out revealing the key you can just put a signature in the header and use a nonce for ordering. 
+
+A different schema, but one that would make a hell of a lot more sense to a regular web2 dev.
+
+-------------------------
+
+abk | 2023-10-16 09:38:46 UTC | #7
+
+At a first glance this seems like a rather heavy way to achieve the goal of deploying Typescript/Python canisters with the same pre-compiled wasm code. It seems to me like that should already be possible with the current infrastructure by having all the python/typescript code in the wasm's data section (or dynamically loading it into memory) and then having a single exported method in the wasm which invokes the main function of the python or typescript.
+
+Have you tried out something like that before?
+
+-------------------------
+
+Maxfinity | 2023-10-16 10:19:31 UTC | #8
+
+[quote="skilesare, post:6, topic:23760"]
+It could be append only. :grimacing: Wouldn’t this kind of model an EVM on top of a canister? Maybe @Maxfinity can comment on how they are doing this kind of thing(I’d guess rpc calls sent to the http_request endpoint?)
+[/quote]
+
+Yes, this seems very similar to what we are doing through the EVM. Store the program as data on the canister, then call  a generic endpoint such as send_raw_transaction with the contract name as an argument for that function. This would be a good approach in general now that the subnet size has increased, but requires a lot to setup.
+
+-------------------------
+
+lastmjs | 2023-10-16 14:08:31 UTC | #9
+
+[quote="rossberg, post:4, topic:23760"]
+How do you envision reliably checking backwards compatibility of public interfaces under this approach? Not breaking clients is a central promise of the IC ecosystem.
+[/quote]
+
+First off I would point out that as far as I know and to a certain extent, Candid is not a part of the System API. That doesn't mean we shouldn't care about backwards compatibility.
+
+To solve this problem (just one idea) we should probably standardize a dynamic means of retrieving the Candid file. Wouldn't that solve the problem?
+
+Either we standardize a certain canister method (like the current get tmp hack thing) or we create a System API that allows for the Candid metadata to change, or the Candid becomes part of the canister settings, or something else...not sure.
+
+If this were implemented right now clients could ask for the current Candid in a method call.
+
+-------------------------
+
+lastmjs | 2023-10-16 14:11:23 UTC | #10
+
+Maybe you meant checking backwards compatibility during the dynamic changing of the canister methods...I personally don't think it's that important, and it should definitely be optional. Candid isn't even part of the System API so not sure it should be addressed here.
+
+If this functionality is desirable couldn't it just be done the same way it is now, just inside of the canister? Each CDK could check a suggested change against the current Candid stored in the Canister, and provide a warning to the developer in response to a call to change the canister methods.
+
+-------------------------
+
+lastmjs | 2023-10-16 14:15:23 UTC | #11
+
+[quote="rossberg, post:4, topic:23760"]
+It sounds like that part of your request is merely about updating a program as data. So why can’t you *store* it as regular data in the canister, or some asset canister, and update it by regular means, i.e., messages?
+[/quote]
+
+Yes I just need a way to get this data in and the metadata section seemed like it would work.
+
+The problem is how to get the source code into the canister during init and post_upgrade so that developers deal with the same init and post_upgrade semantics as for Motoko and Rust canisters. Otherwise, init and post_upgrade wouldn't be the atomic initialization steps, as another update call would be required to finish initialization.
+
+The problem is, how do we get the source code into the init and post_upgrade calls so that the interpreter can be fully initialized by the end of the execution of those methods. The only way I see to do it without a protocol change is in the params, but that is very undesirable.
+
+-------------------------
+
+lastmjs | 2023-10-16 14:20:26 UTC | #12
+
+If I understand what you're suggesting it would make JavaScript/Python and other interpreted language canisters function fundamentally different from compiled languages. As in clients wouldn't be able to invoke query or update calls directly by name, they'd have to call one single exported canister method to invoke any other methods in the canister.
+
+If we want interpreted canisters to fundamentally break out of the current Candid service paradigm then yes things could work now, but I'm trying to preserve the same paradigm as other canisters.
+
+-------------------------
+
+rossberg | 2023-10-16 14:31:58 UTC | #13
+
+[quote="lastmjs, post:11, topic:23760"]
+The problem is how to get the source code into the canister during init and post_upgrade
+[/quote]
+
+But you wouldn't even need to do a canister upgrade in that design. Instead, you'd use your own message protocol entirely for updating user programs. You'd only need a canister upgrade if you wanted to upgrade the interpreter itself for some reason.
+
+That in fact would sound like a big plus to me, since canister upgrades are much hairier than mere update messages. We only do upgrades because we have to with compiled code. Interpreted code doesn't have that problem.
+
+-------------------------
+
+lastmjs | 2023-10-16 14:43:03 UTC | #14
+
+I see, but this would make interpreted languages depart greatly from compiled languages in terms of Candid. Essentially interpreted languages would only have one canister method ever, and the Candid file would simply show that method with no information about params or return types for the actual canister methods the developer intends to expose...it would break the Candid tooling for interpreted languages wouldn't it?
+
+Also the departure from the regular semantics of init and post_upgrade doesn't seem desirable, and what if the initialization of the interpreter and source code is rather heavy? init and post_upgrade have a much higher instruction limit (200 billion) compared to update calls (20 billion).
+
+It just seems very messy and hacky to force interpreted languages outside of the current initialization, upgrade, and Candid semantics that currently exist.
+
+-------------------------
+
+skilesare | 2023-10-16 14:51:28 UTC | #15
+
+I think a quick ICRC that defines functions where the candid and maybe other options system data(controller, cycles) would be a great idea.
+
+-------------------------
+
+skilesare | 2023-10-16 14:52:57 UTC | #16
+
+I guess with this method you're going to lose some ability to verify wasms...you might even need to certify the parsed code + parse order somehow(this might be a feature of kybra/azle).
+
+-------------------------
+
+rossberg | 2023-10-16 14:57:40 UTC | #17
+
+@lastmjs, well, I was primarily replying to the upgrading part there. The message entrypoint question is somewhat separable, at least in principle.
+
+If you absolutely want to update the user sources through a canister upgrade, then that's okay. But you can already store them as regular data in Wasm data sections today. No need to (ab)use the custom section mechanism and require new API for that.
+
+But if you prefer going with upgrades anyway, then it should also be unnecessary to install message entrypoints dynamically. All you need is a little build tool in the dynamic language CDK that takes (1) the interpreter, (2) the user source, and (3) some interface description, and links that into the final Wasm module. It generates the functions for the entrypoints based on the interface description, forwarding the calls to the interpreter. That is the kind of tooling I'd expect a CDK to include.
+
+-------------------------
+
+abk | 2023-10-16 15:13:35 UTC | #18
+
+[quote="lastmjs, post:12, topic:23760"]
+If I understand what you’re suggesting it would make JavaScript/Python and other interpreted language canisters function fundamentally different from compiled languages. As in clients wouldn’t be able to invoke query or update calls directly by name, they’d have to call one single exported canister method to invoke any other methods in the canister.
+[/quote]
+
+Edit: Leaving my original message here, but it looks like I'm suggesting the same thing as what Andreas wrote above.
+
+Yeah that would be a drawback, but there could be be ways around it if you're willing to modify the wasm code a bit. Then you could take the precompiled wasm and inject a single exported function for each update or query method. You'd have to integrate this into your tooling that's distributed to devs, but it would be a lot smaller than having a full compiler. These injected functions would just call into the interpreter and pass along the arguments so they wouldn't need to a compiler to generate the code.
+
+-------------------------
+
+lastmjs | 2023-10-16 15:13:24 UTC | #19
+
+[quote="rossberg, post:17, topic:23760"]
+But if you prefer going with upgrades anyway, then it should also be unnecessary to install message entrypoints dynamically. All you need is a little build tool in the dynamic language CDK that takes (1) the interpreter, (2) the user source, and (3) some interface description, and links that into the final Wasm module. It generates the functions for the entrypoints based on the interface description, forwarding the calls to the interpreter. That is the kind of tooling I’d expect a CDK to include.
+[/quote]
+
+Yes I've tried to build exactly this kind of tooling, you're saying by manipulating the Wasm binary to add all of this functionality? Perhaps it's my inexperience, but the process was extremely error-prone and hacky and eventually I gave up on that path, thinking that the updates to the System API would be much more elegant.
+
+For context I tried Wat/Wast manipulation and/or Walrus, it was not pretty.
+
+To be clear, the dynamic function part probably wouldn't be too bad, as we could use number indexes to call into the correct functions, which wouldn't require string names and editing the data section dynamically (which was the worst part). But putting the source code into the binary dynamically seemed very difficult, especially ensuring that no other indexes into the data section were ruined by adding to it.
+
+-------------------------
+
+abk | 2023-10-16 15:28:45 UTC | #20
+
+[quote="lastmjs, post:19, topic:23760"]
+But putting the source code into the binary dynamically seemed very difficult, especially ensuring that no other indexes into the data section were ruined by adding to it.
+[/quote]
+
+I would think this could be done in a clean way by adding a new `passive` data segment (see https://webassembly.github.io/spec/core/syntax/modules.html#syntax-datamode) which then get's copied into a vector controlled by the interpreter before executing the interpreted code. Then you don't need to worry about messing up existing data segments because you don't touch them and you also don't need to worry about clobbering the existing wasm memory when copying the bytecode in because it can be copied into a vector that the interpreter has already allocated.
+
+-------------------------
+
+rossberg | 2023-10-16 17:49:46 UTC | #21
+
+[quote="lastmjs, post:19, topic:23760"]
+To be clear, the dynamic function part probably wouldn’t be too bad, as we could use number indexes to call into the correct functions, which wouldn’t require string names and editing the data section dynamically (which was the worst part). But putting the source code into the binary dynamically seemed very difficult, especially ensuring that no other indexes into the data section were ruined by adding to it.
+[/quote]
+
+As far as I can see, nothing in this manipulation would be dynamic – it would be a step of the build/linking process. Or perhaps I misunderstand what you mean by that.
+
+To be sure, shifting indices is what tools like wasm-merge (a static linker that's part of Binaryen) also do as part of their normal operation, nothing shady about that – programming language nerds would simply call this alpha-renaming :).
+
+That said, a tool like described shouldn't even need to do that if it simply inserts the additional data segments at the end?
+
+-------------------------
+
+lastmjs | 2023-10-16 18:02:38 UTC | #22
+
+I had issues inserting active data segments at the end, even after manually inspecting everything and ensuring all indexes were correct, a seemingly spurious Rust ownership/borrowing error would occur where it shouldn't have. I would remove the data section and the error would disappear. After studying all ways to accomplish this it seemed I couldn't accurately update the data section without essentially doing what the Rust compiler would do, thus why not just use the Rust compiler? But then we're back to the original problem I aim to solve, which is removing the need to ship a Rust compiler environment.
+
+By dynamic I just mean I have to manipulate the Wasm binary "dynamically" to add the functions into the binary and create their exports.
+
+I think the missing piece is really adding the data segment into the binary, an active segment doesn't seem very easy to do, a passive segment I was definitely aware of but didn't pursue for some reason I don't remember.
+
+-------------------------
+
+lastmjs | 2023-10-16 18:04:28 UTC | #23
+
+Another way to do it that @ulan has suggested is to create a static array in Rust and initialize it with like 10MiB of zeros, thus the data segmenting would all be done correctly. As long as less than 10MiB of source code is needed, I would then just write into that segment. But this would ensure at least a 10MiB binary, which when gzipped would compress very well, but still.
+
+It's a hack still, I would love to have an elegant solution.
+
+-------------------------
+
+rossberg | 2023-10-16 18:33:33 UTC | #24
+
+Hm, I can't speak to the specific problems Rust was creating with this, other than saying that Rust is obviously not a great language for writing compilers and similar tools in. In principle, this transformation should be fairly straightforward to implement. FWIW, I don't see how passive segments change it much.
+
+-------------------------
+
+ulan | 2023-10-17 09:29:05 UTC | #25
+
+I looked for existing tools that might help here. [Wizer](https://github.com/bytecodealliance/wizer) seems promising:
+
+> First we instantiate the input Wasm module with Wasmtime and run the initialization function. Then we record the Wasm instance's state:
+> 
+> - What are the values of its globals?
+> - What regions of memory are non-zero?
+>
+> Then we rewrite the Wasm binary by intializing its globals directly to their recorded state, and removing the module's old data segments and replacing them with data segments for each of the non-zero regions of memory we recorded.
+
+@lastmjs: I wonder if the tool would work for you. If not, I think we could write something similar but custom to your case that can embed bytecode and also export static endpoints.
+
+IIUC, in your use case, developers need to upload a new Wasm binary and use standard canister installation. In such cases, dynamic endpoints might be an overkill since we have the new binary anyways.
+
+That's said, dynamic endpoints might still be useful for interpreted language to enable completely new use cases. For example, running multiple versions of the application in the same canister (e.g. for A/B testing or for zero downtime upgrades). This would work if Azle would support multiple JS contexts in the same JS engine. I am not sure if there is an appetite for such use cases in the community right now.
+
+-------------------------
+
+bigbro | 2023-10-17 10:10:22 UTC | #26
+
+Do you have public seed/genesis neuron?
+
+-------------------------
+
+abk | 2023-10-17 11:19:03 UTC | #27
+
+Here's a small POC I made which shows how you could create a "static" wasm module which expects a passive data segment to be added later and can read from that data segment at runtime: https://github.com/adambratschikaye/wasm-inject-data
+
+It currently uses a rust crate `wasm-transform` to mutate the wasm and this is code that I've copied over from our instrumentation code in the replica. But we could easily publish it as a stand alone crate if you'd find it useful.
+
+-------------------------
+
+lastmjs | 2023-10-17 17:14:05 UTC | #28
+
+Thank you so much.
+
+After thinking and discussing with @ulan I will pursue the Wasm binary modification again for now. If I could continue to get help as I go then hopefully we can get this sorted.
+
+It should become apparent any limitations and then we can weigh those against possible protocol changes, as @ulan said dynamic method registration may provide more use cases down the road.
+
+-------------------------
+
+rossberg | 2023-10-18 07:10:24 UTC | #29
+
+Nice! Is there a reason why you made passive_data_size a function instead of just a global?
+
+-------------------------
+
+abk | 2023-10-18 07:38:56 UTC | #30
+
+[quote="rossberg, post:29, topic:23760"]
+Is there a reason why you made passive_data_size a function instead of just a global?
+[/quote]
+
+I think it would be better to have it a global, but I just ran into some issues when trying to make it work. I'm sure it's doable, but I just went with the function for this simple example because I got it working faster.
+
+-------------------------
+
+lastmjs | 2023-10-18 16:45:06 UTC | #31
+
+@rossberg @abk Is it necessary to use a passive data segment?
+
+-------------------------
+
+abk | 2023-10-19 06:42:34 UTC | #32
+
+[quote="lastmjs, post:31, topic:23760"]
+Is it necessary to use a passive data segment?
+[/quote]
+
+It should also be doable with an active segment, but I think it might require some more complicated logic when you inject the new data segment. Since the segment is active, you'll need to decide exactly where it ends up in the Wasm memory when do the injection and you'll need to make sure that that region doesn't later get overwritten by the Rust stack or heap while the module executes. A Wasm module compiled from Rust seems to have globals called `__stack_pointer`, `__data_end`, and `__heap_base` so it might be enough to place the data at `__data_end` and then increment both `__data_end` and `__heap_base`, but I haven't tried that.
+
+Is there any reason you'd prefer to have it as an active data segment?
+
+-------------------------
+
+lastmjs | 2023-10-19 13:54:45 UTC | #33
+
+I would prefer whatever works best, and I had everything working (well, I had the manipulation working at least) with an active segment, but it just didn't work. I'm assuming for similar reasons to what you described.
+
+I just don't remember why I didn't pursue passive segments, so just curious. I'm excited to try passive segments.
+
+I really appreciate all of the help, I'll be getting to this soon.
+
+-------------------------
+
+lastmjs | 2024-06-13 17:47:18 UTC | #34
+
+There is still a major problem here that could be simplified if we had dynamic canister method registration. We haven't dug into the Wasm binary manipulation yet, but we are trying to go to 1.0 soon and this will probably be included.
+
+The problem is that to even get the names of the methods to export in the Wasm binary, that requires either a dynamic execution of the canister's JS code, which is error-prone and could add to compilation/build time, or we need to write a compiler to get this information. Writing that compiler is non-trivial to do correctly, and it's how Azle started and we abondoned it after ~18 months because of the complexity of achieving a full solution.
+
+Dynamic canister method registration would make this whole process simple. We could just use a pre-compiled Wasm binary, swap out JS code, and deploy. During init the canister would register its methods.
+
+No need to execute the code twice, no need for a complicated static analysis pass, no need for a more complicated Wasm binary manipulation.
+
+I would love it if we could reconsider adding dynamic canister method registration...or as an alternative, default canister method callbacks could work possibly.
+
+-------------------------
+
+lastmjs | 2024-07-11 16:50:52 UTC | #35
+
+We have the binary manipulation working very well, just figuring out those last few issues to get our test suite passing.
+
+I would still like to push for dynamic canister method registration. Right now we are still required to deploy an entirely new binary every time the canister's methods change. If we could dynamically change the canister methods we could just use update calls to completely swap out a canister at runtime. This may provide better latency than having to go through the whole deploy and init process.
+
+-------------------------
+

@@ -1,0 +1,278 @@
+icme | 2022-05-08 07:29:47 UTC | #1
+
+In several of the developer discord community calls there have been meandering discussions around how to guard canisters and canister methods against denial of service attacks. These discussions have resulted in no clearly defined solutions, and so hopefully bringing this concern to the forums will accelerate the conversation.
+
+While we have [inspect_message](https://smartcontracts.org/docs/current/references/ic-interface-spec#ingress-message-inspection) and could guard a specific canister against an attack by having it only accept messages from a single principal, public canisters or canisters that accept all authenticated principals would still be susceptible to a denial of service attack if throttling is not configurable on a per principal/anonymous level through the boundary nodes or at a high enough level of abstraction that protects the individual canister.
+
+By looking at the [Internet Identity repo "Architecture Overview" section of the README](https://github.com/dfinity/internet-identity/blob/main/README.md#architecture-overview), the Internet Identity currently resides on a single canister, which means that canister is a single point of failure for applications on the IC, and therefore the Internet Identity as a service as a whole is susceptible to being overwhelmed by a denial of service attack.
+
+What is the Internet Identity application currently doing to safeguard against denial of service attacks? 
+
+If the app already guards against denial of service, how is it accomplishing this, and what can other developers learn from this approach in terms of designing single canisters to be resilient against denial of service attacks?
+
+<br/>
+<br/>
+
+Tagging some contributors (current and previous) of the Internet Identity team that I've seen active on the forums
+@diegop @nmattia @nomeata @frederikrothenberger
+
+-------------------------
+
+nomeata | 2022-05-08 08:32:17 UTC | #2
+
+My understanding is that one of the promises of the Internet Computer is that app developer’s _don’t_ have to worry about all these issues of what was called the conventional “shit stack”, and that the Internet Computer itself takes care of that (e.g. on the boundary nodes). How well that works I cannot say, though.
+
+-------------------------
+
+jzxchiang | 2022-05-09 20:30:58 UTC | #3
+
+This might be helpful: https://github.com/dfinity/internet-identity/blob/8242862b591dc78dd816a72783546f12e40169b6/docs/internet-identity-spec.adoc#why-we-do-not-use-canister_inspect_message
+
+It doesn't really answer the question of how DoS attacks by authenticated principals can be prevented. I agree that boundary nodes should be strengthened as the first line of defense.
+
+-------------------------
+
+diegop | 2022-05-09 20:40:35 UTC | #4
+
+I do not know, but you saw you tagged me. All I know is that the folks who know more are reading this thread and will hopefully reply soon.
+
+-------------------------
+
+nmattia | 2022-05-10 08:35:37 UTC | #5
+
+@nomeata is (as often) correct. Basically the Boundary Nodes (the actual computers you connect to and that turn HTTP calls into canister calls) generally rate limit requests -- I am _guessing_ IP-based but not 100% sure.
+
+Moreover, the Boundary Nodes include a ~~hack~~ special bit of code for Internet Identity, that rate-limits anchor creation even more (limiting the number of anchor created to N per hour). I'll let some BN specialist expand on that if necessary.
+
+Hope this helps!
+
+-------------------------
+
+icme | 2022-05-10 17:04:12 UTC | #6
+
+[quote="nmattia, post:5, topic:12791"]
+Basically the Boundary Nodes (the actual computers you connect to and that turn HTTP calls into canister calls) generally rate limit requests – I am *guessing* IP-based but not 100% sure.
+[/quote]
+
+Makes sense, so for the most part we'd have some protection against a single machine/IP attempting to lock down a canister.
+
+[quote="nmattia, post:5, topic:12791"]
+he Boundary Nodes include a ~~hack~~ special bit of code for Internet Identity, that rate-limits anchor creation even more (limiting the number of anchor created to N per hour)
+[/quote]
+
+Got it, that makes sense in terms of anchor creation - applications can also limit their user creation/per hour.
+
+Moving to not a single IP attacker, but a coordinated traffic event or attack - since there are already hundreds of thousands of identities, what would happen if:
+
+1.  ~100K identities attempted to authenticate/login (via II) to a single IC application on the mainnet at the same time? 
+2. This wasn't just a spike in usage, but an attack and each of those identities tried to log into 50-100 applications on the IC at the same time?
+3. Now the attacker has figured out an automated solution for passing captcha and has slowly been amassing internet identities,  such that the same attack as (2) happens, but with 1 million identities, or 10 million identities.
+
+-------------------------
+
+faraz.shaikh | 2022-05-10 18:23:22 UTC | #7
+
+Hi @icme 
+
+TLDR: Application canisters are protected by `subnet` level rate limits. Rate-limiting beyond the subnet level defaults has to be done by the canister itself. We are looking into providing canisters with all the info needed to make these rate-limiting decisions locally. 
+
+
+
+
+
+The boundary node infra is responsible for rate-limiting requests for Internet Computers at a subnet level. The boundary node is oblivious to canisters specific and imposes rate limits in a `general` sense (reasonable defaults). These defaults will change as the platform matures AND/OR when we are under `constrained conditions` like a DDOS attack. Current defaults are 
+
+Per subnet / Per boundary node
+1. 500 Queries/Second
+2. 50 Updates/Second
+3. 100 Request/second per IP. (irrespective of request type)
+
+If we have N boundary nodes the overall upper bound to queries/updates seen by a subnet is `500 * N` & `50 * N` Rps
+
+
+Q. how does Internet Identity (II) handle DDOS?
+
+II did face spam attacks in the past. To thwart this spam, additional rate limits were placed `specifically` for the II canister such that only 1 II `create` request was allowed **per minute per IP**. This was possible only because we knew the mechanics of the II which helped in decoding the CBOR and applying the rate limits.
+
+Please note, that the II-like special handling cannot be extended for general canisters. In all likelihood, boundary rate limits are to be **relaxed** in the future.
+
+-------------------------
+
+jzxchiang | 2022-05-11 21:13:16 UTC | #8
+
+Thank you for the response. This should be required reading material for every Internet Computer developer.
+
+Just curious: do replicas perform any rate limiting? Boundary nodes only handle ingress messages, but what if a single canister makes an excessive number of inter-canister calls within a subnet?
+
+-------------------------
+
+icme | 2022-05-11 21:54:29 UTC | #9
+
+@faraz.shaikh Thanks for the detailed response and insights!
+
+[quote="faraz.shaikh, post:7, topic:12791"]
+II did face spam attacks in the past. To thwart this spam, additional rate limits were placed `specifically` for the II canister such that only 1 II `create` request was allowed **per minute per IP** . This was possible only because we knew the mechanics of the II which helped in decoding the CBOR and applying the rate limits.
+[/quote]
+
+Very interesting - does the custom rate limiting by IP have any considerable impact on the performance of logins or query/update calls for individual users?
+
+<br/>
+<br/>
+
+Also - how difficult would it be to expose rate limiting on an IP/Principal basis for IC developers?
+
+I know `inspect_message` is currently being implemented for Motoko, but it would be awesome if this rate limiting by IP/Principal functionality could be exposed/integrated with the existing inspect_message API as an optional field.
+
+I gave a naive shot as what that might look like in Motoko here https://github.com/dfinity/motoko/issues/2528#issuecomment-1111845528
+
+It looks right now like `inspect_message` is being exposed as a system function - the in progress PR by @claudio can be found [here](https://github.com/dfinity/motoko/pull/3210).
+
+Would be great if DFINITY could take these learnings from the II canister, generalize them, and talk to the Rust/Motoko CDK teams to find the best language abstractions for exposing this functionality to developers.
+
+I would imagine that for DeFi and certain applications where reliability and high availability are assumed, this is pretty high up on their list of priorities.
+
+-------------------------
+
+faraz.shaikh | 2022-05-11 22:27:35 UTC | #10
+
+> Just curious: do replicas perform any rate-limiting? Boundary nodes only handle ingress messages, but what if a single canister makes an excessive number of inter-canister calls within a subnet?
+
+Hey, flow control on the Internet computer is an involved topic. I would try and be brief here but this is a good candidate for a blog entry.
+
+Replica and the networking connecting the replicas operate at disparate processing speeds. At any given time some replicas may be faster/slower than the others (asynchronous nature of the network).   IC needs to employ intelligent queuing/buffering to keep such nodes in sync in spite of the asynchronous nature of the underlying network. Flow control for the IC broadly has to take care of.
+
+1. Ingress message 
+2. Consensus messages.
+3. Cross canister message part of the execution.
+
+Ingress message flow control: Leaky bucket, where messages that don't fit in the queue are dropped. This is fine as the user agent can retry the message. Fairness and thus no starvation are goals here.  Once an ingress makes it into the replicas ingress pool, it can still be dropped as it can expire before it is picked up by the block maker for consensus/execution. This is the only layer where we can tolerate message drops.
+
+Consensus: The P2P layer implements fixed-sized i/o queues per replica. So malicious replicas cannot overwhelm other replicas. These queues are sized (size and count of messages) sufficiently well such that replicas operating within the protocol limits will never run out of queue space.  I a replica genuinely falls behind (transient sluggish network) it can ask for retransmission to do a quick resync. If a part of the subnet is lagging behind for longer periods of time - it will fail to do quick resyncs and eventually fall back to CUP-based state-syncs. This queuing model works on the premise the CUP-based state syncs are orders of magnitude faster than actual consensus-based progress.
+
+Message routing: Flow control in message routing is similar to P2P routing in essence. XNet messaging employs Stream Transmission Protocol (look up this description by David Derler). It's very close to TCP ordered message delivery. Again Per canister per subnet fixed-size, message routing queues make sure that no single canister/subnet is overwhelming the IC network bandwidth.   The goals in messaging routing are: Guaranteed, ordered delivery of messages across canisters. Since there is the promise of guaranteed delivery - something has to give in if the processing slows down. So if a canister makes exorbitantly high cross net messages its execution may slow down as queues back up. 
+
+
+
+This is a high-level description. Flow control is a well-researched academic topic, and the IC overall does a great job at it (wrtx to another blockchain tech out there.) Cross net messaging and subnets are one of the key innovations of the IC.
+
+-------------------------
+
+faraz.shaikh | 2022-05-11 22:50:17 UTC | #11
+
+Yes, that's the right direction. Boundary node rate limiting can only be coarse-grained as it lacks the context to make the rate-limiting decision. It has its place for rate-limiting ingress. 
+
+ `inspect_message` is a good control point to implement per user per IP rate limiting.  However, note the following 
+1. inspect_messages is post consensus. The messages at that control point could be both user-originated and canister originated. (Reading the spec)
+2. Don't know what environment is available to the inspect_messages() to make the rate-limiting decision. 
+
+real-IP should be provided to inspect_message. Please drive the requirements, we can help with the implementation.
+
+-------------------------
+
+faraz.shaikh | 2022-05-13 04:30:34 UTC | #12
+
+Hello, 
+
+More understanding of inspect_messages from the code and talking with @claudio 
+
+1. inspect_messages is invoked **`prior`** to consensus and **`prior`** to ingress gossip.
+https://smartcontracts.org/docs/current/references/ic-interface-spec#state-transitions
+See section: Api request submission conditions 
+Code: https://github.com/dfinity/ic/blob/936986831646b74ef245db6047dc65232bbeef1f/rs/http_handler/src/call.rs#L216
+
+2. It’s invoked by “a” replica. If that replica is malicious it can
+* 2.a accept a message the canister intended to drop 
+* 2.b drop a message that a canister intended to accept
+
+2.b is innocuous as the requested retry will be routed to a random replica on the next attempt
+2.a May not be that innocuous 
+
+So specifically `inspect_messages` should be used for rate limiting but not for any type of security access control. As any such check can be bypassed due to 2.b
+
+That is If one intends that a canister method need not be invoked by principal X for security reasons `inspect_messages` is not the right place to place such checks.
+
+Inspect message execution context is similar to query and all state changes done by it are discarded. So don’t use inspect messages to count the number of times something was discarded etc.
+https://github.com/dfinity/ic/blob/master/rs/execution_environment/src/hypervisor.rs#L877
+
+
+
+@nomeata @claudio
+
+-------------------------
+
+nomeata | 2022-05-13 08:18:59 UTC | #13
+
+[quote="faraz.shaikh, post:12, topic:12791"]
+That is If one intends that a canister method need not be invoked by principal X for security reasons `inspect_messages` is not the right place to place such checks.
+[/quote]
+
+Absolutely! Note that `inspect_message` is _also_ not using for inter-canister calls, so that would be another easy way to bypass a misplaces access check there.
+
+-------------------------
+
+GLdev | 2022-05-13 17:26:01 UTC | #14
+
+Thanks @icme for starting this topic, I meant to write down some ideas on this topic for a while now, but I kept delaying it. Here's a list that I had in my notes, some of the things have already been discussed in this topic.
+
+1. authentication vs. authorization - the IC provides the first (e.g. principals) but the canister needs to implement the second.
+2. "dumb" DDoS vs. "smart" DoS - the IC provides some help for the first, with the exception of inter-canister calls. (e.g. a sufficiently well funded attacker could ddos any service). There are currently no libs for handling "smart" DoS.
+3. smart DoS -> analyze interfaces, create as much work with as few requests. 
+
+(ideas for lib)
+4. inspect_message based ACL for web-based attacks. Should cover 90+% of low effort attacks (i.e. bots & co). Note that inspect_message does not work for inter-canister calls.
+5. ACL at the entrypoint of every update to double-down on inspect_message ACL.
+6. how important is it to trap early? Conditional ACL based on "states" and logging libs? (e.g. only ACL when canister is in "heavy_traffic" state, as defined by some logging metrics) Need some stats. 
+7. advanced authorization patterns - use spawned canisters to provide on-boarding, have the main canister only "talk" to authorized principals. Has anyone red-teamed this? How many messages is enough to "clog" a canister?
+
+
+---
+
+The numbers provided by faraz are interesting. It would be nice if someone running heavy traffic canisters in prod can publish some numbers on call rates, attack traces, and possible mitigations. We could use those to begin writing up some core concepts and start working towards a "better than nothing" ACL lib. The fact that inspec_message is only used for ingress messages is concerning, and most likely all the ACL logic will have to be doubled in every update call, but it's better to start somewhere, and at least have protection against *some* attacks.
+
+edit1: @Seb mentioned during the Friday call that there is some limit on inter-canister messages? Can you please expand on that? Any numbers or sources on this?
+
+-------------------------
+
+cryptoschindler | 2022-05-25 10:21:26 UTC | #15
+
+[quote="faraz.shaikh, post:7, topic:12791"]
+The boundary node infra is responsible for rate-limiting requests for Internet Computers at a subnet level. The boundary node is oblivious to canisters specific and imposes rate limits in a `general` sense (reasonable defaults). These defaults will change as the platform matures AND/OR when we are under `constrained conditions` like a DDOS attack. Current defaults are
+[/quote]
+
+what if we setup our own boundary node that doesn't obey to those rules? can this be used to flood a subnet?
+
+-------------------------
+
+faraz.shaikh | 2022-05-26 17:16:42 UTC | #16
+
+I worked on replica p2p stack before moving to boundary nodes. the replica networking stack “assumes” boundary nodes are malicious and implements ddos mitigations.
+
+The replica networking stack design factors in the assumption that every other other entity on network (other replicas, other boundary nodes, user agents, routers) could be malicious. Most replica components have a leaky bucket Or back-pressure mechanism to mitigate flooding of messages.
+
+
+So a malicious boundary node cannot launch  a successful ddos attack on the core ic network.
+
+-------------------------
+
+icme | 2022-06-28 20:18:05 UTC | #17
+
+Found this gem in the Supernova submissions for those interested. 
+
+https://devpost.com/software/dfinity-ddos-defender
+
+Not sure how useful it is/how well it works in practice, but seems like there are some starter ideas there that one can build upon.
+
+The end goal however imo will involve yet more enhancements to `inspect_message`
+
+-------------------------
+
+ilbert | 2023-07-04 08:28:17 UTC | #18
+
+Let's say I have two canisters: **service** and **database**. The **service** canister exposes all the methods called by off-chain clients and runs with the logic I need. The **database** canister stores data and accepts calls only from the **service** canister, but since the [inspect_message is not invoked for inter-canister calls](https://forum.dfinity.org/t/is-canister-inspect-message-valid-for-inter-canister-call/20141/2), the caller's principal check is done inside the method.
+
+This means that every time *anyone* can send update calls to the **database** canister (which exposes only **update** methods since inter-canister query calls are not possible) and consume 560K cycles for each call (according to the [Gas and cycles cost](https://internetcomputer.org/docs/current/developer-docs/gas-cost) table).
+
+Could the solution be to *also* implement the `inspect_message` on the **database** canister to filter out all principals except the **service** canister's so that any off-chain request is discarded and cycles are not consumed?
+
+-------------------------
+

@@ -1,0 +1,178 @@
+michael-weigelt | 2024-05-07 08:51:15 UTC | #1
+
+# Pocket IC
+
+We have released [PocketIC server 4.0.0](https://github.com/dfinity/pocketic/releases/tag/4.0.0) and its [Rust library 3.1.0](https://crates.io/crates/pocket-ic).
+
+## IC [HTTP interface](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-interface) compatibility
+
+**The most significant change in the new release is that PocketIC instances are now compatible with agent-based tools** (agent.rs, agent.js, ic-repl, etc). Many existing dfx-based test suites can now be seamlessly integrated with PocketIC, and advanced tools such as ic-admin just work. **You can even interact with frontend canisters running on PocketIC in your browser.**
+
+Note that PocketIC instances, if launched in the regular way, do not "make progress" by themselves, i.e., the state machines that represent subnets on the IC do not execute any messages without a call to `tick()` and their timestamps lag behind the current time without a call to `advance_time(...)`. But the agent-based tools expect their target to make progress automatically (as the IC mainnet and the replica launched by dfx do).
+
+For that reason, you need to explicitly make an instance **live** by calling `make_live(...)` on it. This will do three things:
+
+- It launches a thread that calls `tick()` and `advance_time(...)` on the instance regularly - several times per second.
+- It creates a gateway (like icx-proxy for the replica launched by dfx) which points to this live instance.
+- It returns a gateway URL which can then be passed to agent-like tools.
+
+**Attention**: Enabling auto-progress makes instances non-deterministic! There is no way to guarantee message order when agents dispatch asynchronous requests, which may interleave with each other and with the `tick`s from the auto-progress thread. If you need determinism, use the old, manually-`tick`ed API.
+
+Live instances can be made deterministic again by disabling auto-progress and disabling the gateway. This is done by calling `make_deterministic` on the instance. Once this call returns, the instance will only continue to make progress when you call `tick` - but the state in which the instance halts is not deterministic. So be extra careful with tests which are setup with a live phase and which then transition to non-live for the test section.
+
+**Caveat**: Before you rush to migrate your tests from dfx + bash to PocketIC, be warned that HTTP outcalls, mainnet canister IDs for user-created canisters and Bitcoin integration are three features still missing in PocketIC.
+
+For a minimal example, see [HowTo](https://github.com/dfinity/ic/blob/HEAD/packages/pocket-ic/HOWTO.md).
+
+## Concurrent Update Calls
+
+Another notable change in the new release are concurrent update calls.
+
+Until the previous version, submitting ingress messages and executing them was **tightly coupled** in the method `update_call`. Since version 4.0.0, the PocketIC server supports concurrent update calls, i.e., first submitting several messages that are later executed concurrently when awaited. This is useful for canister testing in the presence of interleaving update calls (e.g., ensuring that locking in critical sections works properly) and potentially also to speed up tests.
+
+Calling the new method `submit_call` on a PocketIC instance submits an update call for asynchronous execution and returns its message ID, **without making any progress on this message**. Later, the update call can be awaited by calling the method `await_call` on the PocketIC instance passing the corresponding message ID as an argument. The method `update_call` can be expressed in terms of the new methods like this:
+
+```rust
+let message_id = pic.submit_call(..., payload)?;
+pic.await_call(message_id)
+```
+
+And the new methods enable interleaved use cases such as this:
+
+```rust
+let message_id_1 = pic.submit_call(..., payload_1)?;
+let message_id_2 = pic.submit_call(..., payload_2)?;
+pic.await_call(message_id_1);
+pic.await_call(message_id_2);
+```
+
+Note that all update calls submitted for asynchronous execution are executed concurrently already when any one of them is being awaited using `await_call`. This means that the update calls need not be awaited concurrently (as is the case for Rust futures that need to be awaited to even start executing). In particular, the second invocation of `await_call` in the example above might return the result immediately without executing any additional rounds.
+
+For more information, see [HowTo](https://github.com/dfinity/ic/blob/HEAD/packages/pocket-ic/HOWTO.md).
+
+For a complete list of changes, see the [server changelog](https://github.com/dfinity/ic/blob/3e120dc791782388de886ef60157b137d17e3992/rs/pocket_ic_server/CHANGELOG.md) and the [library changelog](https://github.com/dfinity/ic/blob/3e120dc791782388de886ef60157b137d17e3992/packages/pocket-ic/CHANGELOG.md).
+
+[Previous post on PocketIC.](https://forum.dfinity.org/t/pocketic-multi-subnet-canister-testing/24901/27)
+
+Your feedback helps us improve PocketIC, so please let us know your thoughts and questions in this thread.
+
+-------------------------
+
+ZenVoich | 2024-05-10 08:36:02 UTC | #2
+
+How to start pocket-ic v4 from CLI with HTTP Interface enabled?
+
+Trying
+```
+pocket-ic --port 4943
+```
+
+Then `dfx deploy ...` or `dfx ping` fails with error:
+```
+Error: Failed while waiting for agent status.
+Caused by: Failed while waiting for agent status.
+  The replica returned an HTTP Error: Http Error: status 404 Not Found, content type "", content: 
+```
+
+-------------------------
+
+fxgst | 2024-05-10 22:10:50 UTC | #3
+
+Hi @ZenVoich, starting PocketIC to act as a local replica is quite involved at the moment. This will get better once it's fully integrated in `dfx`. Here are the manual steps you need to run at the moment:
+
+```bash
+# Start PocketIC
+./pocket-ic --port 8000 --ttl 3600
+
+# Create a PocketIC instance with the NNS subnet and one application subnet
+curl -X POST -H "Content-Type: application/json" http://localhost:8000/instances -d '{"nns": {"state_config": "New", "instruction_config": "Production", "dts_flag": "Enabled"}, "sns": null, "ii": null, "fiduciary": null, "bitcoin": null, "system": [], "application": [{"state_config": "New", "instruction_config": "Production", "dts_flag": "Enabled"}]}'
+
+# Set time on the PocketIC instance
+curl -X POST -H "Content-Type: application/json" http://localhost:8000/instances/0/update/set_time -d "{\"nanos_since_epoch\": $(gdate +%s%N)}" # use date instead of gdate on Linux
+
+# Activate auto progress mode on the instance
+curl -X POST http://localhost:8000/instances/0/auto_progress
+
+# Start the gateway
+curl -X POST -H 'Content-Type: application/json' http://localhost:8000/http_gateway -d '{"forward_to": {"PocketIcInstance": 0}, "listen_at": 8080}'
+
+# Deploy your canister to the PocketIC instance with dfx
+dfx deploy --network http://localhost:8080 --no-wallet
+```
+
+Note that deploying with dfx to PocketIC is not fully supported yet, so you might run into all sorts of errors. If you're having wallet canister related errors, `rm -rf .dfx .env` can help.
+
+-------------------------
+
+ZenVoich | 2024-05-13 10:19:45 UTC | #4
+
+Thanks @fxgst! I was able to run pocket-ic server and deploy canisters using dfx.
+
+But running my tests seems to be as slow as on dfx replica. Is there any config to make it faster?
+
+-------------------------
+
+fxgst | 2024-05-13 12:30:13 UTC | #5
+
+What sort of tests are you running? Calls to the canister through `dfx` in a bash script? The speedup of PocketIC might not show in all scenarios.
+
+-------------------------
+
+ZenVoich | 2024-05-13 13:55:58 UTC | #6
+
+Tests in JavaScript using agent.js
+
+-------------------------
+
+NathanosDev | 2024-05-13 14:05:12 UTC | #7
+
+Are you running tests in the browser or in NodeJS?
+
+-------------------------
+
+ZenVoich | 2024-05-13 15:29:34 UTC | #8
+
+In NodeJS with vitest
+
+-------------------------
+
+NathanosDev | 2024-05-13 15:38:28 UTC | #9
+
+Since you're running on NodeJS, I'd recommend trying [PicJS](https://hadronous.github.io/pic-js/docs/guides/getting-started) instead of using the PocketIC server directly from the command line.
+
+-------------------------
+
+ZenVoich | 2024-05-14 06:13:41 UTC | #10
+
+I faced that I need to encode my `initArg.did` file into `ArrayBufferLike` to pass it to `setupCanister` https://hadronous.github.io/pic-js/docs/pic-js/interfaces/SetupCanisterOptions#arg and I have no idea how to do it (my old topic with the same question https://forum.dfinity.org/t/node-js-to-from-candid/19526)
+
+For example, init arg for icp ledger:
+```
+(
+  variant {
+    Init = record {
+      minting_account = "e82226d3101bd8525111e2c6501a79365f2484d82d3f2be96269b78fe200eeaa";
+      initial_values = vec {
+        record {
+          "8b61ff722d7e6321eb99bb607ab0cf323b3c64b43d6a13c245c8a4e197f7b38b";
+          record { e8s = 1_000_000_000_000_000 }
+        };
+      };
+      send_whitelist = vec {};
+    }
+  }
+)
+```
+
+-------------------------
+
+NathanosDev | 2024-05-14 10:03:48 UTC | #11
+
+To encode the init args for any canister, you need to have the `idlFactory` for the `init` function. If you have the canister setup with DFX, then you get it using `dfx generate`. For the ICP ledger, you can also find it [here](https://github.com/dfinity/ic-js/blob/main/packages/ledger-icp/candid/ledger.idl.js#L330-L375).
+
+And then you can use it similarly to [this example](https://github.com/hadronous/pic-js/blob/main/examples/counter/tests/src/counter.spec.ts#L31-L35).
+
+If you have any further issues with PicJS, feel free to post it on the [PicJS thread](https://forum.dfinity.org/t/announcing-picjs-typescript-javascript-support-for-pocketic/24479) to keep this one relevant to the original topic.
+
+-------------------------
+

@@ -1,0 +1,187 @@
+Jesse | 2024-01-16 15:33:33 UTC | #1
+
+I'm attempting to make an HTTP call to a Post method in which the body of the request is an ECDSA signed envelope. To do that, I must serialize the request body into CBOR format. How does one achieve such a serialization from within a Motoko canister?
+
+-------------------------
+
+Gekctek | 2024-01-16 16:36:16 UTC | #2
+
+One of the ICDevs bounties I completed was a CBOR library, so you are in luck
+
+https://mops.one/cbor
+
+-------------------------
+
+Jesse | 2024-01-16 16:40:00 UTC | #3
+
+I literally just discovered you're repo 30 minutes ago. I searched "Vessel Packages" and it came up. This is exactly what I need.
+
+-------------------------
+
+Jesse | 2024-01-16 17:56:18 UTC | #4
+
+@Gekctek, can you confirm whether or not I'm using this Encoder correctly?
+In order to get the `envelope` object in the form of a `[Nat8]` array that can be inserted into the encoder, I use the `to_candid()` function to convert it into a `candid` blob, then from there, I convert the candid blob into a [Nat8] array. I wonder if this is allowed. 
+
+```
+public type EnvelopeContent = {
+    nonce: ?[Nat8];
+    ingress_expiry: Nat64;
+    sender: Principal;
+    canister_id: Principal;
+    method_name: Text;
+    arg: [Nat8];
+};
+
+public type Envelope = {
+    content: EnvelopeContent;
+    sender_pubkey: ?[Nat8];
+    sender_sig: ?[Nat8];
+};
+let envelope : Envelope = <some_envelope>;
+let envelopeAsCandidBlob : Blob = to_candid(envelope);
+let envelopeAsCandidNat8Array : [Nat8] = Blob.toArray(envelopeAsCandidBlob);
+let result = Encoder.encode(#majorType2(envelopeAsCandidNat8Array));
+```
+
+-------------------------
+
+Gekctek | 2024-01-16 18:21:07 UTC | #5
+
+No. So the envelope/content need to be in cbor vs candid as seen here in the docs
+https://internetcomputer.org/docs/current/references/ic-interface-spec#api-cbor
+The only candid encoded part should be the 'arg' bytes
+
+So here is the annoying part. Motoko does not have a way to have a record like `Envelope` to directly be serialized, its all a manual process. So in this case you would have to do the following
+```motoko
+let content = #majorType5([
+    (#majorType3("nonce"), nonceBytes),
+    ....
+]);
+let bytes: Types.CborValue = #majorType5([
+    (#majorType3("content"), content),
+    (#majorType3("sender_pubkey"), #majorType2(pubKeyBytes)),
+    (#majorType3("sender_sig"), #majorType2(signatureBytes))
+]);
+let bytes: [Nat8] = switch(CborEncoder.encode(bytes)) {
+    case (#err(e)) ...;
+    case (#ok(c)) c;
+};
+```
+
+Also i find it helpful to use https://cbor.me/ to debug the bytes of cbor if needed
+
+-------------------------
+
+Jesse | 2024-01-17 20:54:16 UTC | #6
+
+@Gekctek, How do I go about encoding `Optional`s, `Blob`s and `Principal`s using the CBOR Encoder that you've written? None of the `Major Types` account for these data types.  
+
+Initially, I thought to simply drop the all optionals and convert the Blobs and Principals to Nat8 arrays so that the data could be encoded using your CBOR encoder, but when I do that, I get the following HTTP response: 
+```
+record {
+    status = 400 : nat;
+    body = opt "unable_to_parse_cbor: invalid type: byte array, expected struct ICRequestContent\n";
+    headers = vec { record { value = "application/cbor"; name = "content-type" } };
+  },
+```
+Its complaining that the Request's content should take the form of an `ICRequestContent` structure which uses Optionals, Principals and Blobs. I've defined the `ICRequestContent` structure below
+
+```
+type ICRequestContent = {
+    sender: Principal,
+    canister_id: ?Principal,
+    method_name: ?String,
+    nonce: ?Blob,
+    ingress_expiry: ?u64,
+    arg: ?Blob,
+}
+```
+
+-------------------------
+
+Gekctek | 2024-01-18 00:40:03 UTC | #7
+
+Here is an example of one I have implemented in C#.
+Principals are just the raw bytes/bytestring of the principal value
+Blobs are just raw bytes
+and if its optional, it looks like you just dont include that property, unless it has a value
+
+Here is a link to my implementation 
+https://github.com/BoomDAO/ICP.NET/blob/main/src/Agent/Requests/CallRequest.cs
+
+Here is a quote from the docs
+```
+The following encodings are used:
+
+Strings: Major type 3 ("Text string").
+
+Blobs: Major type 2 ("Byte string").
+
+Nats: Major type 0 ("Unsigned integer") if small enough to fit that type, else the Bignum format is used.
+
+Records: Major type 5 ("Map of pairs of data items"), followed by the fields, where keys are encoded with major type 3 ("Text string").
+
+Arrays: Major type 4 ("Array of data items").
+```
+
+-------------------------
+
+LightningLad91 | 2024-01-18 11:51:43 UTC | #8
+
+My understanding of the spec is that the optional fields are not included in the CBOR content map.
+
+-------------------------
+
+Jesse | 2024-01-20 10:17:42 UTC | #10
+
+@Gekctek, I'm still getting a 400 status (malformed request) returned when making the request and I'm not seeing any clear reason why. I formed the request as shown below using the CBOR encoder you made. The last thing I do is run the `envelopeAsMajorType` object through the CBOR encoder, then take the resulting Nat8 array and convert it to a Blob to use as the body of the request. Am I missing something?
+
+```
+let envelopeContentInMajorType5Format : [(Value.Value, Value.Value)] = ([
+   (#majorType3("nonce"), #majorType2(nonce)),
+   (#majorType3("request_type"), #majorType3("call")),
+   (#majorType3("ingress_expiry"), #majorType0(ingress_expiry)),
+   (#majorType3("method_name"), #majorType3(method_name)),
+   (#majorType3("sender"), #majorType2(Blob.toArray(Principal.toBlob(sender)))),
+   (#majorType3("canister_id"), #majorType2(Blob.toArray(Principal.toBlob(canister_id)))),
+   (#majorType3("arg"), #majorType2(arg))
+]);
+
+let envelopeAsMajorType : Value.Value = #majorType5([
+   (#majorType3("content"), #majorType5(envelopeContentInMajorType5Format)),
+   (#majorType3("sender_pubkey"), #majorType2(public_key)),
+   (#majorType3("sender_sig"), #majorType2(Blob.toArray(signature)))
+]);
+
+```
+
+-------------------------
+
+Jesse | 2024-01-20 10:22:00 UTC | #11
+
+Nevermind. I found the problem. I had the ingress_expirey parameter set too low at just 5 seconds. Increasing it to 60 seconds resolved the issue.
+
+-------------------------
+
+tomijaga | 2024-01-20 18:54:11 UTC | #12
+
+
+I've added support for @Gekctek CBOR library to the [serde](https://mops.one/serde) library to make it more convenient to convert motoko variables. Here's an example of how it works:
+
+```swift
+    import { CBOR } "mo:serde";
+
+    let request : ICRequestContent = { ... content };
+    let candid = to_candid(request);
+    
+    // The encoder requires a list of all the field names in the datatype.
+    let fields = ["sender", "canister_id", "method_name", "nonce", "ingress_expiry", "arg"];
+    let #ok(cbor) = CBOR.encode(candid, fields, null) else Debug.trap("error converting to cbor");
+```
+
+At the moment, the library doesn't support variants, but I recently added support for encoding Principals based on the discussion in this forum. However, since the principle is tagged as a blob during this step, it can't be converted back to the original principle. Instead, it will be converted to Motoko as a `Blob`. This issue could be solved if there were specific tags for Motoko datatypes that are missing in the CBOR standard for Principals and Variants.
+> You can convert from CBOR to Motoko using the `CBOR.decode()` method.
+
+-------------------------
+

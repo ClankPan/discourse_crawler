@@ -1,0 +1,110 @@
+nomeata | 2021-09-14 18:42:08 UTC | #1
+
+Time for the final post in the series: In
+
+https://www.joachim-breitner.de/blog/786-A_Candid_explainer__Quirks
+
+I go through a few corners of Candid’s design that I might consider odd, explain why it came to that, and maybe point to alternatives. Note that this post is not to discredit Candid as a whole – these are just quirks, not serious issues, and even that’s just _my_ opinion.
+
+-------------------------
+
+rossberg | 2021-09-15 07:20:53 UTC | #2
+
+As @nomeata says, some of these quirks are historical, some are subjective, but there is one point I'd like to comment on, which is the problem of exposing the interface of a canister.
+
+The main problem with that has in fact been that the IC currently provides no way to attach _meta data_ to a canister -– and the interface description is an instance of that. There have been discussions how to introduce such functionality in a suitably general fashion, but nothing came out of it so far. The language team is currently picking that up again and we want to push for a solution.
+
+So why do I think it is crucial to think of the interface description as meta data, and not something dynamic?
+
+Well, an interface essentially is the _type_ of a canister, just like the type of a value in a programming language. And as such it doesn't make sense to allow it to change randomly. Other services interacting with a canister are built with concrete assumptions about its interface, and because these are built in, they are _static_ assumptions. A canister would be programmatically useless without statically fixing at least parts of its interface. And even for parts that are not "fixed", you'd ideally still want a statically fixed description of what's "dynamic" about them and how it could change (generic types are one example of that, but there are more flexible notions one could have).
+
+There also is a methodological argument for separating the interface domain from a canister's "meta interface", such as the ability to ask about its interface. The latter essentially is a form of reflection. And nowadays it is an established wisdom, at least in programming language design, that reflection ought to be separated from the functional domain. Some arguments to this effect are summarised in the original paper on [mirrors](https://bracha.org/mirrors.pdf), which are a more modern incarnation of a reflection mechanism that adheres to this principle. And some of these arguments likewise apply to the IC.
+
+Polluting each canister with an interface reflection method would be a step backwards in that regard. It also doesn't extend to meta data that is not meant for public consumption (such as the internal stable types of a Motoko canister, which only the owner ought to see). So we need something better.
+
+-------------------------
+
+nomeata | 2021-09-15 08:43:05 UTC | #3
+
+Thanks for that summary; it’s good to have a public record of the reasoning to point to.
+
+Not to repeat or lengthen our discussion, but merely to complete the picture, I’d like to briefly outline my rebuttal: The Internet Computer is not a blockchain with immutable smart contracts, but hosts services that change their behavior over time, and the type of a service is a coarse summary/contract of its behavior. This dynamic aspect is a feature, and one of the main goals of Candid is to actually support such dynamic behavior.
+
+Canister behavior typically changes because of code change (e.g. `canister_update`), but can also change because of state changes. (Examples could be a service that goes “live” only after some trigger, or a canister whose logic is scripted, and thus changes not via wasm-changing-calls to the system, but rather via a state change, or a canister that proxies another canister and assumes that canister’s interface). To me, whether a service evolves due to an actual code change, or merely a state change, is an implementation detail that a use of the service need not be bothered with. I'd consider it a break of abstraction if that implementation choice bleeds out of the nice abstractions that Candid provides. Tying the candid interface to the code only on the raw system level would prevent some possibly uncommon, but useful applications, I’d say.
+
+I acknowledge that such a flexible low-level interface (like most flexible low-level interfaces) can be a footgun, as you rightly point out. But just like memory safety is something that Motoko or Rust provides on top of a raw, flexible, low-level system API based on WebAssembly, I’d leave it to the CDKs to assist the developer to get this right.
+
+-------------------------
+
+rossberg | 2021-09-15 10:02:51 UTC | #4
+
+Upgrades can change an interface just fine, by updating the meta data as well. But only in limited and controlled ways! We went to all this length with Candid to be able to make sure that this is a compatible change – one of the major design goals was to enable tools to check and enforce this, as you explain nicely in the blog posts.
+
+State change should _not_ change the interface, let alone in completely uncontrolled ways! There would be no way to ensure the consistency and compatibility of interfaces if they were just the result of random dynamic methods. That would completely defeat the purpose of, e.g., the upgrade check we want to implement in dfx, and by extension, much of Candid itself.
+
+Stratification between static and dynamic is important here, as with all type systems. Conflating upgrade and state change would make everything collapse.
+
+(Of course, much of this is conceptual, and can still be broken at a lower level. E.g., a developer could circumvent these mechanisms and manually create a broken canister and lie about its interface. But they would have to manually bypass the tool chain to do so, ideally it should not be possible by accident.)
+
+-------------------------
+
+nomeata | 2021-09-15 11:36:32 UTC | #5
+
+[quote="rossberg, post:4, topic:7237"]
+much of this is conceptual, and can still be broken at a lower level
+[/quote]
+
+I think this is the gist of our disagreement. I do agree about the conceptual goals, and also about the “the purpose of, e.g., the upgrade check we want to implement in dfx, and by extension, much of Candid itself.”. But note that `dfx`, Motoko, Candid are on a higher level of abstraction. So it comes down to the judgment call of where to enforce these restrictions: On the low-level and raw system (as spec’ed in the Interface Spec), or in the tooling on top (dfx, Candid, Motoko)?
+
+-------------------------
+
+rossberg | 2021-09-15 11:52:07 UTC | #6
+
+Well, above you argued with flexibility and some very hypothetical use cases. But we would not _actually_ be able to expose this flexibility to devs, unless we were willing to give up the desired guarantees at the higher level. These simply are fundamentally incompatible goals, AFAICS.
+
+OTOH, if flexibility is not an actual goal, then the meta data approach is clearly cleaner, more generally useful, and doesn't violate reflection layering principles.
+
+-------------------------
+
+nomeata | 2021-09-15 12:15:43 UTC | #7
+
+I think the flexibility _is_ a goal – but as a powerful tool for special needs only.
+
+Most developers will be happy to leave it to the tooling to handle their interface automatically, safely. To them, the two implementations on the lower interface are indistinguishable, because in either case the tooling takes care of it.
+
+But some may rightfully want to do more advanced things, and I wouldn’t want to prevent them from doing so, assuming they are aware that they are leaving the guardrails behind and are now working at a lower level of abstraction. The analogies here might be FFI-to-C in an otherwise type safe language, or `unsafe` in Rust, or the ability to write a unix process that deals in actual IP packages instead of the higher-level TCP.
+
+If someone now writes a canister whose logic is interpreted (maybe some no-code platform with a declarative UI to assemble the service), then these developers will have to deal with the more flexible, less guardraily interface, but with the effect that those developers working on that platform again get the experience you want: that interface and code changes together.
+
+-------------------------
+
+rossberg | 2021-09-15 14:25:25 UTC | #8
+
+Candid is supposed to guide interoperation between multiple canisters. So your FFI analogy doesn't quite fit, I think. Leaving it up to individual devs to mess with the assumptions willy-nilly is a dangerous proposition for the platform. My experience with the Web tells me that this would invite all sorts of horrible ideas spreading quickly – never underestimate how devs do dubious things just because they can and it makes them feel clever.
+
+As long as there isn't a very convincing, broad practical use case for something super-dynamic I would stay away from it. This is consistent with our preference for a typed programming environment and not wanting to repeat the mistakes of the Web.
+
+And even in a dynamic environment we'd still want to layer reflection capabilities properly. To wit, Gilad Bracha is the main author of the mirrors paper, and he is all for super-dynamic semantics. ;)
+
+-------------------------
+
+levi | 2021-09-15 18:02:00 UTC | #9
+
+[quote="rossberg, post:4, topic:7237"]
+State change should *not* change the interface, let alone in completely uncontrolled ways! There would be no way to ensure the consistency and compatibility of interfaces if they were just the result of random dynamic methods.
+[/quote]
+
+I think if this was restricted then the whole internet-computer goes out the window. It is not the internet-computer’s-job to “ensure the consistency and compatibility of interfaces”. Canisters are not consistent, they live, just like the NNS and the ic itself. Imagine if the nns had certain restrictions that blocked itself from updating in certain ways. That would be the end of the IC.
+
+Since when does smart-contracts mean no dynamic-public-methods?
+
+.
+
+[quote="rossberg, post:4, topic:7237"]
+if they were just the result of random dynamic methods.
+[/quote]
+
+Where did you get the word random from?
+
+-------------------------
+

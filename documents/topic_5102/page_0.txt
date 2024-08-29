@@ -1,0 +1,266 @@
+ccyanxyz | 2021-06-12 14:49:39 UTC | #1
+
+Two questions about canister controller:
+1. How to get the controller principal id inside the canister with Rust/Motoko?
+2. How to set a different controller for an already deployed canister?
+
+Thanks :)
+
+-------------------------
+
+lsgunn | 2021-06-13 17:30:23 UTC | #2
+
+If you are the owner/controller of a canister, you can use the `dfx canister set-controller` command to specify the principal you want to be the controller of a specific canister.
+However, most *canister management operations* (to create a new canister or install code, for example) require a cycles wallet canister identifier. You can use the `dfx wallet add-controller` command to add a principal identifier as a controller of a cycles wallet. 
+So, depending on exactly what you are trying to do, you might use different commands. 
+You can find some more information here, but if you provide more details about what your goals are, we might be able to provide more useful and specific information to help.
+https://sdk.dfinity.org/docs/developers-guide/cli-reference/dfx-canister.html
+https://sdk.dfinity.org/docs/developers-guide/cli-reference/dfx-wallet.html
+HTH a little bit ...
+
+-------------------------
+
+ccyanxyz | 2021-06-14 05:13:10 UTC | #3
+
+Thanks for the information, it answers the second question.
+
+I'm trying to implement a token canister, in which I need a `get_controller` function so that the users can query who is the controller of the token canister. Canister is upgradable on the IC, if a single person controls the token canister, people are going to worry about scam or rug pulls, so this controller better be a DAO canister, in which people vote on proposals related to this token canister, then the DAO canister can choose to upgrade the token canister or not based on the voting results.
+
+So, inside the token canister, we need a `get_controller` query function for users to get the controller of the token canister(question 1: how to get the controller principal id inside the canister with Rust/Motoko), and we need to set the controller of the token canister to the DAO canister(question 2: how to set a different controller for an already deployed canister). Question 2 is clear now, can you provide more information on question 1? Or is there any other way for users to query the controller of a specific canister?
+
+-------------------------
+
+wang | 2021-06-14 06:40:26 UTC | #4
+
+As far as I know, you can't query for controller of an arbitrary canister on chain if you are not the controller. This restriction will hopefully be lifted in the future (right @nomeata?)
+
+-------------------------
+
+nomeata | 2021-06-14 09:49:26 UTC | #5
+
+Yes, probably. Maybe we need to expose the public information from the state tree in a uniform way? Maybe we need to add a `canister_status_public` that only reveals the information that is not considered confidential? Maybe “we” need to declare all information in canister status to be non-confindential and simply drop the restriction that only controllers can use it. 
+
+In fact, the last maybe is what needs to be resolved first.
+
+-------------------------
+
+lsgunn | 2021-06-14 14:14:38 UTC | #6
+
+I filed an issue requesting a dfx canister get-controller CLI command a while back. I’ll take a look at wether that’s open or was closed because of the restrictions
+
+-------------------------
+
+senior.joinu | 2021-06-29 19:08:57 UTC | #7
+
+Are there any news on this issue? I'm very much in need for this.
+
+Right now this works much contrary to "everything on-chain" paradigm.
+
+-------------------------
+
+claudio | 2021-06-29 19:39:15 UTC | #8
+
+> (question 1: how to get the controller principal id inside the canister with Rust/Motoko)
+
+According the spec, a canister should be able to call `canister_status` to read its own status.
+
+https://sdk.dfinity.org/docs/interface-spec/index.html#canister-status
+
+In particular, the spec states that:
+> 
+> The controllers of the canister can initiate transitions between these states using [ `stop_canister` ](https://sdk.dfinity.org/docs/interface-spec/index.html#ic-stop_canister) and [ `start_canister` ](https://sdk.dfinity.org/docs/interface-spec/index.html#ic-start_canister), and query the state using [ `canister_status` ](https://sdk.dfinity.org/docs/interface-spec/index.html#ic-canister_status). **The canister itself can also query its state using [ `ic0.canister_status` ](https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-canister-status).**
+
+Have you tried that?
+
+I'll see if I can come up with a Motoko example...
+
+-------------------------
+
+claudio | 2021-06-29 20:03:27 UTC | #9
+
+According to my reading of the spec, I would expect this Motoko code to work:
+
+```
+import Principal "mo:base/Principal";
+import Debug "mo:base/Debug";
+
+
+actor Self { // name the actor so we can access its Principal below
+
+  // Use an actor reference to access the well-known, virtual
+  // IC management canister with specified Principal "aaaaa-aa",
+  // asserting its interface type
+  // NB: this is a smaller supertype of the full interface at
+  //     https://sdk.dfinity.org/docs/interface-spec/index.html#ic-management-canister
+  let IC =
+    actor "aaaaa-aa" : actor {
+      // richer in ic.did
+      canister_status : { canister_id : Principal } ->
+        async { // richer in ic.did
+          controllers : [Principal]
+        };
+
+    };
+
+  public func get_controllers() : async [Principal] {
+    let principal = Principal.fromActor(Self);
+    let status = await IC.canister_status({ canister_id = principal });
+    return status.controllers;
+  };
+
+};
+```
+However, when I call 
+```
+crusso@vm:~/examples/motoko/controller$ dfx canister call actor_reference get_controllers
+The Replica returned an error: code 4, message: "Only the controllers of the canister rrkah-fqaaa-aaaaa-aaaaq-cai can control it.
+Canister's controllers: rwlgt-iiaaa-aaaaa-aaaaa-cai
+Sender's ID: rrkah-fqaaa-aaaaa-aaaaq-cai"
+```
+I get an error (that does actually reveal the controller, but embedded in a textual error).
+
+I ran the example on a local replica using dfx 0.7.2.
+
+I do think this aspect of the spec changed recently, so perhaps the replica shipped with dfx 0.7.2 is behind.
+
+Perhaps @akhilesh.singhania or @nomeata would know.
+
+-------------------------
+
+claudio | 2021-06-29 21:32:10 UTC | #10
+
+Sorry folks, I misinterpreted the spec. 
+
+The sentence
+> **The canister itself can also query its state using [ `ic0.canister_status` ].**
+
+This sentence is actually referring to [this](https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-canister-status) System API function (confusingly also ending in `canister_status`). Motoko doesn't expose that, and it wouldn't give you access to the controller anyway.
+
+I think my code above would work if the canister was installed with itself as one of the controllers though - is that the case in your Token canister?
+
+-------------------------
+
+claudio | 2021-06-30 04:48:05 UTC | #11
+
+My code above was slightly wrong and should read:
+
+```
+import Principal "mo:base/Principal";
+import Debug "mo:base/Debug";
+
+
+actor Self { // name the actor so we can access its Principal below
+
+  // Use an actor reference to access the well-known, virtual
+  // IC management canister with specified Principal "aaaaa-aa",
+  // asserting its interface type
+  // NB: this is a smaller supertype of the full interface at
+  //     https://sdk.dfinity.org/docs/interface-spec/index.html#ic-management-canister
+  let IC =
+    actor "aaaaa-aa" : actor {
+      // richer in ic.did
+      canister_status : { canister_id : Principal } ->
+        async { // richer in ic.did
+          settings : { controllers : [Principal] }
+        };
+
+    };
+
+  public func get_controllers() : async [Principal] {
+    let principal = Principal.fromActor(Self);
+    let status = await IC.canister_status({ canister_id = principal });
+    return status.settings.controllers;
+  };
+
+};
+```
+(the difference is that the `controllers` record is embedded in a record with a field called `settings` field).
+
+If you make the canister its own controller, then calling `IC.canister_status` on the principal of `Self` will actually succeed.
+
+E.g.
+
+```
+crusso@vm:~/examples/motoko/controller$ dfx deploy
+Creating a wallet canister on the local network.
+The wallet canister on the "local" network for user "crusso" is "rwlgt-iiaaa-aaaaa-aaaaa-cai"
+Deploying all canisters.
+Creating canisters...
+Creating canister "actor_reference"...
+"actor_reference" canister created with canister id: "rrkah-fqaaa-aaaaa-aaaaq-cai"
+Building canisters...
+Installing canisters...
+Creating UI canister on the local network.
+The UI canister on the "local" network is "ryjl3-tyaaa-aaaaa-aaaba-cai"
+Installing code for canister actor_reference, with canister_id rrkah-fqaaa-aaaaa-aaaaq-cai
+Deployed canisters.
+crusso@vm:~/examples/motoko/controller$ dfx canister call actor_reference get_controllers
+The Replica returned an error: code 4, message: "Only the controllers of the canister rrkah-fqaaa-aaaaa-aaaaq-cai can control it.
+Canister's controllers: rwlgt-iiaaa-aaaaa-aaaaa-cai
+Sender's ID: rrkah-fqaaa-aaaaa-aaaaq-cai"
+crusso@vm:~/examples/motoko/controller$ dfx canister update-settings actor_reference --controller rrkah-fqaaa-aaaaa-aaaaq-cai
+Updated "rrkah-fqaaa-aaaaa-aaaaq-cai" as controller of "actor_reference".
+crusso@vm:~/examples/motoko/controller$ dfx canister call actor_reference get_controllers
+(vec { principal "rrkah-fqaaa-aaaaa-aaaaq-cai" })
+```
+
+Not sure that's useful for you, but there you go.
+
+-------------------------
+
+ccyanxyz | 2021-06-30 04:54:36 UTC | #12
+
+Thanks for the reply, I've figured it out.
+Here are some examples of how to interact with the management canister(ic0), hope this will help the others.
+https://github.com/dfinance-tech/dtoken/blob/master/src/registry.mo#L138-L171
+
+-------------------------
+
+LevenSton | 2021-07-09 06:08:24 UTC | #13
+
+hello，How to prevent one controller from deleting or stopping the canister？How to realize the decentralization of the user's canister。thanks
+
+-------------------------
+
+ccyanxyz | 2021-07-09 11:46:15 UTC | #14
+
+Two ways I can think of:
+1. Set the controller of the canister to a blackhole principal id, then no one can control it
+2. Set the controller of the canister to a tokenized governance canister, where people vote on proposals making changes to the controlled canister.
+
+-------------------------
+
+LevenSton | 2021-07-09 12:59:14 UTC | #15
+
+the first way. I can understand.
+but second way.  how to Set the controller of the canister to a tokenized governance canister, where people vote on proposals making changes to the controlled canister.
+do you have some reference？ I do not know how to implement？ thanks！！！
+
+-------------------------
+
+ccyanxyz | 2021-07-10 14:23:42 UTC | #16
+
+https://github.com/DFINITY-Education/governance
+
+-------------------------
+
+Fulco | 2021-07-10 16:27:31 UTC | #17
+
+Another good place for inspiration might be the NNS root and lifeline canister https://github.com/dfinity/ic/tree/024de2fc73d7f6f5df5a92edf9675851f9ebbf59/rs/nns/handlers
+
+-------------------------
+
+lastmjs | 2022-04-22 18:05:52 UTC | #18
+
+So you have to set the controller of a canister to itself in order to call the management canister and get its status? This seems undesirable.
+
+It seems this is still the case. Does anyone know if there are plans to allow canisters to query their own status without being their own controller?
+
+-------------------------
+
+jzxchiang | 2022-04-25 04:30:31 UTC | #19
+
+You can add a canister to its own list of multiple controllers. Definitely feels hacky though.
+
+-------------------------
+

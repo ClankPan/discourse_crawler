@@ -1,0 +1,116 @@
+ulan | 2021-11-26 12:35:07 UTC | #1
+
+# Summary
+
+The state of subnet `pjljw` diverged causing the subnet to stall. The subnet became effectively read-only for ~12 hours until a disaster recovery with a hotfix was performed.
+
+The state divergence was in the counter that keeps track of modified memory pages. The actual contents of the memory pages did not diverge. Non-determinism caused some pages to be marked as modified even though they were actually clean. The hotfix ensures that the list of modified pages is computed based on the actual bytes in memory.
+
+# Impact
+
+The subnet was in read-only mode for ~12 hours.
+
+# Timeline (UTC)
+
+* 12:10: The finalization rate of pjljw drops to 0.
+* 12:15: Code red is declared. Investigation starts.
+* 12:50: It is clear that the incident is caused by state divergence.
+* 12:59: The incident is added to the [status page](https://status.internetcomputer.org/incidents/mzk9kpl9yslz).
+* 13:00 - 15:00: The team is trying to find out which bits of the state diverged.
+* 15:00: The state divergence is narrowed down to the heap delta counter in the canister metadata.
+* 15:00 - 17:00: The team is trying to reproduce the divergence locally using `ic-replay`.
+* 17:00: A hotfix is proposed after auditing code related to the heap delta counter. It cannot be verified because there is no local reproduction yet.
+* 17:00 - 20:30: The team continues to try to reproduce the divergence locally using `ic-replay`, which is very slow due to the large state.
+* 20:30: The team decides to go ahead with the hotfix because there is no progress with the local replay.
+* 21:00 - 23:05: The team performs disaster recovery on the subnet.
+* 23:21: The incident is marked as resolved in the [status page](https://status.internetcomputer.org/incidents/mzk9kpl9yslz).
+
+# What went wrong?
+
+* Missing outstanding replies can block a canister from stopping and upgrading.
+The incident happened just before the deadline of [proposal 30496](https://dashboard.internetcomputer.org/proposal/30946) to upgrade the ledger canister and enable canisters to transfer ICP, which was aborted due to this risk.
+* The execution stack had a source of non-determinism, which was not caught by tests and production until now.
+* The `ic-replay` tool had a deadlock bug that the team had to debug and fix while investigating the main incident.
+* The disaster recovery environment was not optimized for large states.
+
+# What went right?
+
+* The team quickly found that the root cause of the finalization rate drop is state divergence.
+* The team narrowed down the divergence to specific bits in the canister state.
+* Disaster recovery of the subnet went smoothly.
+
+# Action items
+
+* Add tests and instrumentation to ensure that the signal handler is deterministic.
+* Audit all system calls that access the WebAssembly memory and ensure that they are deterministic.
+* Fix the discovered bugs in the `ic-replay` tool.
+* Improve replaying and disaster recovery for large states.
+
+# Technical details
+
+The state divergence was caused by a combination of two issues:
+
+1. The implementation of the `ic0.msg_arg_data_copy()` system call uses `copy_from_slice()` to copy the message argument data to the WebAssembly memory. Internally that function uses `__memmove_avx_unaligned()` of `libc`, which writes into memory either in the increasing or decreasing order of addresses depending on the addresses of the arguments. Thus, the order of writes is not deterministic and may differ from node to node.
+2. The signal handler relies on the deterministic order of writes for keeping track of modified pages. If that doesn’t hold, then the signal handler may erroneously mark some clean pages as modified. Because of that, the counter that keeps track of the modified pages becomes non-deterministic. The actual bytes in memory are not affected and remain deterministic.
+
+The hotfix removes the dependency of the signal handler on the order of writes and ensures that the list of modified pages is computed based on the actual bytes in memory. As a follow-up action item, the non-deterministic order of writes in system calls should be fixed, but that is not critical and doesn't affect the overall determinism of execution anymore.
+
+-------------------------
+
+mparikh | 2021-11-27 02:14:03 UTC | #2
+
+Thanks! A quick question : what was the RTO & RPO for DR?
+
+-------------------------
+
+jzxchiang | 2021-11-27 04:59:34 UTC | #3
+
+What is `ic-replay` used for? Is that open source yet?
+
+-------------------------
+
+GLdev | 2021-11-27 07:18:30 UTC | #4
+
+Wanted to ask this for a while, I guess this topic kind of fits... Is there a way to choose what subnet a new canister is deployed to? I'm considering having some functionality that can be handled by multiple canisters, based on a "processing que". I was thinking that having canisters in multiple subnets could help.
+
+-------------------------
+
+ulan | 2021-11-29 15:27:30 UTC | #5
+
+[quote="jzxchiang, post:3, topic:9099, full:true"]
+What is `ic-replay` used for? Is that open source yet?
+[/quote]
+It is a tool used in disaster recovery and it was open sourced today: https://github.com/dfinity/ic/tree/master/rs/replay
+
+[quote="GLdev, post:4, topic:9099"]
+Is there a way to choose what subnet a new canister is deployed to?
+[/quote]
+According to [this thread](https://forum.dfinity.org/t/could-we-deploy-a-canister-on-a-specified-subnet/7936) is it not possible currently, but that may change in the future.
+
+
+[quote="mparikh, post:2, topic:9099, full:true"]
+Thanks! A quick question : what was the RTO & RPO for DR?
+[/quote]
+
+I am not an expert in that area, so I am going to defer this questions to others.
+
+-------------------------
+
+northman | 2021-11-29 20:53:38 UTC | #6
+
+That was a very informative incident retrospective.
+
+Is there a subnet status page using Traffic Light Protocol (Red, Yellow, Green).
+
+I did see finalization rates drop - but is there something succinct like a dashboard on status where one does not need to understand the complexities of some of the tech?
+
+If not, it could be an opportunity for improvement.
+
+-------------------------
+
+ulan | 2021-11-30 14:33:14 UTC | #7
+
+Thanks @northman! That's a good idea. I'll suggest that to the team maintaining the IC dashboard.
+
+-------------------------
+

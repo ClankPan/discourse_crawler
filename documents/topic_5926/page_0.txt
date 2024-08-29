@@ -1,0 +1,277 @@
+RMCS | 2021-07-15 18:53:37 UTC | #1
+
+Hi,
+
+I'm having the following issue;
+
+I have the following function that will add a new member to the group based on the principal (`msg.caller`);
+
+```
+public shared(msg) func join(groupId: Int) : async Result.Result<Bool, GroupError> {
+        var existing = groups.get(groupId);
+
+        switch (existing) {
+            case (?existing) { 
+				let newGroup : Group = {
+					id = existing.id;
+					members = Array.append<Principal>(existing.members, [msg.caller]);
+                };
+				groups.put(groupId,newGroup);
+				#ok(true);
+             };
+            case (null) {
+                #err(#message("No Group Found"));
+            };
+        }; 
+    };
+```
+When i try to filter out the groups where the user is in the `members` array, i find that the added principal (`msg.caller`) is different then the `getIdentity().getPrincipal()` in the frontend :confused:  
+
+As seen in the image, the first principal is the one i get from `getIdentity().getPrincipal()` and the array i get from the `group.members`..
+![image|690x196](upload://3VPfL8Gj7IA82VP0q51BUVSS3rn.png)
+
+What am i doing wrong?
+
+Thanks in advance
+
+-------------------------
+
+kpeacock | 2021-07-15 18:56:23 UTC | #2
+
+How are you setting up and passing the identity client-side?
+
+-------------------------
+
+RMCS | 2021-07-15 19:00:06 UTC | #3
+
+```
+let authClient: AuthClient;
+
+async function createAuthClient() {
+		try {
+			const newAuthClient = await AuthClient.create();
+			setState(prevState => ({ ...prevState, authClientReady: true }));
+			authClient = newAuthClient;
+			console.log('created');
+		} catch (error) {
+			console.log(error);
+			setState(prevState => ({ ...prevState, authClientReady: false }));
+		}
+	}
+
+function getIdentity() {
+		return authClient.getIdentity();
+	}
+```
+
+-------------------------
+
+kpeacock | 2021-07-15 19:03:32 UTC | #4
+
+By default, your `HttpAgent` will be making all calls with an `AnonymousIdentity`. To have your actor use the identity, you'll need to recreate the `HttpAgent`, passing the new identity as an option. 
+
+https://github.com/krpeacock/auth-client-demo/blob/main/src/frontend/src/index.ts#L30
+
+-------------------------
+
+RMCS | 2021-07-15 19:07:59 UTC | #5
+
+Ahh i didn't know that, i thought it was the other way around, so if you wanted to use the `AnonymousIdentity` you needed to specify this.
+
+Let me check if this works :+1:  thanks in advance
+
+-------------------------
+
+RMCS | 2021-07-15 20:15:18 UTC | #6
+
+[quote="kpeacock, post:4, topic:5926"]
+https://github.com/krpeacock/auth-client-demo/blob/main/src/frontend/src/index.ts#L30
+[/quote]
+
+Hmm when i set it i get a `TypeError: id.getPrincipal is not a function` error :thinking:
+
+-------------------------
+
+kpeacock | 2021-07-15 20:19:05 UTC | #7
+
+oh yeah, I've encountered that error before. I think it had to do with the canisterId not being set properly during the actor setup.
+
+I should make an issue for that
+
+-------------------------
+
+RMCS | 2021-07-15 20:25:37 UTC | #8
+
+I now have something like this 
+```
+import { Actor, HttpAgent, HttpAgentOptions, Identity } from '@dfinity/agent';
+import { idlFactory as profile_idl, canisterId as profile_id } from 'dfx-generated/ProfileController';
+import { default as PROFILE_SERVICE } from './ProfileController';
+import { idlFactory as group_idl, canisterId as group_id } from 'dfx-generated/GroupController';
+import { default as GROUP_SERVICE } from './GroupController';
+
+let identity: Identity = JSON.parse(localStorage.getItem('identity')!);
+
+const agentOptions: HttpAgentOptions = {
+// ONLY ENABLE THIS FOR LOCAL TESTING
+host: 'http://localhost:8000',
+identity
+};
+
+const agent = new HttpAgent(agentOptions);
+
+// ONLY ENABLE THIS FOR LOCAL TESTING
+agent.fetchRootKey();
+
+export function profileController(): PROFILE_SERVICE {
+return Actor.createActor(profile_idl, {
+agent: agent,
+canisterId: profile_id
+});
+}
+
+export function groupController(): GROUP_SERVICE {
+return Actor.createActor(group_idl, {
+agent: agent,
+canisterId: group_id
+});
+}
+```
+
+-------------------------
+
+kpeacock | 2021-07-15 20:44:41 UTC | #9
+
+I'm not seeing anything you're doing wrong per se - although I don't think the return types you're using will work correctly. 
+
+The way I would do this would be to update to 0.7.7 and use the exported `createActor` method, passed like this:
+```
+const identity = authClient.getIdentity();
+const profileActor = createActor(profile_id, {
+  agentOptions: { identity: authClient?.getIdentity() },
+});
+```
+
+You'll need to update `webpack.config.js` and `package.json` to match the new `dfx new` output, but I'm still working on migration docs
+
+```
+DFX_VERSION="0.7.6" sh -ci "$(curl -fsSL https://sdk.dfinity.org/install.sh)"
+```
+
+-------------------------
+
+RMCS | 2021-07-15 20:55:54 UTC | #10
+
+Hmm, will wait for the docs then, i just installed version 0.7.7 and it generates some other code, but got some reference errors, btw i'm using vite instead of webpack.
+
+![image|690x93](upload://7oewHeLJnjkNJ5BHpKKxlFBqSkm.png)
+
+```
+import { Identity } from '@dfinity/agent';
+import { createActor as createProfileActor, canisterId as ProfileId } from 'dfx-generated/ProfileController';
+import { createActor as createGroupActor, canisterId as GroupId } from 'dfx-generated/GroupController';
+
+let identity: Identity = JSON.parse(localStorage.getItem('identity')!);
+
+export function profileController() {
+	return createProfileActor(ProfileId, {
+		agentOptions: {
+			host: 'http://localhost:8000',
+			identity
+		}
+	});
+}
+
+export function groupController() {
+	return createGroupActor(GroupId, {
+		agentOptions: {
+			host: 'http://localhost:8000',
+			identity
+		}
+	});
+}
+
+```
+tsconfig
+```
+{
+	"compilerOptions": {
+		"target": "ESNext",
+		"lib": ["DOM", "DOM.Iterable", "ESNext"],
+		"types": ["vite/client"],
+		"allowJs": true,
+		"skipLibCheck": true,
+		"esModuleInterop": false,
+		"allowSyntheticDefaultImports": true,
+		"strict": true,
+		"forceConsistentCasingInFileNames": true,
+		"module": "ESNext",
+		"moduleResolution": "Node",
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"noEmit": true,
+		"jsx": "react",
+		"baseUrl": "./",
+		"paths": {
+			"src/*": ["./src/*"],
+			"dfx-generated/ProfileController": [".dfx/local/canisters/ProfileController"],
+			"dfx-generated/GroupController": [".dfx/local/canisters/GroupController"]
+		}
+	},
+	"include": ["./src"]
+}
+
+```
+
+-------------------------
+
+kpeacock | 2021-07-15 21:02:14 UTC | #11
+
+Okay, for vite, you will want to do the following:
+
+1. remove the `prebuild` job from `package.json`
+2. replace the `process.env` variables in the generated code with **`import.meta.env.`**
+3. Follow this guide to handle environment variables in vite for `NODE_ENV` and `<canister_name_uppercase>_CANISTER_ID`
+https://vitejs.dev/guide/env-and-mode.html#intellisense
+
+-------------------------
+
+RMCS | 2021-07-15 21:08:18 UTC | #12
+
+Thanks! Will check back tomorrow 👍🏻
+
+-------------------------
+
+RMCS | 2021-07-16 12:01:30 UTC | #13
+
+Do you have an example project or something and iss this new method stable? 
+Running into error after error, to the point i reverted everything. Think it's better to wait until the migration is documented.
+
+in the meantime do you have a solution to fix this with dfx version 0.7.2?
+
+-------------------------
+
+stephenandrews | 2021-07-16 13:57:52 UTC | #14
+
+What was your issue with 0.7.2? Your code looked OK
+```
+let identity: Identity = JSON.parse(localStorage.getItem('identity')!);
+```
+Can you output identity to ensure it is a valid Identity?
+
+-------------------------
+
+RMCS | 2021-07-16 17:35:26 UTC | #15
+
+The 3d line is  `console.log(identity)`;
+![image|690x322](upload://r10IaqeVuMC9AlTAnNugdo7KmPM.png)
+and the last log is the error i am getting
+
+-------------------------
+
+stephenandrews | 2021-07-19 06:06:18 UTC | #16
+
+For future reference, this was resolved in private. The issue was storing the identity in localstorage as opposed to pulling it again via `authClient.getIdentity()`
+
+-------------------------
+

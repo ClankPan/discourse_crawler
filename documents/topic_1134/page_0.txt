@@ -1,0 +1,127 @@
+morrolan | 2020-08-26 14:40:31 UTC | #1
+
+What would an idiomatic (and preferably efficient) way to explode a `WordN` into an array of individual bytes (so `Word8`) be?
+
+As a use case, consider that you've got an algorithm operating on individual bytes (eg a hash algorithm), which you feed a variable-length input, in the form of eg an arbitrarily-sized number, or text.
+
+The way I currently handle it consists of three steps:
+- Starting with `WordN`, use a combination of right-shift and binary AND to pull one specific byte out 
+- Convert the resulting `WordN` into a `Word8` by means of `Word8.fromNat(WordN.toNat(x))`
+- Do that N/8 times, once for each of the bytes contained within the `WordN`
+
+Eg something along those lines:
+```
+  // Explode Word32 into byte array, with LSB first.
+  func explodeWord32(x : Word32) : [Word8] {
+    return Array.tabulate<Word8>(
+      4, // 4 bytes in a Word32
+      func(i : Nat) : Word8 {
+        return(extractByte(x, i));
+      }
+    );
+  };
+
+  // Extract byte with offset (valid values 0 - 3, starting at the LSB) from Word32.
+  func extractByte(x : Word32, offset : Nat) : Word8 {
+    return word32ToWord8(
+      (x >> (Word32.fromNat(offset) * 8)) & 0xFF
+    );
+  };
+
+  // This implicitly 'truncates' the Word32, returning only the LSB, probably
+  // by means of implicit rollover.
+  func word32ToWord8(x : Word32) : Word8 {
+    return Word8.fromNat(Word32.toNat(x));
+  };
+```
+
+I don't particularly mind the bit masking to pull specific bytes out, but I severely dislike the roundtrip via conversion to and from `Nat`, just to have a proper `Word8` in the end.
+
+Are there more idiomatic ways to handle that? Other languages tend to offer ways to explode a uint (as well as text etc) into byte arrays, which might be worth considering for Motoko.
+
+-------------------------
+
+cryptoschindler | 2020-09-03 16:04:26 UTC | #2
+
+Maybe @enzo can help?
+
+-------------------------
+
+morrolan | 2020-09-03 20:56:36 UTC | #3
+
+Maybe to clarify - ideally I'd of course like Motoko to provide a `.bytes()` (or `.toWord(n : Nat)` if you want to be fancy) method on especially `Text`, and arbitrary-precision/length ints & naturals. That'd allow to efficiently get hold of the individual bytes, of when you need them - a common pattern in other languages. And at least for Text/Int/Nat that should be fairly straight forward & efficient to implement, as I would imagine those are implemented as arrays of `WordN` under the hood.
+
+But for the time being I'm working around it (with lower efficiency) as per above. For arbitrary-length Ints/Naturals even more inefficiently, by means of repeat division with remainder by 2^8 :joy:
+
+Might be I'm missing a more elegant way though, so grateful for input on that topic :)
+
+-------------------------
+
+chenyan | 2020-09-04 05:28:16 UTC | #4
+
+For `Text`, you can use `Text.toIter(text)` or `text.chars()` to iterate individual characters. 
+
+For `Int`, you are doing the right thing. I agree it's tedious to convert between different number types. There is actually a proposal to remove the `WordN` type, so that we don't need to do this conversion in the future. 
+
+There are probably some other hacks we can do, e.g. converting the number to text and then process them character by character (not quite what you want and not very efficient, but it's fewer lines of code); we can also send the number to frontend and do the bit manipulation there.
+
+-------------------------
+
+morrolan | 2020-09-04 08:36:46 UTC | #5
+
+Ah, fair point about being able to get an iterator of chars from a `Text` - from there it's then straight-forward to get `Word32`s out. :slight_smile:
+
+I'm a bit uncertain about the proposal to remove `WordN` - a numeric type with modular arithmetics can be quite useful, as well as certain binary operations seemingly only being implemented on the `WordN` types.
+
+-------------------------
+
+chenyan | 2020-09-04 17:25:23 UTC | #6
+
+Yes, we can introduce wrapping operators for all `IntN` and `NatN` types, e.g. `+%`, `-%`, and `*%`.
+
+-------------------------
+
+enzo | 2020-09-24 16:26:52 UTC | #7
+
+Sorry for the delayed reply here!
+
+Seems this this thread fell into my backlog.
+
+Yeah, this should be pretty straight-forward.
+
+```
+  public func natToBytes(n : Nat) : List<Word8> {
+    var a = 0;
+    var b = n;
+    var bytes = List.nil<Word8>();
+    var test = true;
+    while test {
+      a := b % 256;
+      b := b / 256;
+      bytes := List.push<Word8>(Prim.natToWord8(a), bytes);
+      test := b > 0;
+    };
+    bytes
+  };
+```
+and if you want to go in the other direction...
+```
+  public func natFromBytes(bytes : List<Word8>) : Nat {
+    var n = 0;
+    var i = 0;
+    List.foldRight<Word8, ()>(bytes, (), func (byte, _) {
+      n += Prim.word8ToNat(byte) * 256 ** i;
+      i += 1;
+    });
+    n
+  };
+```
+
+-------------------------
+
+morrolan | 2020-09-25 11:30:41 UTC | #8
+
+Thanks for the response - so pretty much the way I went about it. I quite like your way of using a linked list instead of a buffer as I did - prevents repeated array reallocation as the buffer grows. :smile:
+
+-------------------------
+

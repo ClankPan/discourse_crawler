@@ -1,0 +1,222 @@
+josephgranata | 2023-07-06 18:29:05 UTC | #1
+
+Folks,
+
+We are working on storing a collection of files from a single user into a canister using the IC Rust support for stable memory.
+
+We have read many discussions on the theoretical tools, and limits for storage here on the forum, and I would appreciate if any of the experts who discussed this subject in the past can help us.
+
+At a very high level we intend to do the following:
+
+- Have a controller canister that stores data of every user in their own canister
+- Use IC Stable Data structures to store data on the user's canister
+https://docs.rs/ic-stable-structures/0.1.1/ic_stable_structures/
+- Most likely use the IC Stable Memory Rust library from Alexander @senior.joinu: https://crates.io/crates/ic-stable-memory
+- Populate the user files into a BTreeMap in his canister, where the nodes are the files from the user using Box data structures.
+
+I do know of two issues with the implementation:
+- Subnet Ingress Message limits of 2 MB. Is this still in place @dsarlis , and what is the recommended way to address it for data?
+- Dealing with cycle execution limits for instructions, any idea on how many seconds we can allow for an upload? Which is very dependent on user connection speed.
+
+Would you say the high level idea looks correct? Or would you suggest any changes? I copy a few of the people who seem to understand this subject well: @dsarlis, @abk, @flyq, @simdi.jinkins ?
+
+Thanks in advance. We know this works using Rust without the IC, now we want to make sure it runs well inside the IC WASM architecture.
+
+-------------------------
+
+Severin | 2023-07-07 07:11:07 UTC | #2
+
+[quote="josephgranata, post:1, topic:21218"]
+Subnet Ingress Message limits of 2 MB. Is this still in place @dsarlis , and what is the recommended way to address it for data?
+[/quote]
+
+Still in place, and I don't think this will change in the near future. The way we deal with it in the asset canister is to do chunked, and somewhat parallelised uploads.
+
+[quote="josephgranata, post:1, topic:21218"]
+Dealing with cycle execution limits for instructions, any idea on how many seconds we can allow for an upload? Which is very dependent on user connection speed.
+[/quote]
+Execution limits are per message, so every 2MB chunk would have a new limit. I don't think this will be relevant for you unless you plan to hash large files on-chain
+
+-------------------------
+
+dsarlis | 2023-07-07 08:59:42 UTC | #3
+
+I'm a bit puzzled on why you mention that you plan to use both ic-stable-structures and ic-stable-memory. The two libraries essentially solve very similar problems and provide very similar data structures. Is there something that's missing in one that you expect to get from the other?
+
+-------------------------
+
+josephgranata | 2023-07-07 17:59:59 UTC | #4
+
+Severin,
+
+Thanks for the confirmation about the Ingress Message limit of 2 MB.
+
+So this means if I was to load a 20 MB file to the IC Chain then it would have to be chunked into 10 pieces correct?
+
+The execution limits are interesting, so it seems they are the same limitation but affecting code execution. In the case of a file load, there is usually a few seconds or minutes to finish the load, from your answer it seems that as long as we "divide the task into 2 MB" chunks we would be okay, correct?
+
+Joseph
+
+-------------------------
+
+josephgranata | 2023-07-07 18:04:25 UTC | #5
+
+Dmitris, we do know the two libraries are very similar, we are just evaluating which to use.
+
+Can you, or perhaps @senior.joinu tell us of any differences we should be aware of to choose one or the other?
+
+Thanks.
+
+-------------------------
+
+Severin | 2023-07-10 07:32:55 UTC | #6
+
+[quote="josephgranata, post:4, topic:21218"]
+So this means if I was to load a 20 MB file to the IC Chain then it would have to be chunked into 10 pieces correct?
+[/quote]
+
+Yes. With some compression you may be able to improve this a little, but depending on the format it may not be worth it.
+
+[quote="josephgranata, post:4, topic:21218"]
+In the case of a file load, there is usually a few seconds or minutes to finish the load, from your answer it seems that as long as we “divide the task into 2 MB” chunks we would be okay, correct?
+[/quote]
+
+Most likely yes. But if you run a long task on completion of the upload (say hashing a 100MB file, or do some video processing) you may run into the limits
+
+-------------------------
+
+flyq | 2023-07-10 10:54:01 UTC | #7
+
+[quote="josephgranata, post:5, topic:21218"]
+Can you, or perhaps @senior.joinu tell us of any differences we should be aware of to choose one or the other?
+[/quote]
+
+I suggest you use [this](https://github.com/bitfinity-network/canister-sdk/blob/main/ic-stable-structures/Cargo.toml), it first wraps the https://github.com/dfinity/stable-structures written by the dfinity team, that is to say, it provides all the functions provided by stable-structures, and also provides multimap, etc. useful data structures. At present, the state of all of our canisters is directly stored in stable memory using it. You can refer to the example: https://github.com/flyq/template_canister
+
+-------------------------
+
+pramitgaha | 2023-07-10 11:48:22 UTC | #8
+
+[quote="josephgranata, post:4, topic:21218"]
+Thanks for the confirmation about the Ingress Message limit of 2 MB.
+
+So this means if I was to load a 20 MB file to the IC Chain then it would have to be chunked into 10 pieces correct?
+[/quote]
+
+maybe this example code of mine help you.
+here I'm doing chunk upload: https://github.com/pramitgaha/upload_file_rs
+sorry in advance, if this is no use for you...
+
+-------------------------
+
+ielashi | 2023-07-10 12:36:19 UTC | #9
+
+[quote="josephgranata, post:5, topic:21218"]
+Can you, or perhaps @senior.joinu tell us of any differences we should be aware of to choose one or the other?
+[/quote]
+
+I can't speak too much for `ic-stable-memory`, but as one of the authors of `ic-stable-structures`, I can tell you some of the design decisions that we made that I believe are different:
+
+
+1. **Compatibility with multi-memory**: when/if canisters have multiple stable memories in the future, it'll be easy to transition stable structures into separate memories and take advantage of that feature.
+
+2. **Data Isolation**: Data structures in `ic-stable-structures` do not share memory, and as a result, a corruption in one of them cannot corrupt the other.
+
+3. **No need for `pre-upgrade` hooks.**
+
+4. **Simple memory management**: Each data structure manages its own memory, and the memory operations are O(1) to prevent cycle drainage.
+
+5. **Interoperability**: the library provides a `MemoryManager`, which allows you to split your stable memory into multiple memories that you can use with other libraries or use them to store data from the heap.
+
+`ic-stable-structures` is used by a number of canisters, including the Bitcoin Canister, ckBTC, and Internet Identity.
+
+-------------------------
+
+pramitgaha | 2023-07-10 14:20:32 UTC | #10
+
+hello author @ielashi .
+I was doing 
+```rs
+struct Tokens{
+    pub tokens: StableBTreeMap<u128, Token, Memory>
+}
+
+self.tokens
+    .get(&id)
+    .unwrap()
+    .transfer(&auth, arg.to.clone())?;
+```
+here the state gets updated in localhost.
+is this the way this should work or this behavior is only in localhost?
+
+-------------------------
+
+ielashi | 2023-07-10 14:29:17 UTC | #11
+
+I'm not sure I understand your question. You can either have your canister running locally via dfx for testing and development, or in production on the IC. Whatever behavior you see locally should be what you see once you deploy to the IC. Are you seeing a discrepancy between the two environments?
+
+-------------------------
+
+pramitgaha | 2023-07-10 14:40:57 UTC | #12
+
+[quote="ielashi, post:11, topic:21218"]
+I’m not sure I understand your question.
+[/quote]
+sorry for not being clear about my question.
+
+does the `get` method of  `StableBTreeMap` returns both `&` and `& mut` to the underlying value?
+
+-------------------------
+
+ielashi | 2023-07-10 14:54:26 UTC | #13
+
+Neither. It returns a copy of the value.
+
+-------------------------
+
+pramitgaha | 2023-07-10 15:09:53 UTC | #14
+
+if it returns the copy, how was the change reflected in state?
+
+-------------------------
+
+ielashi | 2023-07-10 15:13:22 UTC | #15
+
+Let's keep this thread on-topic. Without looking at any code, I can't answer your question. Feel free to message me directly with your code and we can discuss it.
+
+-------------------------
+
+pramitgaha | 2023-07-10 16:11:01 UTC | #16
+
+@ielashi messaged you...........
+
+-------------------------
+
+josephgranata | 2023-07-11 23:31:02 UTC | #17
+
+Much appreciated Liquan, I will strongly consider it, and review the code as well.
+
+Thank you!
+
+-------------------------
+
+josephgranata | 2023-07-11 23:31:41 UTC | #18
+
+Thanks, it will probably be useful!
+
+-------------------------
+
+josephgranata | 2023-07-11 23:34:19 UTC | #19
+
+Thanks Mr. El-Ashi for that detailed explanation.
+
+I really like to avoid the pre-upgrade hooks, and to know that this tech is used by DFINITY for several of their major features, like ckBTC. It is definitely in my short list!
+
+-------------------------
+
+cryptoschindler | 2023-08-22 15:38:04 UTC | #20
+
+would be nice to have some documentation for this and then adding it to awesome internet computer :slight_smile:
+
+-------------------------
+

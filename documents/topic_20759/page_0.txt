@@ -1,0 +1,272 @@
+infu | 2023-06-19 12:15:25 UTC | #1
+
+I am coming to this problem a few times and it seems there is no way around it but to figure it out.
+
+## Goal 
+Have something like SQL 
+`SELECT * FROM something WHERE skill > 20 and fireballs < 10 ORDER BY name `
+
+Or something like the MongoDB syntax which seems to be widely adopted too.
+```js
+const queryResults = await myDatabase.heroes // 'heroes' should be the collection name
+    .find()
+    .where({
+        'skills.name': 'fireball', // Searching within the skills array for a skill with the name 'fireball'
+        'birthyear': {
+            $gte: 1940, // Born on or after 1940
+            $lte: 1950  // Born on or before 1950
+        }
+    })
+    .sort({name: 1})
+    .limit(5)
+    .exec(); // Execute the query
+```
+
+## Problems
+When creating a library that tries to make the above examples work: One of the biggest obstacles is the inability of Motoko to have functions that accept `any` type and work on data structures without knowing what they are. In JS you can do `obj.properyname` or `obj["propertyname"]` and address something. In Motoko, if implemented it would work similarly to how arrays work. A function doesn't have to specify exactly how many members an array needs to have. If someone tries to access a non-existent member `arr[23234]` an exception is thrown. Is the Motoko team planning on adding such property addressing? 
+
+The workaround is to use Candy library. But then if you use that or the 'untyped addressing', we are losing the benefits coming from the type system.
+
+The Candy Utils can now do things like 
+```
+let candy4 = get(candy, path("books[author.name == $.mostPopularAuthor].pageNumber")));
+
+let candy5 = get(candy, path("books[author.name == $.mostPopularAuthor | pageNumber < @.numberOfPurchases].pageNumber"));
+```
+which will definitely save time. Making that or SQL syntax or MongoDB syntax work with native Motoko structures without Candy (not sure how to call them) is impossible.
+ 
+That leaves us with one more option, to create some kind of interface that gets it done without circumventing the type system. I will try to do that with the query above.
+```
+const queryResults = heroes.find()
+    .where([
+        #func(func(x) { x.skills.name == 'fireball' }),
+
+```
+so far so good. We have converted `'skills.name': 'fireball'` to something that is alright.
+```
+       #func(func(x) { x.birthyear < 1940 and x.birthyear > 1950 }),
+```
+this will work if we are doing full table scans. (scanning the whole memory without using indexing).
+But we do need indexing, this means something like that should be the syntax
+```
+       #index("birthyear", [#gt(1940), #lt(1950)])
+```
+now how will the sorting work, it also should allow indexed sorting or non indexed sorting
+```mo
+       #sort_index("name", #asc)
+```
+or
+```
+       #sort_func(func(a,b) { a.created > b.created })
+```
+and we end with 
+```mo
+       #limit(5)
+```
+
+How will the initialization look like:
+```
+type MyType = {
+  name : Text;
+  birthyear: Nat;
+  skills:[{name: Text}]
+}
+
+stable var heroes = MDB<MyType>(
+{
+//... other config options
+indexes: [
+  ("name", func(x) { x.name }),
+  ("birthyear", func(x) { lexicographic.encode(x.birthyear) })
+]
+}
+```
+
+I think the last approach is my personal favorite. It gets a bit getting used to, but it is kind of intuitive - because you can't do it in another way (that I can think of). What do you think? 
+
+We can set a bounty for this once we nail the interface designs and some requirements. It's already possible to do with @ZhenyaUsenko Map and Set and @icme 's BTree
+
+-------------------------
+
+skilesare | 2023-06-16 18:02:59 UTC | #2
+
+There are probably some patterns from Johan's data centric approach that would play nicely here.
+
+-------------------------
+
+infu | 2023-06-19 12:31:08 UTC | #3
+
+Progress update: Well, I was going just to design it, but It was going well, so I almost made it all. 
+Currently uses Map, BTree and I am thinking of adding Vector. There has to be an option between Map or Vector for the primary key.
+
+
+Setup:
+![image|643x500](upload://5wlKDJRQpTbVlyrdK1adXWzbstj.png)
+As you can see, it allows the dev to create indexes and they can dynamically generate them from something like an array of 'skills'. You can also think of it as searching by tag.
+
+Inserting/updating data:
+![image|690x86](upload://acD2Hrl9UF6srjhSUCeiq0qW6gF.png)
+
+Queries (These examples provide performance similar to well-indexed SQL)
+![image|690x447](upload://hQJuPNOPkpFfGZMGgtBw2NDANld.png)
+
+It's stable even tho it looks like a Class.
+No need to provide `<Types>` or hashing or comparison when you use it.
+Talking about the interface -> I believe that's how libraries should be written unless someone has valid optimization concerns. No need to provide types or hashing functions on every line when the thing's supposed to know them already.
+
+
+I wasn't very happy using Text keys in BTree, but it seems it may be the most optimal solution. Optionally we could have a library that compresses case insensitive [a-z0-9] key text into another text (not blob) and this way it will probably take 1/3 of the space. (Example: "PeterLee" becomes "a$C")
+https://forum.dfinity.org/t/text-compression-in-motoko/10306/4
+
+-------------------------
+
+infu | 2023-06-19 10:54:47 UTC | #4
+
+I also wonder if Skip Lists won't be better for this job than RBTrees. Redis (in-memory db) is using Map+Skip Lists for its sorted sets. Provided GPT is correct:
+![image|351x499](upload://2v1jhfG0eYipvBKkrQwcM60c96w.png)
+If I remember correctly, during tests the memory consumption of RBTrees wasn't the problem., it was hitting the instruction limit after growing ~4mil tiny records and 600mb memory. Or was it something else with the memory? Looks like Skip Lists will be cheaper to read and write
+
+-------------------------
+
+timo | 2023-06-19 11:17:17 UTC | #5
+
+[quote="infu, post:4, topic:20759"]
+Or was it something else with the memory?
+[/quote]
+
+If it was hitting the instruction limit of the garbage collector then that problem may now have gone away with the incremental garbage collector.
+
+[quote="infu, post:1, topic:20759"]
+and @icme 's RBTree
+[/quote]
+
+You mean @icme's b-tree (not rbtree)?
+
+-------------------------
+
+infu | 2023-06-19 12:18:11 UTC | #6
+
+[quote="timo, post:5, topic:20759"]
+b-tree (not rbtree)
+[/quote]
+
+Yes, correct. The Stableheapbtreemap
+
+If Skip Lists are not rebalancing, does that also mean there will be a lot less garbage to collect
+
+-------------------------
+
+claudio | 2023-06-19 16:16:58 UTC | #7
+
+> If it was hitting the instruction limit of the garbage collector then that problem may now have gone away with the incremental garbage collector.
+
+Note you'll need to enable the incremental gc with the  compiler option `--incremental-gc`. It's not the default.
+
+-------------------------
+
+infu | 2023-06-20 15:31:53 UTC | #8
+
+:fire: 
+Thanks to @claudio who explained how to optimize the internal storage I've managed to put 966000 (using dfx 0.14.1 moc, no special args) documents inside the DB (before I hit the instruction limit on insertion of 1k records) (with the config above) which adds ~ 9 indexes (excessive amount for test purposes) per document (stored in BTree), while the documents are stored in Vector. This means around ~10mil key->val links. For me, that is plenty of db space to work with. There are many possible optimizations, which can push it even further. 
+
+
+
+Before upgrade:
+```
+{
+    "documents": "966000",
+    "memory_size": "1990590464",
+    "max_live_size": "811297608",
+    "stable_size": "297392585",
+    "heap_size": "1206821744",
+    "total_allocation": "10443691636",
+    "reclaimed": "9236869596"
+  }
+```
+After upgrade:
+```
+{
+    "documents": "966000",
+    "memory_size": "1540554752",
+    "max_live_size": "620405352",
+    "stable_size": "297392585",
+    "heap_size": "620406984",
+    "total_allocation": "917945404",
+    "reclaimed": "297538272"
+  }
+```
+Future improvements:
+* Lexicographic key compression
+* Custom index logic that stores only top results (EX: when you want to show top 100 users by score, top posts by likes in a category, etc.., you won't have to store 1mil key-vals, but only just a bit above 100) 
+* Configure different Index engines for each index, Map, BTree, SkipLists, Enumeration
+* Validation config
+* Data Integrity
+
+-------------------------
+
+timo | 2023-06-20 18:07:26 UTC | #9
+
+What’s the btree order that you are using and have you experimented with different values?
+
+And are you using incremental GC ?
+
+-------------------------
+
+infu | 2023-06-20 18:48:23 UTC | #10
+
+This test was done with 32. Earlier tests used 4, but they failed for other reasons. I will try different values, it takes 30min to insert ~1mil records on my machine (10 async simultaneous async requests)
+I was using the default dfx 0.14.1, not sure which GC it uses. I'll try different and see what will happen.
+I will leave devs to configure the btree order for each index.
+
+-------------------------
+
+infu | 2023-06-21 10:48:40 UTC | #11
+
+After trying a few interface variations, I've got this (a very complicated setup). It's a bit hard to configure, but after that, it's used with short one-liners. 
+![image|419x500, 100%](upload://pG6UOz0fnx15jkypwzkORFcnyiI.jpeg)
+It allows you to dynamically manage indexes. The last part is creating an index for each skill and keeping only the top 200 entries by score. 
+In the end, it may become more of a pattern than a 'database'. To make it easy to start - the config file for a document can be generated from JSON schema.
+
+-------------------------
+
+infu | 2023-06-21 14:22:29 UTC | #12
+
+I've scrapped the first few MDB iterations and started from scratch.
+
+For the archive, this is what made the code above work: <https://gist.github.com/infu/26ee7c26dcdf3df2941250918ea03c58>
+
+The newest version allows a lot more flexibility using the RxMo library I've made <https://github.com/infu/rxmo>
+
+Now we can have plugins that change the functionality. Pretty happy with how it turned out. It allows devs to customize index types and what data structures they use while RxMDB connects everything.
+  
+Just got the optional BTree PK Plugin to work:
+![image|674x500](upload://klKFInYzXlNN30V98yR7znivJC9.png)
+
+One can comment out these lines and there won't be PKs 
+![image|690x87, 75%](upload://btdNeluUYXgWr6YDc04CJZSLIGL.png)
+
+If the PK plugin is active, when documents are inserted, it will look for the document by PK and replace it instead of adding a new one.
+
+Here is what the plugin looks like (It replaces a part of the pipeline and extends it by subscribing to an observable)
+![image|690x309](upload://rg7YH2Gd5taijbMeurJz80qjwcJ.png)
+
+Indexes on data will also be plugins. There can be validation plugins, data integrity check plugins, etc.
+
+-------------------------
+
+cryptoschindler | 2023-08-16 06:12:05 UTC | #13
+
+very cool! any plans to push this to production? maybe with a grant ;)
+
+-------------------------
+
+infu | 2023-08-17 12:02:50 UTC | #14
+
+It's usable in production. Not a lot of features, not audited, not a lot of tests, and not a lot of documentation and examples tho :slight_smile: 
+But other than that, there shouldn't be problems with it. <https://mops.one/rxmodb/docs>
+I create these libraries because I use them in my projects and hopefully someone attaches and improves them too. This one is about to be used in my next production projects. Then I'll find more bugs if there are any.
+
+Link to the latest thread about the DB <https://forum.dfinity.org/t/rxmodb-database-v-0-1-0/21076>
+
+-------------------------
+

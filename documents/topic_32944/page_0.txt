@@ -1,0 +1,76 @@
+dsarlis | 2024-07-09 08:57:50 UTC | #1
+
+Hey everyone, here's the post mortem for the incident that affected lgh73 a couple weeks ago. Credits to @abk for preparing most of it, I am posting on his behalf since Adam is on PTO. Please let us know if there any questions in the comments.
+
+## Summary
+
+On June 24, 2024, between 9:05 UTC and — 16:55 UTC, the IC Mainnet subnet lhg73 was stuck in a crash loop and all dapps running on that subnet became unavailable.
+
+The root cause of the crash was due to a mismatch in the logic for validating changes to canister state (via [the update_settings API](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-update_settings)) and the logic for applying those changes. In particular, setting the [reserved_cycles_limit](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-create_canister) to a value below the current reservation would pass validation, but trigger a panic when applying the changes.
+
+As described in the [Resource Reservation proposal](https://dashboard.internetcomputer.org/proposal/126094), reservation doesn’t kick in until a subnet grows to beyond 450 GiB. At the time of the incident, lhg73 was the only subnet over 450 GiB which is why it was the only subnet affected.
+
+## Scope and severity of impact
+
+From an end user perspective the incident affected subnet lhg73, in particular update calls were non-functional while the subnet was stalled. An ongoing ICP ledger upgrade did not succeed: the ICP ledger was involved in a call tree to top up some canister on the affected subnet. The ledger had made a notify() call to the CMC canister, which in turn made a call to deposit cycles in a canister on the affected subnet. Since this call did not return, the ledger canister could not stop to allow for a safe upgrade and it was restarted after 5 minutes. After the subnet was halted and the replicas stopped restarting, query calls could work reliably, and the open call context of the ICP ledger was closed.
+
+## Timeline of Events (UTC)
+
+All times are on Monday 2024-06-24 unless otherwise indicated:
+
+* 2024-06-14 3:58: Subnet lgh73 state size first exceeds 450 GiB.
+* 9:05: Subnet lgh73 enters a crash loop.
+* 10:06: The problem is detected and the incident response team is alerted.
+* 11:16: The recovery process is started on the subnet node controlled by DFINITY.
+* 11:20: [Proposal 130744](https://dashboard.internetcomputer.org/proposal/130744) halts the subnet.
+* 11:44: The source of the problem has been identified and a hotfix has been planned.
+* 12:55: [Hotfix](https://github.com/dfinity/ic/commit/48c500d1501e4165fc183e508872a2ef13fd0bef) is prepared.
+* 13:00: Consensus team begins implementing a small tool to help with the recovery.
+* 14:03: Hotfix is adopted via [Proposal 130749](https://dashboard.internetcomputer.org/proposal/130749).
+* 14:55: Consensus team finishes implementation of the utility tool and removes uncertified artifacts above and including the problematic height from the pool.
+* 15:12: [Proposal 130754](https://dashboard.internetcomputer.org/proposal/130754) to set the recovery cup for the subnet is submitted.
+* 16:16: Recovery is completed by moving the new checkpoint to the state directory of the DFINITY controlled node and restarting it.
+* 16:26: [Proposal 130754](https://dashboard.internetcomputer.org/proposal/130754) to set the recovery cup for the subnet is executed.
+* 16:48: The subnet is un-halted via [Proposal 130756](https://dashboard.internetcomputer.org/proposal/130756).
+* 16:55: The subnet starts making progress again.
+
+## Actions Taken
+
+After determining the source of the crashes, a fix was produced and tested which would fail canister settings changes which reduce the reserved_cycles_limit below the current reservation.
+
+A recovery of lhg73 was performed with the fix and the fix was also rolled out as a hotfix to subnets eq6en, mpubz, k44fs, yinp6, and 2fq7c which were approaching 450 GiB in memory.
+
+### What went wrong
+
+* The validation logic for updating canister settings missed the case where the reserved cycles limit is set to be lower than the current reserved cycles balance of the canister leading to the crash later when the change was applied. There was no test coverage for this specific scenario.
+* The alerts we have kicked in more than 1 hour after the issue had started. An alert which should have been triggered by the low FR only kicked in after we halted the subnet and the nodes stopped crash-looping.
+* In order to create the recovery checkpoint, blocks had to be replayed up to and excluding the height causing the deterministic crash of the state machine. This can be done using a special CLI argument of ic-replay. However, ic-recovery didn’t expose the same CLI argument, and the ic-replay binary itself was not present on the node.
+* Although we didn’t have to download the subnet state, creating local copies of it using rsync took a significant amount of time.
+
+### What went well
+
+* Experts were pulled together quickly once we were notified about the issue. The problem was identified and fixed relatively quickly.
+
+### Lessons Learned
+
+* There are places in replica code where a mutation to state is first validated and then separately applied (with the assumption that it will succeed due to validation). This design is chosen for situations where it would be difficult to directly apply the changes because rollback would be difficult if an error occurs. In these situations we should consider a redesign which would allow rollback on error. If such a redesign is not possible, better testing should ensure all possible error conditions are checked.
+* We should add the ic-replay binary to the node machines or make sure our recovery processes don’t need it.
+* The recovery process showed that large subnet states can be a problem during subnet recovery.
+
+## Action Items
+
+* Fix the handling of changes to the reserved_cycles_limit setting to produce better errors and handle decreasing the limit below the current reservation.
+* Attempt redesign of canister settings logic so that a separate validation step is not required.
+* Review testing of canister settings logic to make sure all error cases are handled.
+* Ensure there are alerts which trigger when a subnet is crash looping.
+* Add ic-replay to the guestOS image or expose all of its parameters in ic-recovery.
+* Improve copying of larger states during subnet recoveries
+
+## Technical details
+
+The logic for [handling changes to canister settings](https://github.com/dfinity/ic/blob/c42d95c174693303e1f5d5737ce58aa1d17a875c/rs/execution_environment/src/canister_manager.rs#L655) first [validates the reserved cycles](https://github.com/dfinity/ic/blob/c42d95c174693303e1f5d5737ce58aa1d17a875c/rs/execution_environment/src/canister_settings.rs#L522) by checking that if the settings change has increased the canister memory usage, then new cycles reservation won’t put the canister over its reserved cycles limit. But when [applying the changes](https://github.com/dfinity/ic/blob/c42d95c174693303e1f5d5737ce58aa1d17a875c/rs/replicated_state/src/canister_state/system_state.rs#L1359) there is a panic whenever the canister’s reserved cycles amount is found to exceed the reserved cycles limit. This means that the replica would crash if a canister with a non-zero reserved cycles amount tried to set its reserved cycles limit to a value below the current amount.
+
+The immediate fix is to unconditionally check that the reserved cycles amount is below the reserved cycles limit during validation of the canister settings.
+
+-------------------------
+

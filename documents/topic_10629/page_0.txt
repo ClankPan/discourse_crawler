@@ -1,0 +1,108 @@
+lastmjs | 2022-02-01 21:46:01 UTC | #1
+
+I think my canister is frozen, but I am not sure. This is the information I get from running `dfx canister --network ic status ohqve-riaaa-aaaae-qaa6a-cai`:
+
+```
+Canister status call result for ohqve-riaaa-aaaae-qaa6a-cai.
+Status: Running
+Controllers: laote-ayaaa-aaaae-qaada-cai
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(2500109)
+Balance: 5_913_693_331 Cycles
+Module hash: 0x5516d2e56036ac7f76166e22b03c873cb6eaa1ac94ca1205680af24a44d0b03f
+```
+Looking through the various information sources, such as the interface spec, I don't see a way to really tell if a canister is frozen. My canister has at least one cross-canister call that doesn't seem to run anymore, but besides that I am not sure how to tell if I have reached the freezing threshold.
+
+It would be really nice if there were a `Frozen` status in addition to `Running`, `Stopping`, and `Stopped`.
+
+Am I missing something?
+
+-------------------------
+
+diegop | 2022-02-01 22:18:17 UTC | #2
+
+I will ask around. I am not sure, tbh.
+
+-------------------------
+
+nomeata | 2022-02-02 05:07:20 UTC | #3
+
+> It would be really nice if there were a Frozen status in addition to Running, Stopping, and Stopped.
+
+We decided against that. The running/stopped/stopping state is set explicitly by the controller, and it would be bad if, say, you stop a canister, it gets frozen, then someone (maybe not even you) tops it up, and suddenly it's running again? So frozen is orthogonal from the running states.
+
+The spec says 
+
+> A canister is considered frozen whenever the IC estimates that the canister would be depleted of cycles before freezing_threshold seconds pass, given the canister’s current size and the IC’s current cost for storage.
+
+So it can be deduced from the other stats, but not very conveniently, indeed, as you need to know the current cost of storage. It also says:
+
+> Calls to a frozen canister will be rejected (like for a stopping canister
+
+So you should be able to tell by making an update call to it, and check the response message. I think it says frozen if so (but I didn't check).
+
+-------------------------
+
+dsarlis | 2022-02-02 08:30:33 UTC | #4
+
+As usual @nomeata's answer is to the point. Allow me to add a few clarifying touches.
+
+ > So it can be deduced from the other stats, but not very conveniently, indeed, as you need to know the current cost of storage
+
+I argue it's not that hard either, especially given that all of this is public knowledge. Let's start with the [cost](https://smartcontracts.org/docs/developers-guide/computation-and-storage-costs.html) of actions on IC. Useful in general but let's focus on the cost storing a GB per second which is 127000 cycles. Your canister has no compute allocation so only the memory consumption is important in this case. Given your canister is using ~2.5MB of memory which is 0.0025 GB, so the freezing balance should be 0.0025 * 127000 * 2592000 (freezing threshold in seconds) = 822_960_000 cycles or say ~823M cycles. Your canister has ~5.9B cycles which means that is has barely enough to start executing an ingress message (the limit for a single message execution is [5B](https://github.com/dfinity/ic/blob/master/rs/config/src/subnet_config.rs#L20) and we need to ensure your canister has at least that much) and still be above the freezing balance. Now, if you consider the cost of having the ingress going through consensus and if e.g. your canister is trying to send a call to another canister when you send an update call, it's very likely that the canister doesn't have enough cycles to support all that.
+
+> So you should be able to tell by making an update call to it, and check the response message. I think it says frozen if so (but I didn’t check)
+
+I believe we don't include the word frozen per se, but we do return an error message like "your canister tried to use X cycles with its freezing balance being Y and current balance Z" where X + Y > Z (so it cannot happen).
+
+-------------------------
+
+lastmjs | 2022-02-02 14:02:00 UTC | #5
+
+Thanks for all of the insight @nomeata and @dsarlis!
+
+What you described @dsarlis I would argue is not really that simple, or not as simple as it could be. I think developers should have a dead-simple way of knowing if their canister is frozen or not, without running back-of-the-napkin calculations nor performing an update call to get an error message. In my case, my canister has no update calls. It is just running a heartbeat.
+
+Why not add a new field to the status of canisters, a field called `Frozen`? It's possible values could be `Yes/No` or `True/False`. So when I obtain my canister status it would look like this:
+
+```
+Canister status call result for ohqve-riaaa-aaaae-qaa6a-cai.
+Status: Running
+Frozen: Yes
+Controllers: laote-ayaaa-aaaae-qaada-cai
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(2500109)
+Balance: 5_913_693_331 Cycles
+Module hash: 0x5516d2e56036ac7f76166e22b03c873cb6eaa1ac94ca1205680af24a44d0b03f
+```
+
+-------------------------
+
+dsarlis | 2022-02-02 14:33:47 UTC | #6
+
+@lastmjs Fair point. It's indeed not as simple as it should be from a user's perspective.
+
+As Joachim pointed out, we had made an explicit decision against a separate `Frozen` status but your idea seems like a good compromise since it's added on top of the canister status as an indication to the developer.
+
+I believe this is possible to add in theory but it might not be 100% accurate either. If your balance is below the freezing threshold, then it's a clear cut, your canister is frozen. However, there are more complex cases where your canister might still be above the freezing balance and it'd only be clear that it's actually frozen when you try to execute an ingress (or a heartbeat if your canister has one) or even submit an ingress (a single replica might reject immediately if you don't even have enough to cover the ingress cost of the message).
+
+Let me sleep over this, I think we _can_ make it work.
+
+-------------------------
+
+lastmjs | 2022-02-02 14:51:38 UTC | #7
+
+Sleep well (over this)!
+
+-------------------------
+
+dsarlis | 2022-02-04 08:23:14 UTC | #8
+
+To close the loop here: I think we can start with something relatively simple which can cover the basic cases of when your canister is considered frozen but with some corner cases. E.g. you have _just_ enough balance to start executing a message but if you try to send messages to other canisters that might still trip your canister over the freezing balance and it'll fail. But I think it'll still catch the average cases where someone wants to know quickly whether their canister is frozen or not.
+
+-------------------------
+

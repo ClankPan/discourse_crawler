@@ -1,0 +1,199 @@
+heldrida | 2021-11-03 11:55:27 UTC | #1
+
+Hi,
+
+Why does the deserialisation fail for the following scenario, where `didc encode` is successful:
+
+Let's assume the following script, which calls a `method` in Service X. The argument that is passed are serialised by `didc encode` and passed as a `raw` argument via `dfx canister call`.
+
+Here's how it looks:
+
+```bash
+#!/bin/bash
+
+# Test 1: start
+# Works!
+RECORD="(record {
+            \"foobar\";
+            variant {
+              Id = principal \"$DFX_USER_PRINCIPAL\"
+            };
+      })"
+
+
+# Fails! Does not throw error
+RAW=$(didc encode "$RECORD")
+
+dfx canister call "$CANISTER_ID" method "$RAW" --type=raw
+
+# Test 1: end
+
+# Test 2: start
+
+# Deserialization error
+RECORD="(record {
+            \"foobar\";
+            variant {
+              Id = (25000:nat64)
+            };
+      })"
+
+# Does not throw error
+RAW=$(didc encode "$RECORD")
+
+dfx canister call "$CANISTER_ID" method "$RAW" --type=raw
+
+# Test 2: end
+```
+
+-------------------------
+
+heldrida | 2021-11-03 11:58:14 UTC | #2
+
+
+When the `raw` is generated in Rust, it works, but not through the didc tool.
+
+```
+The Replica returned an error: code 5, message: "Canister xxxxx trapped explicitly: Custom(Fail to decode argument 0 from table0 to record
+```
+
+```
+1: Deserialize error: binary parser error: Opaque reference not supported at byte offset 129)
+```
+
+Tested with:
+
+```
+didc 0.1.0
+```
+
+Will now update and test again
+
+-------------------------
+
+heldrida | 2021-11-03 12:26:01 UTC | #3
+
+Nope! Latest `didc 0.1.1` does not work either.
+
+Guess would be best to report to the repo at some point, but in case I'm missing something, let know! Thanks
+
+-------------------------
+
+chenyan | 2021-11-03 16:31:50 UTC | #4
+
+Why are you passing `Id` as `principal` in the first test, and `nat64` in the second test?
+
+Also, if you are writing scripts about canister calls, I recommend you checking out ic-repl (https://github.com/chenyan2002/ic-repl).
+
+-------------------------
+
+heldrida | 2021-11-03 17:52:07 UTC | #5
+
+Take it as pseudo-code, to expose the issue, as principal works but not any other type; of course that it reflects the method signature.
+
+I'll check the ic-repl, wasn't aware of it.
+
+Thanks!
+
+-------------------------
+
+chenyan | 2021-11-03 18:50:32 UTC | #6
+
+There is no issue here. The target method expects a principal type. Providing a different type will cause decoding errors.
+
+-------------------------
+
+heldrida | 2021-11-03 19:39:32 UTC | #7
+
+@chenyan the example above was just to highlight the fact that when the target method expects a different type, it fails with the error above, but not when principal.
+
+When:
+
+```
+source sends principal -> method expects principal works
+source sends any other type -> method expects other types fails
+```
+
+On the other hand, when the raw data is encoded via rust and passed to the dfx cli, it works.
+
+Works:
+
+```
+dfx canister call "$CANISTER_ID" method "$RAW_FROM_RUST" --type=raw
+```
+
+Fails:
+
+```
+dfx canister call "$CANISTER_ID" method "$RAW_FROM_DIDC_ENCODE" --type=raw
+```
+
+When possible for me, I'll try to provide a reproducible example
+
+-------------------------
+
+chenyan | 2021-11-04 00:30:24 UTC | #8
+
+What does `RAW_FROM_RUST` mean? `didc` is written in Rust and is using the same candid crate. I need a concrete example to understand your problem.
+
+-------------------------
+
+borovan | 2023-08-22 08:34:06 UTC | #9
+
+Hi there, resurrecting this thread as it seems to be the only result on the interweb for the problem I'm experiencing.  Hopefully its something simple.
+
+I have a doubly wrapped Principal.  We wrap all the third party types once to standardise things like Display, Serialize, etc.  Then we wrap them again inside the ORM so they can benefit from Storable and all the other ORM-specific traits.  This allows seamless integration of all types into our ORM so they can be used as keys, values etc.
+
+My issue is that I can't seem to send this doubly wrapped Principal via the ic_cdk::call command.
+
+![image|524x500](upload://rOQ4pc29Q9rC2c53F7GlTcXHcsC.png)
+
+This is calling with the doubly-wrapped type, and returning the newly inserted row.
+
+![image|690x356](upload://98OhVeVthDd39mfK798nAjT7Pfk.png)
+
+It's calling init_player on our Player canister.  All the types match up.  Here's the error I'm getting.
+
+```
+adam@Alien:~/projects/dragginz/backend$ dfx canister call main register_player 'principal "aaaaa-aa"'
+(
+  variant {
+    Err = variant {
+      Canister = "IC0503: Canister ahw5u-keaaa-aaaaa-qaaha-cai trapped explicitly: failed to decode call arguments: Custom(Fail to decode argument 0 from principal to principal\n\nCaused by:\n    0: input: 4449444c000168_3f7132706a652d68686e63712d756f6b346c2d616e3577662d73357365362d676e6134322d6a336371752d726b7262362d69616169352d7035376c672d627165\n       wire_type: principal, expect_type: principal\n    1: Deserialize error: binary parser error: Opaque reference not supported at byte offset 7) (CanisterError)"
+    }
+  },
+)
+```
+
+dont worry about the aaaaa-aa bit, that argument is overridden by the first code block.
+
+This works if I change both the send and receive arguments to just plain Principal.
+
+Here are the debug messages
+
+```
+2023-08-22 08:26:21.629880878 UTC: [Canister b77ix-eeaaa-aaaaa-qaada-cai] can        : ahw5u-keaaa-aaaaa-qaaha-cai
+2023-08-22 08:26:21.629880878 UTC: [Canister b77ix-eeaaa-aaaaa-qaada-cai] can dbg    : Principal { len: 10, bytes: [128, 0, 0, 0, 0, 16, 0, 14, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+2023-08-22 08:26:21.629880878 UTC: [Canister b77ix-eeaaa-aaaaa-qaada-cai] player     : q2pje-hhncq-uok4l-an5wf-s5se6-gna42-j3cqu-rkrb6-iaai5-p57lg-bqe
+2023-08-22 08:26:21.629880878 UTC: [Canister b77ix-eeaaa-aaaaa-qaada-cai] player dbg : Principal(Principal(Principal { len: 29, bytes: [237, 20, 40, 229, 113, 96, 111, 108, 89, 118, 68, 241, 154, 14, 105, 59, 20, 41, 21, 68, 62, 64, 0, 142, 191, 191, 89, 131, 2] }))
+2023-08-22 08:26:21.629880878 UTC: [Canister b77ix-eeaaa-aaaaa-qaada-cai] args       : (Principal(Principal(Principal { len: 29, bytes: [237, 20, 40, 229, 113, 96, 111, 108, 89, 118, 68, 241, 154, 14, 105, 59, 20, 41, 21, 68, 62, 64, 0, 142, 191, 191, 89, 131, 2] })),)
+```
+
+-------------------------
+
+borovan | 2023-08-22 09:55:57 UTC | #10
+
+Actually I think I know what's going on...
+
+-------------------------
+
+borovan | 2023-08-22 10:04:02 UTC | #11
+
+![image|690x314](upload://owxMg8GINulLZVSNi1yaaYMjK8R.png)
+
+![image|690x324](upload://4OUxL59MGouOAmyGLw6fDr8LPTY.png)
+
+The issue was PEBKAC.  This was really old candid serialization code that I was playing with and I had left in there, was a tough one to figure out.
+
+-------------------------
+

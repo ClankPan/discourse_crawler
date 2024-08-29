@@ -1,0 +1,261 @@
+icme | 2022-01-25 05:57:02 UTC | #1
+
+I was just starting to learn about testing in Motoko, and love the functional aspect of it.
+
+The matchers library works for most cases, but for the case where I'm writing a function that utilizes several other functions or using a third party library, I'd like for the opportunity to mock out those third party libraries, so I can strictly test the unit, or the logic of the top level function that I am writing.
+
+For example, let's say I'm using a UUID and Time library and want to mock out the implementation of those, so I can control their output.
+
+```
+module.mo
+
+import Time "mo:base/Time";
+import Text "mo:base/Text";
+import UUID "../src/UUID";
+
+module {
+  public func createUser(name: Text): MyUserType {
+    let time = Time.now();
+    let id = UUID.create();
+    return {
+      time: time,
+      id: id,
+      name: text
+    } 
+  }
+}
+```
+
+I started playing around with rebinding the functions inside a Module like so
+
+```
+import UUID "../src/UUID";
+
+actor {
+  public func tryMock(): async () {
+    UUID.create = func() {
+      return "1";
+    };
+  }
+}
+```
+
+And got the error, `type error [M0073], expected mutable assignment target`.
+
+This leads me to believe that all declared functions inside a module are immutable. Any declaration of a mutable variable within a module returns the error, `type error [M0014], non-static expression in library or module`.
+
+I've tried a few other "hacky" approaches, but haven't been able to rebind or overwrite the module itself so that it is "mocked" in tests.
+
+My questions then are:
+1) Am I missing something, is mocking at all possible in Motoko?
+2) Is the intention for mocking/stubbing to not be supported in Motoko, and to prefer other testing patterns?
+3) What is the recommended way for unit testing this type of scenario? (Hopefully something other than integration testing).
+
+-------------------------
+
+paulyoung | 2022-01-25 06:57:56 UTC | #2
+
+I believe IC Kit does something like what you’re trying to do for Rust so perhaps something can be learned from that.
+
+https://github.com/Psychedelic/ic-kit
+
+The simplest way would be to pass in the things you’d like to mock. Something like:
+
+```
+module {
+  type Env = {
+    Time : {
+      now : () -> Time;
+    };
+    UUID : {
+      create : () -> UUID;
+    };
+  };
+
+  func public func createUser(env : Env, name : Text) : MyUserType {
+    let time = env.Time.now();
+    let id = env.UUID.create();
+
+    return {
+      time: time,
+      id: id,
+      name: text
+    } 
+  };
+}
+```
+
+Then during testing, provide whatever `env` you like.
+
+-------------------------
+
+icme | 2022-01-25 07:32:10 UTC | #3
+
+Makes sense, and could definitely see this working out for different production stages. I would prefer a solution that doesn't require adding an additional parameter to every function in the module, but this solution is a good starting place! 
+
+In fact, this approach probably lends itself better to either a class approach with the env as an instance variable initialized in the constructor (or a wrapper function that returns an object containing all the accessible items in the module), so that the env can be shared between all the functions in the module.
+
+-------------------------
+
+sardariuss | 2024-08-01 22:04:16 UTC | #4
+
+I implemented this BaseMock.mo the other day because I like unit testing and was a bit frustrated not being able to do it in Motoko. It requires a bit of work to make it work for your interface and it might not work with every case, but hey it's a start. Full code [here](https://github.com/sardariuss/carlson_protocol/tree/master/tests/mocks) 
+
+BaseMock:
+```
+    public type ITearDownable = {
+        teardown: () -> ();
+    };
+
+    public type IMock<R> = ITearDownable and {
+        expect_call: R -> ();
+        expect_calls: [R] -> ();
+    };
+
+    public class BaseMock<R, M>({
+        to_text: M -> Text;
+        from_return: R -> M;
+        method_hash: Map.HashUtils<M>;
+    }) : IMock<R> {
+
+        let expected_calls = Map.new<M, Deque.Deque<R>>();
+
+        public func expect_call(arg: R) {
+            let method = from_return(arg);
+            let deque = Option.get(Map.get(expected_calls, method_hash, method), Deque.empty<R>());
+            Map.set(expected_calls, method_hash, method, Deque.pushBack(deque, arg));
+        };
+
+        public func expect_calls(args: [R]) {
+            for (arg in Array.vals(args)){
+                expect_call(arg);
+            };
+        };
+
+        public func pop_expected_call(method: M) : R {
+            switch(Map.get(expected_calls, method_hash, method)){
+                case(?deque) {
+                    switch(Deque.popFront(deque)) {
+                        case(?(head, tail)) {
+                            if (Deque.isEmpty(tail)){
+                                Map.delete(expected_calls, method_hash, method);
+                            } else {
+                                Map.set(expected_calls, method_hash, method, tail);
+                            };
+                            return head;
+                        };
+                        case(_) {};
+                    };
+                };
+                case(_) {};
+            };
+            Debug.trap("Unexpected call to " # to_text(method));
+        };
+
+        public func teardown() {
+            if (not Map.empty(expected_calls)){
+                Debug.trap("Expected calls not made!");
+            };
+        };
+    };
+```
+
+Actual mock (here called DecayMock to simulate a IDecayModel)
+
+```
+type IDecayModel = {
+        compute_decay: (Time) -> Float;
+    };
+
+   public type Method = {
+        #compute_decay;
+    };
+
+    public type Return = {
+        #compute_decay: {
+            #returns: Float;
+        };
+    };
+
+    public class DecayMock() : Interfaces.IDecayModel and MockTypes.IMock<Return> {
+
+        let base = BaseMock.BaseMock<Return, Method>({
+            to_text = func(arg: Method) : Text {
+                switch(arg){
+                    case(#compute_decay) { "compute_decay"; };
+                };
+            };
+            from_return = func(args: Return) : Method {
+                switch(args){
+                    case(#compute_decay(_)) { #compute_decay; };
+                };
+            };
+            method_hash = (
+                func(m: Method) : Nat32 {
+                    switch(m){
+                        case(#compute_decay) { 1; };
+                    };
+                },
+                func (m1: Method, m2: Method) : Bool {
+                    switch(m1, m2){
+                        case(#compute_decay, #compute_decay) { true };
+                    };
+                }
+            )
+        });
+
+        public func compute_decay(_: Time) : Float {
+            let arg = base.pop_expected_call(#compute_decay);
+            switch(arg){
+                case(#compute_decay(#returns(value))) {
+                    return value;
+                };
+            };
+            Debug.trap("Unexpected argument for compute_decay!");
+        };
+
+        public func expect_call(arg: Return) {
+            base.expect_call(arg);
+        };
+
+        public func expect_calls(args: [Return]) {
+            base.expect_calls(args);
+        };
+
+        public func teardown() {
+            base.teardown();
+        };
+
+    };
+```
+
+then I kinda wrap the call to test method to accept mocks:
+
+```
+    public func test(name: Text, mocks: [MockTypes.ITearDownable], fn: () -> ()){
+        Test.test(name, func() {
+            fn(); 
+            for (mock in Array.vals(mocks)) {
+                mock.teardown();
+            };
+        });
+    };
+```
+
+Then in my test:
+```
+let decay_model = DecayMock.DecayMock();
+ test("Unique keys", [decay_model], func() {
+        let map = Map.new<Nat, HotElem>();
+        let args = { amount = 100; timestamp = 1; };
+        decay_model.expect_calls(Array.tabulate(2, func(_: Nat) : DecayMock.Return { #compute_decay(#returns(1.0)); } ));
+        verify<Bool>(Result.isOk(add_new({ map; key = 1; args; })), true , Testify.bool.equal);
+        verify<Bool>(Result.isOk(add_new({ map; key = 2; args; })), true , Testify.bool.equal);
+        verify<Bool>(Result.isOk(add_new({ map; key = 2; args; })), false, Testify.bool.equal);
+    });
+```
+
+What do you think @icme ?
+
+-------------------------
+

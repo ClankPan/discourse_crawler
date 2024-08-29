@@ -1,0 +1,345 @@
+Jesse | 2022-03-29 00:43:03 UTC | #1
+
+I've looked through the posts on this forum where ppl had similar issues, but none of which seem to have a complete explanation on what the process is for updating the data structure of a stable variable. None of them start at the beginning. and the documentation is confusing for me. So would someone be willing to help me with this task. 
+
+I have a stable variable that I'm trying to update. That stable variable is defined like so:
+
+```
+    private stable var journal : Trie.Trie<Nat, JournalEntry> = Trie.empty();
+
+```
+
+the `JournalEntry` type is defined as follows: 
+
+```
+type JournalEntry = {
+        entryTitle: Text;
+        text: Text;
+        location: Text;
+        date: Text;
+        lockTime: Int;
+        unlockTime: Int;
+        sent: Bool;
+        emailOne: Text;
+        emailTwo: Text;
+        emailThree: Text;
+        file1MetaData: {
+            fileName: Text;
+            lastModified: Int;
+            fileType: Text;
+        };
+        file2MetaData: {
+            fileName: Text;
+            lastModified: Int;
+            fileType: Text;
+        };
+    }; 
+```
+
+I mean to add a `read` field of type `Bool` to the JournalEntry type data structure. 
+
+I haven't much of an idea as to how to go about doing this. I know that the preupgrade and postupgrade hooks have something to do with this and thats about as far as my knowledge spans on this topic. Would someone be so kind as to explain the process that gets me from my current data structure to the desired data structure where the `read` field is included? An example of how the preupgrade and postupgrade methods should be defined would be great as well!
+
+thanks in advance!
+
+-------------------------
+
+jzxchiang | 2022-03-29 01:00:15 UTC | #2
+
+So according to [this](https://smartcontracts.org/docs/language-guide/upgrades.html#_stable_type_signatures), you're allowed to add stable variables, but you can only update an existing stable variable type to one that is a supertype of the original type.
+
+In your case, you're trying to do the latter―update an existing `JournalEntry`-typed stable variable. Unfortunately, an object with an additional field is a subtype of the original object and NOT a supertype, so if you try adding `read` and running `dfx deploy` you should get a stable compatibility error.
+
+I think you may need to create a new stable variable of type `NewJournalEntry` (with the `read` field) and migrate the old stable variable contents to the new stable variable.
+
+Here's a sketch of what I'd try:
+
+1. Create a new stable variable of type `NewJournalEntry`
+2. Add logic in `postupgrade` that manually constructs the `NewJournalEntry` stable variable from the existing `JournalEntry` stable variable
+3. Run `dfx deploy` (no stable compatibility errors should occur)
+4. Remove the old `JournalEntry` stable variable
+5. Remove the `postupgrade` logic you added in step 2
+6. Run `dfx deploy` (you'll get an error for deleting a stable variable... just say "yes")
+
+I think `preupgrade` shouldn't be involved.
+
+@chenyan, can you confirm whether this is the right way to go about this? For the record, I've never done this and if I were trying it, I'd definitely test it locally before doing it in mainnet.
+
+Also, you need to make sure you have enough canister memory to do this, as it involves double the size of `JournalEntry`... so not ideal.
+
+I'm hoping the stable compatibility restrictions can be relaxed at some point. Adding fields to records seems like a very common use case.
+
+-------------------------
+
+AdamS | 2022-03-29 14:39:35 UTC | #3
+
+Given `{ stuff }`, `{ stuff; extra: Bool; }` is indeed a subtype, but `{ stuff; extra: ?Bool; }` is a supertype, if I remember correctly. As long as the fields are optional, you can add more of them and they will be populated with `null` on upgrade.
+
+-------------------------
+
+Jesse | 2022-03-29 14:52:02 UTC | #4
+
+If that’s the case, that makes life so much simpler. I’ll give that a try.
+
+-------------------------
+
+Jesse | 2022-03-29 15:22:48 UTC | #5
+
+How would I go about defining the upgrade hooks to update the stable variable? and whats the procedure for performing the update?
+
+-------------------------
+
+AdamS | 2022-03-29 15:28:59 UTC | #6
+
+You would not need an upgrade hook. Defining the existing stable variable as the new type is enough.
+
+-------------------------
+
+Jesse | 2022-03-29 15:30:42 UTC | #7
+
+Do you have a reference to an example?
+
+-------------------------
+
+AdamS | 2022-03-29 15:45:19 UTC | #8
+
+I have no such example for Motoko, but in Rust, in the cycles wallet, we recently [added a new field](https://github.com/dfinity/cycles-wallet/commit/6941c3570f59d5a7c682f74da9b411925acb8953#diff-e8087caef22a009e3087ff806f468a366121d20cf1c0ad5d3342223e180a6cddR47) to a data type we were storing in stable storage, and the only special thing we do in the post-upgrade hook is copy data into it (because it's just an index of existing data).
+
+-------------------------
+
+Jesse | 2022-03-29 15:45:48 UTC | #9
+
+Taking a look now. Thank you so much
+
+-------------------------
+
+Jesse | 2022-03-29 16:02:18 UTC | #10
+
+Rust is foreign to me at the moment. Where exactly are the preupgrade and postupgrade hooks defined in the example you sent me? and which data type is that had the new field added to it.
+
+edit: I just re-clicked the link you provided. It took me directly to the data type. Thank you!
+
+-------------------------
+
+chenyan | 2022-03-29 18:52:51 UTC | #11
+
+Yes, it is unfortunate that you cannot add a new field (doesn't matter if it's optional or not) to a stable record, because the stable typing follows the Motoko subtyping not the Candid subtyping rule.
+
+To add a new field, you will need to define a new stable variable and copy the old data over to the new stable var. This come be done either through the `postupgrade` logic or in the initialization if the data structure is simple enough. For example,
+
+```
+stable var old_record = { a = 42; };
+stable var new_record = { a = old_record.a; b = "default_value_for_new_field" };
+```
+
+This is not ideal as you point out: 1) it doubles the memory usage; 2) it's simply not convenient, as adding a new optional field is very common. 
+
+We choose this approach, because it's the least effort at the moment to prevent data loss during upgrade statically. In the long term, we probably need to design a new serialization format for stable variables to fit the use cases better.
+
+-------------------------
+
+claudio | 2022-03-29 21:58:18 UTC | #12
+
+Another relevant link that tries to explain this is 
+
+https://sdk.dfinity.org/docs/language-guide/compatibility.html
+
+-------------------------
+
+Jesse | 2022-03-30 16:10:56 UTC | #13
+
+I was actually able to add a new optional field to the stable variable. it was pretty easy. I didn't have to define any upgrade hooks either. 
+
+The stable variable that I have is 
+
+```
+    private stable var journal : Trie.Trie<Nat, JournalEntry> = Trie.empty();
+
+```
+
+where `JournalEntry` was originally structured like so:
+
+```
+type JournalEntry = {
+        entryTitle: Text;
+        text: Text;
+        location: Text;
+        date: Text;
+        lockTime: Int;
+        unlockTime: Int;
+        sent: Bool;
+        emailOne: Text;
+        emailTwo: Text;
+        emailThree: Text;
+        file1MetaData: {
+            fileName: Text;
+            lastModified: Int;
+            fileType: Text;
+        };
+        file2MetaData: {
+            fileName: Text;
+            lastModified: Int;
+            fileType: Text;
+        };
+    }; ```
+
+```
+
+and I added a new optional `read` field. so the data structure was updated to looked like this:
+
+```
+type JournalEntry = {
+        entryTitle: Text;
+        text: Text;
+        location: Text;
+        date: Text;
+        lockTime: Int;
+        unlockTime: Int;
+        sent: Bool;
+        emailOne: Text;
+        emailTwo: Text;
+        emailThree: Text;
+        read: ?Bool;
+        file1MetaData: {
+            fileName: Text;
+            lastModified: Int;
+            fileType: Text;
+        };
+        file2MetaData: {
+            fileName: Text;
+            lastModified: Int;
+            fileType: Text;
+        };
+    }; 
+```
+
+one thing you have to be careful of is that if you are doing any hardcoding for values of an optional field, you have to be sure to but the `?` in front of the value. otherwise, you'll get an error when you try to deploy. so in my case, I was hardcoding some values for the `read` boolean field as `false` and was getting errors when trying to deploy. The proper way to hardcode the value was like so: `read = ?false`. 
+
+and that did the trick.
+
+-------------------------
+
+Jesse | 2022-03-30 19:44:07 UTC | #14
+
+I was able to update the data structure and deploy it without getting an error, but when I look at whats returned from the backend, the new field isn't present. Is there a specific dfx command i need to run after updating data structures for the changes to take effect after deploying to the IC? The command I ran was `dfx deploy --network ic <canister-name>`
+
+-------------------------
+
+Jesse | 2022-03-30 20:14:54 UTC | #15
+
+I figure out why the new field wasn't returning from the backend. I deployed the backend but didn't redeploy the frontend since I hadn't changed anything on the frontend. but apparently i still needed to redeploy the front end in order for the new field to show up from the backend.
+
+-------------------------
+
+jzxchiang | 2022-03-31 01:19:05 UTC | #16
+
+[quote="AdamS, post:3, topic:11758, full:true"]
+Given `{ stuff }`, `{ stuff; extra: Bool; }` is indeed a subtype, but `{ stuff; extra: ?Bool; }` is a supertype, if I remember correctly. As long as the fields are optional, you can add more of them and they will be populated with `null` on upgrade.
+[/quote]
+
+Interesting! That's really surprising to me, as that doesn't seem documented [here](https://smartcontracts.org/docs/language-guide/language-manual.html#subtyping).
+
+@chenyan @claudio Do you mind confirming if this is intended? Thanks!
+
+-------------------------
+
+claudio | 2022-03-31 07:53:56 UTC | #17
+
+The behaviour is expected, but only in the current implementation, which uses an extended form of Candid to preserve stable variables across upgrades.
+
+It is undocumented behaviour because we don't want people to exploit/rely on it. Candid is not actually a good format for the purpose of storing stable variables and we would like the liberty to replace it with a better stable variable format in the future.
+
+One of the reasons Candid is a poor choice is  that it does not, and cannot easily, preserve sharing of immutable data. This means that, for example, in memory DAGs can be linearized to trees on serialization, duplicating data and blowing up memory use.
+
+-------------------------
+
+AdamS | 2022-03-31 17:42:43 UTC | #18
+
+It is documented in the Candid spec: https://github.com/dfinity/candid/blob/master/spec/Candid.md#records-1
+
+Its purpose is not only stable variables but also API evolution - adding new optional parameters to functions, for example.
+
+-------------------------
+
+Jesse | 2022-03-31 19:03:24 UTC | #19
+
+@AdamS, @claudio, adding the new field as optional works for getting the canister to deploy with no errors, but for some reason, that field always comes back as null. no matter what argument you pass in as the value.
+
+Would the upgrade hooks allow me to iterate over a stable Trie and with each iteration perform the following:
+
+1.) copy the data from the old Trie over to the new Trie
+2.) delete the data from the old Trie right away? 
+
+I’m thinking of going with the strategy @jzxchiang suggested, but I don’t want it to require double the storage in order to migrate the data. I’d rather migrate each key/value pair and then discard them immediately to limit the storage usage.
+
+-------------------------
+
+claudio | 2022-04-01 12:14:34 UTC | #20
+
+Unfortunately not.
+
+The Motoko GC will only kick in at the end of a message, so deleting entries incrementally won't actually free up any space until after the upgrade has completed.
+
+Creating the new Trie and then just discarding the old Trie might be easier, if you've got the space.
+
+Another option might be to store the new data in a separate Trie, with the same keys, so you don't need to copy the existing data, but that introduces it's own overhead.
+
+-------------------------
+
+claudio | 2022-04-01 12:16:56 UTC | #21
+
+[quote="AdamS, post:18, topic:11758, full:true"]
+It is documented in the Candid spec: https://github.com/dfinity/candid/blob/master/spec/Candid.md#records-1
+
+Its purpose is not only stable variables but also API evolution - adding new optional parameters to functions, for example.
+[/quote]
+
+Right, but the fact that we use Candid to serialize Motoko stable variables is undocumented, and an implementation detail we would like to be free to change. Rely on it at your peril.
+
+-------------------------
+
+Jesse | 2022-04-02 16:14:18 UTC | #22
+
+I implemented the method for adding the new field to the stable variable that both you and @jzxchiang suggested. When I did, everything deployed correctly without any errors rendering in the console. but when i go to check the changes in the browser, The canister traps with this error:
+
+```
+index.js:2 Uncaught (in promise) Error: Call was rejected:
+  Request ID: c021af817518bdc3e1c2db55c75df522d34e6b6b6b686eb2634ea805a706e4e3
+  Reject code: 5
+  Reject text: Canister ... trapped explicitly: IDL error: did not find field read in record
+
+    at mt (index.js:2:117316)
+    at async St.r (index.js:2:121300)
+    at async index.js:2:648391
+```
+
+I've tried putting the logic in both the postupgrade hook and the preugrade hook to see if either of them would work and both yield this same console error in the browser. Locally, I was able to resolve this issue by deleting the .dfx file and then deploying again, but that strategy doesn't work for resolving this error on the IC. Any ideas? @claudio @AdamS , I'd love y'all's input too if you y'all have an idea for a solution.
+
+-------------------------
+
+chenyan | 2022-04-02 19:53:12 UTC | #23
+
+Are you using the latest dfx? In 0.9.3, dfx will certainly issue a warning when you add an optional field.
+
+Similarly for the frontend, there was a bug in earlier versions of agent-js that prevents you from deserializing an opt field when it's missing on the wire.
+
+-------------------------
+
+Jesse | 2022-04-02 20:16:33 UTC | #24
+
+I was using version 0.9.2. I just upgraded it and tried again, but still no luck with the added optional field. I'll retry migrating the data again using the upgrade hooks and see what that yields.
+
+-------------------------
+
+cyberowl | 2022-12-12 09:44:35 UTC | #25
+
+Any update on better ways of doing this or is copying the data in `postupgrade` onto the new var still the way to go?
+
+-------------------------
+
+claudio | 2022-12-13 03:44:30 UTC | #26
+
+Still the way to go, I'm afraid.
+
+-------------------------
+

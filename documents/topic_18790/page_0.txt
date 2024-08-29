@@ -1,0 +1,126 @@
+msumme | 2023-03-02 22:26:15 UTC | #1
+
+Hi ICPeople.  I made a small script to participate in an SNS token sale.
+
+Keep in mind this hasn't been battle tested in a live sale yet, so if you *really* want to participate in a sale, it might be a good idea to also be ready to use your Internet Identity.  It was exercised against an SNS in a test environment, but that's it.
+
+**Use at your own risk,**.  Make sure you understand what it does before you try running it on your real identity.
+
+You'll need to download [dfx](https://internetcomputer.org/docs/current/developer-docs/setup/install/), [quill](https://github.com/dfinity/quill), and [idl2json](https://github.com/dfinity/idl2json).  You'll have to clone the [IC repository](https://github.com/dfinity/ic) locally as well.   I also have not tested with a dfx identity that uses encrypted private keys.  But it might be a useful reference for people wanting to participate from their dfx identities. 
+
+See the [WIKI](https://wiki.internetcomputer.org/wiki/How-To:_SNS_sale_participation_via_quill) on how to participate with quill for more information on what you should do before participating.
+
+Also, you will need to have ICP associated with your dfx identity, which you can confirm by running `dfx ledger --network ic balance`
+
+Hopefully this is useful to someone.
+
+```
+#!/bin/bash
+set -euo pipefail
+
+if ! which quill >/dev/null; then
+    >&2 echo "quill not found, please install..."
+    exit 1
+fi
+
+if ! which dfx >/dev/null; then
+    >&2 echo "dfx not found, please install..."
+    exit 1
+fi
+
+if ! which idl2json; then
+    >&2 echo "idl2json not found, please install..."
+    exit 1
+fi
+
+export IDL2JSON=$(which idl2json)
+
+IC_REPO=${IC_REPO?"export IC_REPO to point to the IC repository"}
+
+NETWORK=${NETWORK:-ic}
+if [ "$NETWORK" != "ic" ]; then
+    export IC_URL="$NETWORK"
+fi
+
+DFX_IDENTITY=$(dfx identity whoami)
+PEM_FILE="$HOME/.config/dfx/identity/${DFX_IDENTITY}/identity.pem"
+
+help() {
+    echo "
+    Usage: $0 <SNS_ROOT_CANISTER_ID> <AMOUNT_ICP>
+        This command participates in a decentralization sale from your current dfx identity's ledger wallet.
+
+    You must have the main ic repo cloned locally to use this script, and export the path to it as IC_REPO.
+
+    You must have 'quill', 'idl2json', and 'dfx' on your path.
+
+    SNS_ROOT_CANISTER_ID: The ID of the SNS Root canister, needed in order to lookup canisters for sns quill
+    AMOUNT: The amount of ICP to contribute (not E8s)
+
+    To test on testnet, 'export NETWORK=http://your-testnet.whatever.com' to send requests there instead of the mainnet IC.
+    "
+}
+
+if [ $# -ne 2 ]; then
+  help
+  exit 1
+fi
+
+SNS_ROOT_CANISTER_ID=$1
+AMOUNT=$2 # Not e8s
+AMOUNT_E8S=$(echo "100000000 * $AMOUNT" | bc)
+
+CANISTER_IDS_FILE="$PWD/sns_canister_ids.json"
+
+# Avoid doing this repeatedly.
+if  [ ! -f "$CANISTER_IDS_FILE" ]; then
+    "$IC_REPO/testnet/tools/nns-tools/cmd.sh" generate_canister_ids_file_for_sns_quill \
+        "$NETWORK" "$SNS_ROOT_CANISTER_ID" >"$CANISTER_IDS_FILE"
+fi
+
+TICKET_MSG="$PWD/ticket-msg.json"
+
+quill sns new-sale-ticket \
+    --amount-icp-e8s "${AMOUNT_E8S}" \
+    --canister-ids-file "$CANISTER_IDS_FILE" \
+    --pem-file "${PEM_FILE}" >"$TICKET_MSG"
+
+TICKET_RESPONSE="$PWD/ticket-quill-response"
+
+quill send \
+    $([ "$NETWORK" != ic ] && echo "--insecure-local-dev-mode") \
+    --yes \
+    "$TICKET_MSG" >"$TICKET_RESPONSE"
+
+echo "Response to ticket quill request was:
+$(cat "$TICKET_RESPONSE")"
+echo
+
+TICKET_CREATION_TIME="$(cat "${TICKET_RESPONSE}" | grep "creation_time" | sed "s/.*creation_time = \([0-9_]*\) : nat64;/\1/" | sed "s/_//g")"
+TICKET_ID="$(cat "${TICKET_RESPONSE}" | grep "ticket_id" | sed "s/.*ticket_id = \([0-9_]*\) : nat64;/\1/" | sed "s/_//g")"
+
+if [ -z "${TICKET_CREATION_TIME}" ]; then
+    echo "ticket could not be created: ${RESPONSE}"
+    exit 1
+else
+    echo "Ticket ($TICKET_ID) created with creation time  $TICKET_CREATION_TIME"
+fi
+
+PAY_MSG="$PWD/pay-msg.json"
+
+quill sns pay \
+    --amount-icp-e8s "${AMOUNT_E8S}" \
+    --ticket-creation-time "${TICKET_CREATION_TIME}" \
+    --ticket-id "${TICKET_ID}" \
+    --canister-ids-file "$CANISTER_IDS_FILE" \
+    --pem-file "${PEM_FILE}" >"$PAY_MSG"
+
+PAY_RESPONSE="$PWD/pay-response.json"
+
+quill send \
+    $([ "$NETWORK" != ic ] && echo "--insecure-local-dev-mode") \
+    "$PAY_MSG" | tee "$PAY_RESPONSE"
+```
+
+-------------------------
+

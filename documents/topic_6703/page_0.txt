@@ -1,0 +1,161 @@
+peterparker | 2021-08-25 14:59:45 UTC | #1
+
+Is it possible to create on the fly with the [IC manager](https://sdk.dfinity.org/docs/interface-spec/index.html#ic-create_canister) a new canister of type "asset"**?
+
+** "asset" as I would define in dfx.json, not "motoko"
+
+My users can upload images to a CDN (the images should be available after upload through  `https://....`) links. I am thinking on creating an architecture where each user get a canister for his/her static data, that's why asking specifically about the "asset" type.
+
+-------------------------
+
+CarstenJ | 2021-08-26 17:10:27 UTC | #2
+
+Yes, it is possible. The create canister request must be called from a canister, one way to do it is to create the canister through the cycles wallet.
+
+-------------------------
+
+peterparker | 2021-08-27 05:45:05 UTC | #3
+
+Oh that's neat! Can you point me to an example? I am a bit lost on that one.
+
+-------------------------
+
+jzxchiang | 2021-08-29 18:23:32 UTC | #4
+
+An "asset canister" actually is just another canister to the IC; it's an abstraction that lives solely on the dfx side.
+
+Here's the [source](https://github.com/dfinity/certified-assets) for the asset canister. Since it's written in Rust, you would need to compile the canister to wasm, hardcode those wasm bytes into the rust canister code that is dynamically creating new canisters, and then have it call the IC management canister with those bytes as a parameter. (See this [comment](https://forum.dfinity.org/t/rust-version-of-actor-class/6712/5?u=jzxchiang).)
+
+It's really a complete pain... In Motoko, it's much simpler and you don't need to worry about hardcoding any bytes (since the compiler does it for you). I'm in a similar boat where I want to dynamically spin up asset canisters when existing ones fill up, and I was hoping to have the "controller" canister be written in Motoko but I don't think I can directly call the IC management canister with byte literals in Motoko...
+
+There's an awesome [project](https://github.com/aviate-labs/asset-storage.mo) I found out about today that's porting over the Rust assets canister code into Motoko, which would be huge for this use case. It's not complete though.
+
+-------------------------
+
+peterparker | 2021-08-29 19:08:56 UTC | #5
+
+Thanks for the feedback, I am following your [thread](https://forum.dfinity.org/t/clearing-up-confusion-over-dynamically-storing-serving-large-assets/6764) and the other related [question](https://forum.dfinity.org/t/what-is-the-best-way-to-store-image-resource-for-ur-dapp/5734) too.
+
+I had the same understanding. It seems that it is quite some work to make this happen and I am still really unclear about "where should I began". That's why I opened this issue. As there is an asset canister, the one that has been open sourced, I was somehow hoping that I missed something and that with the help of some options and the main IC management or by importing it, it would be possible to create such canisters easily but, seems it ain't the case.
+
+-------------------------
+
+jzxchiang | 2021-08-29 22:08:39 UTC | #6
+
+Yeah, I think it's a pretty common use case to store assets or blobs in a canister, so having some clarity and standardization seems essential.
+
+Even how exactly we use the asset canister [interface](https://github.com/dfinity/certified-assets/blob/main/assets.did#L78) is a bit opaque to me. For small <2 MB assets I assume we call [`store`](https://github.com/dfinity/certified-assets/blob/b06c8a7a53fdb214596ba12cd10be8508b6f2192/assets.did#L128), but how about for larger assets? Do we call `create_asset`, `create_batch`, or `create_chunk`, or all three? In what order? Since dfx is not open source, I don't know how this interface is intended to be used. Any examples would be nice. @kpeacock do you happen to have any? Thanks.
+
+-------------------------
+
+kpeacock | 2021-08-30 23:24:02 UTC | #7
+
+Dfx is coming sooner than you might think! 
+
+The latest update on the changelog reads: 
+
+```
+
+=== feat: The asset canister can now store assets that exceed the message ingress limit (2 MB)
+
+* Please note that neither the JS agent nor the HTTP server have been updated yet to serve such large assets.
+* The existing interface is left in place for backwards-compatibility, but deprecated:
+** retrieve(): use get() and get_chunk() instead
+** store(): use create_batch(), create_chunk(), and commit_batch() instead
+** list(): use keys() instead
+```
+
+-------------------------
+
+jzxchiang | 2021-08-31 01:07:09 UTC | #8
+
+When is this changelog from? I thought those methods were already available on the asset canister.
+
+Hope to see the source soon!
+
+-------------------------
+
+peterparker | 2021-10-02 08:07:30 UTC | #9
+
+[quote="kpeacock, post:7, topic:6703"]
+`** list(): use keys() instead`
+[/quote]
+
+Is `list` really deprecated @kpeacock ?
+
+In the [Certified Assets Canister](https://github.com/dfinity/certified-assets) that has been open sourced I cannot find trace of the replacement function `keys()`.
+
+-------------------------
+
+peterparker | 2021-10-04 21:00:17 UTC | #10
+
+Really, really, really rough and without any checks or rules but, I think I've got a proof of concept: [GitHub](https://github.com/peterpeterparker/ic_assets).
+
+Basically, a canister can receive assets thanks to three functions:
+
+1. `create_batch` -> initialize a batch for one asset to be uploaded
+2. `create_chunk` -> upload the chunks of a particular asset
+3. `commit_batch` -> finalize upload basically move what has been uploaded in an hashmap
+
+To serve the assets, in my use case, I add a function `http_request` to the canister so that it can answer to http GET 200 aka "accessing images through web urls".
+
+On the frontend side, the asset(s) need to be chunked for upload. This can be done with [Blob.slice](https://developer.mozilla.org/en-US/docs/Web/API/Blob/slice).
+
+In my sample repo, there is a rough canister but also a rough frontend with a file input.
+
+Thanks @jzxchiang for all the useful links!
+
+p.s.: the beautiful result 😉
+
+![Capture d’écran 2021-10-04 à 22.40.18|616x500](upload://rtjnAVsJH6Cwm3pRn5mlBTbMKOL.jpeg)
+
+-------------------------
+
+jzxchiang | 2021-10-04 21:59:19 UTC | #11
+
+Nice. Now the next thing to worry about is what if the asset is more than 2 MB in size? In that case, you'll need to implement a `http_request_streaming_callback`.
+
+-------------------------
+
+peterparker | 2021-10-05 09:51:30 UTC | #12
+
+Good call @jzxchiang 
+
+I have implemented the strategy and `http_request_streaming_callback` query function in my example repo but, the callback is not called when I call the URL on the simulated local network. Am I missing something? Any idea?
+
+Update: I am probably facing the [same issue](https://forum.dfinity.org/t/cryptic-error-from-icx-proxy/6944) as the one you reported. How did you solve it?
+
+**Solved:** Alright same [workaround](https://forum.dfinity.org/t/cryptic-error-from-icx-proxy/6944/14?u=peterparker) as yours also solved my issue.
+
+-------------------------
+
+jzxchiang | 2021-10-05 23:33:14 UTC | #13
+
+Haha yep exactly, glad it works.
+
+My next issue is how to scale once 4 GB (or the eventual 300 GB) is not enough, which it probably won't be if you have a lot of users & assets.
+
+I might need to do a BigMap-style solution where the "index canister" spins up new "asset canisters" on demand. Have you thought about this yet?
+
+-------------------------
+
+peterparker | 2021-10-06 04:50:26 UTC | #14
+
+I most probably, for not saying definitely, will create one canister per user.
+
+This is already the solution we have got in place for the users' data (right now one canister per presentation - [GitHub](https://github.com/deckgo/deckdeckgo/tree/main/canisters/src)).
+
+-------------------------
+
+tinywateer | 2022-06-21 10:42:18 UTC | #15
+
+hello，https://github.com/peterpeterparker/ic_assets is 404，could you share it，I want to learn it.
+
+-------------------------
+
+peterparker | 2022-06-21 12:38:28 UTC | #16
+
+I deleted that working repo indeed. You can checkout the [Aviate-labs asset-storage](https://github.com/aviate-labs/asset-storage.mo) Github repo for an example that fits well a learning purpose as well.
+
+-------------------------
+

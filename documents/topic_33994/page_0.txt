@@ -1,0 +1,152 @@
+icme | 2024-08-08 01:21:31 UTC | #1
+
+Does an all or nothing batch transaction standard already exist? 
+
+For example, right now, most DeFi applications that make transactions want to assess some sort of fee, which requires 3 transactions
+
+1. ICRC-2 `transfer_from` app collects amount + app fee from payer and sends to a holding account
+(2 and 3, in parallel)
+2. App sends the amount to the payee destination (could be another user of the app)
+3. App sends the fee to the fees collection destination (app revenue account).
+
+The issue with this is that instead of hitting the ledger directly from the frontend, all these calls need to be made to the canister. So instead of 2-4 seconds for a ledger update on a fiduciary subnet, you get:
+
+2 sec (app canister update call) +
+6 sec (cross subnet call plus step 1)
+6 sec (cross subnet call plus 2 & 3 in parallel)
+
+= 14 seconds, minimum.
+
+If all or nothing batch transactions were enabled, then we could define the order of transactions and send all together, in order transaction 1, 2, & 3 and if #3 fails then the rest are rolled back since these would all occur synchronously on the ledger,
+
+This would greatly simplify the need to create complex SAGA conditional payout workflows with asynchronous rollback conditions.
+
+I’m not saying that this can’t be built without all or nothing batch transactions, but moreso I think it would eliminate a lot of DeFi complexity, speed up compound transactions, and help out any ICP apps that wants to incorporate just-in-time fees into their business.
+
+-------------------------
+
+quint | 2024-08-08 09:49:45 UTC | #2
+
+ICRC7 already has the concept of (atomic) batch transfers.
+[ICRC4](https://github.com/dfinity/ICRC/issues/4) tries to do the same for ICRC1, but it seems like it is not finalized yet.
+
+All or nothing batch transfers are not always easy to guarantee, in the ICRC7 the token has to indicate explicitly whether it supports this through `icrc7_atomic_batch_transfers : () -> (opt bool) query;`. I do not see a reason why this can not be done for fungible token too.
+
+Other thread: https://forum.dfinity.org/t/icrc4-batch-transfers-nearing-finalization-please-review/27395
+
+-------------------------
+
+dfxjesse | 2024-08-08 11:55:42 UTC | #3
+
+Hasn't this type of flow been one of the main issues that was holding back ICP DeFI? Looks like you described atomic vs async DeFi? Im glad to hear it's being worked on in ICRC-7 and ICRC-4.
+
+-------------------------
+
+skilesare | 2024-08-08 13:55:58 UTC | #4
+
+You can do atomic if the items are on the same canister.  If they aren't on the same canister, then atomic can be done, but via saga and it involves latency.  I don't think there is a great solution. It is the same dilemma that every L2 has. They have atomicity once the assets are on that chain, but you have to get them there first.
+
+-------------------------
+
+ZenVoich | 2024-08-09 07:16:50 UTC | #5
+
+Can it be done on IC protocol level at least within the same subnet? Multiple async calls to multiple canisters but as one atomic transaction.
+
+-------------------------
+
+skilesare | 2024-08-09 12:59:16 UTC | #6
+
+Maybe. There are some peculiarities in how motoko works with the replica where async calls on the same subnet are 'like sync' calls most of the time, but I don't think you can guarantee it. (This is how the canpack stuff works with rust libraries).
+
+In theory I think that other pending async class initiated during the round by other canisters on the subnet could be intersperced between your calls, but I think the biggest 'danger' is when the round is closing and it starts bumping calls to the next round. Timers could be scheduled before your await runs and that could cause atomicity issues.
+
+See: https://forum.dfinity.org/t/motoko-timers-specific-behavior/32977/7?u=skilesare
+
+-------------------------
+
+Sormarler | 2024-08-10 00:07:20 UTC | #7
+
+How do sharded blockchains like MultiverseX achieve all-or-nothing transactions across shards, despite the inherent asynchronous nature of the internet? Are there specific techniques or architectural patterns they employ that could be adapted to improve composability and atomicity on the Internet Computer, considering its subnet architecture shares some similarities with sharding?
+
+-------------------------
+
+Sormarler | 2024-08-11 18:11:50 UTC | #8
+
+So my guess is we are stuck with processing transactions one at a time, which can take up to one minute. This will make it extremely hard to attract DeFi projects which value great user experience. Believe it or not, crypto people see speed as good user experience.
+
+-------------------------
+
+icme | 2024-08-11 23:48:37 UTC | #9
+
+[quote="Sormarler, post:8, topic:33994"]
+So my guess is we are stuck with processing transactions one at a time, which can take up to one minute.
+[/quote]
+
+I want to clarify a few things here.
+
+1. As an ICP user, making an ICP transaction from an app to a ledger on ICP doesn't hold up other ledger transactions from happening. There's general message, ingress, and instruction limits, but ledgers on ICP are quick and can process thousands of transactions per round of consensus  (~2-4 sec). The call is quick if the call is made from a principal/delegate identity on the frontend (log in with II, Plug, NFID, any ecosystem wallet).
+
+2. Canisters can send hundreds of calls (transactions) at a time in parallel to any other canister right now. That's what this [icrc2-batch library](https://github.com/MemeFighterCo/icrc2-batch) does. The current ~500 call limit canister A -> canister B comes from [canister output queue limits](https://forum.dfinity.org/t/canister-output-message-queue-limits-and-ic-management-canister-throttling-limits/15972/2), which could be raised in the future.
+
+4. Referring to point #1, making calls with a delegated identity will always be quick. The slowdown in the case I've described occurs when an application wants to perform the transaction asynchronously via an inter-canister call to perform a transaction without triggering a wallet pop-up for UX purposes. For example, the ICRC-2 standard (approve/transfer_from) allows a user to approve another principal (user or app) to spend X amount of funds on their behalf. This enables things like recurring payments, or transferring funds without needing to click yes to transfer funds for every single action, and utilize the X amount of funds that have been previously approved. <br/> <br/> In our case, we'd like to be able to trigger these transactions through a canister for improved UX on the user's behalf (no endless popups), as well as to assess fees on top of each payment that is made. That's the primary reason why we're going through the canister to perform each of these actions.
+
+
+With that context in place, having an all-or-nothing batch endpoint, where all calls are made to the same ledger canister would reduce the number of edge cases and complexity that apps need to handle. Projects on ICP want to both provide value and make a profit, and this would help with both!
+
+[quote="Sormarler, post:7, topic:33994, full:true"]
+Are there specific techniques or architectural patterns they employ that could be adapted to improve composability and atomicity on the Internet Computer, considering its subnet architecture shares some similarities with sharding?
+[/quote]
+
+State changes within a canister are synchronous in nature within a round of consensus, so going from ICRC-4 (batch transactions) which is already in place, to all-or-nothing batch transactions isn't a technical problem. It's just something that the ICRC standards community needs to align on and prioritize.
+
+The main point of this forum post from my side was to trigger a conversation, and learn if any work is being done on this front.
+
+Moving forwards is both as easy (and as hard) as getting community consensus to both implement (code) and upgrade (governance) existing token ledgers (ICP, ckBTC, SNS, etc.) to support all or nothing batch transactions. I'd expect ICRC-4 to come first (batch transactions, without all-or-nothing), but this is a nice addition.
+
+@quint [above](https://forum.dfinity.org/t/all-or-nothing-batch-transaction-icrc-standard/33994/2?u=icme) mentioned ICRC-7, which upon reading more about [ICRC-7](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md)
+> " `icrc7:atomic_batch_transfers` of type `bool` (optional): `true` if and only if batch transfers of the ledger are executed atomically, i.e., either all transfers execute or none, `false` otherwise. Defaults to `false` if the attribute is not defined."
+
+The atomic batch transfer referenced in this quote is stored this in the canister's metadata, which makes me thing that all batch transactions on the canister are either atomic or not. I'm not sure why there isn't the option to perform both atomic and non-atomic batch transfers on the same canister/ledger :man_shrugging: , but maybe that's a point for discussion moving forwards.
+
+-------------------------
+
+sea-snake | 2024-08-12 14:04:00 UTC | #10
+
+If an ICRC-7 ledger supports atomic transaction, there's no need for non atomic calls since both would basically result in the same behavior and response in that ledger implementation. 
+
+With only one key difference, an atomic ledger will immediately return an error element. But even a non atomic ledger can throw a single error as response which will need to be handled just the same.
+
+So basically an atomic ledger doesn't actually behave differently from the perspective from a client, it returns a list of 0 or more response with possibly an error. But if you know the ledger is atomic (by checking this metadata field) you additionally know that it won't return partial lists of responses.
+
+-------------------------
+
+skilesare | 2024-08-12 14:49:11 UTC | #11
+
+[quote="icme, post:9, topic:33994"]
+That’s what this [icrc2-batch library](https://github.com/MemeFighterCo/icrc2-batch) does. The current ~500 call limit canister A → canister B comes from [canister output queue limits](https://forum.dfinity.org/t/canister-output-message-queue-limits-and-ic-management-canister-throttling-limits/15972/2), which could be raised in the future.
+[/quote]
+
+Does this assume the same subnet? I can't ever get more than like 12 async calls at a time before hitting the instruction limit on most of my tests.  Curious if I'm doing something wrong.
+
+For example: https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1234933381
+
+The function "test" uses self call one shots and I get 55 in one round with an artificial await after every item. Call test and then getsum.
+
+If I remove the await on line 23 I only get 24 items processed before I get a 
+
+```
+Call was rejected:
+Request ID: 7894f1259e0345929f4c030cacff02b4831c613920ae76e45b93da76d03371ca
+Reject code: 4
+Reject text: could not perform oneway
+```
+(It is actually somewhat interesting that 24 of these actually get processed. Because I hit a trap I would expect the whole thing to get rolled back)
+
+If I instead call ignore thisactor.doAThing(x); instead (has a standard async) I get the same behavior.
+
+It looks like here you are doing an await as well once you get above a threshold...what threshold are you currently using?: https://github.com/MemeFighterCo/icrc2-batch/blob/9d43b1b9fd3d3bb776df14bdd2df08fd919c6220/internal/WrappedICRC2Actor.mo#L41
+
+It is a small point, but we should be clear that these batches are being spanned across multiple rounds and you can't assume elsewhere in your code that other stuff isn't happening while you are waiting multiple rounds for all the items to get filed.
+
+-------------------------
+

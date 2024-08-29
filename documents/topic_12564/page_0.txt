@@ -1,0 +1,392 @@
+bjoern | 2022-05-28 08:09:46 UTC | #1
+
+**NOTE:** Since the latest [governance upgrade](https://dashboard.internetcomputer.org/proposal/61899), the method described below does not work anymore since `disburse_to_neuron` does not copy the followees anymore. I will update this tutorial shortly to use `spawn` instead, where the same strategy still works.
+
+# How to create a decentralized community neuron
+
+Recent months have brought amazing progress toward the decentralization of the IC governance system, the NNS. Several named neurons have been created and accumulated significant following, including ICPMN and ICDev, which both represent communities rather than individuals. A natural voting setup for such a community neuron is to follow multiple neurons controlled by community members; the community neuron then votes like the majority of the individual neurons it follows. This setup is used by ICPMN's and DFINITY's neurons.
+
+But how does one _control_ and configure a community neuron? After all, if it is a neuron that represents the community, so there should not be a single community member asserting control over the neuron's configuration. This text outlines various options and details one that can be implemented today.
+
+## Different ways to control a neuron
+
+There are three different ways of controlling a neuron, with different levels of authority:
+
+1. Each neuron has a _controller_, which is a principal derived from a cryptographic key. The controller can make the neuron vote, configure the neuron, and even disburse it. There is only one controller of a neuron, and it cannot be changed.
+2. A neuron can be configured through neuron management proposals, which are voted on by a set of designated followee neurons. Neuron management proposals can make the neuron vote and configure the neuron, but not disburse it.
+3. A neuron can have one or more hotkeys, each of which is a principal that may be either derived from a cryptographic key or a canister id. Hotkeys can make a neuron vote and configure following (with the exception of the neuron management topic), but they cannot configure the dissolve status or delay, or disburse the neuron.
+
+In principle, each of the levels of control can be used for community neurons.
+
+### Decentralized control
+
+The neuron controller is a principal derived from a cryptographic key; canisters cannot _directly_ control neurons. But canisters can hold cryptographic keys: [canister signatures](https://smartcontracts.org/docs/interface-spec/index.html#canister-signatures) have been fully supported for a few months already, and ECDSA signatures will be rolled out within the next month. Together with the upcoming HTTP requests for canisters, those will enable a canister to send signed ingress messages to the IC, and thereby control a neuron.
+
+Of course, a neuron controlled by a canister is only as decentralized as the canister. But the canister controlling a community neuron could be blackhole-d or controlled by a Service Nervous System, another feature of the IC that will land within the next two months.
+
+All in all, this method of controlling a neuron seems very promising in the future, essentially creating a neuron controlled by a DAO. But there is also still significant work to be done, so this is not an option right now.
+
+### Neuron management proposals
+
+To manage a neuron through neuron management proposals, that target neuron must be set up to follow other neurons on the `ManageNeuron` topic. The neuron is controlled by the followee neurons through a proposal process that resembles the usual voting process on the NNS, with the following differences:
+
+* For a proposal to manage a neuron, only the followees of that neuron on the `ManageNeuron` topic are eligible to vote.
+* The proposal passes if a strict majority of the followees approves.
+* Each proposal costs 0.01 ICP, there is no distinction between successful and failed proposals.
+* The voting period is 12h.
+* No rewards are paid for voting on neuron management proposals.
+
+There are `ManageNeuron` proposal for each operation that a neuron controller can execute on a neuron, with two exceptions: `disburse` and `disburse_to_neuron`. The neuron management mechanism is mature and has been used by DFINITY and the ICA since the launch of the IC. There are a few things, though, that need clarification and are covered below:
+
+* How to create a neuron without a controller.
+* How to configure the neuron via proposals.
+
+Note that since the neuron does not have a controller and neither `ManageNeuron` proposals nor hotkeys can be used to disburse a neuron, the stake will be locked in the neuron indefinitely.
+
+### Hotkeys
+
+A community neuron can also be set up by creating a neuron without a controller (similar to the setup for neuron management proposals), and with a canister id acting as a hotkey. The complexity of this method is similar to decentralized control, as the hotkey canister will have to be controlled in a decentralized manner.
+
+## How to create a neuron that is configured via neuron management proposals
+
+The steps in the following sections make use of two tools: [`quill`](https://github.com/dfinity/quill) and [`ic-repl`](https://github.com/chenyan2002/ic-repl). Both tools support cold-storage setup for added security. The commands shown here use a simplified setup working directly on a machine connected to the Internet.
+
+### Set up quill and deposit ICP
+
+Generate a new seed phrase and private key file with `quill`.
+
+```
+$ quill generate --pem-file key.pem
+Principal id: gj5k5-qwlqm-f3lto-5srio-5trnc-z4pge-4pkua-a4bek-cqgb5-c5jg3-qqe
+Account id: f8ecf27f1033e8baafc261883ab8daa765587b5b7b9f033ce1a38c0f94a89d9b
+```
+
+This command generates a new file `seed.txt` in the working directory, which contains the seed phrase as ASCII text, as well as the file `key.pem`. The next step is to send 2.5 ICP to the displayed account id, which is `f8ecf27f1033e8baafc261883ab8daa765587b5b7b9f033ce1a38c0f94a89d9b` in this example.
+
+### Create and configure a donor neuron
+
+Create a donor neuron with `quill`.
+
+```
+$ quill --pem-file key.pem neuron-stake --amount 2.4 --nonce 0 | quill send --yes /dev/stdin
+[...]
+(
+  record {
+    result = opt variant {
+      NeuronId = record { id = 1_539_427_856_015_449_940 : nat64 }
+    };
+  },
+)
+```
+
+The new neuron has the id `1_539_427_856_015_449_940`.
+
+### Create the community neuron
+
+The following step creates the community neuron by executing an operation called `disburse_to_neuron` on the donor neuron, that is, the operation will partially disburse the donor neuron and create a new neuron that is controlled by a different principal. We choose a controller principal for which we can plausibly claim that no one knows the associated private key.
+
+We use the function `disburse_to_neuron` since the [current code](https://github.com/dfinity/ic/blob/31ff26935ffa83ceb5b76ce1f630820eec5fae6b/rs/nns/governance/src/governance.rs#L3576) copies the followees from the donor neuron. So before we create the new neuron, we first set up the donor neuron to follow on topic 1, which is `ManageNeuron`. The operation `disburse_to_neuron` then copies that setting to the community neuron, so we can control the new neuron via neuron management proposals as well.
+
+**Note**: This behavior of `disburse_to_neuron` may change in the future, so please check the current implementation before doing the above operation. In that case, you can still `spawn` a reward neuron from an existing one that has sufficient maturity, where [followees are copied](https://github.com/dfinity/ic/blob/31ff26935ffa83ceb5b76ce1f630820eec5fae6b/rs/nns/governance/src/governance.rs#L3219) as well.
+
+So let us go ahead and configure neuron management. For the sake of this example, I'll have the neuron follow the neuron with id `4966238184624706117`.
+
+```
+$ quill --pem-file key.pem neuron-manage 1_539_427_856_015_449_940 --follow-topic 1 --follow-neurons 4966238184624706117 | quill send --yes /dev/stdin
+[...]
+```
+
+We can quickly validate that the command worked correctly:
+
+```
+$ quill --pem-file key.pem list-neurons | quill send --yes /dev/stdin
+[...]
+    full_neurons = vec {
+[...]
+        followees = vec {
+          record {
+            1 : int32;
+            record {
+              followees = vec {
+                record { id = 4_966_238_184_624_706_117 : nat64 };
+              };
+            };
+          };
+[...]
+```
+
+Next, let's consider the controller principal. The principal is derived from a cryptographic key by computing `sha224(public_key) | 0x02`. Typical security properties of hash functions imply that they are not efficiently invertible, so if we choose a 28-byte value that has a lot of structure, it's plausible that no one knows even the preimage, i.e., the public key, let alone the corresponding private key. The following example uses the byte string corresponding of 28 bytes 0x02, which is converted into the textual representation using the bash script from the [interface spec](https://smartcontracts.org/docs/interface-spec/index.html#textual-ids).
+
+```
+$ textual_encode 0202020202020202020202020202020202020202020202020202020202
+uduew-qycai-baeaq-caiba-eaqca-ibaea-qcaib-aeaqc-aibae-aqcai-bae
+```
+
+`quill` does not support the operation `disburse_to_neuron`, so we use `ic-repl` instead.
+
+```
+$ ../ic-repl/target/debug/ic-repl -r ic
+Ping https://ic0.app...
+Canister REPL
+anonymous@ic 1> identity private "./key.pem"
+Current identity gj5k5-qwlqm-f3lto-5srio-5trnc-z4pge-4pkua-a4bek-cqgb5-c5jg3-qqe
+private@ic 2> call nns.manage_neuron(record{ id = opt record{ id = 1_539_427_856_015_449_940 : nat64 }; command = opt variant{ DisburseToNeuron = record{ dissolve_delay_seconds = 31536000 : nat64; kyc_verified = true; amount_e8s = 100_010_000 : nat64; new_controller = opt principal "uduew-qycai-baeaq-caiba-eaqca-ibaea-qcaib-aeaqc-aibae-aqcai-bae"; nonce = 0; } } })
+record {
+  command = opt variant {
+    DisburseToNeuron = record {
+      created_neuron_id = opt record { id = 2_649_066_124_191_664_356 : nat64 };
+    }
+  };
+}
+                                                                                                                                                                               (6.59s)
+private@ic 3>
+```
+
+There is a lot to unpack here. The first command imports the private key from the file created by `quill`. The second command calls the method `manage_neuron` on the governance canister, which `ic-repl` refers to as `nns`. We specify the parameters in Candid, namely that we want to operate on neuron `1_539_427_856_015_449_940`, invoking the command `DisburseToNeuron`. The initial dissolve delay is `31536000` seconds or one year. We set `kyc_verified` to `true`, that does not have practical implications. The `amount_e8s` is chosen so that the neuron receives exactly 1 ICP; the transfer fee of 10,000 e8s is deducted from the specified amount. The controller is set as explained above. The nonce does not matter too much, it simply has to be different for all neurons controlled by the same principal, otherwise the command will fail.
+
+The governance canister responds with the id of our new community neuron: `2_649_066_124_191_664_356`. The full details of that neuron can be viewed from the controller of each followee on topic 1, so in the example above from the controller of `4966238184624706117`. Listing the neuron details then results in the following output:
+
+```
+(
+  variant {
+    Ok = record {
+      id = opt record { id = 2_649_066_124_191_664_356 : nat64 };
+      controller = opt principal "uduew-qycai-baeaq-caiba-eaqca-ibaea-qcaib-aeaqc-aibae-aqcai-bae";
+      recent_ballots = vec {};
+      kyc_verified = true;
+      not_for_profit = false;
+      maturity_e8s_equivalent = 0 : nat64;
+      cached_neuron_stake_e8s = 100_000_000 : nat64;
+      created_timestamp_seconds = 1_651_349_246 : nat64;
+      aging_since_timestamp_seconds = 1_651_349_246 : nat64;
+      hot_keys = vec {};
+      account = blob "T0\04\9e=\0c\1e\f4C\be\fd\a8s\8a:l\1a\c51\10\8e\90a$\02]\09cJ\edD]";
+      joined_community_fund_timestamp_seconds = null;
+      dissolve_state = opt variant {
+        DissolveDelaySeconds = 31_536_000 : nat64
+      };
+      followees = vec {
+        record {
+          1 : int32;
+          record {
+            followees = vec {
+              record { id = 4_966_238_184_624_706_117 : nat64 };
+            };
+          };
+        };
+        record {
+          0 : int32;
+          record { followees = vec { record { id = 28 : nat64 } } };
+        };
+      };
+      neuron_fees_e8s = 0 : nat64;
+      transfer = null;
+      known_neuron_data = null;
+    }
+  },
+)
+```
+
+Wonderful! That's exactly what the new neuron should look like: we can plausibly deny knowing the key corresponding to the controller principal, the neuron has 1 ICP stake, 1 year dissolve delay, is not dissolving, and can be controlled via neuron management from neuron `4966238184624706117`.
+
+### Clean up the donor neuron
+
+There is no reason to keep the donor neuron around, so we simply dissolve it via `quill`.
+
+```
+% quill --pem-file key.pem neuron-manage --disburse 1_539_427_856_015_449_940 | quill send --yes /dev/stdin
+[...]
+```
+
+The account managed by `quill` now contains `1.4997` ICP, which you may want to send elsewhere using `quill transfer`.
+
+### Change the follower setup
+
+The main operation to be performed on the community neuron from now on will be changing the settings related to following. The following command clears the following on the default topic of the neuron I created. I could have used `ic-repl` as above, but I decided to show the same command executed with `dfx`, using the neuron `4966238184624706117` as configured above:
+
+```
+$ dfx canister --network ic call governance manage_neuron '(record{ id = opt record{ id = 4_966_238_184_624_706_117 : nat64 }; command = opt variant{ MakeProposal = record{ url = ""; title = opt "manage neuron"; action = opt variant{ ManageNeuron = record{ id = opt record{ id = 2_649_066_124_191_664_356 : nat64}; command = opt variant{ Follow = record{ topic = 0 : int32; followees = vec{} } }}}; summary = ""; } } })'
+```
+
+The `manage_neuron` method operates on neuron `4966238184624706117`, and the command is to make a new proposal. That proposal in turn calls `manage_neuron`, but now on the community neuron `2_649_066_124_191_664_356`. The command run on that neuron sets the list of followees for topic 0 - default - to empty. As the neuron has only a single followee for `ManageNeuron` and the proposer implicitly approves the proposal, the effect of the command is immediate.
+
+Analogous commands are used to set following to voter neurons, most likely for topics 0 (default) and 4 (governance), and of course to set following to hopefully multiple neurons that together control the community neuron on topic 1 (neuron management).
+
+# Final words
+
+I can imagine that this was _a lot_ to digest. The tutorial above makes use of functions that are not yet readily available in user-friendly tooling, so one has to resort to general-purpose tools such as `ic-repl` and `dfx`. But I wanted this material to be out in public so that upcoming community neurons can be set up to be managed in a decentralized way. I hope that there will be better tooling in the future.
+
+I'll be here for questions, of course. And ... now that neuron `2_649_066_124_191_664_356` has been set up as a community neuron already, it would be a shame if no one was using it, right?
+
+-------------------------
+
+skilesare | 2022-04-30 23:11:31 UTC | #2
+
+Can we please put the manage_neuron topic back in the NNS app? It should be in a different place than the other follow management, but lengthy of this post is evidence that it is needed.
+
+“Go to the NNS, click neurons, click “Assign Managers”, and enter the list of neurons you want to mange your neuron.”
+
+-------------------------
+
+weedpatch2 | 2022-05-01 02:34:48 UTC | #3
+
+So... Uhh 🤯... Thanks for this!!! 🔥♥️💯
+
+-------------------------
+
+LightningLad91 | 2022-05-01 02:34:47 UTC | #4
+
+Yes, thank you! This will be extremely helpful going forward.
+
+-------------------------
+
+skilesare | 2022-05-01 17:41:05 UTC | #5
+
+We also have a hack at https://ICDevs.org/donations.html If you want one of your current NNS neurons to be managed by another neuron. It is a bit less complicated, but you have to know how to operate the chrome developer console.
+
+-------------------------
+
+nomeata | 2022-05-01 18:11:16 UTC | #6
+
+Neat stuff!
+
+[quote="bjoern, post:1, topic:12564"]
+Together with the upcoming HTTP requests for canisters, those will enable a canister to send signed ingress messages to the IC, and thereby control a neuron.
+[/quote]
+
+Not the main topic here, but HTTP requests initially only support GET, so until that also supports POST, one still needs a (trustess) external component to bounce the requests, right?
+
+-------------------------
+
+bjoern | 2022-05-01 19:23:23 UTC | #7
+
+[quote="skilesare, post:5, topic:12564"]
+We also have a hack at [ICDevs.org](https://ICDevs.org/donations.html) If you want one of your current NNS neurons to be managed by another neuron.
+[/quote]
+
+Right, but that way you still have the single controller that can still wipe the entire neuron management setup. One main goal of the above is to get rid of any central control.
+
+[quote="nomeata, post:6, topic:12564"]
+Not the main topic here, but HTTP requests initially only support GET, so until that also supports POST, one still needs a (trustess) external component to bounce the requests, right?
+[/quote]
+
+Correct, the HTTP POST may take a bit longer. But the external bouncer is indeed a good intermediary solution.
+
+-------------------------
+
+skilesare | 2022-05-01 19:36:45 UTC | #8
+
+[quote="bjoern, post:7, topic:12564"]
+Right, but that way you still have the single controller that can still wipe the entire neuron management setup. One main goal of the above is to get rid of any central control.
+[/quote]
+
+Absolutely. ICDevs is a 501c3 so we have some administrative overhead and IRS demanded obligations that don’t allow us to completely blackhole the neuron. If you have an organizational neuron that you need ultimate oversight, but the day to day would be helped by delegation, it is a decent way to get that done.
+
+-------------------------
+
+superduper | 2022-05-01 21:57:21 UTC | #9
+
+there was something like this on https://axon.ooo but with a GUI
+
+unfortunately I don't think it is being actively developed
+
+-------------------------
+
+wpb | 2022-05-01 22:28:34 UTC | #10
+
+[quote="bjoern, post:7, topic:12564"]
+Right, but that way you still have the single controller that can still wipe the entire neuron management setup. One main goal of the above is to get rid of any central control.
+[/quote]
+
+@bjoern response to @skilesare above applies to axon as well…
+
+-------------------------
+
+skilesare | 2022-05-01 23:09:00 UTC | #11
+
+If you are using axon, Norton still theoretically controls the canister. I don’t think anyone is using for serious business at this point, but if you want to for it and install it yourself you can blackhole it. I wouldn’t use the official axon.ooo 
+
+We have a bounty to add a generic motion to axon and to add the new callraw function to make it useful for calling all canisters. If someone doesn’t pick it up soon I think I’m just going to have to do it myself. I’d much rather someone make some cash and gain some learning from it!
+
+-------------------------
+
+superduper | 2022-05-01 23:53:50 UTC | #12
+
+i still use it for a daily json feed of neurons maturity changes for my Llc :sweat_smile:
+
+if there will be some alternative at some point that's actively managed i'm happy to move over to something that's actively supported
+
+-------------------------
+
+jzxchiang | 2022-05-02 03:55:52 UTC | #13
+
+> But canisters can hold cryptographic keys: [canister signatures](https://smartcontracts.org/docs/interface-spec/index.html#canister-signatures) have been fully supported for a few months already, and ECDSA signatures will be rolled out within the next month. Together with the upcoming HTTP requests for canisters, those will enable a canister to send signed ingress messages to the IC, and thereby control a neuron.
+
+Why does a DAO canister need to send signed ingress messages? Why can't it directly make inter-canister call to the governance canister? (I'm assuming that's the canister that the DAO canister will be calling to control its neuron.)
+
+-------------------------
+
+bjoern | 2022-05-02 08:28:44 UTC | #14
+
+[quote="skilesare, post:8, topic:12564"]
+If you have an organizational neuron that you need ultimate oversight, but the day to day would be helped by delegation, it is a decent way to get that done.
+[/quote]
+
+I may not understand what you mean by "oversight", but you get all the data about the neuron also if you're manage-neuron following it or via a hotkey. The *only* operation that you *cannot* do with manage-neuron following is disbursing the neuron.
+
+[quote="jzxchiang, post:13, topic:12564"]
+Why does a DAO canister need to send signed ingress messages? Why can’t it directly make inter-canister call to the governance canister? (I’m assuming that’s the canister that the DAO canister will be calling to control its neuron.)
+[/quote]
+
+Canisters cannot directly control neurons at the moment, there is an explicit check that the principal controlling a neuron is self-authenticated (ie. derived from a cryptographic key).
+
+-------------------------
+
+skilesare | 2022-05-02 12:59:04 UTC | #15
+
+[quote="bjoern, post:14, topic:12564"]
+I may not understand what you mean by “oversight”
+[/quote]
+
+In this case, I specifically mean that the IRS could show up and tell us we need to disburse the neuron and we'd either have to do it or lose non-profit status.  There should be a very small chance of this, but as they don't like to be overly specific, our lawyers advised us to keep all our options open.
+
+-------------------------
+
+bjoern | 2022-05-02 13:12:25 UTC | #16
+
+Oh, I did not know that such a thing would be possible!
+
+-------------------------
+
+jzxchiang | 2022-05-03 01:21:44 UTC | #17
+
+I see. Is this because inter-canister calls use canister Principals, which are opaque IDs?
+
+It does seem somewhat strange that a canister must make an external ingress HTTP request to communicate with another canister. I don't quite understand why canister signatures aren't checked in inter-canister calls. Will this restriction ever be lifted?
+
+-------------------------
+
+nomeata | 2022-05-03 07:12:40 UTC | #18
+
+Canister Signatures came very late, we added them just two weeks before the launch for the Internet Identity feature; inter-canister messaging was much older. If we had had both from the start, maybe we would have that already.
+
+Note that even then we wouldn’t “check canister signatures” in internet-canister calls. There is no crypto involved in inter-canister calls, and the system could just allow the canister to impersonate any principal it “owns”  this way. (There is crypto involved in a cross-subnet calls, and that’s of course signed, but that’s all on the level of subnets and we can ignore that for here.)
+
+-------------------------
+
+jzxchiang | 2022-05-04 06:57:18 UTC | #19
+
+[quote="nomeata, post:18, topic:12564"]
+the system could just allow the canister to impersonate any principal it “owns” this way
+[/quote]
+
+Is that even possible right now? I thought that a canister can only use its own principal when it makes inter-canister calls to another canister. To be specific, in the destination canister's called method the `caller` would be the caller canister's principal. I didn't know impersonation was possible in inter-canister calls right now (unless I misinterpreted your comment).
+
+-------------------------
+
+nomeata | 2022-05-04 14:24:29 UTC | #20
+
+It’s _not_ possible at the moment (the sending canister has no way of indicating that some other principal should be used, and the system fills in the sending canister’s id as the `caller`). What I am saying is that it would be reasonable, and possibly even useful, to _allow_ the sending canister to control the value of the `caller`, and set it to one of the principals it “owns”. Of course this would only affect the `caller` as seen by the receiving canister; on the system level (message routing etc.) the sender’s canister id still needs to be kept track of. But yes, this is just musing about a possible future API extension.
+
+-------------------------
+

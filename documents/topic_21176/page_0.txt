@@ -1,0 +1,48 @@
+qwertytrewq | 2023-07-04 21:03:27 UTC | #1
+
+I split inserting operations into my DB into two parts like (not the real API, just to show the idea):
+- `startInserting(dbKey: Text, value: Text): Nat` (returns `insertId`)
+- `finishInserting(insertId: Nat): (Text, Text)` (returns `dbKey` + the partition of the DB where it is stored)
+
+This split into two API calls instead of one is necessary, because the insert functionality of my multi-partition DB requires `await` (non-atomic operation). If I had just one API call `insert`, this would make impossible to check whether the operation succeed.
+
+Now I have a map of max. 15 entries created by `startInserting` that keep information for `finishInserting` to finish insert operation.
+
+The bug: Call it 15 times and further inserts are blocked. As a workaround I would allow anybody to call `finishInserting` even on `insertId` created by another user, but in this way, for the user who called `startInserting` the return value of `finishInserting` would be lost.
+
+I can't remove the limit on the maximum number of insert operations, as this would allow an attacker to overflow my memory by calling many `startInserting` without finishing them by `finishInserting`.
+
+So I don't know what to do.
+
+A similar situation is met in invoice canister. I don't remember how they solve the similar problem. I think they remove old created invoices in order to save memory, correct? Should I do the same? How many insertions should I allow in parallel? (is 15 a good number?) If old insertions are removed, then should I in TypeScript code repeat `startInserting` if necessary more than once?
+
+I realize that my explanation is clumsy. Please ask questions to understand me.
+
+-------------------------
+
+timo | 2023-07-05 07:22:21 UTC | #2
+
+[quote="qwertytrewq, post:1, topic:21176"]
+This split into two API calls instead of one is necessary, because the insert functionality of my multi-partition DB requires `await` (non-atomic operation). If I had just one API call `insert`, this would make impossible to check whether the operation succeed.
+[/quote]
+
+A single `insert` can do an `await` internally and return to the user after that `await` completed with the result (success or not). The `await` alone cannot be the reason you need two calls. Do you have other reasons? Like, for example, do you want to hide latency or do you want to batch multiple inserts into one call to the downstream canister (which would prevent you from replying to them individually with their respective result)?
+
+[quote="qwertytrewq, post:1, topic:21176"]
+I can’t remove the limit on the maximum number of insert operations, as this would allow an attacker to overflow my memory by calling many `startInserting` without finishing them by `finishInserting`.
+[/quote]
+
+Do you have a way to abort the insertion after the first step? Say `startInserting` completed but `finishInserting` wasn't called for the `insertId` and then you won't to overwrite that `insertId` (for example in a circular buffer of length 15). Then is it ok to overwrite that `insertId`? Can you undo in the downstream canisters everything that `startInserting` already caused?
+
+-------------------------
+
+qwertytrewq | 2023-07-06 18:49:28 UTC | #3
+
+If `await` did not success, I have item inserted but the notification procedure not ran, that is an inconsistent program state.
+
+I have no way to abort the insertion after the first step.
+
+Whether I can you undo in the downstream canisters everything that `startInserting` already caused, requires further analysis and stress testing.
+
+-------------------------
+

@@ -1,0 +1,869 @@
+saikatdas0790 | 2022-12-23 03:20:32 UTC | #1
+
+Right now, if pre_upgrade fails for whatever reason, your canister is stuck even if you try to push new canister upgrades. Only option is to do a complete reinstall. Which will WIPE ALL STATE. Which is not ideal, to say the least 😭
+
+Today, if your app holds any amount of significant user data, upgrades are a scary and gut-wrenching experience. Even with precautions and the stringent conventions being followed, it takes a simple slip up of making changes to memory layout of existing data structures to corrupt your entire app state.
+
+What I'm proposing is introduction of another hook, something like `try_pre_upgrade` that runs the logic in the hook. If everything works as expected, it will behave exactly like `pre_upgrade` currently does. 
+
+However, if there's a panic during the `pre_upgrade` step, it will simply revert to the last working checkpoint exactly how panics during update calls behave right now. I imagine this will require minimal changes to the platform since you're borrowing behaviour from update calls on how to handle panics.
+
+Additionally, add another upgrade mode to the existing `upgrade`, `install`, `reinstall` called `lifecycle_upgrade` that lets us upgrade only the lifecycle hooks in canisters while retaining their current heap. I imagine this can also borrow implementation logic from how canisters are put to sleep and woken up on the execution layer. Something around saving the entire heap memory contents to stable storage.
+
+I imagine this entire feature can be incremental without requiring breaking changes to the existing APIs.
+
+Thoughts?
+@ulan 
+
+Tagging a couple of other devs who I've recently chatted with regarding canister backups and upgrades.
+@senior.joinu 
+Bruce from @AstroX 
+@icme
+
+P.S This request is born from a real life use case for us at Hot or Not. I recently had to upgrade a canister with around 51 GB of memory used. The back story involves an implementation that was leaking stable memory. So, trying to migrate the data to heap memory required us to use the ic_cdk stable APIs. However, what we were unaware of was that those API are actually only limited to using 32 bit internal API since the heap maxes out at 4GB, that's fine. However, since our canister had breached those sizes, our preupgrade was failing without any way for us to recover that canister ultimately leading us to reinstall the entire canister.
+Horror story that we hope to never have to repeat 😭
+
+-------------------------
+
+paulyoung | 2022-12-23 02:40:47 UTC | #2
+
+[quote="saikatdas0790, post:1, topic:17605"]
+What I’m proposing is introduction of another hook, something like `try_pre_upgrade` that runs the logic in the hook
+[/quote]
+
+Is there a reason why `pre_upgrade` can’t be changed to make it safe?
+
+I don’t understand why we’d want to preserve the behavior of bricking a canister even if it traps.
+
+-------------------------
+
+saikatdas0790 | 2022-12-23 03:22:49 UTC | #3
+
+Mostly for backward compatibility. But that's just my take. I'm happy with a BREAKING change as well.
+
+-------------------------
+
+rossberg | 2022-12-23 09:41:41 UTC | #4
+
+> What I’m proposing is introduction of another hook, something like `try_pre_upgrade` that runs the logic in the hook. If everything works as expected, it will behave exactly like `pre_upgrade` currently does.
+>
+> However, if there’s a panic during the `pre_upgrade` step, it will simply revert to the last working checkpoint exactly how panics during update calls behave right now.
+
+Maybe I misunderstand, but a trap in the pre_upgrade hook already causes a rollback, so how is that different?
+
+> Additionally, add another upgrade mode to the existing `upgrade` , `install` , `reinstall` called `lifecycle_upgrade` that lets us upgrade only the lifecycle hooks in canisters while retaining their current heap. I imagine this can also borrow implementation logic from how canisters are put to sleep and woken up on the execution layer. Something around saving the entire heap memory contents to stable storage.
+
+Of course that desire is understandable, and I agree that some solution is needed.
+
+However, the fundamental reason why we have upgrade hooks in the first place instead of persisting the heap through upgrades is the fact that **code changes can change the heap layout**. That is a fact of life with almost every interesting compiler, including Rust and Motoko (e.g., because memory regions move, pointers change, indices shift, etc.). And it implies that **new code can *not* use the old heap**.
+
+Unfortunately, adding, removing, or replacing upgrade hooks is a code change as well. In fact, even recompiling the *exact same source code* might change the heap layout if you are using a different compiler version or different compiler options!
+
+Thus, we simply cannot assume that a heap image still is valid and safe to use after an upgrade, no matter how small the change.
+
+If you need stable heap layout, then your only option currently is to use stable memory directly, and manually lay out your data in it. But then the responsibility is all yours that this layout remains backwards compatible. I would hope that the community would eventually build some decent libraries for that.
+
+-------------------------
+
+paulyoung | 2022-12-23 09:14:20 UTC | #5
+
+[quote="rossberg, post:4, topic:17605"]
+Maybe I misunderstand, but a trap in the pre_upgrade hook already causes a rollback, so how is that different?
+[/quote]
+
+My understanding is that trapping in `pre_upgrade` leaves your canister unusable.
+
+In [Effective Rust canisters](https://mmapped.blog/posts/01-effective-rust-canisters.html#upgrade-hook-panics), @roman-kashitsyn writes:
+
+> if your `pre_upgrade` hook traps, there is not much you can do about it. Changing canister behavior needs an upgrade, but that is what a broken `pre_upgrade` hook prevents you from doing
+
+Is the behavior of “trap” different in Motoko?
+
+-------------------------
+
+roman-kashitsyn | 2022-12-23 09:31:00 UTC | #6
+
+[quote="saikatdas0790, post:1, topic:17605"]
+What I’m proposing is introduction of another hook, something like `try_pre_upgrade` that runs the logic in the hook. If everything works as expected, it will behave exactly like `pre_upgrade` currently does.
+
+However, if there’s a panic during the `pre_upgrade` step, it will simply revert to the last working checkpoint exactly how panics during update calls behave right now.
+[/quote]
+
+That's precisely the semantics of `pre_upgrade` hook: if it fails, we roll back the canister state as if the upgrade never happened (modulo charging cycles). I don't see how the `try_pre_upgrade` hook helps.
+
+[quote="paulyoung, post:5, topic:17605"]
+My understanding is that trapping in `pre_upgrade` leaves your canister unusable.
+[/quote]
+
+No, trapping in `pre_upgrade` rolls back to the state before the upgrade. Panicking in `pre_upgrade` usually makes your canister _non-upgradable_. From the same article you mentioned:
+
+> The `pre_upgrade` and `post_upgrade` hooks appear to be symmetrical. The canister returns to the pre-upgrade state if either of these hooks traps. This symmetry is deceptive.
+
+-------------------------
+
+saikatdas0790 | 2022-12-23 10:43:19 UTC | #7
+
+So, till now I have been assuming **trap** and **panic** are the same thing on the IC. Can you clarify how they are different? Also, pointing to any relevant documentation would be really helpful.
+
+Update canister calls on the IC roll back to their last working checkpoint without becoming unrecoverable. Shouldn't the `pre_upgrade` behave the same in case of a panic, then?
+
+Secondly, this panic that I'm referring to originated in the `ic_cdk`, so I'm going to raise the fact that in this case, even `ic_cdk` developers from Dfinity also do not clearly distinguish between them.
+
+For the context, we had a canister whose memory usage had reached 60GB, which included both stable and heap. And we were trying to move only the heap to stable storage in a `pre_upgrade`. The code looked like this:
+![image|614x500](upload://kPY6mBj1PBbq2TMbbGXGhK8otIj.png)
+
+However, we were unaware (since this is an outlier scenario and not explicitly documentend anywhere) that the `ic_cdk::storage::stable` APIs only support the 32 bit API and treats memory usage (heap+stable) as the qualifying criteria for the limit stated below. So, even if your heap is below the 4GB limit and stable save is technically possible using the stable storage API, upgrades are disallowed if total memory usage exceeds 4GB. So the canister started panicking during the pre_upgrade. Note that the panic orginates from `ic_cdk` source code. 
+
+This is what the error message looked like:
+![image|674x101](upload://2ciMesLYOHvMdE2KOxcXQyO7Woq.png)
+
+Hence, any upgrades to the canister are impossible at this stage without losing ALL state.
+
+This is a nightmare scenario for any developer where they lose entire app state without any backup mechanisms.
+
+And in general, this leads to upgrades on the IC being a truly scary and anxiety inducing experience. Escpecially if you're building any practical use case with real users instead of a hobby project.
+
+We REALLY need a mechanism for developers to recover from this state, no matter what the lifecycle hooks look like.
+
+Thoughts? 
+@rossberg
+@roman-kashitsyn
+
+-------------------------
+
+roman-kashitsyn | 2022-12-23 11:01:26 UTC | #8
+
+[quote="saikatdas0790, post:7, topic:17605"]
+So, till now I have been assuming **trap** and **panic** are the same thing on the IC. Can you clarify how they are different? Also, pointing to any relevant documentation would be really helpful.
+[/quote]
+
+There is no significant difference between `trap` and `panic`. As far as I know, ic_cdk sets up a panic hook that maps panics to traps for better error messages. Generally, the system behaves identically whether you `panic!` (`unreachable!`, `unimplemented!`, etc.) or `trap`.
+
+[quote="saikatdas0790, post:7, topic:17605"]
+Hence, any upgrades to the canister are impossible at this stage without losing ALL state.
+[/quote]
+
+The canister is still usable after the `pre_upgrade` hook panicked, right? After the upgrade failed, the system reverted your canister to the last usable state. I don't see how a `try_pre_upgrade` hook would solve your problem (or how it's different from `pre_upgrade` in the first place).
+
+[quote="saikatdas0790, post:7, topic:17605"]
+We REALLY need a mechanism for developers to recover from this state
+[/quote]
+In my opinion, the system can't do much once we reach this state. I have some ideas on organizing the canister code to prevent this kind of disaster (which I came up with while working on ckBTC minter), but this requires preventive action.
+
+-------------------------
+
+saikatdas0790 | 2022-12-23 11:26:51 UTC | #9
+
+It did not, right? Let me explain.
+
+Currently my canister is on version C1. I have now upgraded to a version C2, where the pre_upgrade panics.
+
+Now, when I push a version C3, the version C2 would run the pre_upgrade included in C2, which would panic, so the canister remains in state C2.
+
+So, no matter how many upgrades, C3, C4, C5, I push, the canister will always revert itself back to C2 essentially never allowing me to go to a canister state where I can upgrade the canister to newer versions. Essentially, unupgradable, hence unusable.
+
+Does the above make sense?
+
+The `try_pre_upgrade` with a canister upgrade mode of only canister lifecycle changes is a naive solution that I came up with to handle this without making breaking changes to existing API. Probably has holes that I am unable to foresee.
+
+Having said that, you are the experts and I defer this to your judgement and expertise on how to solve this problem of unrecoverable canisters that dapp developers run into on a regular basis
+
+@roman-kashitsyn @rossberg
+
+-------------------------
+
+free | 2022-12-23 14:53:37 UTC | #10
+
+[quote="saikatdas0790, post:9, topic:17605"]
+So, no matter how many upgrades, C3, C4, C5, I push, the canister will always revert itself back to C2 essentially never allowing me to go to a canister state where I can upgrade the canister to newer versions. Essentially, unupgradable, hence unusable.
+[/quote]
+
+Unusable in the context of the wider dapp, I guess. I.e. if you have a dapp consisting of multiple canisters and e.g. version C4 is incompatible with version C2, then C2 is unusable in that sense. But taken out of that context, the canister is still very much functional: it can handle requests from other C2 canisters or ingress messages from a v2 frontend. You and Roman are saying the same thing.
+
+[quote="saikatdas0790, post:9, topic:17605"]
+The `try_pre_upgrade` with a canister upgrade mode of only canister lifecycle changes is a naive solution that I came up with to handle this without making breaking changes to existing API. Probably has holes that I am unable to foresee.
+[/quote]
+
+Those holes are exactly what rossberg above described. A canister Wasm with new lifecycle methods is a different canister Wasm. And there is no way of ensuring that it has the same heap layout as the earlier canister Wasm. Which is why you need `pre_upgrade` and `post_upgrade` hooks to begin with.
+
+The suggested solution is to not rely on the heap, but instead design your own data layout and use it to lay out your data in stable memory. Then you won't need to implement `pre_upgrade` and `post_upgrade` hooks at all. All versions of your canister will understand and be able to work with your custom memory layout. If you do the heavy-lifting and ensure backwards and forwards compatibility yourself. Which is not trivial.
+
+-------------------------
+
+roman-kashitsyn | 2022-12-23 15:59:28 UTC | #11
+
+[quote="saikatdas0790, post:9, topic:17605"]
+The `try_pre_upgrade` with a canister upgrade mode of only canister lifecycle changes is a naive solution that I came up with to handle this without making breaking changes to existing API. Probably has holes that I am unable to foresee.
+[/quote]
+
+I think I understand what you mean now.
+
+You want the system to execute the following calls during an upgrade:
+```
+C1.pre_upgrade()
+C2.post_upgrade()
+C2.pre_upgrade()
+```
+So the system exercises the `pre_upgrade` hook at least once before accepting the new version.
+
+Note that nothing stops you from calling the `pre_upgrade` hook from your `post_upgrade` hook. You don't need a new system feature for that.
+
+This scheme will save you from trivial errors in the `pre_upgrade` hooks but not errors caused by increased data size. If I understand correctly, the problem in your case was the following:
+```
+C1.pre_upgrade()
+C2.post_upgrade()
+... C2 functions normally
+... Accumulating a lot of data and leaking memory
+C2.pre_upgrade() <- traps
+```
+
+If it's the case, then calling `pre_upgrade` right after `post_upgrade` would not have resolved your issue.
+
+-------------------------
+
+saikatdas0790 | 2022-12-23 16:56:54 UTC | #12
+
+[quote="free, post:10, topic:17605"]
+The suggested solution is to not rely on the heap, but instead design your own data layout and use it to lay out your data in stable memory. Then you won’t need to implement `pre_upgrade` and `post_upgrade` hooks at all. All versions of your canister will understand and be able to work with your custom memory layout. If you do the heavy-lifting and ensure backwards and forwards compatibility yourself. Which is not trivial.
+[/quote]
+
+This sounds like a mini database to me. Efficiently manage indexes in memory and store the actual data in hard drives.
+
+On the IC, efficiently manage pointers to actual data (indexes) in heap memory and store the actual data in stable memory.
+
+Kinda impractical to expect every dapp developer to come up with this themselves. 😅
+
+-------------------------
+
+paulyoung | 2022-12-23 18:52:56 UTC | #13
+
+[quote="roman-kashitsyn, post:11, topic:17605"]
+Note that nothing stops you from calling the `pre_upgrade` hook from your `post_upgrade` hook. You don’t need a new system feature for that.
+[/quote]
+
+I suppose the trade off here is that it could be an expensive operation.
+
+***
+
+[quote="roman-kashitsyn, post:11, topic:17605"]
+Note that nothing stops you from calling the `pre_upgrade` hook from your `post_upgrade` hook. You don’t need a new system feature for that.
+[/quote]
+
+There was a feature mentioned at some point that would allow backing up and restoring canisters.
+
+Not only might that mitigate some of the risk around upgrades, it could potentially be used to test upgrades locally with a similar volume of data as in a production environment.
+
+-------------------------
+
+roman-kashitsyn | 2022-12-23 21:48:14 UTC | #14
+
+[quote="paulyoung, post:13, topic:17605"]
+I suppose the trade off here is that it could be an expensive operation.
+[/quote]
+
+Yes, I fully agree. It might be worth doing in a "debug" canister build for local testing.
+
+[quote="paulyoung, post:13, topic:17605"]
+There was a feature mentioned at some point that would allow backing up and restoring canisters.
+[/quote]
+
+Yes, I'd love this feature. 
+
+[quote="paulyoung, post:13, topic:17605"]
+it could potentially be used to test upgrades locally with a similar volume of data as in a production environment.
+[/quote]
+In my opinion, the main issue here is downloading and verifying a replica's snapshot. Currently, there is no suitable mechanism for streaming gigabytes of data from the IC. 
+
+One approach that could work is introducing the `fork` system call or something similar. The workflow could be:
+1. Clone a canister at version 1 with a new ID. The clone could start its life in a Stopped state.
+2. Try to upgrade the clone to version 2.
+3. Try upgrading the clone to version 2 one more time to exercise the pre_upgrade hooks.
+4. If everything goes well, upgrade the primary instance. Drop the clone if you don't need it anymore.
+
+-------------------------
+
+levi | 2022-12-23 23:47:14 UTC | #15
+
+Hi @saikatdas0790, 
+
+
+
+Here is what I do to make sure that if a canister is ever in that situation, I can always download the canister-data, reinstall, and upload the data. 
+```rust
+
+
+thread_local! {
+    static CANISTER_DATA: RefCell<CData> = RefCell::new(CData::new()); 
+    static STATE_SNAPSHOT: RefCell<Vec<u8>> = RefCell::new(Vec::new());    
+}
+
+
+fn create_state_snapshot() {
+    let cdata_candid_bytes: Vec<u8> = with(&CANISTER_DATA, |cdata| { encode_one(cdata).unwrap() });
+    
+    with_mut(&STATE_SNAPSHOT, |state_snapshot| {
+        *state_snapshot = cdata_candid_bytes; 
+    });
+}
+
+fn load_state_snapshot_data() {
+    
+    let cdata_of_the_state_snapshot: CData = with(&STATE_SNAPSHOT, |state_snapshot| {
+        match decode_one::<CData>(state_snapshot) {
+            Ok(cdata) => cdata,
+            Err(_) => {
+                trap("error decode of the state-snapshot CData");
+                /*
+                // or when upgrading the CData-struct, create a CData from the oldCData
+                let old_cdata: OldCData = decode_one::<OldCData>(state_snapshot).unwrap();
+                let cdata: CData = CData{
+                    field_one: old_cdata.field_one,
+                    ...
+                };
+                cdata
+                */
+            }
+        }
+    });
+
+    with_mut(&CANISTER_DATA, |cdata| {
+        *cdata = cdata_of_the_state_snapshot;    
+    });
+    
+}
+
+
+#[pre_upgrade]
+fn pre_upgrade() {
+    
+    create_state_snapshot();
+    
+    let current_stable_size_wasm_pages: u64 = stable64_size();
+    let current_stable_size_bytes: u64 = current_stable_size_wasm_pages * WASM_PAGE_SIZE_BYTES as u64;
+
+    with(&STATE_SNAPSHOT, |state_snapshot| {
+        let want_stable_memory_size_bytes: u64 = STABLE_MEMORY_HEADER_SIZE_BYTES + 8/*len of the state_snapshot*/ + state_snapshot.len() as u64; 
+        if current_stable_size_bytes < want_stable_memory_size_bytes {
+            stable64_grow(((want_stable_memory_size_bytes - current_stable_size_bytes) / WASM_PAGE_SIZE_BYTES as u64) + 1).unwrap();
+        }
+        stable64_write(STABLE_MEMORY_HEADER_SIZE_BYTES, &((state_snapshot.len() as u64).to_be_bytes()));
+        stable64_write(STABLE_MEMORY_HEADER_SIZE_BYTES + 8, state_snapshot);
+    });
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+    let mut state_snapshot_len_u64_be_bytes: [u8; 8] = [0; 8];
+    stable64_read(STABLE_MEMORY_HEADER_SIZE_BYTES, &mut state_snapshot_len_u64_be_bytes);
+    let state_snapshot_len_u64: u64 = u64::from_be_bytes(state_snapshot_len_u64_be_bytes); 
+    
+    with_mut(&STATE_SNAPSHOT, |state_snapshot| {
+        *state_snapshot = vec![0; state_snapshot_len_u64 as usize]; 
+        stable64_read(STABLE_MEMORY_HEADER_SIZE_BYTES + 8, state_snapshot);
+    });
+    
+    load_state_snapshot_data();
+} 
+
+
+#[update]
+pub fn controller_create_state_snapshot() -> u64/*len of the state_snapshot*/ {
+    if caller() != controller() {
+        trap("Caller must be the controller for this method.");
+    }
+    
+    create_state_snapshot();
+    
+    with(&STATE_SNAPSHOT, |state_snapshot| {
+        state_snapshot.len() as u64
+    })
+}
+
+
+
+
+
+#[query(manual_reply = true)]
+pub fn controller_download_state_snapshot(chunk_i: u64) {
+    if caller() != controller() {
+        trap("Caller must be the controller for this method.");
+    }
+    let chunk_size: usize = 1 * MiB as usize;
+    with(&STATE_SNAPSHOT, |state_snapshot| {
+        reply::<(Option<&[u8]>,)>((state_snapshot.chunks(chunk_size).nth(chunk_i as usize),));
+    });
+}
+
+
+
+#[update]
+pub fn controller_clear_state_snapshot() {
+    if caller() != controller() {
+        trap("Caller must be the controller for this method.");
+    }
+    with_mut(&STATE_SNAPSHOT, |state_snapshot| {
+        *state_snapshot = Vec::new();
+    });    
+}
+
+#[update]
+pub fn controller_append_state_snapshot(mut append_bytes: Vec<u8>) {
+    if caller() != controller() {
+        trap("Caller must be the controller for this method.");
+    }
+    with_mut(&STATE_SNAPSHOT, |state_snapshot| {
+        state_snapshot.append(&mut append_bytes);
+    });
+}
+
+#[update]
+pub fn controller_load_state_snapshot_data() {
+    if caller() != controller() {
+        trap("Caller must be the controller for this method.");
+    }
+    
+    load_state_snapshot_data();
+}
+
+
+```
+
+-------------------------
+
+skilesare | 2022-12-24 01:11:09 UTC | #16
+
+We've been using https://github.com/ZhenyaUsenko/motoko-migrations which switches the upgrades to the core instantiating function...if this fails, I'd assume things would revert. It makes pre and post a bit irrelevant you use only functional, stable types.
+
+-------------------------
+
+saikatdas0790 | 2022-12-24 04:50:54 UTC | #17
+
+[quote="roman-kashitsyn, post:11, topic:17605"]
+Note that nothing stops you from calling the `pre_upgrade` hook from your `post_upgrade` hook. You don’t need a new system feature for that
+[/quote]
+
+I don't quite understand how this would work. Can you explain?
+
+The pre_upgrade hook runs for the canister version that is being upgraded.
+
+The post_upgrade hook runs for the canister version being installed.
+
+How can I call the former from the latter?
+
+If either of this is missing, the heap data is not serialized to stable memory and the app state is lost.
+
+Please clarify if I'm misunderstanding something.
+
+-------------------------
+
+saikatdas0790 | 2022-12-24 04:55:37 UTC | #18
+
+[quote="roman-kashitsyn, post:14, topic:17605"]
+One approach that could work is introducing the `fork` system call or something similar. The workflow could be:
+
+1. Clone a canister at version 1 with a new ID. The clone could start its life in a Stopped state.
+2. Try to upgrade the clone to version 2.
+3. Try upgrading the clone to version 2 one more time to exercise the pre_upgrade hooks.
+4. If everything goes well, upgrade the primary instance. Drop the clone if you don’t need it anymore.
+[/quote]
+
+Yes, this please.
+
+This would open the door to snapshot backups. And as a developer, I'm happy to pay cycle storage costs for all the snapshot backups that I'm retaining
+
+-------------------------
+
+saikatdas0790 | 2022-12-24 05:01:55 UTC | #19
+
+[quote="levi, post:15, topic:17605"]
+Hi @saikatdas0790,
+
+Here is what I do to make sure that if a canister is ever in that situation, I can always download the canister-data, reinstall, and upload the data.
+[/quote]
+
+Thank you for the sample code. I can definitely see the utility of this. 
+
+But this is boilerplate that every developer will have to write and maintain because the solution is specific to how data is structured inside the specific canister.
+
+The problem that I'm trying to raise is 2 fold:
+- Canisters should not get stuck in "un-upgradable" state.
+- Canisters need to provide a mechanism for data backup/restore that is data agnostic in case something does go wrong
+
+I believe both of the above require changes at the system/protocol level rather than have developers write more boilerplate code that increases the surface area of things that can go wrong.
+
+-------------------------
+
+saikatdas0790 | 2022-12-24 05:07:23 UTC | #20
+
+[quote="free, post:10, topic:17605"]
+Those holes are exactly what rossberg above described. A canister Wasm with new lifecycle methods is a different canister Wasm. And there is no way of ensuring that it has the same heap layout as the earlier canister Wasm. Which is why you need `pre_upgrade` and `post_upgrade` hooks to begin with.
+[/quote]
+
+There could be approaches where the upgrade hooks/system functions are not stored with the canister wasm but treated as separate wasm instructions/bundle so that application logic that lives inside a canister doesn't change at all. Of course, there are internal details/complications that I'm not aware of, hence such a naive suggestion.
+
+However, my point is, these are techincal hurdles at this stage. Dfinity engineers could definitely figure this out if **safe backups/restores** were prioritized on the roadmap
+
+-------------------------
+
+saikatdas0790 | 2022-12-24 05:10:20 UTC | #21
+
+[quote="skilesare, post:16, topic:17605"]
+It makes pre and post a bit irrelevant you use only functional, stable types.
+[/quote]
+
+Thank you for the alternative approach. 
+
+This thread is more of a request to provide better protocol level support rather than getting the developer to adopt clever workarounds that are not officially (official -> developer docs) prescribed
+
+-------------------------
+
+roman-kashitsyn | 2022-12-24 09:11:40 UTC | #22
+
+[quote="saikatdas0790, post:17, topic:17605"]
+I don’t quite understand how this would work. Can you explain?
+[/quote]
+
+I meant something like the following:
+
+```rust
+#[pre_upgrade]
+fn pre_upgrade() {
+  persist_state();
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+  restore_state();
+  #[cfg(feature = "test_upgrade")]
+  persist_state();
+}
+```
+
+-------------------------
+
+skilesare | 2022-12-24 12:24:36 UTC | #23
+
+[quote="saikatdas0790, post:21, topic:17605"]
+This thread is more of a request to provide better protocol level support rather than getting the developer to adopt clever workarounds that are not officially (official → developer docs) prescribed
+[/quote]
+
+From an addition by subtraction perspective, perhaps the docs should be changed and pre and post should be deprecated. In hindsight they encourage poor data management practices. They make some sense if you were designing the protocol from scratch, but in hindsight they were an unnecessary complication of the protocol level.
+
+-------------------------
+
+saikatdas0790 | 2022-12-24 12:48:07 UTC | #24
+
+Quick question, is there anything stopping me from directly calling the `pre_upgrade` function directly from `post_upgrade`? Instead of an intermediate `persist_state` function?
+
+Also, what's the expectation in terms of computations allowed with this approach? If this is a prescribed workaround, could we have some estimates of how much data we are limited to serializing and deserializing in a single go? Since the `post_upgrade` effectively performs both the functions now?
+
+-------------------------
+
+berestovskyy | 2022-12-25 12:00:35 UTC | #25
+
+[quote="roman-kashitsyn, post:14, topic:17605"]
+1. Clone a canister at version 1 with a new ID. The clone could start its life in a Stopped state.
+2. Try to upgrade the clone to version 2.
+3. Try upgrading the clone to version 2 one more time to exercise the pre_upgrade hooks.
+4. If everything goes well, upgrade the primary instance. Drop the clone if you don’t need it anymore.
+[/quote]
+
+I think cloning/forking is a very useful feature, but the following seems still holds:
+
+[quote="roman-kashitsyn, post:11, topic:17605"]
+This scheme will save you from trivial errors in the `pre_upgrade` hooks but not errors caused by increased data size.
+[/quote]
+
+It seems on top of the cloning/forking, we still need to be able to fix the pre-upgrade code, something like `install_code(mode = replace, wasm_module = ...)` which would just replace the WASM module, without calling any hooks or touching the canister heap.
+
+So the canister recovery process would be:
+
+1. Clone a canister at version 1.
+2. Try to upgrade the clone to version 2, invoking pre-, start and post-upgrade hooks as normal.
+3. If the upgrade fails, replace version 1 with a fixed version 1' (no hooks invoked) and try step 2 again.
+4. Once everything goes well, upgrade the primary instance, applying the same fix before the upgrade.
+
+Yes, it's hard to produce a binary with exactly the same memory layout. But IMO using reproducible builds, it might be possible to fix many silly mistakes/typos in pre-upgrade handlers.
+
+Also, the replacing WASM module might be a completely new application. For example, it might be a special downloader, which just allows to download the canister state chunk by chunk for offline data recovery. So, the final step in the recovery process might be:
+
+5. If there is no way to fix canister version 1, replace canister code with a state downloader, and download the state for offline recovery.
+
+-------------------------
+
+rossberg | 2022-12-30 09:23:53 UTC | #26
+
+[quote="berestovskyy, post:25, topic:17605"]
+It seems on top of the cloning/forking, we still need to be able to fix the pre-upgrade code, something like `install_code(mode = replace, wasm_module = ...)` which would just replace the WASM module, without calling any hooks or touching the canister heap.
+[/quote]
+
+As I explained [above](https://forum.dfinity.org/t/feature-request-if-pre-upgrade-fails-revert-canister-to-earlier-state-snapshot-of-before-pre-upgrade-ran-and-discard-current-pre-upgrade-logic/17605/4?u=rossberg), **changing the code generally invalidates the heap**, even if you just replace the pre-upgrade hook. We can never assume that works. The more likely outcome is that replacing the Wasm code irreversibly destroys the canister and all its heap data. It's like attempting open-heart surgery with a saw.
+
+-------------------------
+
+berestovskyy | 2022-12-30 22:41:57 UTC | #27
+
+hoi Andreas,
+[quote="rossberg, post:26, topic:17605"]
+**changing the code generally invalidates the heap**
+[/quote]
+
+Right, and I pointed it out:
+
+[quote="berestovskyy, post:25, topic:17605"]
+it’s hard to produce a binary with exactly the same memory layout. But IMO using reproducible builds, it might be possible to fix many silly mistakes/typos in pre-upgrade handlers
+[/quote]
+
+To be more concrete, I remember two cases when a canister pre-upgrade method was trapping in production:
+1. The pre-upgrade handler was exceeding the size of the stable memory, as the `ic0.stable_grow()` was not called.
+2. The pre-upgrade handler was violating the contract, as it was calling an unsupported System API function.
+
+It's not a representative sample, but in both those cases the fix would just add or remove a single System API call in pre-upgrade.
+
+From my experience, adding/removing a System API call from the pre-upgrade hook in Rust does not change the memory layout nor invalidate the heap.
+
+The reproducible builds are quite easy with docker, but even it was not used, still the WASM binary could be decoded to WAT, the System API call could be easily located and removed, and the WAT could be encoded back to WASM with the same memory layout.
+
+---
+Also, as the canister cloning opens a way to snapshot the canister state, the code replacement opens a way to backup/restore the canister state locally:
+
+1. Replace the canister code with the state downloader.
+2. Download the canister state chunk by chunk locally.
+
+and then to restore it:
+
+1. Replace the canister code with the canister state uploader.
+2. Upload the canister state from the local backup.
+3. Replace the canister state uploader with the actual canister code.
+
+All the operations could be greatly facilitated by `dfx`:
+
+1. The `dfx` could provide a user friendly way to backup/restore the canister state, i.e. replacing canister code with downloader/uploader, manage chunks etc...
+2. The `dfx` could do a sanity check that the memory layout is the same by comparing data segments and function tables for the `install(mode = replace, ...)`
+3. The `dfx` could clone the canister state before each install/upgrade operation, providing a user friendly way to revert to the state before the install/upgrade even if the upgrade itself was successful.
+
+---
+So, canister state cloning feature combined with a feature to replace WASM module, keeping the heap could get us:
+
+1. A way to snapshot and backup/restore the canister state locally.
+2. A practical way to fix some (maybe even most) of the pre-upgrade issues.
+3. A better overall user experience and upgrade confidence.
+
+-------------------------
+
+sardariuss | 2023-01-11 20:33:42 UTC | #28
+
+I think this motoko-migrations repo is gold. I will definetly use it.
+
+Something that surprised me in the main.mo is that a non-stable variable initialized from a stable one acts like a pointer to the stable one? Intuitively I thought it would have been a copy.
+
+By example:
+  
+
+```
+  stable var stable_struct = { var toto: Text = "whatever"; };
+
+  // This acts like pointer on the stable_struct, or ?
+  let non_stable_struct = stable_struct;
+
+  public shared func updateToto(text: Text) : async() {
+    // This actually updates the stable_struct in stable memory, doesn't it ?
+    // Does this mean that there is no Text saved on the heap at all ?
+    non_stable_struct.toto := text;
+  };
+```
+
+So far I was avoiding using classes to be able to save everything in stable memory. But if that's true that means I could just use classes which members are initialized from stable variables, and get the best of both world: OOP + stable memory. :exploding_head:
+
+-------------------------
+
+skilesare | 2023-01-11 20:41:04 UTC | #29
+
+[quote="sardariuss, post:28, topic:17605"]
+So far I was avoiding using classes to be able to save everything in stable memory. But if that’s true that means I could just use classes which members are initialized from stable variables, and get the best of both world: OOP + stable memory.
+[/quote]
+
+Yes! If you want to use "stable" your classes just need to be functional in nature. It took me a good long while to get over that understanding hump.  It is annoying to put that ref in every parameter set, but it works well.
+
+-------------------------
+
+rossberg | 2023-01-17 11:54:46 UTC | #30
+
+Sorry for the late reply.
+
+[quote="berestovskyy, post:27, topic:17605"]
+It’s not a representative sample, but in both those cases the fix would just add or remove a single System API call in pre-upgrade.
+[/quote]
+
+Again, even the smallest changes might invalidate the heap. To give a simple example, even changing a single literal (number, string) in the code can already be a breaking change, because it might reside in the heap. Let alone adding or removing one, e.g., as argument for an extra call. In principle, even adding a call with no arguments can affect the heap.
+
+While there might be cases that happen to work, that is entirely incidental and totally language, compiler, version, mode dependent. Hence I'm afraid it would be impractical to try coming up with reliable, stable(!), and general rules about what is guaranteed to work and what's not, even with reproducible builds, even for Motoko, let alone for compilers we do not control, like Rust.
+
+And there would be no way to safe-guard against mistakes either, and such mistakes would most likely result in fatal and permanent corruption: in the best case, the canister will be immediately destroyed and crash; in the worst case, you won't even notice the data corruption until much later.
+
+-------------------------
+
+berestovskyy | 2023-01-17 13:46:44 UTC | #31
+
+It's hard to debate here, as I completely agree with everything you wrote, Andreas: there is no generic way to guarantee the heap is still valid.
+
+My point is rather practical: if we have a choice between a bricked canister with no way to recover the data or a practical way to fix it...
+
+Leaving the toolchains aside, dissassembling the code using `wasm2wat`, adding/commenting out a system API call, and assebling it back with `wat2wasm`. Do you agree the wasm heap will be still valid in this case?
+
+-------------------------
+
+rossberg | 2023-01-17 18:50:12 UTC | #32
+
+Of course, if you hand-craft assembly code then you can make it work. But that won't help normal devs.
+
+If we can't provide devs with any sufficiently safe, practical recipe (or even a way to check!) that won't nuke their canisters forever, then it's clearly not a feature that would be responsible to put out. Especially if the likelihood of nuking it is as high as here.
+
+A corrupted canister is much worse than a non-upgradable one. With the latter, you at least have some chance to still retrieve data.
+
+-------------------------
+
+berestovskyy | 2023-01-17 20:24:03 UTC | #33
+
+[quote="rossberg, post:32, topic:17605"]
+Of course, if you hand-craft assembly code then you can make it work.
+[/quote]
+
+Right, and that would solve 100% of canister pre-upgrade issues I know.
+
+[quote="rossberg, post:32, topic:17605"]
+A corrupted canister is much worse than a non-upgradable one.
+[/quote]
+
+Again, fully agree. The code replacement must be implemented only once we have canister snapshotting/cloning in place, so there is an easy way to roll back.
+
+Despite it's complexity and unsafety, IMO this approach would be still way better than what we did to fix those two pre-upgrade issues...
+
+-------------------------
+
+saikatdas0790 | 2023-01-18 04:24:22 UTC | #34
+
+[quote="berestovskyy, post:31, topic:17605"]
+dissassembling the code using `wasm2wat`, adding/commenting out a system API call, and assebling it back with `wat2wasm`
+[/quote]
+If this works as described, then this would solve our scenarios too where we got stuck with unupgradable canisters. Again, this mechanism of manual assembly coding should be annotated with the mandatory "HERE BE DRAGONS" warnings, but if canister developers do get stuck in an unupgradable loop, at least they have a way out.
+
+Because as long as we have the existing likelihood of canister devs getting stuck with the `pre_upgrade` hook, a lot of them will. And having a way of getting unstuck would help.
+Most canister devs would be blissfully unaware of this footgun until they run into this for a failing pre_upgrade.
+
+-------------------------
+
+rossberg | 2023-01-18 08:36:20 UTC | #35
+
+The percentage of problems that can realistically be fixed by hand-editing assembly is likely extremely small, especially for code produced by a high-level language compiler. At the same time, the percentage of devs that will destroy their data in an attempt of doing so is probably orders of magnitude higher, especially among those that already did not assess the original upgrade problem.
+
+This would be like handing out a bone saw to everybody and tell them to try opening their thorax in case of a heart attack. How many heart surgeons are there among the general population, and what's the likelihood of survival? And is that the solution for making driving safer?
+
+-------------------------
+
+berestovskyy | 2023-01-18 14:33:02 UTC | #36
+
+[quote="rossberg, post:35, topic:17605"]
+The percentage of problems that can realistically be fixed by hand-editing assembly is likely extremely small
+[/quote]
+My experience is exactly the opposite. Again, it's not representative at all...
+
+[quote="rossberg, post:35, topic:17605"]
+This would be like handing out a bone saw to everybody and tell them to try opening their thorax in case of a heart attack.
+[/quote]
+While IMO it's an underestimation of software engineers' skills, I won't argue here. But there is one important point: freedom.
+
+If I've got a heart problem, I'd rather find a surgeon with the right tools to fix my heart. But I have the freedom to do the surgery myself.
+
+vs
+
+On average, people have no skills to do heart surgeries, so if I've got a heart problem, I just die. And next time, I better be born with a flawless heart...
+
+N.B. in both pre-upgrade cases I faced, the bug was introduced by a seasoned engineer. People make mistakes.
+
+-------------------------
+
+rossberg | 2023-01-18 11:43:21 UTC | #37
+
+[quote="berestovskyy, post:36, topic:17605"]
+While IMO it’s an underestimation of software engineers skills
+[/quote]
+
+If I've learnt one thing then it's to never overestimate my own software engineering skills, no matter how experienced I am.
+
+[quote="berestovskyy, post:36, topic:17605"]
+People make mistakes.
+[/quote]
+
+Well, exactly. If somebody already made mistakes with the original program, where they had plenty of opportunity to test, why have confidence to get it right for a critical situation under way more difficult circumstances? Keep in mind, there would be no real way to test it, it's a one-time chance in general, and if they screw it up just a little bit, years of data would be lost forever.
+
+[quote="berestovskyy, post:36, topic:17605"]
+if I’ve got a heart problem, I just die in peace.
+[/quote]
+
+No, a patient in a coma at least isn't entirely lost, and there might be ways to revive them.
+
+-------------------------
+
+berestovskyy | 2023-01-18 12:02:15 UTC | #38
+
+[quote="rossberg, post:37, topic:17605"]
+never overestimate my own software engineering skills
+[/quote]
+
+Ah no, I just mean a better analogy to "a random person has to do a heart surgery" would be "a random doctor has to do a heart surgery"...
+
+[quote="rossberg, post:37, topic:17605"]
+it’s a one-time chance in general, and if they screw it up just a little bit, years of data would be lost forever.
+[/quote]
+
+If they screw it up, they roll back the changes and they can try again...
+
+[quote="rossberg, post:37, topic:17605"]
+a patient in a coma at least isn’t entirely lost
+[/quote]
+
+Right, there will be always an option to get back into the coma...
+
+-------------------------
+
+rossberg | 2023-01-18 15:14:38 UTC | #39
+
+[quote="berestovskyy, post:38, topic:17605"]
+If they screw it up, they roll back the changes and they can try again…
+[/quote]
+
+If the code update works, the new code runs "successfully", but corrupts the data without failing the upgrade itself, then how would you roll that back? I think your patient is dead. This is not an unlikely scenario at all.
+
+-------------------------
+
+berestovskyy | 2023-01-18 16:52:32 UTC | #40
+
+[quote="rossberg, post:39, topic:17605"]
+If the code update works, the new code runs “successfully”, but corrupts the data without failing the upgrade itself, then how would you roll that back?
+[/quote]
+We agreed in this thread above that the "replace code" feature should not be standalone but implemented along with the canister snapshotting/cloning/forking.
+
+Here [Roman suggests a syscall](https://forum.dfinity.org/t/feature-request-if-pre-upgrade-fails-revert-canister-to-earlier-state-snapshot-of-before-pre-upgrade-ran-and-discard-current-pre-upgrade-logic/17605/14) to clone the canister and its state, but it could be also implemented as a take/revert snapshot, TBD.
+
+The recovery process for non-upgradable canisters would be:
+
+1. Prepare a binary with a fixed pre-upgrade (using `wasm2wat` or other tools).
+2. Take a canister snapshot (`dfx` could take it automatically).
+3. Replace the canister binary with a fixed one, keeping the old heap (`dfx` could allow only tiny changes between the old and fixed binaries)
+4. Upgrade the canister as normal. The fixed pre-upgrade should succeed now.
+5. The newly deployed canister could initiate a data validation process.
+6. If something goes wrong, revert the state to the snapshot and try again.
+
+If there is no way to fix it, there is a way to download years of data:
+
+1. Replace the non-upgradable canister binary with a special `state downloader`, keeping the old heap.
+2. Download the heap chunk by chunk.
+3. Recover the data offline.
+4. Re-install the canister as normal with a new version (the heap will be lost at this point).
+5. Upload the recovered data.
+
+Note, the `state downloader` does not use the WASM heap. All it does is `ic0.msg_reply_data_append()` a chunk of the old heap and then just `ic0.msg_reply()`.
+
+-------------------------
+

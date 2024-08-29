@@ -1,0 +1,77 @@
+jasonzhu | 2024-04-19 14:38:53 UTC | #1
+
+# Context
+
+In a previous incident some neurons got an incorrect age ([52-year neuron](https://forum.dfinity.org/t/icp-neuron-age-is-52-years/21261)). In addition to fixing the bug, neurons with unreasonably large age were cleaned-up by resetting their age to genesis ([forum post](https://forum.dfinity.org/t/security-patch-nns-governance-neuron-aging-2023-07-17/21455), [proposal](https://dashboard.internetcomputer.org/proposal/123485)).
+To determine whether a neuron had an unreasonably large age, their age was compared to the age of genesis neurons. Genesis neurons were already ‘pre-aged’ at genesis with 18 months and thus had the largest possible age.
+
+# Problem
+
+The genesis timestamp used for the condition whether a neuron’s age is older than pre-aged neurons was incorrect - the timestamp used was a constant defined [here](https://sourcegraph.com/github.com/dfinity/ic@937c10eefdf8c46d982615e71b6f20a52c107dd4/-/blob/rs/types/types/src/time.rs?L30), while the real timestamp is `SystemTime::now()` (defined [here](https://sourcegraph.com/github.com/dfinity/ic@937c10eefdf8c46d982615e71b6f20a52c107dd4/-/blob/rs/nns/gtc/src/init.rs?L60-65)) when the genesis token canister init payload was prepared before genesis. As a result, all genesis neurons had an aging_since_timestamp_seconds older than the incorrect pre-age timestamp and were incorrectly reset to genesis. This resulted in genesis neurons losing about 1.5 years of age bonus (~10%).
+
+# Solution
+
+On a high level, in [proposal 129394](https://dashboard.internetcomputer.org/proposal/129394) we proposed to reverse the incorrect update and give the genesis neurons their age back.
+
+To do so, the upgrade used the [audit event log](https://sourcegraph.com/github.com/dfinity/ic@937c10eefdf8c46d982615e71b6f20a52c107dd4/-/blob/rs/nns/governance/proto/ic_nns_governance/pb/v1/governance.proto?L2543-2572) that tracked all changes when the age was reset. For each neuron with an entry in the audit log for resetting the age, their age was restored as long as they are identified as genesis neurons, unless such a neuron is already dissolving/dissolved (and thus cannot get an aging bonus).
+
+Note that those neurons’ age and stake might have changed since then and now (e.g. neurons are merged within each other, or topped up). In cases of the pre-aged neurons merging with each other and topped up with small amounts, neurons should still have their age restored because those actions would not have invalidated their age bonus.
+
+At the same time there shouldn’t be a significant difference of the neurons’ stake between then and now as otherwise preserving the old age would not be justified. To avoid this, the update procedure was built so that it would fail if there were more than 10% of neuron stake difference for all the neurons having their age restored. In fact, we observed that the stake difference is -1%.
+
+## RestoreAgingSummary
+
+In order for the community to be able to examine the result of the restore procedure, the Governance canister collects and exposes a get_restore_aging_summary endpoint:
+
+```
+$ dfx canister --network=ic call rrkah-fqaaa-aaaaa-aaaaq-cai get_restore_aging_summary '(record {})' --candid rs/nns/governance/canister/governance.did
+(
+  record {
+    groups = vec {
+      record {
+        count = opt (11 : nat64);
+        previous_total_stake_e8s = opt (672_288_418_097 : nat64);
+        current_total_stake_e8s = opt (581_178_449_788 : nat64);
+        group_type = 1 : int32;
+      };
+      record {
+        count = opt (823 : nat64);
+        previous_total_stake_e8s = opt (409_298_633_360_417 : nat64);
+        current_total_stake_e8s = opt (457_235_955_399_405 : nat64);
+        group_type = 2 : int32;
+      };
+      record {
+        count = opt (232 : nat64);
+        previous_total_stake_e8s = opt (85_273_804_461_471 : nat64);
+        current_total_stake_e8s = opt (34_508_239_431_262 : nat64);
+        group_type = 3 : int32;
+      };
+      record {
+        count = opt (1 : nat64);
+        previous_total_stake_e8s = opt (151_506_122_448 : nat64);
+        current_total_stake_e8s = opt (151_506_122_448 : nat64);
+        group_type = 4 : int32;
+      };
+      record {
+        count = opt (4_987 : nat64);
+        previous_total_stake_e8s = opt (4_966_982_310_182_829 : nat64);
+        current_total_stake_e8s = opt (4_966_982_310_182_829 : nat64);
+        group_type = 5 : int32;
+      };
+    };
+    timestamp_seconds = opt (1_713_535_929 : nat64);
+  },
+)
+```
+
+
+The above results can be interpreted as such:
+
+* 11 neurons were not pre-aged and were the result of the 52-year neuron incident, and their age is not restored.
+* 823 neurons are now dissolved/dissolving, and they don’t have their age restored.
+* 232 neurons had 852K ICPs when reset, and now they have only 345K ICP. Their age is restored.
+* 1 neuron with 1.5K ICP had their age changed while the stake remained the same. Its age is restored.
+* 4987 neurons with 49.66M ICP had their age and stake remaining the same, their age is restored.
+
+-------------------------
+

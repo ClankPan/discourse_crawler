@@ -1,0 +1,183 @@
+lastmjs | 2021-08-07 19:42:47 UTC | #1
+
+I am trying to get [proptest](__getrandom_custom), a property-testing library in Rust, to compile and run from within a canister. It has a dependency on `getrandom`, and I assume that because `getrandom` is being compiled for a Wasm environment, it expects a `__getrandom_custom` import from the host environment. I get the following error when trying to deploy a canister with that uses `proptest`:
+
+```bash
+Installing canisters...
+Upgrading code for canister graphql, with canister_id rrkah-fqaaa-aaaaa-aaaaq-cai
+The invocation to the wallet call forward method failed with the error: An error happened during the call: 5: Wasm module of canister rrkah-fqaaa-aaaaa-aaaaq-cai is not valid: Wasm module has an invalid import section. Module imports function '__getrandom_custom' from 'env' that is not exported by the runtime.
+```
+
+It would be very nice for the Rust CDK to provide this functionality, it seems that dealing with Rust randomness, packages like `rand` and `getrandom`, isn't as smooth as it could be. I would expect randomness to simply work across the major Rust packages, since the IC has an excellent source of randomness with the random beacon.
+
+Until all of that is sorted out, is there a way for me to provide the `__getrandom_custom` function to my canister?
+
+-------------------------
+
+lastmjs | 2021-08-07 20:41:50 UTC | #2
+
+I've at least gotten this to compile.
+
+Cargo.toml:
+
+```toml
+[dependencies]
+proptest = { version = "1.0.0", default-features = false, features = ["std"] }
+getrandom = { version = "0.2.2", features = ["custom"] }
+```
+I needed to enable the `custom` feature for getrandom, and in my canister I needed to implement the function:
+
+```rust
+use getrandom::register_custom_getrandom;
+
+fn custom_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    // TODO get some randomness
+    return Ok(());
+}
+
+register_custom_getrandom!(custom_getrandom);
+```
+
+-------------------------
+
+lastmjs | 2021-08-07 20:44:18 UTC | #3
+
+It compiles, but now when I try to actually use `proptest`, I get a panic.
+
+Here's the function I am trying to run:
+
+```rust
+#[query]
+fn test_canister(schema: String) -> String {
+    let mut runner = TestRunner::new(Config {
+        cases: 10,
+        max_shrink_iters: 0,
+        .. Config::default()
+    });
+
+    return "{}".to_string();
+}
+```
+I'm just creating a basic `proptest` runner, and I get: `
+
+-------------------------
+
+lastmjs | 2021-08-07 20:46:15 UTC | #4
+
+I'm just creating a basic `proptest` runner, and I get:
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Panicked at 'not supported on this platform', library/std/src/sys/wasm/../unsupported/os.rs:76:5
+```
+
+If anyone has experience with `proptest`, randomness, etc with the wasm32-unknown-unknown, I would love some help tracking down the source of this panic.
+
+-------------------------
+
+rckprtr | 2021-09-07 00:53:51 UTC | #5
+
+Im seeking a similar answer, basically these random libraries use wasm-pack and this is not supported on the IC as it requires JS imports the IC does not provide.
+
+-------------------------
+
+ildefons | 2022-04-16 07:07:22 UTC | #6
+
+What is the way to generate random numbers within a canister implemented with rust?
+
+-------------------------
+
+lastmjs | 2022-04-16 12:18:02 UTC | #7
+
+You can go to the random beacon (call raw_rand on the management canister) to get some random bytes. From there you can seed an rng and/or use the custom get random function like in my comment above. Later I can post some code.
+
+-------------------------
+
+ildefons | 2022-04-17 10:39:14 UTC | #8
+
+I tried the following snipped (below) but it does not compile. Specifically, the call "ic_cdk::call" says that 
+
+"the trait `for<'a> ArgumentDecoder<'a>` is not implemented for `std::vec::Vec<u8>`"
+
+Any idea what I can be doing wrong?
+```
+#[ic_cdk_macros::update]
+pub async fn subnet_raw_rand() -> Result<Vec<u8>, String> {
+    let management_canister = ic_cdk::export::Principal::management_canister();
+    let rnd_buffer: Vec<u8> = match ic_cdk::call(management_canister, "raw_rand", ()).await {
+        Ok(result) => result,
+        Err(err) => {
+            ic_cdk::println!("Error invoking raw_rand: {:?} {}", err.0, err.1);
+            return Err(err.1);
+        }
+    };
+
+    Ok(rnd_buffer.to_vec())
+}
+```
+
+-------------------------
+
+lastmjs | 2022-04-18 14:56:25 UTC | #9
+
+It's confusing, but the return type of the call here is a tuple. Try this:
+
+```rust
+let rnd_buffer: (Vec<u8>,) = 
+```
+
+-------------------------
+
+ildefons | 2022-04-18 15:05:25 UTC | #10
+
+Is it possible to make it work without deploying in the main network? in other words can I call the manager canister from my local development setup?
+
+I am asking because now I get an execution error:
+
+ildefons@ildefons-VirtualBox:~/rstest/rust_hello$ dfx canister call rust_hello subnet_raw_rand
+FIX ME! variant { 17_724 : table1; 3_456_837 : text } <: opt variant { ok : vec nat8; error : text } via special opt rule.
+This means the sender and receiver type has diverged, and can cause data loss.
+(null)
+
+-------------------------
+
+lastmjs | 2022-04-18 15:14:28 UTC | #11
+
+Yes you can call it locally
+
+-------------------------
+
+massimoalbarello | 2022-12-13 15:52:57 UTC | #12
+
+I had the same problem but thanks to this I got unstuck :slight_smile: 
+I would like to understand why you need that tho, do you know?
+
+In particular, before I was simply using `rand::thread_rng().gen_range(0..100)` but I got the error you mentioned above even tho I had the dependencies 
+`getrandom = { version = "0.2", features = ["custom"] }`
+`rand = "0.8.5"`
+
+Why would registering a custom `getrandom` function solve the problem? I simply copied and pasted your `custom_getrandom` function without any changes and it compiled.
+
+-------------------------
+
+lastmjs | 2022-12-13 18:49:42 UTC | #13
+
+The ic does not provide a randomness implementation that is automatically compatible with the rand crate in Rust from what I can gather, thus we need to provide our own custom implementation.
+
+On other platforms the rand crate is able to hook into the randomness implementation that already exists.
+
+-------------------------
+
+massimoalbarello | 2022-12-13 22:33:49 UTC | #14
+
+Ok I understand but as I didn't implement anything instead of `// TODO get some randomness` in `custom_getrandom`, why does it work?
+
+Thanks a lot :slight_smile:
+
+-------------------------
+
+lastmjs | 2022-12-15 01:33:18 UTC | #15
+
+I think because rand just looks for the implementation, notice it passes in a mutable buffer that you're supposed to fill up with randomness. If you don't fill it up with actual random bytes, you'll notice that many things you attempt aren't actually random, but they still produce a result.
+
+-------------------------
+

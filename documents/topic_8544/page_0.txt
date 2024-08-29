@@ -1,0 +1,387 @@
+akhilesh.singhania | 2021-11-12 13:17:10 UTC | #1
+
+# Background
+
+In order to properly understand the proposal below, we need to first agree on some terminology.
+
+![Untitled drawing|666x500](upload://609hxbU10JfYaPHtH7gfRkonXyN.jpeg)
+
+
+As the drawing above shows, a canister smart contract can expose two types of functions, update functions and query functions. A canister can be called by external users or by other canisters.
+
+Further, calls can either be replicated or non-replicated. A replicated call means that the subnet blockchain came to an agreement to process the call and all honest nodes will perform it. Non-replicated calls only execute against a single node in the subnet.
+
+When an update function executes successfully, the state changes that it makes are persisted and the state changes made by a query function are discarded. Hence, an update function can only be called as a replicated call while it is possible to call a query function as both replicated and non-replicated calls.
+
+Now we can define the following types of calls:
+
+* Ingress. When a user calls an update function. The user submits an ingress message and there is an agreement on the subnet blockchain to process the message.
+* User query. When a user calls a query function as a non-replicated call. It is also possible for the user to call the function as a replicated call, in this case the user must submit an ingress message to call the function.
+* Update call: When a canister calls an update function. There is an agreement on the subnet blockchain(s) to process the message.
+* Non-replicated query: This is when the calling canister is executing a user query in the non-replicated fashion and it calls a query function on another canister. This feature is not currently supported and generally is referred to as the inter-canister query calls feature.
+* Replicated query: When a canister is executing an update call (and hence executing a replicated call), it can call a query function on another canister that is also executed as a replicated call.
+
+# Proposal
+
+Canister smart contracts need to expose various bits of state to other canisters and to external users.  Examples of this state are set of controllers; wasm module hash, etc. Some of this state should only be exposed to their controllers (private state) and some of this state can be exposed to everyone (public state). Currently, not all necessary information is exposed and the exposed information is not exposed in a standardised way. This makes the developer experience unnecessarily complicated.
+
+The two distinct mechanisms available today are:
+
+* Reading from the [System state tree](https://sdk.dfinity.org/docs/interface-spec/index.html#state-tree). Currently this is only available to external users and this can only be used to expose the public state.
+* Calling the [IC method canister_status](https://sdk.dfinity.org/docs/interface-spec/index.html#ic-canister_status). This can only be called by controllers and only available in replicated calls (Ingress from users or update calls from canisters).
+
+There are a number of scenarios that the above mechanisms do not address:
+
+* Canisters cannot access the public information that another canister is exposing.
+* The information available to controllers is only available in replicated calls. A user who is a controller has to use ingress messages which are relatively slow (compared to non-replicated queries) and also more expensive in terms of cycles charged to the called canister.
+
+The end goal would be that all the public state that canisters want to expose is available to all principals (external users and canisters) and all private state is similarly exposed to all controllers (external users and canisters) in the most efficient manner.
+
+The proposed solution is to add a new IC method: read_state. The input to this method will be the state tree as before and the response will be the hashtree and an optional certificate. This method will be callable by canisters as well as external users. It will be available as a query function. This will have the following properties:
+
+* Users can call it efficiently in a non-replicated call using User Queries. In this case, the response will include a certificate which can be used by the caller to validate the response.
+* Canisters will be able to call it as a replicated query. The response is guaranteed to be genuine so no certificate will be necessary.
+* In the future, if we add support for inter-canister queries, then canisters will also be able to call it as a non-replicated call. In this case, the certificate will again be included.
+
+Once the above method is added, the two existing methods, in particular the [read_state http interface](https://sdk.dfinity.org/docs/interface-spec/index.html#http-interface) and the [IC method canister_status](https://sdk.dfinity.org/docs/interface-spec/index.html#ic-canister_status), can both be deprecated.
+## Contributors
+A number of people (potentially unknowingly) contributed to this proposal.  The list should include at least: @chenyan, @bogdanwarinschi, @bjoern, @nomeata.
+
+-------------------------
+
+chenyan | 2021-11-12 17:48:43 UTC | #2
+
+`read_state` is also used by users to poll the status of an update call. We cannot deprecate that endpoint, right?
+
+IIUC, users have to manually verify the certificate returned by the `read_state` query method. In contrast, if we use the http interface, we get certified results for free. Another concern is that the query method doesn't always return the latest state, and if we send multiple `read_state` calls, the content can be out of sync. I think it's still beneficial to keep the http interface and add a `read_state` query method in the management canister.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-12 18:58:00 UTC | #3
+
+Sorry, not sure I understand.  If the user can query the mgmt canister's `read_state` function then why do they need to use the `read_state` http endpoint.
+
+-------------------------
+
+jzxchiang | 2021-11-12 21:30:47 UTC | #4
+
+I had no idea a user could call a query function in both a replicated or non-replicated way. I don't even know if there's an easy way in `agent-js` to make a replicated query call.
+
+Is the only benefit of making a replicated query call that it's more safe? For example, certificate (or certified variable) validation wouldn't be necessary.
+
+-----
+
+Separate question: why was the original `canister_status` callable only by the controller? This proposal will make it so any canister's controller is publicly readable information, IIUC. I wonder if there was any good reason for the original restriction, which this proposal will remove.
+
+-------------------------
+
+jzxchiang | 2021-11-12 21:34:11 UTC | #5
+
+Also, if the `read_state` HTTPS method is deprecated, I would hope that `agent-js` (and other agent libraries) are updated ASAP to instead `query` the new `read_state` IC method when polling the status of a call, otherwise everything would break.
+
+As an aside, I'm guessing changes to the HTTPS interface involve the boundary nodes and not the replica nodes. Since the boundary nodes are not managed by the NNS, I'm guessing DFINITY can simply deploy to them without needing a proposal (ignoring the IC method change)?
+
+-------------------------
+
+kpeacock | 2021-11-12 22:01:09 UTC | #6
+
+We don't have a super easy way to make a replicated query call, but you can remove the `query` from the IDL of any call and have it go through consensus. I will add designing a nice interface for that to the `agent-js` backlog for myself.
+
+-------------------------
+
+chenyan | 2021-11-13 02:06:08 UTC | #7
+
+A big advantage of the HTTP endpoint is that you get certified result for free. With the query method, how do you verify the response? Certified data is only 32 bytes, and there is no generic way to verify the data.
+
+There is also a consistency problem: in replicated state, the method call is processed in the middle of the block, where the new state tree is not generated yet. Returning the latest state tree makes the data out of date as well.
+
+-------------------------
+
+nomeata | 2021-11-14 16:39:51 UTC | #8
+
+Overall in favor, although so far I haven't seen a solution that is obviously desirable for all callers.
+
+If you use this method from a canister, it will be executed in the “middle” of a block. Do you even have a hash tree of the state then to return a pruned response?
+
+Actually, if you return no certificate, there is no need for the hash tree to have a certain root node. Therefore no need to have any pruned tree nodes. In other words, you can just create a fresh tree consisting of just the requested data.
+
+But at this point the question is: why even return an unwieldy data structure like a hash tree when there is no certification around? Why not something more easier to digest, like Candid?
+
+And continuing this train of thought leads again to roughly where we we are now.
+
+Hmm, the more I think about this, the more I believe we need to solve this at a more fundamental and general level. It should be possible to describe the canister state in a high level way (Candid), and then get all that we need. And next time we add something to the state, everything about data formats and certification follows. This scheme and associated tooling would then also help canister developers who are then facing the same issue.
+
+What would that entail:
+
+ *  (Possibly) pick a subset of Candid types, call them certifiable.
+ * Define a (simple) query language for them, similar to `read_state`, to select fragments of such a value.
+ * Define a mapping from these abstract Candid values to our hash tree. This needs to be compatible with the above query language (i.e. a certificate reveals only the query result and that it is indeed the right result for this query, including the negative case).
+ * In replicated calls, simply return Candid as now.
+ * In non-replicated calls, return the hash tree representation _of the same candid value_, plus certificate.
+
+If we can pull this off the whole replicated vs. certified distinction disappears on the application level. But it's not trivial, unfortunately.
+
+But if we don't do this, and suddenly important functionality is now no longer reachable via our common high level interop system, we are again weakening the coherence vision of the IC…
+
+---
+
+Minor wording nits:
+
+[quote="akhilesh.singhania, post:1, topic:8544"]
+and this can only be used to expose the public state.
+[/quote]
+
+Not quite true, some parts of the state tree are only accessible via suitable authentication (in particular, ingress call status).
+
+
+[quote="akhilesh.singhania, post:1, topic:8544"]
+The input to this method will be the state tree as before
+[/quote]
+
+Do you mean it's parameters, i.e. “state tree paths”? Or rather the internal “input”, e.g. which data structure it reads from?
+
+-------------------------
+
+chenyan | 2021-11-14 18:05:27 UTC | #9
+
+Certainly in favor of the certified Candid types. But why picking a subset? Would something like https://dl.acm.org/doi/abs/10.1145/2578855.2535851 work for all Candid types?
+
+-------------------------
+
+nomeata | 2021-11-14 20:22:01 UTC | #10
+
+Just saying “possibly” to indicate that I wouldn't consider it a blocker if we can't support everything.
+
+Based on the paper abstract certainly sounds interesting. Not open access though and it's too late today for my brain to process papers anyways. Did we discuss this paper before, when designing certified variables and/or candid?
+
+https://github.com/dfinity/motoko/issues/1814 is also relevant, and may provide another attack vector for this problem: define the various data accesses as plain Candid-returning query methods, and (somehow) have a generic mechanism to certify these.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-15 08:06:52 UTC | #11
+
+[quote="jzxchiang, post:4, topic:8544"]
+Is the only benefit of making a replicated query call that it’s more safe? For example, certificate (or certified variable) validation wouldn’t be necessary.
+[/quote]
+
+Replicated queries are essentially calling https://sdk.dfinity.org/docs/interface-spec/index.html#http-query via an ingress message.  If you called it as a query, you do not have any certification that you can validate.  But if you call it as an ingress message, you get the result in the ingress status (via `read_state`) for which you now have a certification.  
+
+[quote="jzxchiang, post:4, topic:8544"]
+Separate question: why was the original `canister_status` callable only by the controller? This proposal will make it so any canister’s controller is publicly readable information, IIUC. I wonder if there was any good reason for the original restriction, which this proposal will remove.
+[/quote]
+
+`canister_status` returns private information about the canister.  This is information that the canister does not want to expose to the rest of the world only to its controllers.  The set of canister's controllers has always been public.  This proposal is not attempting to change any restrictions.  The public data will remain public and the private data will remain private.
+
+[quote="nomeata, post:8, topic:8544"]
+Actually, if you return no certificate, there is no need for the hash tree to have a certain root node. Therefore no need to have any pruned tree nodes. In other words, you can just create a fresh tree consisting of just the requested data.
+[/quote]
+
+Precisely, thanks for stating clearly what I meant to say in the original proposal.  
+
+[quote="nomeata, post:8, topic:8544"]
+But at this point the question is: why even return an unwieldy data structure like a hash tree when there is no certification around? Why not something more easier to digest, like Candid?
+[/quote]
+
+Indeed, this is the usual point on which we keep getting stuck.  
+
+I suppose, conceptually, what the proposal is suggesting is that `read_state` return the following struct:
+
+`(HashTree, Option<Certificate>`.  The hash tree is always returned and when executing as a non-replicated call, then the certificate is additionally returned.  
+
+Instead would something like the following make sense?
+
+`Result<CandidStruct, (HashTree, Certificate)>`.  Now when executing a replicated call, you get an easier to digest struct and when executing a non-replicated call, you get the HashTree and the certificate.
+
+-------------------------
+
+nomeata | 2021-11-15 11:52:02 UTC | #12
+
+Something like that, with a generic (not application specific) way to relate the hash tree to the payload in the `CandidStruct`. So that, for example, Candid UI or ic.rocks can validate such responses from arbitrary canisters.
+
+Hmm, that seems to be a good criteria to evaluate solutions: is it expressive and general enough to be compatible with such canister-agnostic tools.
+
+(Or we just do certified queries on the system level (threshold signatures on query call responses, independent of the main chain, [internal link](https://docs.google.com/document/d/1lPT3o_VwksxMYuCvi7aBf0BfOPTpUPXzMo2ls21WzPU/view)), and save sooo much complexity and effort in upper layers…)
+
+-------------------------
+
+Fulco | 2021-11-15 12:24:25 UTC | #13
+
+Could also be a good opportunity to defintely decide what information about a canister we would like to be private or public by default? there have been earlier discussions about this before. 
+
+https://forum.dfinity.org/t/canister-controller-and-cycle-balance-need-to-be-public/5591 
+
+https://forum.dfinity.org/t/any-way-to-know-if-a-canister-was-updated/3987
+
+https://forum.dfinity.org/t/getting-a-canisters-controller-on-chain/7531
+
+I know that there are solutions like setting the blackhole canister as a controller, but as a developer that just seems cumbersome to me (now needing to manage the cycles of the blackhole canister as well just to expose this information). 
+
+I know I have seen @wang  @stephenandrews and myself express a preference for making the currently private information public by default and optionally private. I've seen @Sherlocked say that he doesn't think the cycle balance of a canister is too much information. I've seen @Levi say that cycle balance is too much information. 
+
+I would love to hear if other community members have an opinion about this as well.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-17 16:07:06 UTC | #14
+
+@Fulco : good points.  I agree these need to be addressed as well.  This will significantly increase the scope of this RFC.  Based on the discussions so far, I think I need to go back to the drawing board a bit on replicated vs. non-replicated queries.  I have some vague ideas that I want to write down first.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-22 08:26:31 UTC | #15
+
+I was thinking about the above proposed API for `read_state` and how I was not happy with it.  I ended up writing down my thoughts on why I am not happy with it.  I am posting them here to keep the conversation going.  No precise proposal yet.  I think more discussions and design is needed here.
+
+# Replicated vs. non-replicated queries
+
+There are two modes of executions possible on the IC. Replicated mode is when all honest nodes on the subnet perform the execution and non-replicated mode is when just a single node performs the execution.
+
+There are two types of functions that a canister can have. Update functions are when the state changes made by the functions are preserved (amongst other capabilities) and query functions are when the state changes made by the functions are discarded (amongst other capabilities).
+
+Since, update functions are modifying the state of the canister, all honest nodes on the subnet need to execute it, in other words, update functions can only run in replicated mode.
+
+On the other hand, state changes from query functions are discarded so they are fine to run in the non-replicated mode. When we originally designed the IC, we asserted that in terms of capabilities, query functions are strictly less capable than update functions so it should be fine to execute query functions as replicated mode as well only with limited capabilities.
+
+The above decision had important ramifications for improving developer experience. It enables update functions to call query functions which then execute in replicated mode. This has the benefit that canisters do not have to provide duplicate function definitions: one callable from update functions and one callable by users in query calls.
+
+Then we implemented support for [data certification](https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-certified-data). When a query function is executing in the non-replicated mode, it can use this feature to return a certificate for data that the caller can validate. As certification validation is only necessary when executing in the non-replicated mode; it is not available in the replicated mode. This means a query function running in the non-replicated mode has different capabilities than a query running in the replicated mode. The certification is also not available for update functions (as they can only run in replicated mode) so now it is no longer the case that query functions are strictly less capable than update functions.
+
+In [comment](https://forum.dfinity.org/t/rfc-standardising-how-smart-contracts-expose-state/8544/11?u=akhilesh.singhania), I made a proposal for how functions executing in replicated mode will have different capabilities than functions executing in non-replicated mode. In particular, I proposed the following function signature:
+
+fn read_state(...) -> Result<CandidStruct, (HashTree, Certificate)>
+
+When a function executing in the replicated mode calls this function, it gets back a `CandidStruct` and when a function executing in the non-replicated mode calls this function, it gets back a `(HashTree, Certificate)`.
+
+This API is not very nice because an update function will always have to handle the `Err` case even though we know that the `Err` case is impossible.
+
+![function capabilities|666x500](upload://jK3Yv0CMGB50ndYU3fFzWbJMOKC.jpeg)
+
+
+What we are seeing above are examples of the different capabilities that query functions have when executing in the replicated and non-replicated modes. More specifically, update functions and query functions in non-replicated mode have different sets of capabilities and query functions in replicated mode have a subset of capabilities of the two.
+
+We can come up with better names for the two classes of queries: queries only callable in non-replicated mode (Q1); and queries callable in both replicated and non-replicated modes (Q2).
+
+We can then say that update functions can only call Q2 queries and in the future when we support inter-canister queries Q1 queries can also call Q2 queries. We can also refine the proposal for read_state to instead define two different functions:
+
+fn certified_read_state(...) -> (HashTree, Certificate)
+
+fn non_certified_read_state(...) -> CandidStruct
+
+certified_read_state is only callable from Q1 and non_certified_read_state is callable from both update functions and Q2.
+
+-------------------------
+
+nomeata | 2021-11-22 15:28:32 UTC | #16
+
+Good analysis! This bifurcation, making query methods no longer a restricted update method has always bothered me (certified variables, but also inter-canister calls). But just giving up and letting the developer deal with this even increased complexity isn't a satisfying answer either. Isn't a goal to hide the complexities of blockchain and crypto from the user? I hope we have hide it in lower level of abstractions that normal developers don't deal with.
+
+Like we have reasonably successfully hidden differences between ingress update calls and inter-canister calls from the developer (e.g. polling only needed in one of them; certification only involved in one of them). We should try hard to maintain that level of abstraction, also for query calls. After all, they are “just” an optimization…
+
+-------------------------
+
+akhilesh.singhania | 2021-11-25 09:03:16 UTC | #17
+
+I agree, the goal should always be to not expose unnecessary complexity to the user.  However, we should also avoid the temptation of pre-mature abstraction.  In particular, in this case, maybe the complexity can be hidden by some language extension or a library.  I would still like to experiment with the raw APIs without adding support for the abstractions in the system.  Upgrading systems while having to maintain backwards compatibility is a chore.
+
+-------------------------
+
+bjoern | 2022-01-12 08:52:30 UTC | #18
+
+I morally agree with @nomeata's point that we should not make developers' lives harder than necessary. But I also think that by using abstractions that do not _quite_ fit, we did this already. The API for certification is one pretty good example. But there are more (meeting with @akhilesh.singhania are often insightful ...), like:
+
+* It is unsafe to call untrusted canisters or canisters on untrusted subnets, which may never return, thus not allowing the calling canister to stop.
+* The semantics of calls to other canisters are not quite what one may expect, as state changes prior to the call are persisted. That means developers must be very careful not to unexpectedly leave state inconsistent during the call or when potentially trapping after it. Which in turn means that one has to understand intricacies of the platform even when working with "nice" abstractions.
+
+To me it seems that sometimes abstractions that don't _quite_ fit may be worse than no abstractions at all.
+
+-------------------------
+
+nomeata | 2022-01-12 11:25:30 UTC | #19
+
+[quote="bjoern, post:18, topic:8544"]
+like:
+[/quote]
+
+Both good reasons to [develop in the pure actor model](https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters) and ditch this convenient but dangerous `async` stuff :-)
+
+-------------------------
+
+levi | 2022-01-12 17:51:42 UTC | #20
+
+![image|230x500](upload://6nJrDEQKSd0blFazim9L9TOc3uD.jpeg)
+
+-------------------------
+
+jzxchiang | 2022-01-12 21:32:12 UTC | #21
+
+I don't think that's him.
+
+-------------------------
+
+PaulLiu | 2022-01-18 20:20:05 UTC | #22
+
+Just want to chime in that once [Enable canisters to make HTTP(S) requests](https://forum.dfinity.org/t/enable-canisters-to-make-http-s-requests/9670) is implemented, one can use it to call `read_state` end point on IC itself. Not exactly a satisfying solution, but will be possible.
+
+-------------------------
+
+akhilesh.singhania | 2022-01-19 09:29:56 UTC | #23
+
+https://forum.dfinity.org/t/canister-integrity-verification-on-chain-is-missing/10353/15?u=akhilesh.singhania
+
+-------------------------
+
+PaulLiu | 2022-01-19 17:36:34 UTC | #24
+
+[quote="akhilesh.singhania, post:1, topic:8544"]
+In the future, if we add support for inter-canister queries, then canisters will also be able to call it as a non-replicated call. In this case, the certificate will again be included.
+[/quote]
+
+If a piece of private state is only meant to be read by controllers, then the security of a call must ensure that the caller is genuine, not just that the result is certified. But of course this is more of a question about how non-replicated query call is going to work.
+
+-------------------------
+
+roman-kashitsyn | 2022-03-08 22:00:31 UTC | #25
+
+[quote="nomeata, post:8, topic:8544"]
+Define a mapping from these abstract Candid values to our hash tree.
+[/quote]
+That's a fantastic idea. Certifying data is a huge pain and doesn't scale well. The only way out of this misery is automation. 
+
+[quote="nomeata, post:19, topic:8544"]
+ditch this convenient but dangerous `async` stuff :slight_smile:
+[/quote]
+
+Amen. I wrote two async runtimes for Rust canisters, and I still hate all things `async` passionately. State machines is the only true way to specify and build distributed software.
+
+Also, I wish I learned about TLA+ 3 years ago :)
+
+-------------------------
+
+jzxchiang | 2022-03-17 22:32:44 UTC | #26
+
+What is the current status of this? Has it been deployed or is it still in the design or implementation phase? Thanks.
+
+-------------------------
+
+jzxchiang | 2022-05-05 20:49:49 UTC | #27
+
+I wanted to follow up if the `read_state` query function (callable by both canisters and external users) will launch soon. Thanks!
+
+-------------------------
+
+dsarlis | 2022-05-06 08:31:35 UTC | #28
+
+Hi @jzxchiang, this has not really been moved further than discussions about what an MVP solution would look like, so I wouldn't expect it to launch soon.
+
+-------------------------
+
+Hazel | 2023-03-23 16:57:39 UTC | #29
+
+Hey all, 
+
+Very very very late to the game here and only just seeing how useful this proposal is. ic-spec is an intimidating document! 
+
+Did we ever end up somewhere here? I know we have outbound HTTP requests so... technically.. this is possible. But, I think being able to verify the `/canister/<canister_id>/*` would solve a ton of composability issues we struggled with building quark.
+
+-------------------------
+

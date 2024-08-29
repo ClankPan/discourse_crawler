@@ -1,0 +1,348 @@
+Dev | 2023-10-17 22:44:48 UTC | #1
+
+I am using `call_raw` for an Intercanister Call which return a `Vec<u8>`. This vec I am passing through the `IDLArgs::from_bytes` function that return a valid `Candid` response.
+
+```
+let encoded: <Vec<u8>> = call_raw(data.canister, &data.method, bytes, 0).await.unwrap();
+let decoded: IDLArgs = IDLArgs::from_bytes(&encoded).unwrap();
+let output: String = decoded.to_string();
+```
+The output I am returning to my front-end is ofcourse the `Candid` response as a string. What I want it to be is a valid `JSON` that I can use in my back-end in further flows and return it to my front-end. 
+
+So I came across a package which does this `idl2json`, but I am getting errors with it that I cant figure out.
+
+here is what I am doing as the the examples in the repo
+```
+let idl_value: IDLValue = Decode!(&encoded[..], IDLValue).expect("Failed to parse buffer");
+let to_string: String = serde_json::to_string(&idl2json(&idl_value, &Idl2JsonOptions::default()))
+```
+This gives me an error
+```
+mismatched types 'IDLValue' and 'candid::parser::value::IDLValue' have similar names, but are actually distinct types
+```
+I can see that the `idl2json` is using `IDLValue` from `use candid::parser::value::IDLValue;`, but there is no such thing available.
+
+Would appreciate some help or guidance.
+
+https://github.com/dfinity/idl2json/blob/main/src/idl2json/examples/init.rs#L31
+
+-------------------------
+
+icpp | 2023-10-17 23:38:43 UTC | #2
+
+I have good experience with this approach:
+- in frontend, convert your JSON data to a string
+- send it to a canister as Candid Text
+- receive it in the canister as Candid Text
+- convert the Text to JSON 
+
+Do the reverse when sending data back.
+
+
+For frontend I used Javascript and Python, who have these conversions between JSON and string build in.
+
+In canister, I use C++, with the nlohmann/json library.  I am sure there is a rust library that can convert between string and JSON.
+
+-------------------------
+
+Dev | 2023-10-18 06:47:43 UTC | #3
+
+Sending data in the front end is fine, like you said I'll be sending it as a JSON and convert it using the `serde_json` package. My issue is entirely on the backend trying to convert Candid to a JSON response. There is a package for this in rust but its giving me errors mentioned above that I cant figure out.
+
+-------------------------
+
+Dev | 2023-10-18 09:37:45 UTC | #4
+
+So I managed to port over the idl2json stuff to my own project. Seems it works but not completly? This is the reponse I get back
+
+```
+{
+    "Ok": "{\"3_456_837\":{\"1_851_232_335\":\"NOT FOUND\"}}"
+} 
+```
+instead it should be
+```
+{
+    "Ok": { "NotFound": "NOT FOUND" }
+}
+```
+this is what I am doing
+```
+let encoded = call_raw(data.canister, &data.method, bytes, 0).await.unwrap();
+let mut de = candid::de::IDLDeserialize::new(&encoded).unwrap();
+let idl_value = de.get_value::<IDLValue>().unwrap();
+de.done().unwrap();
+
+let oke = idl2json(&idl_value, &Idl2JsonOptions::default());
+let to_string = serde_json::to_string(&oke).unwrap();
+```
+
+-------------------------
+
+RMCS | 2023-10-18 10:30:37 UTC | #5
+
+Maybe you can try to decode it the same way as `DFX` does it when supplying a custom candid file on the `dfx canister call` method.
+
+https://github.com/dfinity/sdk/blob/master/src/dfx/src/commands/canister/call.rs#L204 and following the `opts.candid`?
+
+ref: https://internetcomputer.org/docs/current/references/cli-reference/dfx-canister#options (`--candid <file.did>`)
+
+Never looked into this, and don't know much about it, also not sure if this is what you mean?
+
+-------------------------
+
+bitdivine | 2023-10-18 11:02:52 UTC | #6
+
+Hello.  I am the author of idl2json.  I think I saw that error when I switched from Candid v0.8.x to v0.9.x.  Which version of Candid are you using?  If you are not specifying a version explicitly, looking in your Cargo.lock will help.  E.g.:
+
+```
+$ sed -nE '/^name = "candid"/{n;p}' Cargo.lock
+version = "0.8.4"
+```
+
+I do have a release of idl2json for candid 0.9.X ready but had some issues publishing.
+
+-------------------------
+
+Dev | 2023-10-18 12:35:39 UTC | #7
+
+@bitdivine I am using version `candid = "0.9.10"`, I tried going back to `8.4` but it was giving me too many `Principal` mismatches so I just gave up.
+
+Is this the expected output tho?
+```
+{
+    "Ok": "{\"3_456_837\":{\"1_851_232_335\":\"NOT FOUND\"}}"
+}
+```
+or is `idl2json_with_weak_names` what I am looking for, meaning I need to fetch the canister's IDL that I am doing an Intercanister Call to?
+
+-------------------------
+
+Dev | 2023-10-18 12:40:58 UTC | #8
+
+actually `idl2json` package I think supports this as well with a `.did` file 
+https://github.com/dfinity/idl2json/blob/main/src/idl2json/examples/init.rs
+
+there is a `idl2json_with_weak_names` which required the `idl_type`, I just need to figure out how to fetch the .did file, also it seems it required a `type_name`
+
+-------------------------
+
+bitdivine | 2023-10-18 12:52:39 UTC | #9
+
+Ok, thanks for the version information.  For Candid 9 you will definitely need the new idl2json.  You can import it now with:
+
+```
+idl2json = { git = "https://github.com/dfinity/idl2json", rev = "v0.9.3" }
+```
+and then you should have no more conflicts.  You can switch back to normal versioning when the crate publishing issue is solved but I am unlikely to get to that this week.
+
+-------------------------
+
+Dev | 2023-10-18 13:09:00 UTC | #10
+
+thanks a bunch! @bitdivine the conflicts are gone. So I need to fetch the `.did` file and call `idl2json_with_weak_names` right, so get proper names instead of numbers. 
+
+Is there a call for this in rust by any chance?
+
+-------------------------
+
+bitdivine | 2023-10-18 13:10:50 UTC | #11
+
+Regarding the .did file, yes, idl2json does support names if available.  If not, it provides whatever it can, which in this case is the numeric form of some keys.
+
+Regarding the type name, it looks as if you are making an API call, so you know the name of the method you are calling.  If you have the .did file, you can parse that, get the service, from there look up the function and get the return value.  It would make sense to add an example of how to do that to the examples.
+
+Regarding where to get the .did file, that is available from canisters that include it in their metadata, so it is not always there.  _If_ it is, you can get it from the command line with:
+```
+dfx canister metadata CANISTER_ID --network ic candid:service
+```
+I have never actually had to get it from within Rust code, either for a CLI tool or withing a canister calling another canister.  That would be something interesting to learn.
+
+By the way, `idl2json` started out as a tool to help me with two very specific problems.  It has gradually become more widely adopted so I really have to put a bit of focus into supporting a wider range of scenarios.  As such, it would be really interesting for me to learn how you are using it, so that I can add relevant examples, documentation, and in some cases even code.  For example, `idl2json` could in principle convert candid code into a JSON AST but I have not needed that so it is not covered.
+
+-------------------------
+
+bitdivine | 2023-10-18 13:18:15 UTC | #12
+
+This is where `dfx` gets canister metadata: https://github.com/dfinity/sdk/blob/6dca5f8e51474a7006cefb4129cf0f67c227d54d/src/dfx/src/commands/canister/metadata.rs#L29
+
+So it looks as if the agent has a method you can use.  Here is the method: https://docs.rs/ic-agent/0.29.0/ic_agent/agent/struct.Agent.html#method.read_state_canister_metadata
+
+-------------------------
+
+RMCS | 2023-10-18 13:18:42 UTC | #13
+
+Bit oftopic prehaps, but do you also know how the Motoko / Rust / Javascript / Typescript is generated from the Candid?
+
+-------------------------
+
+bitdivine | 2023-10-18 13:24:21 UTC | #14
+
+Typically with: `didc bind --target rs some-did-file.did`
+
+The didc code is here: https://github.com/dfinity/candid/tree/master/tools/didc
+
+It could potentially be an idea to make idl2json just another binding.  idl2json also has the reverse function, going from json or yaml to candid.  That might not necessarily fit into that framework as it is now but it's a space to explore.
+
+-------------------------
+
+Dev | 2023-10-18 13:25:19 UTC | #15
+
+@bitdivine I indeed know the method name and the canisterId to call. So the only thing I am missing is a `.did` file.
+
+So my use case is: 
+
+I am developing an iPaaS kinda application, to connect various data sources (canisters). A user can setup an input node (starting point) that acts as a data receiver, basically you'd have to call this input node's canister and send data as JSON stringified.
+
+One of the possibilities is that a user can decide to do a "Lookup" to a different canister in the flow. This means that the user can fetch additional data from an unknown canister (supplying caniserId, method name and args) and combine the received data from the lookup with its initial input node's data.
+
+So the "Lookup" feature also has a "preview call" where the user can prevuew the data from the specified canister. For this feature I probably need to fetch the `.did` file in Rust.
+
+-------------------------
+
+bitdivine | 2023-10-18 13:29:57 UTC | #16
+
+To get the .did file from Rust, this seems to be the appropriate method in ic-agent: https://docs.rs/ic-agent/0.29.0/ic_agent/agent/struct.Agent.html#method.read_state_canister_metadata
+
+If this is a preview, you might be able to do the rendering just in the browser.  I mention this just as query calls and even certified query calls are really fast, so this may give a better user experience.
+
+-------------------------
+
+Dev | 2023-10-18 13:39:16 UTC | #17
+
+@bitdivine yes, the rendering of the preview happens in the front end, and is a seperate `update` call due to being an ICC, I just want the correct fields to be shown in the candid instea of the numbers.
+
+what do you mean exactly with this?
+> If this is a preview, you might be able to do the rendering just in the browser
+
+-------------------------
+
+bitdivine | 2023-10-18 13:45:27 UTC | #18
+
+I mean, if you get candid in the browser and also pull the .did file into the browser you could potentially do  what idl2json does in the browser.
+
+-------------------------
+
+Dev | 2023-10-18 13:53:47 UTC | #19
+
+I understand. Thank you for your help @bitdivine, I will try some stuff and see how it goes tonight (or having this feature inside `idl2json` :stuck_out_tongue:)
+
+-------------------------
+
+Dev | 2023-10-18 17:53:58 UTC | #20
+
+@bitdivine btw if I use 
+```
+idl2json = { git = "https://github.com/dfinity/idl2json", rev = "v0.9.3" }
+``` 
+my editor stops showing me errors and autocompletion in rust code. when I disable the package it works again.
+
+EDIT: 
+when I am trying to deploy I am getting lots of errors haha. maybe the reason I thought it worked is the same reason as above, it stopped showing me errors in the code...
+
+example
+```
+error[E0614]: type `f32` cannot be dereferenced
+  --> .cargo/git/checkouts/idl2json-59b6c00779b19b00/36a99cd/src/idl2json/src/typed_conversion.rs:99:42
+   |
+99 |             serde_json::Number::from_f64(*f as f64)
+```
+
+-------------------------
+
+bitdivine | 2023-10-19 09:33:34 UTC | #21
+
+I will put some work into examples.  With a bit of luck I will encounter any issues you are seeing and be able to iron them out.
+
+-------------------------
+
+Dev | 2023-10-19 10:39:31 UTC | #22
+
+awesome, thank you for looking into this!
+
+-------------------------
+
+Dev | 2023-10-19 12:43:51 UTC | #23
+
+@bitdivine btw I am also getting issues using `ic_agent` package in rust. This is how I setup the call to made for `read_state_canister_metadata`
+```
+let metadata: Vec<u8> = ic_agent::agent::Agent::read_state_canister_metadata(
+    &AgentBuilder::default().build().unwrap(),
+    data.canister,  
+    &"candid:service".to_string() // Not sure if this is the correct one
+).await.unwrap();
+```
+I had to include `getrandom = { version = "0.2", features = ["js"] }` but after deploying I am getting 2 errors
+
+```
+error[E0004]: non-exhaustive patterns: `Some(_)` not covered
+   --> /.cargo/registry/src/index.crates.io-6f17d22bba15001f/ic-agent-0.29.0/src/agent/mod.rs:558:19
+    |
+558 |             match retry_policy.next_backoff() {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ pattern `Some(_)` not covered
+    |
+note: `std::option::Option<std::time::Duration>` defined here
+   --> /.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/option.rs:571:5
+    |
+563 | pub enum Option<T> {
+    | ------------------
+...
+571 |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+    |     ^^^^ not covered
+    = note: the matched value is of type `std::option::Option<std::time::Duration>`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+578 ~                 None => return Err(AgentError::TimeoutWaitingForResponse()),
+579 ~                 Some(_) => todo!(),
+    |
+
+error[E0308]: mismatched types
+  --> /.cargo/registry/src/index.crates.io-6f17d22bba15001f/ic-agent-0.29.0/src/agent/http_transport/reqwest_transport.rs:36:47
+   |
+36 |     pub fn create<U: Into<String>>(url: U) -> Result<Self, AgentError> {
+   |            ------                             ^^^^^^^^^^^^^^^^^^^^^^^^ expected `Result<ReqwestTransport, AgentError>`, found `()`
+   |            |
+   |            implicitly returns `()` as its body has no tail or `return` expression
+   |
+   = note:   expected enum `Result<ReqwestTransport, AgentError>`
+           found unit type `()`
+```
+
+-------------------------
+
+Samer | 2023-11-15 16:48:12 UTC | #24
+
+[quote="Dev, post:23, topic:23847"]
+`non-exhaustive patterns: `Some(_)` not covered`
+[/quote]
+
+Also getting `non-exhaustive patterns: `Some(_)` not covered` from ic-agent 0.29.0
+
+-------------------------
+
+kristofer | 2023-11-22 19:23:59 UTC | #25
+
+I am experiencing the same issue with ic-agent.
+
+-------------------------
+
+bitdivine | 2023-12-15 15:27:02 UTC | #26
+
+Hello all.  I'm really sorry, I've not been able to make any progress on this.  I am working like crazy on several things and I'm not getting enough sleep, let alone a few hours to address this.  Maybe I'll get a breather over Christmas and I can look into this then.
+
+-------------------------
+
+borovan | 2024-02-11 17:57:50 UTC | #27
+
+hey bumping this, did anybody fix the non-exhaustive pattern error?
+
+Ignore this - turns out we were using the canister builder when it was the wrong package... should have just used the management canister interface.
+
+-------------------------
+
+bitdivine | 2024-03-13 09:22:49 UTC | #28
+
+Recent updates on idl2json:  There are now releases for `candid` 9 (idl2json version 0.9.3) and candid 10 (idl2json version 0.10.1).  It seems a good idea to keep the major and minor versions in sync with candid.  That should be fine as long as idl2json is fairly stable.  If idl2json needs breaking changes that link will break so no promises! :slight_smile:
+
+-------------------------
+

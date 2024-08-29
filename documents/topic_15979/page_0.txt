@@ -1,0 +1,950 @@
+ulan | 2022-10-21 08:29:58 UTC | #1
+
+This proposal has been extracted from the long discussion in https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754. We will present and discuss it in the upcoming session of https://forum.dfinity.org/t/technical-working-group-scalability-performance/14265 on October 20.
+
+# Composite queries
+
+## Background & Problem statement
+
+Canisters have two types of methods: updates and queries. In contrast to updates, queries are not composable. In other words, a query cannot call other queries. This limitation makes it difficult to build scalable dapps that shard data across multiple canisters. Supporting calls in query methods is one of the most requested features.
+
+We have an experimental prototype implementation of the feature. The prototype has two limitations:
+
+1. it does not support cross-subnet calls, which means that a query can only call queries of other canisters that are on the same subnet as the original canister.
+2. it does not support replicated execution, which means that a query is executed on a single machine of a subnet and its result doesn’t go through consensus.
+
+Implementing the missing parts is a large (1-2 years) engineering effort due to technical challenges outlined in [this forum post](https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/84).
+
+## Proposal
+
+Our proposal is to release the prototype with the known limitations and postpone the full implementation to the future.
+
+We expect the following work before the prototype can be released:
+
+* Add a new query type for backwards compatibility.
+* Implement protection against malicious canisters.
+* Improve performance.
+* Write the specification.
+
+We need a new query type because the existing queries can be executed both in non-replicated and replicated mode. Since the prototype doesn’t support replicated execution, releasing it without a new query type would break the contract of the existing queries.
+
+We propose to name the new query type `composite_query` and propose the following changes:
+
+* Add a new public entry-point type in the WebAssembly module of canisters: `canister_composite_query <name>`.
+* Add a new `composite_query` keyword in Motoko, Rust CDK, and Candid.
+
+Composite queries will be similar to the existing regular queries except that they can call other queries and they do not support replicated execution. Note that composite queries can call both regular and composite queries. Update methods cannot call composite queries.
+
+## Future outlook
+
+In the future it should be possible to implement support for both cross-subnet calls and replicated execution.
+
+For cross-subnet calls we would need to solve the technical challenge related to the security of `caller_id` ([details](https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/53#explanation-of-trade-off-2-6)) and rewrite the existing implementation of query calls to use an asynchronous/distributed algorithm.
+
+Replicated execution support has more complexity and unknowns. Core components of the Internet Computer such as state manager, message routing, execution would need to support multiple versions of the same canister in the replicated state.
+
+If both features are implemented, we would be able to unify composite queries and regular queries.
+
+## Alternatives
+
+We could attempt to avoid a new query type by implementing support for replicated execution before releasing the feature. We expect this to be a significant engineering effort that would delay the feature by at least 1-2 years.
+
+## Authors
+@Manu, @stefan-kaestle, @ulan
+
+-------------------------
+
+skilesare | 2022-10-19 11:25:48 UTC | #2
+
+Certainly having some functionality is better than none, but it is a real bummer that devs have to think about sub nets, especially considering the lack of control you have over where your canisters are created.
+
+Would a prerequisite to this feature be targeted subnet deployment….or even exclusive subnets?  I could see something like a canDB instance needing to know that all its shards are out on one subnet.
+
+-------------------------
+
+ulan | 2022-10-19 11:32:19 UTC | #3
+
+When a canister creates another canister, the child canister will be on the same subnet. If the shards are created from the same root canister, then the query calls will work for them. I think that would be the workaround until we implement cross-subnet calls.
+
+-------------------------
+
+ulan | 2022-10-19 11:38:10 UTC | #4
+
+[quote="skilesare, post:2, topic:15979"]
+Would a prerequisite to this feature be targeted subnet deployment….or even exclusive subnets?
+[/quote]
+
+To answer this question: we are not planning to block on this since there is a workaround.
+
+-------------------------
+
+Manu | 2022-10-19 12:17:11 UTC | #5
+
+I agree, it's a compromise between delivering something quick vs having the optimal solution. We do plan on allowing users to install on a specific subnet when creating a canister from an ingress message. As Ulan said when you install a canister from a canister, you already land on the same subnet.
+
+-------------------------
+
+paulyoung | 2022-10-20 06:27:03 UTC | #6
+
+[quote="ulan, post:1, topic:15979"]
+it does not support replicated execution, which means that a query is executed on a single machine of a subnet and its result doesn’t go through consensus.
+[/quote]
+
+Could you help me understand how this is different from the way queries work today?
+
+-------------------------
+
+ulan | 2022-10-20 08:50:51 UTC | #7
+
+You're right that in most cases there will be no difference because queries by default use non-replicated execution. However, the existing queries also support replicated execution, which has these use cases:
+* The user wants the result of the query to go through consensus to protect against malicious nodes.
+* A canister executing an update method calls a query method of another canister.
+
+-------------------------
+
+Manu | 2022-10-21 12:26:40 UTC | #8
+
+This proposal is now live: [87599](https://dashboard.internetcomputer.org/proposal/87599).
+
+-------------------------
+
+skilesare | 2022-10-21 12:38:32 UTC | #9
+
+I hate to be adult, but does this mean that my composite queries can call queries??
+
+-------------------------
+
+Manu | 2022-10-21 12:46:29 UTC | #10
+
+If i understand your question correctly you're asking which types of methods you can call from a composite query method. You can call both queries and composite queries from a composite query method.
+
+-------------------------
+
+skilesare | 2022-10-21 14:25:07 UTC | #11
+
+Is it correct to say that if you hit a regular query you won't beable to call beyond that?  So any existing queries will need to be upgraded from query to composite query if they want that functionality in the future?
+
+Sounds like a great improvement!
+
+-------------------------
+
+Manu | 2022-10-21 14:33:09 UTC | #12
+
+Yes exactly. There is still an advantage to having a query method though: you can call it in replicated mode (so going through consensus, which is slower/more expensive but more secure). You cannot call composite queries in replicated mode (which is why it had to be a new method type). 
+
+So it probably makes sense that you would use query methods for things that don't need to call anything, and composite query methods where you want to make other (composite) query calls in the method.
+
+-------------------------
+
+jzxchiang | 2022-10-22 05:22:43 UTC | #14
+
+> Note that composite queries can call both regular and composite queries. Update methods cannot call composite queries.
+
+I can foresee the latter being a potential footgun. I'm guessing there's no way around that, as update methods must run completely in replicated execution mode? Is a world where that restriction is relaxed really that bad?
+
+-------------------------
+
+lastmjs | 2022-10-22 16:06:09 UTC | #15
+
+Is there any way to simplify all of the rules described here? Not being able to call composite queries from update methods I can see being very confusing.
+
+Just to make sure I understand, are you saying that eventually we can completely unify the query/composite query concepts back into query?
+
+I understand the nature of the challenges here, but this is going to introduce significant cognitive complexity to developers, especially new developers. I would suggest simplifying even more if possible.
+
+I also understand that might not be possible.
+
+-------------------------
+
+Seb | 2022-10-22 17:07:10 UTC | #16
+
+![Screenshot 2022-10-22 at 18.05.22|690x381, 75%](upload://4S7sWZZPFney19v3ZwHxOYJoAbB.jpeg)
+
+Just posting this picture from the WG for clarity. More slides can be found [here](https://docs.google.com/presentation/d/1CRKOhwh75mIZC5uvO5JrUYO2OoABe87p9P9lItv7nJA/edit#slide=id.g1000d4da809_0_294).
+
+-------------------------
+
+skilesare | 2022-10-22 17:16:26 UTC | #17
+
+Visual question: 
+![image|690x382](upload://ydjH1F9yhNkC6e7QXqKtM1wObPp.jpeg)
+
+Can I call an update from a composite?
+
+-------------------------
+
+Seb | 2022-10-22 17:19:38 UTC | #18
+
+This won't be possible since composite query only run in non-replicated mode while update only run in replicated mode
+
+-------------------------
+
+ulan | 2022-10-23 10:07:27 UTC | #19
+
++1 to @Seb's comments.
+
+> Just to make sure I understand, are you saying that eventually we can completely unify the query/composite query concepts back into query?
+
+Yes, we can unify them when we have replicated execution for composite queries, which the main technical challenge here. If we start working on replicated execution now, I think it will take us at least a year because we would need to make large changes in the core components of the replica.
+
+The trade-off is either to release composite queries now with potentially confusing rules or to work on replicated execution and release the proper query calls in 1-2 years.
+
+> Can I call an update from a composite?
+
+It's a good question. Assuming that in the future we support replicated execution for composite queries, I am not sure if we should allow composite queries to call updates because it would be confusing w.r.t. state changes. I guess an update called from a composite query would need to behave like a query and discard the state changed. That might confuse the users.
+
+-------------------------
+
+ulan | 2022-10-23 10:16:56 UTC | #20
+
+[quote="jzxchiang, post:14, topic:15979"]
+I’m guessing there’s no way around that, as update methods must run completely in replicated execution mode? Is a world where that restriction is relaxed really that bad?
+[/quote]
+
+Yes, exactly. The only way to safely relax the restriction is to support replicated execution for composite queries.  If we allow an update to call a composite query without that support, then each `ic0.call_perform()` in the composite query will fail with an error.
+
+-------------------------
+
+claudio | 2022-10-29 11:07:44 UTC | #21
+
+@ulan thinking a bit more about the trusted caller-id for queries, would it not make sense to restrict composite queries to only  call other composite queries, never ordinary queries (removing one arrow from the picture above). Then a regular query can continue to trust its caller id, while the new composite query cannot. Indeed, composite queries probably shouldn't even be allowed to inspect the caller_id.
+
+-------------------------
+
+skilesare | 2022-10-29 12:11:52 UTC | #22
+
+[quote="claudio, post:21, topic:15979"]
+composite queries probably shouldn’t even be allowed to inspect the caller_id.
+[/quote]
+
+That sounds like a nerf…hmmmm….how do you provide private data if you don’t have this? Can we have an original_caller that is passed along?
+
+-------------------------
+
+ulan | 2022-10-31 10:31:08 UTC | #23
+
+Thanks for the idea, @claudio. I haven't considered this option.
+
+Right now it is not clear whether we can manage to get secure `caller_id` in cross-subnet calls or not.
+I think we have the following options:
+
+A. We manage to make `caller_id` secure in cross-subnet calls. There is an idea by @bogwar on how to support secure/repeated cross-subnet queries with replication factor of `f+1` in a subnet with `3f+1` nodes. That would be something between non-replicated and fully replicated execution mode. I'll write up a detailed explanation of the idea.
+
+B. We are not able to make caller_id secure in cross-subnet calls. 
+- B.1 [dynamic caller-id]: Replace `caller_id` with the anonymous principal is cross-subnet calls, but keep it valid in same-subnet calls.
+- B.2 [caller-id signed by node]: Follow @nomeata's [suggestion](https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/60?u=ulan)  that there is no critical regression in security if the node is able to query what any canister that it is hosting can query.
+- B.3 [disable caller-id for composite queries]. This is your suggestion.
+
+The plan is to make option A work because that maximises the usefulness of composite queries. If that fails then fall back to B.1 or B.2.
+
+As @skilesare mentioned, it seems that option B.3. will greatly reduce the usefulness of composite queries even in cases when the `caller_id` is guaranteed to be secure (same subnet calls and calls from users).
+
+-------------------------
+
+nomeata | 2022-10-31 15:03:18 UTC | #24
+
+B.1 breaks with the goal that subnet placement is transparent as far as possible (which, I know, is under pressure anyways, but hey). B.3 may be too restrictive. I still stand by my suggestion of B.2!
+
+-------------------------
+
+claudio | 2022-10-31 15:14:59 UTC | #25
+
+Thanks @ulan. 
+
+Actually, just to be clear, my main suggestion was to prevent regular queries from being invoked from composite queries, so that a regular query can continue to reliably inspect its caller. Or maybe that was never the case in the first place if a malicious replica can always fake that information anyway.
+
+-------------------------
+
+ulan | 2022-11-01 09:26:57 UTC | #26
+
+> I still stand by my suggestion of B.2!
+
+Thanks for confirming that your choice didn't change.
+
+> Actually, just to be clear, my main suggestion was to prevent regular queries from being invoked from composite queries, so that a regular query can continue to reliably inspect its caller.
+
+Yep, I got it and I think that would reduce usefulness of composite queries because most of the queries exported by canisters will be regular queries. The developers that want to compose these canisters would need to wait until the controllers change the regular queries to composite query. But that change would come with the downside of making the query not callable by updates (until we get replicated mode support for composite queries). 
+
+If composite queries can call regular quereis, then choosing the query type would be much simpler:
+
+* if the query doesn't call other queries, then make it a regular query.
+
+* if the query calls other queries, then make it a composite query.
+
+-------------------------
+
+ulan | 2022-11-18 15:13:58 UTC | #27
+
+@claudio and I have been discussing recursive composite query calls. We need your input to decide what is the most natural (least surprising) semantics for developers.
+
+Please take a look at this example, where we have two canisters: A and B. Each canister has a global counter set to 0 and a composite query method `inc_counter()` that increments the counter and returns its new value. Additionally, canister B has two composite query methods: `call_a()` and `call_b()`. 
+
+What would you expect the queries to return when invoked by a user (e.g. using `dfx`).
+
+## Canister A:
+```rust
+counter: int32 = 0; // <= Global variable
+
+#[composite_query]
+fn inc_counter() -> int32 {
+	counter += 1;
+    return counter;
+}
+```
+
+## Canister B:
+```
+counter: int32 = 0; // <= Global variable
+
+#[composite_query]
+fn inc_counter() -> int32 {
+	counter += 1;
+    return counter;
+}
+
+#[composite_query]
+fn call_a() -> int32 {
+    counter += 1;
+    // Canister B calls canister A twice.
+    let a1 = call("Canister A", "inc_counter").await;
+    let a2 = call("Canister A", "inc_counter").await;
+    return counter + a1 + a2;
+}
+
+#[composite_query]
+fn call_b() -> int32 {
+    counter += 1;
+    // Canister B calls canister B (self) twice.
+    let b1 = call("Canister B", "inc_counter").await;
+    let b2 = call("Canister B", "inc_counter").await;
+    return counter + b1 + b2;
+}
+```
+
+# Option 1
+
+Composite queries are fully isolated from each other (do not see each other's changes):
+* `A.inc_counter()` returns `1`.
+* `B.inc_counter()` returns `1`.
+* `B.call_a()` returns `3 (=1+1+1)`.
+* `B.call_b()` returns `3 (=1+1+1)`.
+
+# Option 2
+
+Composite queries see each other's changes if they are in the same call graph:
+* `A.inc_counter()` returns `1`.
+* `B.inc_counter()` returns `1`.
+* `B.call_a()` returns `4 (=1+1+2)`. That is: `counter=1`, `b1=1`, `b2=2`.
+* `B.call_b()` returns `8 (=3+2+3)`. That is: `counter=3`, `a1=2`, `a2=3`.
+
+# Option 3
+Composite queries are isolated except when they are recursive:
+* `A.inc_counter()` returns `1`.
+* `B.inc_counter()` returns `1`.
+* `B.call_a()` returns `3 (=1+1+1)`.
+* `B.call_b()` returns `8 (=3+2+3)`.
+
+# Option 4
+Composite queries are isolated and recursion is not allowed:
+* `A.inc_counter()` returns `1`.
+* `B.inc_counter()` returns `1`.
+* `B.call_a()` returns `3 (=1+1+1)`.
+* `B.call_b()` returns `Error: recursive calls are not allowed`.
+
+Tagging everyone how commented in this thread: @skilesare, @Manu, @paulyoung, @jzxchiang, @lastmjs, @Seb, @nomeata.
+
+-------------------------
+
+nomeata | 2022-11-18 16:13:40 UTC | #28
+
+I’d expect Option 1: It behaves the same as if canister B was not on the IC, but rather off the IC (remember the original vision of canisters living on and off chain and still being able to communicate).
+
+Or put differently: An inter-canister query call behaves like a external query call, and behaves the same when done from an update method or a composite query method.
+
+-------------------------
+
+johan | 2022-11-18 16:31:09 UTC | #29
+
+I also think Option 1 is most natural and easiest to understand.
+
+-------------------------
+
+dymayday | 2022-11-18 17:16:05 UTC | #30
+
+Thanks for seeking our feedbacks!
+I would say Option 1 as according to the explicit contract on the IC, queries should discard their states. So if you need to pass a current query computation, you just pass it as an argument.
+
+That being said, I understand that this might be the most limiting implementation though 🤔
+
+-------------------------
+
+jplevyak | 2022-11-18 19:03:32 UTC | #31
+
+Option 1 is the perhaps the most readily understandable, but Option 2 is the most useful and makes the most sense when considering the collection of canisters as representing a single logical computational environment.  Option 2 enables A -> B -> A calls where A is managing some large state and uses B as a stateful service which may require some portion of the A state (which it doesn't know a priori).   For example, if A is processing a DB query with some proposed update and B is a service which is validating some aspect of the overall DB it would need to query A against the proposed updates already represented in A's memory space.   This applies all the way down the call stack as portions of the call tree may wish to cache or incrementally build data structures necessary to respond to the query.  While Option 1 makes sense it isn't nearly as useful and becomes unintuitive when the user attempts to refactor their code across canisters e.g. for space or parallelism reasons.  At that point, moving functions and objects changes the result of the computation in non-intuitive ways.
+
+-------------------------
+
+cyberowl | 2022-11-19 12:26:43 UTC | #32
+
+
+I want to first start off by saying the update of state in a composable query is confusing since queries should not change state. 
+
+Option 1 reverts the state back to origin as the same method is actor A or B is called. Thereby, each caller will get the same response. If you are just querying data I think this makes the most sense. 
+
+Option 4 is similar except it doesn't allow for any method calls of itself. As long as the dev doesn't call a function that might never terminate I think it is good to allow an actor to call a method of itself. 
+
+Option 2 is just forcing recursion on all the calls. However not sure we want to force recursion without allowing default non recursion use case. 
+
+Option 3 is probably the best case for recursion. You allow it but only when an actor is calling itself. So the dev knows that function will be recursive no matter what.
+
+I would stay away from recursion as default since it is more difficult to reason about. Even going through those simple examples it was hard to understand what was happening.
+
+-------------------------
+
+jzxchiang | 2022-11-21 02:47:44 UTC | #33
+
+> For example, if A is processing a DB query with some proposed update
+
+I'm not sure I understand why a DB query would contain a proposed update. If the user is calling a `composite_query`, I think it is fair to assume they are not trying to store or mutate data.
+
+-------------------------
+
+skilesare | 2022-11-21 03:49:18 UTC | #34
+
+Maybe a dumb question here, but can the composite query call a regular function that isn't async? I definitely want to be able to call various functions and accumulate a set of data.  I'm fine with the accumulator being limited to a snapshot in time without being able to change state, but I do need to bob and weave through the a number of objects and functions to build a "report".
+
+I'd love @icme 's take as I'd imagine accumulators that could function across queries would be great for complex queries.
+
+-------------------------
+
+ulan | 2022-11-21 09:29:55 UTC | #35
+
+> can the composite query call a regular function that isn’t async? 
+
+Yes, a call to a regular (synchronous) function will be compiled as part of the same composite query. So the function will behave as expected in traditional programming: all global changes are visible and propagated to the caller. BTW, this already works in existing regular queries since they also can call regular functions.
+
+> I do need to bob and weave through the a number of objects and functions to build a “report”.
+
+For regular (sync) functions this would not be a problem. For queries, I would suggest a map-reduce pattern that would work with all the options proposed above:
+
+```
+#[composite_query]
+fn generate_report() -> Report {
+    let report = Report::new();
+    for callee in canisters {
+        let result = call(canisters, "generate_sub_report").await;
+        report.add(result);
+    }
+    return report;
+}
+```
+
+-------------------------
+
+ulan | 2022-11-21 09:49:07 UTC | #36
+
+[quote="jplevyak, post:31, topic:15979"]
+Option 2 enables A → B → A calls where A is managing some large state and uses B as a stateful service which may require some portion of the A state (which it doesn’t know a priori).
+[/quote]
+
+That works well if both A and B are part of the same service. I am worried about the cases where A and B are completely independent services written by different developers. Then the reentrant B → A query might not expect changes in the global state of A done by the initial query.
+
+To give a concrete example: let's say A is a booking service canister and B is a hotel canister. The user calls `A.find_hotel(user, date)`, which calls `B.find_room(user, date)`, which calls `A.get_user_info(user)`.
+
+Option 2 would execute `A.get_user_info()` against the intermediate state that has changes from `A.find_hotel()` that may break `A.get_user_info()`. (The developer A might have assumed that it is okay to destroy the global state of A in `A.find_hotel()` because the query state changes are discarded anyways).
+
+-------------------------
+
+benji | 2022-11-21 15:14:40 UTC | #37
+
+To me option 1 makes most sense because query calls should be scoped and should not be allowed to update the canister state.
+
+-------------------------
+
+Seb | 2022-11-21 17:00:07 UTC | #38
+
+I purposely didn't read any other feedback before answering and the Option 1 seems more natural to me.
+
+-------------------------
+
+icme | 2022-11-21 22:13:26 UTC | #39
+
+[quote="skilesare, post:34, topic:15979"]
+I definitely want to be able to call various functions and accumulate a set of data.
+[/quote]
+
+Why not accumulate data through a single canister?
+
+So let's say we have something like Canister A, B, C, and D where the public facing endpoint is in canister A and the data that needs reducing is in Canisters B, C, and D
+
+1. Caller queries Canister A
+2. A queries B, C, and D
+3. A receives responses from B, C, and D and then reduces/accumulates the result
+4. A returns the accumulated result to the original caller
+
+@ulan it also seems like if the IC allows the holding of intermediate state with composite queries, then if inter-canister composite query closed-loop cycles exist between canisters (A -> B -> A), then the state tree could expand significantly (needing to hold each commit point of the previous composite query). So I'm pretty in favor of option 1 - with one caveat.
+
+...specifically this part of **option 4**:
+
+[quote="ulan, post:27, topic:15979"]
+`B.call_b()` returns `Error: recursive calls are not allowed`.
+[/quote]
+
+I haven't tried recursive canister update calls out yet, so I'm actually interested if their current implementation is at all close to what heartbeat is doing. 
+
+Can you or anyone else provide a use case for allowing recursive canister self calls? If there isn't a good use case, then it might be best to just block recursive calls and go forward with **option 4** for now. I'd imagine that starting out with recursive calls being blocked also has the benefit of being a backwards compatible change if we then later on decide to allow recursive calls, whereas the reverse (allowing recursive calls at the start) is backwards-incompatible and a breaking change.
+
+-------------------------
+
+ulan | 2022-11-22 11:38:39 UTC | #40
+
+> then the state tree could expand significantly
+
+Yes, I expect the peak memory usage of Option 2 to be much higher than the peak memory usage of Option 1. (The former is proportional to the size of the call graph whereas the latter is proportional to the depths of the call graph.)
+
+> Can you or anyone else provide a use case for allowing recursive canister self calls?
+
+I think the recursive calls will appear mostly "accidentally" if multiple independent services rely on each other. See my example above: https://forum.dfinity.org/t/proposal-composite-queries/15979/36
+
+@claudio mentioned that Option 2 would be useful for implementing anonymous async blocks in composite queries using self-calls.
+
+-------------------------
+
+icme | 2022-11-22 17:54:32 UTC | #41
+
+[quote="ulan, post:40, topic:15979"]
+> Can you or anyone else provide a use case for allowing recursive canister self calls?
+
+I think the recursive calls will appear mostly “accidentally” if multiple independent services rely on each other. See my example above: [Proposal: Composite Queries - #36 by ulan](https://forum.dfinity.org/t/proposal-composite-queries/15979/36)
+[/quote]
+
+I'm moreso talking about the case where you have B -> B recursive self calls. Is this the case being described here when you talk about recursive self calls?
+
+[quote="ulan, post:27, topic:15979"]
+`B.call_b()` returns `Error: recursive calls are not allowed`.
+[/quote]
+
+From my understanding **Option 4** allows A -> B -> A (with intermediate state being discarded), but does not allow B --> direct loop to --> B calls.
+
+As an aside, in some of my Motoko code I have patterns like:
+
+```
+// main.mo
+import H "./doHelper";
+
+actor {
+  public func doIt(): async () {
+    await H.doThis();
+    await H.doThat();
+  };
+
+  public func sometimesDoIt(): async () {
+    if (conditionIsMet) {
+      await doIt()
+    };
+  }
+};
+```
+
+```
+// doHelper.mo
+module {
+  public func doThis() {
+    await asyncTask1();
+  };
+
+  public func doThat() {
+    await asyncTask2();
+  };
+};
+```
+
+Would option 4 break any of these use cases? Specifically the ones where async helper functions are called, or `sometimesDoIt()` calls `doIt()`?
+
+If it would break this, then I'd vote for option 1.
+
+-------------------------
+
+ulan | 2022-11-23 09:51:38 UTC | #42
+
+> Is this the case being described here when you talk about recursive self calls?
+
+I meant both direct and indirect recursion: A → A and A → B → A.
+
+> From my understanding **Option 4** allows A → B → A (with intermediate state being discarded), but does not allow B → direct loop to → B calls.
+
+Option 4 would disallow both cases because A → B → A is an indirect recursion, so the question whether second A sees the changes of the first A applies to this case as well.
+
+> Would option 4 break any of these use cases?
+
+Yes, Option 4 would break these cases. Option 1 would as long as these helpers do not communicate using the shared/global state, but rather take inputs, work on local state, and return outputs.
+
+-------------------------
+
+jplevyak | 2022-11-23 15:12:10 UTC | #43
+
+As a developer I don't think I would make the assumption that I could destroy the query state because it "will be discarded anyways".   Most likely my code would be shared with the Update version and I would not assume the context that I was in.   Moreover outside of say a DB system the idea that my state will roll back is not common.   Much more likely I would assume that each part of the stack would act in a stateful way and that the overall behavior of the composite execution would act exactly as if it was an Update call *except* at the very end, after the execution has completed, where a query would have all the state changes tossed.
+
+-------------------------
+
+jplevyak | 2022-11-23 15:19:17 UTC | #44
+
+TL;DR IMO a composite query should execute exactly like an update until the very end where any state changes are discarded for the composite query.   Anything else would be surprising.
+
+-------------------------
+
+chenyan | 2022-11-25 04:09:55 UTC | #45
+
+It's a tough call. At the first glance, I thought Option 1 is the most natural option, as each query call reverts its state. Then I realized this actually changes the semantics of `await`: `await` becomes a rollback point, instead of a commit point. If I want to change this function from `composite_query` to `update`, this function will suddenly have a very different behavior and it's very hard to debug. In this sense, Option 2 is the least surprising one, as it emphasizes the `composite` aspect of the function, and preserves the semantics of `await`.
+
+Also, are we allowed to call update method in a composite query, and what's the expected semantics?
+
+-------------------------
+
+ulan | 2022-11-25 08:33:28 UTC | #46
+
+Thanks for the insightful comments @jplevyak and @chenyan!
+
+> Most likely my code would be shared with the Update version and I would not assume the context that I was in.
+
+Only synchronous code that doesn't have `await` is likely to be shared between `composite_query` and `update` (that works the same for all options). Asynchronous code that calls self or other canister end-points would be difficult to share because `composite_query` cannot call `update` and vice versa. 
+
+> Moreover outside of say a DB system the idea that my state will roll back is not common.
+
+My main concern are IC developers that got used to working with the existing queries and rely on the rollback/don't commit semantics.
+
+> `await` becomes a rollback point, instead of a commit point.
+
+More precisely: `await` doesn't rollback changes in the current query, but does rollback the changes for other queries.
+
+Another way to look at it is: `await` doesn't commit the changes to the global/canonical state from which other queries are executed.
+
+I think your comment captures the essence of the difference between Option 1 and Option 2:
+
+* Option 1: changes are not committed at await points and at the end of each query.
+* Option 2: changes are committed at await points and at the end of each query except for the root query. At the end of the root query all committed changes in all canisters are rolled back.
+
+> If I want to change this function from `composite_query` to `update` , this function will suddenly have a very different behavior and it’s very hard to debug.
+
+A similar argument applies to regular queries, right? If I want to change a `query` to `update` there will be some subtleties around state changes.
+
+> Also, are we allowed to call update method in a composite query, and what’s the expected semantics?
+
+A composite query cannot call an update.
+
+-------------------------
+
+saikatdas0790 | 2022-11-29 06:48:33 UTC | #47
+
+Instead of prohibiting composite queries from calling updates or having the developer have to worry about same vs xnet subnet calls, would it be bad design to transparently upgrade a call from a composite query to an update call automatically instead of having the call fail?
+
+It's quite difficult for dapp developers to have to deal with the intricacies of query vs update calls with the additional overhead of certified queries. Adding more complications like the above would just make it more difficult for dapp developers to use and test it.
+
+There's no sane way that I can imagine a dapp developer can test xnet composite query behaviour on their local replica and expect their mainnet behaviour to behave the same way
+
+From a personal perspective, I would then rather choose a plain update call and have users deal with the latency than use a complicated and unpredictable cross canister calling mechanism like this.
+
+Also, for the dapp I'm working on, our canisters are sharded to multiple subnets, so we would have ideally wanted to use this feature at some point in the future to reduce latency
+
+-------------------------
+
+ulan | 2022-11-29 08:54:50 UTC | #48
+
+[quote="saikatdas0790, post:47, topic:15979"]
+would it be bad design to transparently upgrade a call from a composite query to an update call automatically instead of having the call fail?
+[/quote]
+
+This would break some canisters because queries have the contract of discarding state changes whereas updates commit state changes. For example, a query that doesn't free allocated objects would be a valid query, but if we turn it into an update, then it would introduce a memory leak into the canister.
+
+> There’s no sane way that I can imagine a dapp developer can test xnet composite query behaviour on their local replica and expect their mainnet behaviour to behave the same way
+
+Sorry about that. Supporting cross-subnet messages in non-replicated mode is a difficult technical challenge. It will take a while until we implement it, until then we are trying to ship a version that will be useful for some users.
+
+-------------------------
+
+LightningLad91 | 2022-11-30 22:01:30 UTC | #49
+
+I'm curious if we could get a version of the HTTPStreamingCallback that supports composite queries.
+
+For example, let's say I have a large file distributed across Canisters A and B; would it be possible to have the boundary node call a composite query that allows me to stream data from Canister A until it reaches a point that it needs to query Canister B for the next piece before relaying it back to the boundary node.
+
+-------------------------
+
+dsd | 2022-12-01 09:44:23 UTC | #50
+
+> The trade-off is either to release composite queries now with potentially confusing rules or to work on replicated execution and release the proper query calls in 1-2 years.
+
+I'd opt for the latter. Inserting a temporary "break" in the API (i.e. the model that the developer has to understand) puts the follow-up work on the critical path for the API to be unified again. Doing "the right thing" on the other hand is a plan that is _more robust_ in face of priority changes, delays, etc.
+
+I wonder, how many severe performance issues that we had in the past critically depend upon this feature? Do we have an estimate on what the overall cost of designing/implementing/testing/adopting this intermediate feature is compared to coming up with, e.g., canister design patterns that mitigate existing performance issues?
+
+-------------------------
+
+chenyan | 2022-12-02 18:38:35 UTC | #51
+
+> More precisely: await doesn’t rollback changes in the current query, but does rollback the changes for other queries.
+
+I wonder if there is another dimension that can affect the state change. For example, the node answering the composite query is lagging behind the consensus. After the `await`, will the node catch up with the rest of the nodes? So even with option 1, the counter can be 0 and 1, just because of state catching up.
+
+> A similar argument applies to regular queries, right? If I want to change a `query` to `update` there will be some subtleties around state changes.
+
+Correct, but adding the `await` difference would be yet another subtlety, besides the local state change. There is also this trick (not sure how widely it's used) that people implement the same function as query and update calls. The frontend calls both methods, and use the result of query call to update the UI before the update commit happens. We lose this ability if we go with Option 1.
+
+-------------------------
+
+skilesare | 2023-01-25 11:51:37 UTC | #52
+
+@claudio Apparently these are already in the local replica. When do you think we will get motoko support for testing them out?
+
+-------------------------
+
+ulan | 2023-01-26 13:30:56 UTC | #53
+
+The results of [the poll](https://forum.dfinity.org/t/proposal-composite-queries/15979/27) about the recursive query semantics in this thread and offline chats:
+
+Option 1: nomeata, johan, dymayday, benji, Seb, icme, christian, dsarlis,  ielashi, roman-kashitsyn, stefan-kaestle, ulan.
+Option 2: claudio, jplevyak, chenyan, AdamS.
+Option 3: cyberowl.
+Other options: berestovskyy - make the behavior configurable by the caller.
+
+I also chatted with several canister developers offline who did not express a preference here and viewed it as a theoretical question that is not relevant to their use case, where the "main" canister that calls multiple "helper" canisters and combines their results.
+
+-------------------------
+
+lastmjs | 2023-03-04 22:22:13 UTC | #54
+
+What is the status of composite queries on mainnet?
+
+-------------------------
+
+ulan | 2023-03-07 09:38:33 UTC | #55
+
+The composite queries did not ship on the mainnet yet. The current status:
+
+* Replica implementation behind a flag => done.
+* Rusk CDK support => done.
+* Motoko support => to do.
+* Specification => in review.
+* Security review => to do.
+
+In terms of timeline, I hope the remaining work will complete soon in O(weeks).
+
+-------------------------
+
+lastmjs | 2023-06-07 22:11:07 UTC | #56
+
+What's the latest on composite queries? Has anything changed in dfx 0.14.1? I don't see anything in the release notes but our tests for composite queries locally are showing some differences.
+
+-------------------------
+
+lastmjs | 2023-06-07 22:11:44 UTC | #57
+
+Looks like the text for one of the composite query tests was simply changed.
+
+-------------------------
+
+Severin | 2023-06-08 07:31:50 UTC | #58
+
+Any change you see in dfx is from us upgrading the included replica. You'd have to follow the replica changelog to see everything that changed there. All hashes of replicas included in a dfx release are in the [releases](https://dashboard.internetcomputer.org/releases)
+
+-------------------------
+
+ulan | 2023-06-08 16:03:00 UTC | #59
+
+We are waiting for Candid and Motoko support before enabling composite queries in production.
+
+-------------------------
+
+lastmjs | 2023-07-05 14:05:25 UTC | #60
+
+Looks like composite queries will be enabled on mainnet soon, would have happened already but the replica binary had some build reproducibility issues: https://dashboard.internetcomputer.org/proposal/123311
+
+-------------------------
+
+ulan | 2023-07-05 15:44:34 UTC | #61
+
+@lastmjs: Yes, the mainnet should get composite queries soon. It is also enabled in
+
+- Candid 0.9.0: https://github.com/dfinity/candid/blob/master/Changelog.md#2022-06-30-rust-090
+- Motoko 0.9.4: https://github.com/dfinity/motoko/blob/master/Changelog.md#094-2023-07-01
+
+We still need a new version of dfx to pick up the new Candid. That and docs are coming soon.
+
+-------------------------
+
+lastmjs | 2023-07-05 16:10:56 UTC | #62
+
+Any version of the `ic-cdk` that allows `#[query(composite = true)]` should work on mainnet right? We've had this implemented in Azle and Kybra for a long time now, and I assume they'll just work on mainnet without having to update `ic-cdk`, `ic-cdk-macros`, and `candid`?
+
+-------------------------
+
+lastmjs | 2023-07-06 19:11:12 UTC | #63
+
+It looks like this is live, the replica binary has been adopted and all subnets updated. Can anyone confirm?
+
+-------------------------
+
+ulan | 2023-07-07 09:17:24 UTC | #64
+
+[quote="lastmjs, post:62, topic:15979"]
+Any version of the `ic-cdk` that allows `#[query(composite = true)]` should work on mainnet right?
+[/quote]
+
+Yes, now it should work. Once the a new dfx with candid 0.9.0 is released, then you would also need to change `query` to `composite_query` in the `did` files of examples.
+
+
+[quote="lastmjs, post:63, topic:15979, full:true"]
+It looks like this is live, the replica binary has been adopted and all subnets updated. Can anyone confirm?
+[/quote]
+
+Yes, I confirm this: all application and verified application subnets should have composite queries now.
+
+-------------------------
+
+TusharGuptaMm | 2023-07-25 12:21:35 UTC | #65
+
+Any update on TAT for new dfx version with composite query? We are in middle of implementing our canisters and it would be helpful to know if dfx is planned to be released in coming days or weeks!
+
+TIA
+
+-------------------------
+
+domwoe | 2023-07-25 20:42:31 UTC | #66
+
+[quote="TusharGuptaMm, post:65, topic:15979"]
+Any update on TAT for new dfx version with composite query? We are in middle of implementing our canisters and it would be helpful to know if dfx is planned to be released in coming days or weeks!
+[/quote]
+
+New pre-release 0.15.0-beta.1 has Candid 0.9.0, see [release notes](https://github.com/dfinity/sdk/releases/tag/0.15.0-beta.1).
+
+You can install with
+`DFX_VERSION=0.15.0-beta.1 sh -ci "$(curl -fsSL ` `https://internetcomputer.org/install.sh` `)"`
+
+-------------------------
+
+TusharGuptaMm | 2023-07-26 15:45:53 UTC | #67
+
+Thank you! Will try it.
+
+-------------------------
+
+TusharGuptaMm | 2023-09-03 10:27:08 UTC | #68
+
+@domwoe we tried using composite queries. A couple of questions:
+
+1- Can we test composite queries on the mainnet using beta SDK, or it's only for local? 
+2- Also will it work on all subnet canisters or only on specific subnet canisters?
+
+TIA
+
+-------------------------
+
+ulan | 2023-09-03 10:40:41 UTC | #69
+
+1. Composite queries are enabled on the mainnet as well as local dfx.
+2. You can a query method of any canister on the same subnet.
+
+More information
+- https://internetcomputer.org/blog/features/composite-query
+- https://medium.com/dfinity/composite-queries-horizontal-scaling-for-multi-canister-dapps-e766e62bdea9
+
+-------------------------
+
+charlesm | 2023-10-19 21:13:57 UTC | #70
+
+Is there a plan in the future for composite queries to be supported within update calls? For example, I make an update call to a canister, and that canister makes a composite query to another canister for some data. It would be great if we could have really fast inter-canister queries in this situation.
+
+-------------------------
+
+ulan | 2023-10-20 09:12:51 UTC | #71
+
+Yes, allowing update methods to call composite queries (a.k.a replicated execution) is planned in the future. However, we are not actively working on it right now because there are higher priority items in the roadmap.
+
+-------------------------
+
+jeshli | 2024-01-03 15:36:20 UTC | #72
+
+* "The instruction limit for a single call to a query method on the Internet Computer is 5 billion Wasm instructions."
+* "The instruction limit for an update call on the Internet Computer is 20 billion Wasm instructions."
+
+However, I do not see specs for composite_queries. I assumed that using composite queries would have enabled us to string together longer queries. Can you confirm that composite_queries can handle no more instructions than a standard query?
+
+I am hoping that it is not that case that in order to run large queries I need to turn them into updates and use something like heartbeat in order to call the updates and save intermediate results until a global state says that it's complete.
+
+
+Amendment #1: I see that "[some special tasks, like code installation, can even go up to 200 billion instructions](https://internetcomputer.org/how-it-works/execution-layer#deterministic-time-slicing)" which suggests that it is feasible somehow to execute that many operations.
+
+Amendment #2: Also, I wrote my composite_query on the same canister that I called using ic_cdk::api::call to call one of its other queries. It may be possible that if the queries within the composite_query were to other canisters that it would somehow not be counted against the instruction limit for the composite_query. If that is true, it would be great for me to know. Thanks!
+
+-------------------------
+
+ulan | 2024-01-06 11:42:38 UTC | #73
+
+@jeshli: composite query currently has the same overall limit as a regular query. In other words, you will _not_ gain more instructions by chaining queries.
+
+The reason why queries have lower instruction limits than updates is because currently queries run for free. If there was a way for canister to pay for query execution, then it would be possible to bump the limit to 20B.
+
+In general, it is a good practice to keep the queries short by maintaining the necessary data-structures in update calls such as indexes.
+
+What is your use case that need long-running queries?
+
+-------------------------
+
+jeshli | 2024-01-05 20:18:06 UTC | #75
+
+@ulan Thank you for clarifying the instruction limits for composite queries on the Internet Computer. I am currently developing an open-source repository for AI inference, aiming to facilitate the deployment of PyTorch/Tensorflow AI models on the IC. The primary challenge is the instruction limit for single queries: models that are within the RAM capacity of a canister often exceed the available instructions.
+
+My initial strategy involved splitting the AI model across multiple canisters and linking them through composite queries. However, I’ve encountered the instruction limit even when testing composite queries with two individually functional queries. Since AI inference and learning processes like backpropagation don’t require updates, running them as updates seems inefficient in terms of cost, energy, and time.
+
+Interestingly, I recently proposed the idea of allowing canisters to pay for increased query execution limits in the [DeAI Technical Working Group](https://forum.dfinity.org/t/technical-working-group-deai/24621/54). This approach could potentially resolve the instruction limit issue for intensive tasks like AI inference.
+
+Moving forward, I plan to evaluate the trade-offs in terms of model speed, capability, and cost when setting the master script to run as an update as compared to a query. I have some follow-up questions: Are query calls made within an update call counted towards the instruction limit of the update? Would calling an update from an update count against the instruction limits of the outer update? Your insights on this would be greatly appreciated.
+
+-------------------------
+
+ulan | 2024-01-06 11:56:09 UTC | #76
+
+Thanks for explaining the use case! I agree that making an update call would be very inefficient since the update call execution is replicated on all nodes.
+
+I replied here about query charging and your suggestion: https://forum.dfinity.org/t/understanding-composite-query-instruction-limits-on-the-internet-computer/26170/2
+
+Let's move the discussion into the query charging thread.
+
+-------------------------
+
+TusharGuptaMm | 2024-01-06 15:20:24 UTC | #77
+
+[quote="ulan, post:73, topic:15979"]
+ntly has the same overall limit as a regular query. I
+[/quote]
+
+Hello Ulan,
+
+In our specific use case, where multiple micro-services collaborate to serve and update data, having the capability to execute composite queries from any Update call would be highly beneficial. Is there timelines for this along with of Inter-canister Composite queries?
+
+Best Regards
+
+-------------------------
+
+qwertytrewq | 2024-06-29 12:03:14 UTC | #78
+
+The implementation of composite queries [has a bug](https://github.com/dfinity/motoko/issues/4583).
+
+-------------------------
+
+ulan | 2024-07-01 08:13:55 UTC | #79
+
+@claudio the reported issue is in Motoko. It seems related to `await*` calls in composite query. Could you please take a look?
+
+-------------------------
+
+qwertytrewq | 2024-07-01 08:58:44 UTC | #80
+
+[quote="ulan, post:79, topic:15979"]
+It seems related to `await*` calls in composite query.
+[/quote]
+
+I'd say in is more related with abstract actor type in Motoko.
+
+-------------------------
+

@@ -1,0 +1,252 @@
+gravity_vi | 2024-02-01 05:44:45 UTC | #1
+
+
+I am trying to upload wasm into this canister and store it in stable memory
+
+The canister state has a field which uses stable memory to store wasm file
+
+```rs
+ #[serde(skip, default = "_default_wasms")]
+ pub wasms: StableBTreeMap<WasmType, Blob<4000000>, Memory>,
+
+fn _default_wasms() -> StableBTreeMap<WasmType, Blob<4000000>, Memory> { 
+    StableBTreeMap::init(get_subnet_orchestrator_wasm_memory())
+}
+```
+
+We have an `upload_wasms` update function that uploads Wasm to according to the wasmtype
+
+```rs
+ #[ic_cdk::update]
+ #[candid_method(update)]
+pub async fn upload_wasms(wasm_type: WasmType, wasm: Vec<u8>) -> Result<String, String> {
+    CANISTER_DATA.with_borrow_mut(|canister_data| {
+        canister_data.wasms.insert(wasm_type, Blob::from_bytes(Cow::Owned(wasm)));
+    });
+    Ok("Success".into())
+}
+```
+
+When testing this functionality using the above update function on local machine using dfx I get 
+```
+Canister <canister-id >trapped: heap out of bounds, error code None
+```
+
+WasmType: 
+```rs
+#[derive(Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, CandidType)]
+pub enum WasmType {
+    SubnetOrchestratorWasm,
+    IndividualUserWasm,
+    PostCacheWasm
+}
+
+impl BoundedStorable for WasmType {
+    const MAX_SIZE: u32 = 4;
+
+    const IS_FIXED_SIZE: bool = true;
+}
+
+impl Storable for WasmType {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        let mut bytes = vec![];
+        ciborium::ser::into_writer(self, &mut bytes).unwrap();
+        Cow::Owned(bytes)
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        let wasm_type: WasmType = de::from_reader(bytes.as_ref()).unwrap();
+        wasm_type
+    }
+}
+```
+
+-------------------------
+
+gravity_vi | 2024-02-01 10:54:23 UTC | #2
+
+@dsarlis do you have any suggestion around this? Kind of stuck due to this
+
+-------------------------
+
+gravity_vi | 2024-02-01 10:57:31 UTC | #3
+
+I am trying the same method with compressed wasm size which is under 1MB.
+
+-------------------------
+
+dsarlis | 2024-02-01 14:59:58 UTC | #4
+
+I think some more information will be needed to help here. What exactly is `CANISTER_DATA`? Where have you defined it? If you can provide a minimal complete example that reproduces the problem (as opposed to giving some extracts of code) we can probably be more efficient in helping.
+
+-------------------------
+
+dsarlis | 2024-02-01 15:03:48 UTC | #5
+
+Actually how many of these Wasms are you attempting to upload?
+
+-------------------------
+
+dsarlis | 2024-02-01 15:10:17 UTC | #6
+
+Also, it'd be interesting to see what `get_subnet_orchestrator_wasm_memory()` is doing.
+
+-------------------------
+
+gravity_vi | 2024-02-02 08:17:17 UTC | #7
+
+@dsarlis Sorry for the confusion. Here are all the details
+
+```
+thread_local! {
+    pub static CANISTER_DATA: RefCell<CanisterData> = RefCell::default();
+}
+```
+
+```rs
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, CandidType)]
+pub enum WasmType {
+    SubnetOrchestratorWasm,
+    IndividualUserWasm,
+    PostCacheWasm
+}
+
+impl BoundedStorable for WasmType {
+    const MAX_SIZE: u32 = 4;
+
+    const IS_FIXED_SIZE: bool = true;
+}
+
+impl Storable for WasmType {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        let mut bytes = vec![];
+        ciborium::ser::into_writer(self, &mut bytes).unwrap();
+        Cow::Owned(bytes)
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        let wasm_type: WasmType = de::from_reader(bytes.as_ref()).unwrap();
+        wasm_type
+    }
+}
+
+
+#[derive(Serialize, Deserialize)]
+pub struct CanisterData {
+    pub all_subnet_orchestrator_canisters_list: HashSet<Principal>,
+    pub all_post_cache_orchestrator_list: HashSet<Principal>,
+    pub subet_orchestrator_with_capacity_left: HashSet<Principal>,
+    pub version_detail: VersionDetails,
+    #[serde(skip, default = "_default_wasms")]
+    pub wasms: StableBTreeMap<WasmType, Blob<2000000>, Memory>,
+    #[serde(skip, default = "_default_canister_upgrade_log")]
+    pub subnet_canister_upgrade_log: StableLog<CanisterUpgradeStatus, Memory, Memory>,
+    pub last_subnet_canister_upgrade_status: CanisterUpgradeStatus
+}
+
+fn _default_wasms() -> StableBTreeMap<WasmType, Blob<2000000>, Memory> { 
+    StableBTreeMap::init(get_subnet_orchestrator_wasm_memory())
+}
+
+fn _default_canister_upgrade_log() -> StableLog<CanisterUpgradeStatus, Memory, Memory> {
+    StableLog::init(get_canister_upgrade_log_index_memory(), get_canister_upgrade_log_memory()).unwrap()
+}
+
+
+ 
+```
+
+
+```
+use ic_stable_structures::{DefaultMemoryImpl, memory_manager::{self, MemoryId, MemoryManager, VirtualMemory}};
+use std::cell::RefCell;
+
+// A memory for upgrades, where data from the heap can be serialized/deserialized.
+const UPGRADES: MemoryId = MemoryId::new(0);
+
+// A memory for BtreeMap to store wasms
+const SUBNET_ORCHESTRATOR_WASM_MEMORY: MemoryId = MemoryId::new(1);
+
+//A memory for canister upgrade log index
+const CANISTER_UPGRADE_LOG_INDEX: MemoryId = MemoryId::new(2);
+
+
+//A memory for canister upgrade log 
+const CANISTER_UPGRADE_LOG: MemoryId = MemoryId::new(3);
+
+// A memory for the StableBTreeMap we're using. A new memory should be created for
+// every additional stable structure.
+
+
+pub type Memory = VirtualMemory<DefaultMemoryImpl>;
+
+thread_local! {
+    // The memory manager is used for simulating multiple memories. Given a `MemoryId` it can
+    // return a memory that can be used by stable structures.
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init_with_bucket_size(DefaultMemoryImpl::default(), 1));
+}
+
+pub fn get_upgrades_memory() -> Memory {
+    MEMORY_MANAGER.with(|m| m.borrow_mut().get(UPGRADES))
+}
+
+pub fn get_subnet_orchestrator_wasm_memory() -> Memory {
+    MEMORY_MANAGER.with_borrow_mut(|memory_manager| memory_manager.get(SUBNET_ORCHESTRATOR_WASM_MEMORY))
+}
+
+
+pub fn get_canister_upgrade_log_index_memory() -> Memory {
+    MEMORY_MANAGER.with_borrow_mut(|memory_manager| memory_manager.get(CANISTER_UPGRADE_LOG_INDEX))
+}
+
+pub fn get_canister_upgrade_log_memory() -> Memory {
+    MEMORY_MANAGER.with_borrow_mut(|memory_manager| memory_manager.get(CANISTER_UPGRADE_LOG))
+}
+
+pub fn init_memory_manager() {
+    MEMORY_MANAGER.with(|m| {
+        *m.borrow_mut() = MemoryManager::init_with_bucket_size(DefaultMemoryImpl::default(), 1);
+    })
+}
+```
+
+-------------------------
+
+gravity_vi | 2024-02-02 08:18:04 UTC | #8
+
+I am trying to store three wasms corresponding to `WasmType` uploaded one at a time using `upload_wasms` method
+
+-------------------------
+
+gravity_vi | 2024-02-05 07:20:55 UTC | #9
+
+@dsarlis I narrowed down the error and it seems like it's only occurring if I have a Blob inside a StableBtreeMap
+
+```rs
+pub wasms: StableBTreeMap<WasmType, Blob<2000000>, Memory>,
+```
+
+When I used other type (a custom struct) it worked just fine.
+
+-------------------------
+
+dsarlis | 2024-02-05 08:16:12 UTC | #10
+
+@gravity_vi Thanks for the extra details. If you say it's only happening when you use a blob that's interesting information -- could indicate a bug perhaps. I'll loop in @ielashi here as he's more proficient with stable structures than I am.
+
+-------------------------
+
+ielashi | 2024-02-05 10:27:23 UTC | #11
+
+@gravity_vi is it possible to share an end-to-end example where we can reproduce the error? Putting it together in a small repo would be very helpful to better triage what the problem could be.
+
+-------------------------
+
+gravity_vi | 2024-02-05 10:28:33 UTC | #12
+
+@ielashi yep I will do that and share it here.
+
+-------------------------
+

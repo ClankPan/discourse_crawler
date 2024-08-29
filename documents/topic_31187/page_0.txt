@@ -1,0 +1,104 @@
+zensh | 2024-05-26 15:58:20 UTC | #1
+
+# DEX Custody Ledger (DCL): Solving Atomicity and High Latency Issues in ICP DeFi
+
+## Summary
+This document proposes a solution for a DEX Custody Ledger (DCL) to address the challenges of atomicity and high cross-subnet latency in developing DeFi applications on the ICP blockchain. The DEX Custody Ledger is designed as a public DeFi infrastructure, fully open and managed by a DAO. Its users include individuals, DEX applications, and other Dapps that require token exchange capabilities.
+
+Note: This proposal is intended to spark discussion and collaboration among DeFi developers in the community to jointly address the issues of atomicity and high cross-subnet latency in ICP DeFi transactions and lay a solid foundation for the growth of the ICP ecosystem.
+
+## Core Design
+
+1. A complete decentralized exchange involves two types of canister smart contracts: DCL (DEX Custody Ledger) and TEX (Tokens Exchanger). They operate on the same subnet. This document primarily focuses on designing the DCL, which is crucial for solving ICP DeFi issues. TEX can be diverse, implemented by decentralized exchange applications, and simply needs to interface with the DCL.
+2. DCL, as a custody ledger, extends the ICRC native token ledger. Its interface is specifically designed for DEX, with the core function of providing lightweight transactions. This allows DEX to fully utilize asynchronous concurrent execution advantages to improve transaction efficiency while ensuring full rollback in case of transaction failures.
+3. DCL, as a public DeFi infrastructure, includes comprehensive security designs. Each ICRC native token ledger corresponds to a DCL, which can be used by different DEX applications and other Dapps needing token exchange integration.
+
+![image|628x500](upload://xS1CZuyiEZYL10r4uGGgxo3xsLV.png)
+
+## Scenario Process
+Since a user has different principals in different Dapps, token ledgers are naturally isolated. The following scenarios assume the user is in the "dex.icp" DEX App.
+
+### Scenario 1: User Transfers 10k PANDA Tokens from NNS Wallet to DCL
+1. The user transfers 10k PANDA tokens from their NNS wallet to their wallet address in dex.icp.
+2. Call ICRC::icrc2_approve to approve the DCL:PANDA canister for 10k PANDA token allowance.
+3. Call DCL::deposit to transfer 10k PANDA tokens from the dex.icp wallet to the DCL:PANDA canister, updating the user's principal PANDA balance to 10k, completing the token transfer.
+
+### Scenario 2: User Adds 10k PANDA/10 ICP Liquidity in dex.icp
+1. Assume the user's dex.icp wallet already has 10k PANDA and 10 ICP.
+2. Call ICRC::icrc2_approve to approve the DCL:PANDA canister for 10k PANDA token allowance.
+3. Call DCL::deposit to transfer 10k PANDA tokens to the DCL:PANDA canister, updating the Account(TEX:dex.icp principal, user principal) PANDA balance to 10k.
+4. Call ICRC::icrc2_approve to approve the DCL:ICP canister for 10 ICP token allowance.
+5. Call DCL::deposit to transfer 10 ICP tokens to the DCL:ICP canister, updating the Account(TEX:dex.icp principal, user principal) ICP balance to 10.
+6. Call TEX:dex.icp interface to update the user's PANDA/ICP liquidity, completing the liquidity addition.
+
+### Scenario 3: User Trades 1k PANDA for 1 ICP in dex.icp
+1. Call DCL::approve to approve TEX:dex.icp to call DCL::transfer to transfer the user's DCL:PANDA balance (only first-time).
+2. Call TEX:dex.icp interface to place an order.
+3. TEX:dex.icp reads price information and concurrently calls DCL:PANDA and DCL:ICP transfer methods, transferring 1k PANDA tokens to TEX:dex.icp canister and 1 ICP token to the user's principal.
+4. If both transfer methods succeed, concurrently call DCL:PANDA and DCL:ICP commit_transfer methods and update the local liquidity pool information in TEX:dex.icp, completing the trade.
+5. If one transfer method fails, call the other party's cancel_transfer method to roll back the trade and notify the user of the failure.
+6. If both transfer methods fail, no rollback is needed, and the user is notified of the failure.
+
+### Scenario 4: User Removes 10k PANDA/10 ICP Liquidity in dex.icp
+1. Call TEX:dex.icp interface to withdraw liquidity.
+2. TEX:dex.icp calls DCL:PANDA and DCL:ICP withdraw methods to transfer the current liquidity pool token balance to the user's dex.icp wallet or directly to the user's NNS wallet.
+
+### Scenario 5: User Withdraws 10k PANDA Tokens from DCL to NNS Wallet
+1. Call the DCL:PANDA withdraw method to transfer 10k PANDA tokens to the user's NNS wallet address.
+
+## DCL Core Interfaces
+
+```
+type Account = record { owner : principal; subaccount : opt blob };
+type ApproveArg = record {
+  allowance : nat;
+  exchanger : principal;
+  expires_at : nat64;
+};
+type DepositArg = record { from : opt Account; amount : nat };
+type Result = variant { Ok : nat; Err : text };
+type Result_1 = variant { Ok; Err : text };
+type TransferArg = record {
+  to : principal;
+  ex_token : principal;
+  from : principal;
+  ex_amount : nat;
+  amount : nat;
+};
+type WithdrawArg = record { to : opt Account; amount : nat };
+service : {
+  deposit : (DepositArg) -> (Result);
+  withdraw : (WithdrawArg) -> (Result);
+  approve : (ApproveArg) -> (Result);
+  transfer : (TransferArg) -> (Result);
+  cancel_transfer : (nat) -> (Result_1);
+  commit_transfer : (nat) -> (Result_1);
+}
+```
+
+-------------------------
+
+EdenCapital | 2024-08-08 09:09:28 UTC | #2
+
+**Great concept**, I'm also a big DeFi enthusiast and I'm really looking forward to a solution to the atomicity problem.
+
+I carefully read your proposal, but it seems I didn't fully understand it.
+
+----
+
+**Here is my understanding of the atomicity problem and a possible solution I thought of**:
+
+Assuming User A buys 12 ICP with 100 ckUSDT from ICPSwap, the possible execution process and block confirmations are as follows:
+
+1. User A initiates a transaction request and sends it to the ICPSwap Canister. This requires 1 block confirmation to ensure the request is received and processed.
+2. Check the ckUSDT balance and lock 100 ckUSDT. This requires 1 block confirmation to ensure the balance check and lock are successful.
+3. Check the availability of 12 ICP and lock 12 ICP. This requires 1 block confirmation to ensure the ICP availability check and lock are successful.
+4. Execute the exchange and transfer funds. This requires 1 block confirmation to ensure the transfer of ckUSDT and ICP is successful.
+5. Confirm the completion of the transaction. This requires 1 block confirmation to ensure the transaction status is updated and the user is notified.
+
+So, a total of at least 5 block confirmations are needed, with each finalization taking 2 seconds, making the fastest time 10 seconds. In reality, it might take 15-30 seconds, causing significant delays.
+
+In contrast, blockchains like Solana package all these transactions together and send them as a whole to the blockchain for confirmation, requiring only 1 block confirmation. **Perhaps if the ICP network also supports transaction "packaging," it could solve this atomicity problem.**
+
+-------------------------
+

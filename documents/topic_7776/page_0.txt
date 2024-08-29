@@ -1,0 +1,319 @@
+HelloRickey | 2021-10-08 18:12:39 UTC | #1
+
+Hi guys, can you answer these questions.thanks.
+
+1. What is the current maximum storage of canister?  4GB or 8GB? 
+
+2. How can I query the storage that the canister has now used?
+
+-------------------------
+
+Safik | 2021-10-08 19:28:31 UTC | #2
+
+Hi Rickey.
+With almost every release, the size increases in DFX 0.8.1 4 GB in DFX 0.7.2, it is better to set it to 2 GB. The canister, like the actor, is the storage, you need an ID. Next, knowing the ID canister = actor(text_canister_id). That is, you have to implement the storage of identifiers somewhere
+
+-------------------------
+
+diegop | 2021-10-12 13:12:17 UTC | #3
+
+The *stable memory* of a canister is 8 GB (used to be 4 GB). The Wasm heap is still limited to 4 GB.
+
+I will post an example to denote why I emphasized stable memory:
+
+
+* Storing a 6 GB video - very possible
+* Declaring a 6 GB Motoko Array that is thrown away after execution - not possible
+
+Think about the Wasm heap as the "RAM memory" accessible to a normal program and the stable memory as the "disk" and this is close enough. You can have 6GiB on the "disk", but not all of it in "RAM" at the same time.
+
+-------------------------
+
+C-B-Elite | 2021-10-09 09:32:20 UTC | #4
+
+Second question:
+You can use the functions of Prim.mo to get the memory has used: 
+```
+Prim.rts_memory_size() -> Nat : the maximum memory has been used
+Prim.rts_heap_size() -> Nat : wasm(canister) heap size at present
+```
+
+-------------------------
+
+HelloRickey | 2021-10-09 09:32:03 UTC | #5
+
+Hi @diegop thank you for your detailed answer. 
+For example, I have a userMap now. When I upgrade canister, it will run preupgrade and postupgrade. If the data stored in my userMap is larger than 4GB, my upgrade will fail. Is that right?
+
+```
+var userMap = HashMap.HashMap<Text, User>(1, isEq, Text.hash); 
+
+stable var userEntries : [(Text, User)] = [];
+
+system func preupgrade() {
+  userEntries := Iter.toArray(userMap.entries());
+};
+
+system func postupgrade() {
+  userMap := HashMap.fromIter<Text, User>(userEntries.vals(), 1, isEq, Text.hash);
+  userEntries := [];
+};
+```
+
+-------------------------
+
+chenyan | 2021-10-11 17:08:36 UTC | #6
+
+Correct. `userMap` is not in the stable memory, so it can never be larger than 4GB. You can use `TrieMap` and define it as `stable`. This way you store more than 4GB and you don't need the pre/post upgrade hooks, because the map is already in the stable memory, and it will persist across upgrades.
+
+-------------------------
+
+rossberg | 2021-10-11 19:56:59 UTC | #7
+
+@chenyan, no, actually, stable variables live in regular memory, too, so can't take up more than 4 GiB either. They just happen to be saved to stable memory during an upgrade.
+
+We are working on providing a Motoko API for direct access to stable memory. Until that is available, Motoko cannot make use of the larger stable memory.
+
+-------------------------
+
+nomeata | 2021-10-11 20:06:41 UTC | #8
+
+Also note that Motoko internally uses the pre and post upgrade hooks to do this copying, and you will very likely hit the cycle limit of that long before you hit the storage limit. I'm actually surprised this hasn't bitten anyone more seriously so far…
+
+-------------------------
+
+diegop | 2021-10-11 23:50:37 UTC | #9
+
+[quote="diegop, post:3, topic:7776"]
+The *stable memory* of a canister is 8 GB (used to be 4 GB). The Wasm heap is still limited to 4 GB.
+
+I will post an example to denote why I emphasized stable memory:
+
+* Storing a 6 GB video - very possible
+* Declaring a 6 GB Motoko Array that is thrown away after execution - not possible
+[/quote]
+
+@rossberg it sounds like my original answer is accurate but potentially misleading because Motoko cannot yet take advantage of the stable memory. I have seen demos of access stable memory, so I assume those are all in Rust? Is that a more helpful description I can give for the future?
+
+-------------------------
+
+HelloRickey | 2021-10-12 02:41:39 UTC | #10
+
+OMG, if I have used userMap to store a lot of user data, and this data is still increasing, how can I upgrade?
+
+-------------------------
+
+HelloRickey | 2021-10-12 03:19:52 UTC | #11
+
+Hey rossberg, if I use TrieMap to replace HashMap, my userMap will have 8GB of stable storage, so I don’t need to use `preupgrade` and `postupgrade` to upgrade, so it won’t exceed the 4GB limit of Wasm heap, right?
+
+-------------------------
+
+rossberg | 2021-10-12 07:04:34 UTC | #12
+
+@diegop, yes, your answer is correct. Plus what @nomeata said.
+
+As for an outlook, I would say: We are working on adopting the IC's new 64 bit stable memory and providing a Motoko API (almost done ;) ) for direct, unlimited access to stable memory. With that, it will be possible to design and implement stable data structures that avoid copying for upgrades. But until that is released, Motoko cannot make use of large memory.
+
+@HelloRickey, unfortunately no. As I said, stable vars still live in regular Wasm memory. The only advantage you get is that you will not need to write pre/postupgrade hooks, because the Motoko compiler does that for you. To actually use unlimited stable memory, you'll need the upcoming API that I just mentioned – or a new library implementing a map on top of that.
+
+-------------------------
+
+nomeata | 2021-10-12 12:38:01 UTC | #13
+
+@rossberg, what are the chances to get stable-memory-backed values that are _not_ in the main memory in between messages? I.e. that if one defines `stable var myState = …` that the data therein is backed by stable memory, and read on demand?
+
+I know it’s not trivial (some form of fat pointers; generated code might have to dynamically handle objects in either place etc; a garbage collector for the main memory), but probably doable, and ultimately I think maybe the only way forward? (The current scheme doesn’t scale; raw memory access is too low level for the Motoko target audience)
+
+-------------------------
+
+rossberg | 2021-10-12 15:48:22 UTC | #14
+
+@nomeata, the idea is that the raw memory API enables us (or inspired devs) to implement things like that as a library abstraction, in Motoko itself. I agree that most users wouldn't want to go there themselves.
+
+-------------------------
+
+nomeata | 2021-10-12 17:39:25 UTC | #15
+
+If it works as a library abstraction, sure. But really transparent support, where any (shared) data can live here or there, and GC takes care of it, probably needs to be built in.
+
+Or put differently: can we achieve the current _semantics_ of the `stable` annotation with an implementation that scales (in particular no use of the dangerous `pre_upgrade` hook, and in general per-message cycle consumption that depends on the work done, independent of the total size of data)?
+
+-------------------------
+
+jzxchiang | 2021-11-06 18:58:47 UTC | #16
+
+When will 8 GB become 300 GB?
+
+My understanding is that the proposal that passed was to increase stable memory to 300 GB, and that 8 GB was just a temporary stopgap.
+
+-------------------------
+
+diegop | 2021-11-06 19:17:53 UTC | #17
+
+It definitely is intended to keep growing as issues and bottlenecks are identified and removed at each stage. I will let @akhilesh.singhania lend some more clarity
+
+-------------------------
+
+akhilesh.singhania | 2021-11-08 11:20:25 UTC | #18
+
+Thanks for the ping @diegop .  
+
+@jzxchiang : after increasing to 8GiB, as expected, we uncovered some performance bottlenecks that the team is currently working on addressing.  One of the key bottlenecks that we discovered is discussed in more detail in https://www.youtube.com/watch?v=NWSeM8YgGv4.  The work here is not completely done yet.  
+
+In general, the problem is that when canisters produce too large a heap delta, they put a lot of load on the node's memory system.  Previously this was slowing down the entire subnet.  @abk then worked on an optimisation where we track the heap delta per canister.  This allowed us to mitigate the problem so that we only slow down the offending canister.  Next @ulan and Adam are working on a file backed PageMap allocator so that we can further reduce the load on the memory system.  
+
+Note that in tandem they are also working on the canister sandboxing feature so progress here is a bit slow.  Once, their PageMap allocator work is done, barring any other critical performance bottlenecks are discovered, we should be in a good place to further increase the canister capacity.
+
+-------------------------
+
+jzxchiang | 2021-11-08 22:02:34 UTC | #19
+
+Interesting, thanks for the response.
+
+I'm curious how wasmtime handles heap deltas for linear 4 GB memory? Is a large heap delta not an issue there because wasmtime is smart about memory allocation or because 4 GB is not big enough where it's a problem?
+
+-------------------------
+
+rossberg | 2021-11-09 07:27:03 UTC | #20
+
+@jzxchiang, maybe I misunderstand your question, but wasmtime is a plain Wasm engine and as such neither implements persistence nor consensus, so "heap deltas" are simply not a notion it has to bother computing.
+
+-------------------------
+
+jzxchiang | 2021-11-09 07:53:20 UTC | #21
+
+Hm yeah, that makes sense. Heap delta is just the act of persisting memory pages from the replica process heap (and not the wasmtime or canister process heap) to a checkpoint file on disk, right?
+
+-------------------------
+
+akhilesh.singhania | 2021-11-10 09:03:03 UTC | #22
+
+Precisely.  You only have to worry about the deltas if you are planning on implementing something like orthogonal persistence or query executions where you need to be able to roll back the changes or execute messages against a different version of the state.
+
+-------------------------
+
+pattad | 2022-02-11 14:15:35 UTC | #23
+
+Just for clarification....
+
+To store a bunch of pictures, let's say 1 MB per picture with the following methodology:
+  private **stable** var stable_pictures : [(Text, [Nat8])] = [  ];
+
+and linking it with this in the pre/post loading methods
+  private var pictures = HashMap.HashMap<Text, [Nat8]>(0, Text.equal, Text.hash);
+
+How many pictures would a canister get me around? 
+And would I run into any upgrading issues?
+
+-------------------------
+
+AnonymousCoder | 2022-03-07 18:56:14 UTC | #25
+
+I am also wondering about real world example (whether theoretic or otherwise) of the current canister storage limitations to get a better idea about how much data I could use in the canisters in total for everything?
+
+Also, would love to see example of storing actual image into the canister? I can see you would be using an array of `Text` for key and `Nat8` array as value? How would you store actual image into `[Nat8]` ?
+
+-------------------------
+
+pattad | 2022-03-07 19:35:11 UTC | #26
+
+Hey there...
+
+Don't use Nat8 Array use a Blob to store a pic.  And I also used ExperimentalStableMemory to store them. Currently I think its possible to store about 8GB. Works really smooth.
+
+-------------------------
+
+AnonymousCoder | 2022-03-07 20:54:10 UTC | #27
+
+Can you explain to me how do you send the image as blob to the canister to store it there? I would like to see an example of this?
+
+-------------------------
+
+pattad | 2022-03-08 19:24:02 UTC | #28
+
+thats a typescript example
+
+
+```
+public async sendPic(pic: Uint8Array) {
+    const picArr: Array<number> = [...pic];
+
+    let icActor = await this.getActor();
+
+    return icActor.sendPic(picArr)
+  }
+```
+
+and expose the sendPic method on motoko side with a blob as input parameter.
+
+-------------------------
+
+AnonymousCoder | 2022-03-08 23:09:25 UTC | #29
+
+Thanks for the code snippet :) Maybe I wasn't clear enough in my question above, but what is confusing to me is how to present image as Uint8Array type ?
+
+What value of Uint8Array type would a google logo have for example (if that makes more sense as a question) ?
+
+Would this be the way to do it in Javascript (convert image to Uint8Array) ? https://stackoverflow.com/questions/51869520/image-to-uint8array-in-javascript#answer-63075520
+
+-------------------------
+
+pattad | 2022-03-09 07:00:13 UTC | #30
+
+Well the Blob or Uint8Array are just binary representations of an image. There are several ways in JS on how to convert it. But your link perfectly shows how to convert a JPG to an img.
+
+-------------------------
+
+jzxchiang | 2022-03-09 07:13:02 UTC | #31
+
+The reason you want `Blob` over `[Nat8]` is described [here](https://forum.dfinity.org/t/motoko-array-memory/5324/3?u=jzxchiang). Basically, `Blob` takes up less space when stored in a canister's memory. (Both are serialized to the same format over the wire though... not sure if that includes stable serialization though.)
+
+-------------------------
+
+jzxchiang | 2022-03-09 07:14:32 UTC | #32
+
+FWIW, this is the code I use to upload a blob (here, it's an image):
+
+```
+async function uploadAsset(
+  assetId: string,
+  path: string,
+  width: number,
+  height: number,
+) {
+  const buffer = await Fs.readFile(path);
+  const assetBytes = Array.from(Uint8Array.from(buffer));
+
+  const numChunks = Math.ceil(assetBytes.length / Globals.MAX_ASSET_CHUNK_SIZE);
+
+  const putChunkPromises: Promise<null | undefined>[] = [];
+
+  for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
+    const byteStart = chunkIndex * Globals.MAX_ASSET_CHUNK_SIZE;
+    const chunkData = assetBytes.slice(
+      byteStart,
+      byteStart + Globals.MAX_ASSET_CHUNK_SIZE,
+    );
+
+    if (chunkIndex === 0) {
+      await Actor.createAssetWithFirstChunk({
+        assetId,
+        numChunks: BigInt(numChunks),
+        firstChunk: chunkData,
+        width: Math.round(width),
+        height: Math.round(height),
+      });
+    } else {
+      putChunkPromises.push(Actor.addChunk(assetId, chunkIndex, chunkData));
+    }
+  }
+
+  return Promise.all(putChunkPromises);
+}
+```
+
+My Motoko backend exposes two functions, one for creating the asset/image with the initial blob chunk, another for adding additional blob chunks to an existing asset/image.
+
+-------------------------
+

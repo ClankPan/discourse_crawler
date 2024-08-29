@@ -1,0 +1,145 @@
+jorgenbuilder | 2022-07-26 21:07:22 UTC | #1
+
+Would love opinions on this alteration to `@dfinity/agent/HttpAgent`. Seeing lots of `503: service overloads` at one point today, so I thought a general retry mechanism would make sense. Is anyone else doing something like this on their frontend? Am I crazy?
+
+```
+/** Agent which retries all failed calls in order to mitigate "certified state unavailable" and "service overload" 5XX errors. */
+class AgentWithRetry extends Agent.HttpAgent {
+  RETRY_LIMIT = 5
+  async call(
+    canisterId: Principal | string,
+    options: {
+      methodName: string
+      arg: ArrayBuffer
+      effectiveCanisterId?: Principal | string
+    },
+    identity?: Identity | Promise<Identity>,
+    attempt: number = 1,
+  ) {
+    try {
+      await return super.call(canisterId, options, identity)
+    } catch (e: unknown) {
+      if (attempt < this.RETRY_LIMIT) {
+        console.warn(
+          `Failed to fetch "${options.methodName}" from "${canisterId}" (attempt #${attempt})`,
+          e,
+        )
+        return new Promise<SubmitResponse>((res) => {
+          setTimeout(
+            () => res(this.call(canisterId, options, identity, attempt + 1)),
+            1000 * attempt,
+          )
+        })
+      }
+      console.error(`Failed to fetch after ${attempt} attempts`)
+      throw e
+    }
+  }
+}
+```
+
+It seems that a few retries can go a long way in reducing user-facing errors.
+
+*Edit: fixed async try/catch, noticing that the same retry would also need to be applied to `HttpAgent.query` and `HttpAgent.readState`*
+
+-------------------------
+
+kpeacock | 2022-07-26 21:09:41 UTC | #2
+
+I haven't heard reports of people getting 503's often, but I still think it's a good idea to add in handling for a 503.
+
+In addition to a retry count, I also want to include default support for `Retry-After` headers, that allow the boundary nodes to potentially have a little more control in getting unstuck
+
+-------------------------
+
+jorgenbuilder | 2022-07-26 21:17:20 UTC | #3
+
+I should qualify "often"—I saw series of 503 errors (something like "service overload") on a couple requests doing some incidental testing today, and have seen some reports of "certified state is not yet ready" trickling in steadily... nothing crazy! In both cases, clicking a button a couple more times fixed it.
+
+`Retry-After` headers sound great, very courteous to the boundary nodes 😊 For now I'll extend this class in my frontend. Happy to share results. An upstream solution would be super cool.
+
+Should perhaps introspect the error a bit, instead of firing off retries for any old thing 🤔
+
+-------------------------
+
+kpeacock | 2022-07-26 21:29:28 UTC | #4
+
+If you come up with an implementation you like, feel free to open a PR and contribute to `agent-js`! My solution won't end up looking very different from what you already have here
+
+-------------------------
+
+skilesare | 2022-07-26 23:01:30 UTC | #5
+
+We are seeing a good number of 503s lately.
+
+-------------------------
+
+coin_master | 2022-07-27 06:29:26 UTC | #6
+
+I am seeing a lot of 503s too.
+```
+Body: Certified state is not available yet. Please try again...
+```
+
+@jorgenbuilder how would you only retry for 503?
+I am doing something like this 
+`if(error.message,.includes("503")) retry`
+But that is not pretty, I would prefer something like `if(error.code === 503)`
+
+-------------------------
+
+stefan.schneider | 2022-08-02 16:19:37 UTC | #7
+
+We have some ideas on how to reduce the number of these errors on the replica side, but they are not going to be a golden bullet. 
+Ultimately these errors are a consequence of individual replicas falling behind. When such a replica receives a query it can either give an error or give an outdated answer. On the replica side we can mainly make sure that we can give an answer more often, as for e.g. a static asset it wouldn't matter if it is outdated anyway. 
+
+Some retry logic is unfortunately still going to be necessary, even if we manage to trigger it less often. Whether that logic should be in the client or with the help of the boundary node is beyond my expertise.
+
+The other avenue is of course rolling out further performance improvements that should make it less likely for nodes to fall behind for the same load. We have several people, myself included, who almost exclusively work on implementing performance improvements, but of course performance will never be a "done" issue.
+
+-------------------------
+
+jorgenbuilder | 2022-08-02 20:59:17 UTC | #8
+
+I haven't had time to iron out a solution yet. But given that the error looks like this...
+
+```
+Error: Call failed:
+  Canister: xxxxx
+  Method: xxxxxx (query)
+  "Status": "rejected"
+  "Code": "SysTransient"
+  "Message": "IC0515: Certified state is not available yet. Please try again..."'
+
+```
+
+I would actually try to isolate this specific issue with an exact match on the `Message`, since I wouldn't want to put everything that may occur under a `503` code into a retry mechanism.
+
+-------------------------
+
+jorgenbuilder | 2022-08-02 21:03:42 UTC | #9
+
+Makes sense, and glad to hear a bit about the underlying issues. I've also heard some rumblings of a coming subnet upgrade [like this one](https://dashboard.internetcomputer.org/proposal/72230) having positive outcomes on the frequency of errors like this one.
+
+Feels like with the blast radius of this certified state issue, and the simplicity of the fix (try again, which is *likely* to hit another replica which is *likely* not out of sync) that an upstream change that keeps this issue out of app developers' hair would be ideal.
+
+-------------------------
+
+jorgenbuilder | 2022-08-02 21:06:32 UTC | #10
+
+Also for the record, the number of "certified state not yet available" errors went absolutely crazy today, on [opn46 subnet](https://dashboard.internetcomputer.org/subnet/opn46-zyspe-hhmyp-4zu6u-7sbrh-dok77-m7dch-im62f-vyimr-a3n2c-4ae), which seems like it may be relevant.
+
+-------------------------
+
+stefan.schneider | 2022-08-03 10:42:06 UTC | #11
+
+Did you see these problems throughout the day, or mainly spiking in short bursts? I'll investigate further if there could be additional causes.
+
+-------------------------
+
+jorgenbuilder | 2022-08-03 14:10:45 UTC | #12
+
+Throughout the day, somewhat spiky. I'm afraid I don't have a documented timeline for you. I'll try to take some notes on events we see going forward. :)
+
+-------------------------
+

@@ -1,0 +1,201 @@
+Stephen-Kimoi | 2024-07-21 12:38:51 UTC | #1
+
+I am trying to perform a write function to an EVM smart contract but I am getting the error: 
+```
+(variant {Err="Failed to send transaction: "Failed to call eth_sendRawTransaction: (CanisterError, \"failed to decode canister response as (backend::evm_rpc::MultiSendRawTransactionResult,): Fail to decode argument 0\")""})
+``` 
+
+This is how that specific section of the function looks like: 
+```
+let (res,): (MultiSendRawTransactionResult,) = call_with_payment(
+            EVM_RPC.0,
+            "eth_sendRawTransaction",
+            (
+                RpcServices::EthSepolia(Some(vec![
+                    EthSepoliaService::PublicNode,
+                    EthSepoliaService::BlockPi,
+                    EthSepoliaService::Ankr,
+                ])),
+                None::<RpcConfig>,
+                signed_tx.clone(),
+            ),
+            10_000_000_000, // Increase the cycles here
+        )
+        .await
+        .map_err(|e| format!("Failed to call eth_sendRawTransaction: {:?}", e))?;
+``` 
+
+Where might I be going wrong?
+
+-------------------------
+
+jennifertran | 2024-07-22 04:57:21 UTC | #2
+
+Are you using the EVM RPC Canister? It doesn't look like you are using the EVM RPC canister directly here but I wanted to ensure. 
+
+Can you share the `call_with_payment` argument types (preferably the full function)? It looks like it does not know what `EVM_RPC.0` is.
+
+-------------------------
+
+jennifertran | 2024-07-24 23:28:14 UTC | #3
+
+Were you able to figure this out?
+
+-------------------------
+
+Stephen-Kimoi | 2024-07-25 22:15:28 UTC | #4
+
+Yes, I managed to debug it. I decided to use the [evm_rpc_canister_types](https://crates.io/crates/evm-rpc-canister-types) package and modified my code to use the ``eth_send_raw_transaction`` function from the package.
+
+-------------------------
+
+Stephen-Kimoi | 2024-07-26 08:16:00 UTC | #5
+
+Hello @jennifertran, now I am getting another interesting error
+
+When I call the function this is returned instead: 
+``` 
+(variant {Ok="Increased count. Transaction hash: [String("InsufficientFunds")]"})
+``` 
+
+This is how my ``call_increase_count()`` function looks like: 
+``` 
+#[ic_cdk::update]
+async fn call_increase_count() -> Result<String, String> {
+    let abi = get_abi();
+    let canister_address = get_canister_eth_address().await;
+    let nonce = get_nonce(&canister_address).await?;
+
+    let result = call_smart_contract(
+        CONTRACT_ADDRESS.to_string(), 
+        &abi,
+        "increaseCount",
+        &[],
+        true,
+        Some(U256::from(11155111)), // Sepolia chain ID as U256
+    )
+    .await;
+
+    match result {
+        Ok(tx_hash) => {
+            ic_cdk::println!("Transaction sent successfully. Hash: {:?}", tx_hash);
+            Ok(format!("Increased count. Transaction hash: {:?}", tx_hash))
+        },
+        Err(e) => {
+            ic_cdk::println!("Error sending transaction: {:?}", e);
+            Err(format!("Failed to send transaction: {:?}", e))
+        }
+    }
+}
+``` 
+
+This is how the section that sends the raw transaction in the ``call_smart_contract()`` function looks like: 
+``` 
+let value = value.unwrap_or_default();
+
+        let signed_tx = sign_transaction(
+            U64::from(CHAIN_ID as u64),
+            contract_address,
+            U256::from(GAS),
+            value,
+            next_id().await, 
+            U256::from(MAX_PRIORITY_FEE_PER_GAS),
+            U256::from(MAX_FEE_PER_GAS),
+            data.to_vec(),
+        )
+        .await?;
+
+        let result = EVM_RPC
+            .eth_send_raw_transaction(
+                RpcServices::EthSepolia(Some(vec![
+                    EthSepoliaService::PublicNode,
+                    EthSepoliaService::BlockPi,
+                    EthSepoliaService::Ankr,
+                ])),
+                None::<evm_rpc_canister_types::RpcConfig>,
+                signed_tx.clone(),
+                10_000_000_000,
+            ).await 
+            .map_err(|e| format!("Failed to call eth_sendRawTransaction: {:?}", e))?;
+
+            match result {
+                (MultiSendRawTransactionResult::Consistent(send_result),) => {
+                    match send_result {
+                        SendRawTransactionResult::Ok(tx_status) => {
+                            // Convert SendRawTransactionStatus to String
+                            Ok(vec![Token::String(format!("{:?}", tx_status))])
+                        },
+                        SendRawTransactionResult::Err(err) => Err(format!("Transaction failed: {:?}", err)),
+                    }
+                }
+                (MultiSendRawTransactionResult::Inconsistent(results),) => {
+                    let errors: Vec<String> = results
+                        .into_iter()
+                        .map(|(service, send_result)| match send_result {
+                            SendRawTransactionResult::Ok(tx_status) => format!("Success with status: {:?}", tx_status),
+                            SendRawTransactionResult::Err(err) => format!("Service {:?} failed: {:?}", service, err),
+                        })
+                        .collect();
+                    Err(format!("Inconsistent results: {:?}", errors))
+                }
+            }
+``` 
+
+Why am I getting the error ``"InsufficientFunds"``?
+
+-------------------------
+
+cryptoschindler | 2024-07-27 15:13:14 UTC | #6
+
+Did you check the ETH balance of the address belonging to the canister ECDSA keypair you are signing with? You have to pay gas with ETH for `eth_send_raw_transaction` calls.
+
+-------------------------
+
+Stephen-Kimoi | 2024-07-28 20:47:34 UTC | #7
+
+Correct me if I'm wrong, I thought if you've deployed your canister to the mainnet and loaded it with enough cycles those cycles are supposed to cater for the gas fees? 
+
+Only when you've deployed the canister locally will you have to load it with ETH to perform the write transaction. 
+
+Cause the canister I'm interacting with is already deployed to the mainnet and has cycles in it. Meaning I don't have to load it with the testnet ETH. 
+
+This has been my understanding
+
+-------------------------
+
+cryptoschindler | 2024-07-29 06:17:14 UTC | #8
+
+[quote="Stephen-Kimoi, post:7, topic:33462"]
+Correct me if I’m wrong, I thought if you’ve deployed your canister to the mainnet and loaded it with enough cycles those cycles are supposed to cater for the gas fees?
+[/quote]
+
+No, cycles are never used to pay for gas on other networks like Ethereum.
+
+[quote="Stephen-Kimoi, post:7, topic:33462"]
+Only when you’ve deployed the canister locally will you have to load it with ETH to perform the write transaction.
+[/quote]
+
+In any case you need to make sure the address you are signing for holds enough ETH to pay gas fees.
+
+[quote="Stephen-Kimoi, post:7, topic:33462"]
+Cause the canister I’m interacting with is already deployed to the mainnet and has cycles in it. Meaning I don’t have to load it with the testnet ETH.
+
+This has been my understanding
+[/quote]
+
+This is not correct, the Ethereum address of the canister you are signing for has to hold ETH, no matter if deployed locally or on mainnet.
+
+Maybe this helps?
+
+https://www.youtube.com/watch?v=6Dq1HxxWWGY&t=1090s&pp=2AHCCJACAQ%3D%3D
+
+-------------------------
+
+Stephen-Kimoi | 2024-07-30 14:44:07 UTC | #9
+
+This is great! Thank you so much for the clarification. 
+
+Let me go through the video.
+
+-------------------------
+

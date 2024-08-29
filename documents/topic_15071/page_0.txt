@@ -1,0 +1,112 @@
+kentosugama | 2022-08-24 21:57:29 UTC | #1
+
+**Actor Classes on the Playground**
+
+Hey everyone!
+
+My name is Kento. I recently joined the languages team at DFINITY. I’d like to announce an update that was released to the Motoko Playground last week: actor classes on the [Playground](https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/)!
+
+Jump straight into an example [here](https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/?tag=3803964340). The Map class is a good entry point to deploy.
+
+As a quick recap, actor classes are a language feature in Motoko that allows the dynamic spawning of canisters, i.e. you can spawn canisters from your canister code, as opposed to manually spawning them using `dfx`.
+
+Syntactically, they’re similar to classes, but for canisters instead of objects. Whenever you instantiate an actor class in your program, you get a new canister instead of a new object. Details: https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/actor-classes/
+
+Previously, you could not use this feature on the Motoko Playground as we had disabled cycle transfers in the playground for security reasons. This meant that while you could dynamically spawn new canisters, you couldn’t dynamically send them cycles, which immediately caused an error upon installation.
+
+The new fix bypasses this issue. Checkout the actor classes examples under “open tutorial”. The example demonstrates a use case with a distributed hashmap, where each bucket in the map is dynamically instantiated as a separate canister. As a personal aside, I think actor classes can be used in many such distributed/sharded systems that need to dynamically scale, so I’m glad new users exploring the Playground can be introduced to this feature early.
+
+At a high level, the fix was implemented by redirecting calls to `create_canister()` at the WASM level from the management canister to the Playground’s backend canister. The playground backend would then return a free canister under its control, instead of requesting a new canister from the IC. For those interested, I will go into much more implementation details below.
+
+Please leave comments and if necessary start debates below about the direction of the playground that might be beneficial to future use! Happy building :)
+
+**Implementation Details**
+
+To discuss the implementation of the fix, I will quickly review how the Playground is architected under the hood. The Motoko Playground (ignoring the frontend and UI aspects) consists of a main “backend” canister, and a pool of free worker canisters. Links to the [source code](https://github.com/dfinity/motoko-playground) and the [PR](https://github.com/dfinity/motoko-playground/pull/118) for the fix.
+
+When a user writes some code in the Playground and deploys it, the Motoko code is compiled in the browser to a WASM module, and this WASM module is sent to the aforementioned backend canister. The backend canister then takes this module and installs it into a free canister from the pool. The Candid UI from this worker canister is then displayed back to the user on the website. You can actually see this process unfolding in the console logs when you deploy a canister on the Playground.
+
+Now let’s say the user’s Motoko program contains the instantiation of an actor class. After compilation, this means that somewhere in the WASM module, there is an inter-canister call to `ic0.create_canister()` and `ic0.install_code()`. These are system calls to the subnet’s management canister for requesting a new canister (in which to instantiate the actor class). The fix for this problem, proposed by @chenyan, was to redirect these calls away from the management canister and to the backend canister in the Playground. Then, the backend canister can return a canister from its pool of free canisters, instead of requesting an actual new canister from the IC. These pool canisters can be topped up with cycles by the backend canister, bypassing the cycle transfer bottleneck in the Playground.
+
+You may be wondering, how do you redirect inter-canister calls? Whenever a canister makes an inter-canister call, it is implemented in its WASM module as a call to `ic0.call_new()`. `ic0.call_new()` is a system call that allows you to build a call progressively by specifying the destination canister, method name, arguments to be passed, etc., which finally cumulates in a call to `ic0.call_perform()`. This final call executes the call that you built up. See details [here](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-call).
+
+The redirection is done by the following open source tool called [ic-wasm](https://github.com/dfinity/ic-wasm), which is a tool that allows you to perform transformation passes on WASM code. The transformation pass that is related to this fix replaces all calls to `ic0.call_new()` with a wrapped version. This wrapped version of `ic0.call_new()` checks if the function being built is directed to the management canister, specifically invoking either the `create_canister()` or `install_code()` methods. It actually checks all methods that require controller status, but I will go into that later. If the above conditions are met, then the management canister’s Principal is replaced by the Principal of the Playground backend, redirecting the system call. Find the WASM transformation [here](https://github.com/dfinity/ic-wasm/blob/dd454242b0b327cde10cccba066f434c1159bf66/src/limit_resource.rs#L213). 
+
+As a note on design decisions, we decided to do all this redirection logic at the WASM level instead of in a Motoko transformation to make the fix source language agnostic.
+
+So now calls to `create_canister()` and `install_code()` are being redirected to the backend canister. The backend canister has implementations of these methods that mimic the behavior of the management canister. Most importantly, calls to `create_new()` are mimicked by grabbing a free canister from the pool and returning it to the caller. 
+
+The fix so far is great for `create_canister()`, but we now have to talk about the [controller status](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-management-canister) I mentioned before. System calls such as `install_code()`, `stop_canister()`, `delete_canister()`, require controller status to call. Due to the redirection described above, the canister running the user code is not the controller over the actor class it instantiates (since the new canister was actually created by the backend canister). This means that these system calls made by user code on instances of actor classes will fail unless this is addressed. The backend can give controller status to the canister running the user code, but we found that this lead to security vulnerabilities.
+
+To address this, we additionally redirect all system calls requiring controller status to the backend canister. The backend canister mimics the behavior of the management canister by internally keeping track of “virtual” controller relations between canisters in its active pool, where canister A has virtual controller status over canister B, if B is an actor class instance spawned by A via the redirected calls. By maintaining and consulting these virtual controller relations, the backend canister can correctly and safely complete redirected system calls on behalf of the user canisters to the management canister. 
+
+As a secondary benefit, these virtual controller relations establish trees of actor classes spawned by other actor classes, all originating from the same user. By bounding the size of the trees that these relations represent, we prevent single users from hogging all the canisters in the Playground by instantiating a large number of (potentially nested) actor classes. You can see the controller relations are modeled as parent-child relations in the Playground code [here](https://github.com/dfinity/motoko-playground/blob/bace8318c821bb7241f5898698cc5e21cccf31c5/service/pool/Types.mo#L55).
+
+In the future, we might use this redirection and virtual management canister feature to implement other cool tricks involving logging, reusing actor class canisters through parent upgrades, etc. It affords us greater control over how canisters interact within the Playground pool (not unlike a private network), which may allow a better learning experience on the Playground as a controlled sandboxing environment.
+
+I’ll keep the details to here but feel free to ask any questions regarding this below! If you spot a security vulnerability, we would greatly appreciate you DMing us instead of posting it on this thread :)
+
+Many thanks to @rvanasa for help in displaying this feature on the frontend and @chenyan for help in planning and building out this feature on all parts of the stack!
+
+-------------------------
+
+nomeata | 2022-08-25 16:58:16 UTC | #2
+
+The design that the management canister is interacted with using normal calls seems to pay off, as it allows these kind of proxying schemes etc. Almost as good as a full capability based model :-)
+
+-------------------------
+
+chenyan | 2022-08-25 17:30:18 UTC | #3
+
+Yep, the canister spawning tree mimics the capability model instead of relying on the controllers.
+
+To go a bit more extreme, we can even redirect all inter-canister calls to a proxy canister. The proxy can then provide mocking interface, cache query calls, or even install missing dependencies on the fly.
+
+-------------------------
+
+ggreif | 2022-08-25 21:45:32 UTC | #4
+
+And with today's `moc` bump to 0.7.0 (also in the playground!), actor classes can even be upgraded by the parent canister. See the release notes https://github.com/dfinity/motoko/releases/tag/0.7.0.
+
+-------------------------
+
+jzxchiang | 2022-09-02 04:41:34 UTC | #5
+
+This is exciting stuff, thanks! Any idea when this will be shipped with dfx?
+
+-------------------------
+
+ggreif | 2022-09-02 09:35:53 UTC | #6
+
+We'll submit to the SDK team soon (@claudio) and it may appear in `dfx` 0.12 (beta) or a 0.13 beta.
+
+-------------------------
+
+skilesare | 2022-09-09 15:36:28 UTC | #7
+
+@kentosugama 
+
+Any reason I'd be seeing this:  [10:35:25 AM] Call was rejected: Request ID: 28fc8690355631cf07df7c814f7c8590a092c252e91e70ccdae9e5f581810c61 Reject code: 5 Reject text: Canister mwrha-maaaa-aaaab-qabqq-cai trapped explicitly: could not perform self call
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=762613933
+
+-------------------------
+
+kentosugama | 2022-09-09 15:50:49 UTC | #8
+
+Yup we're aware of this issue. Looking into a fix
+
+-------------------------
+
+kentosugama | 2022-09-09 17:28:17 UTC | #9
+
+Should be resolved now! Service ran out of cycles
+
+-------------------------
+
+ggreif | 2022-09-10 17:37:48 UTC | #10
+
+https://github.com/dfinity/sdk/releases/tag/0.12.0-beta.2 has it. Enjoy!
+
+-------------------------
+

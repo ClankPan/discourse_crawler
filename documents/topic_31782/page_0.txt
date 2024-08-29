@@ -1,0 +1,96 @@
+megared | 2024-06-11 07:54:27 UTC | #1
+
+The documentation says "stop new processing" as follows, but what exactly does this mean with regard to the timer task?
+
+https://internetcomputer.org/docs/current/tutorials/developer-journey/level-1/1.6-managing-canisters#setting-the-canisters-freezing-threshold
+https://internetcomputer.org/docs/current/developer-docs/smart-contracts/topping-up/topping-up-canister#managing-cycle-depletion-with-freezing-threshold
+
+>The freezing threshold is important because if a canister runs out of cycles, it will be uninstalled. The freezing threshold protects it from deletion, since if the cycles balance dips below the threshold, the canister will stop processing any new requests; however, it will continue to reply to existing requests.
+
+I would like to know the specific behaviour in this regard.
+I understand that the Timer task reserves a task on the ic side and calls canister from the ic side.
+if the canister side is below freezing threthold, where is the error?
+
+There is also a related contribution below, which is also of concern in this regard.
+
+https://forum.dfinity.org/t/what-happens-when-a-canister-hits-freezing-threshold-i-will-not-do-anything-for-a-long-time/15790
+
+>Cycles will drop to zero, state (memory) will be lost and then…?
+
+In terms of the moment below the threshold, the memory information is maintained, right?
+
+-------------------------
+
+berestovskyy | 2024-06-11 12:28:06 UTC | #2
+
+hey negated,
+Regarding the timers, the [spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#call-context-creation) reads:
+
+> If canister `C` exports a method with name `canister_global_timer` , the global timer of canister `C` is set, and the current time for canister `C` has passed the value of the global timer, the IC will create the corresponding call context and deactivate the global timer.
+
+Now, answering your question:
+
+> the Timer task reserves a task on the ic side and calls canister from the ic side. if the canister side is below freezing threthold, where is the error?
+
+If the canister is below the freezing threshold, the timer won't be scheduled, but will remain active. The global timer will be scheduled and deactivated as soon as there are enough cycles.
+
+Regarding the freezing threshold, the [spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-create_canister) reads:
+
+> A canister is considered frozen whenever the IC estimates that the canister would be depleted of cycles before `freezing_threshold` seconds pass, given the canister's current size and the IC's current cost for storage.
+
+> Calls to a frozen canister will be rejected with `SYS_TRANSIENT` reject code. Additionally, a canister cannot perform calls if that would, due the cost of the call and transferred cycles, would push the balance into frozen territory; these calls fail with `ic0.call_perform` returning a non-zero error code.
+
+> Default value: 2592000 (approximately 30 days).
+
+Now, answering your question:
+
+> In terms of the moment below the threshold, the memory information is maintained, right?
+
+The canister will be slowly draining the cycles balance below the freezing threshold to keep its memories and Wasm module for ~30 days.
+
+After ~30 days, once the canister balance becomes zero, the canister will be uninstalled as described in the [spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#canister-out-of-cycles).
+
+Once the frozen canister balance is above the freezing threshold, the canister is back to normal.
+
+-------------------------
+
+megared | 2024-06-12 02:24:12 UTC | #3
+
+Thank you for even sharing the reference document.
+
+[quote="berestovskyy, post:2, topic:31782"]
+If the canister is below the freezing threshold, the timer won’t be scheduled, but will remain active. The global timer will be scheduled and deactivated as soon as there are enough cycles.
+[/quote]
+
+This is also the case if a recurring task has been set up, as in the following enum, this means that if you have set up a recurring task like the following enum, scheduling and periodic execution will resume once the cycles have been replenished, is this correct? (meaning that the developer does not need to set up the task again).
+
+https://github.com/dfinity/cdk-rs/blob/7fa27b03d0d891b30a89b1b281ca3ba0661f2750/src/ic-cdk-timers/src/lib.rs#L45-L48
+
+-------------------------
+
+berestovskyy | 2024-06-12 08:27:38 UTC | #4
+
+There are two cases:
+
+1. The canister balance is below the freezing threshold. In this case, the CDK code will be called only when the canister balance is above the freezing threshold as described above.
+
+2. The canister balance is very close to the freezing threshold. In this case the Rust CDK code might be executed, but there might be not enough cycles to execute the user code. This was [fixed recently](https://forum.dfinity.org/t/changing-some-error-codes/28171/13), so the Rust CDK library should now retry user code execution once there are enough cycles.
+
+So, to best of our knowledge, the periodic execution should gracefully handle low cycles balances in Rust CDK.
+
+Note, there are likely still some corner cases, such as when the canister runs out of memory. In this case the Rust CDK code will panic, and the error message should be available in the canister log.
+
+For completeness, all the timers are deactivated after a canister upgrade.
+
+-------------------------
+
+megared | 2024-06-18 08:25:35 UTC | #5
+
+[quote="berestovskyy, post:4, topic:31782"]
+So, to best of our knowledge, the periodic execution should gracefully handle low cycles balances in Rust CDK.
+[/quote]
+
+Thank you. I understood that it is handled gracefully, except for edge cases.
+
+-------------------------
+

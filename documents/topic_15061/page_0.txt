@@ -1,0 +1,200 @@
+Persu | 2022-08-24 06:33:56 UTC | #1
+
+Hi guys, Just wanted to know how can we transfer ICP from one account to another using motoko. I have tried in my local using the command line like:
+```
+dfx wallet send <wallet id> <amount>
+```
+How can we achieve this using motoko. Is there any function?
+
+-------------------------
+
+Severin | 2022-08-24 07:50:15 UTC | #2
+
+Please have a look at the [ledger-transfer](https://github.com/dfinity/examples/tree/master/motoko/ledger-transfer) example. It contains the function you asked about.
+
+-------------------------
+
+Persu | 2022-08-24 16:42:44 UTC | #3
+
+```
+public func transferFunds(){
+    let now = Time.now();
+    let res = Ledger.transfer({
+      amount = { e8s = 2_000_000_000 };
+      created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(now)) };
+      fee = { e8s = 10_000 };
+      from_subaccount = null;
+      memo = 42;
+      to = "22oak-uehh2-5fc2j-rdhlb-zypwb-hwgyq-kgrfl-tvait-nwqof-hssiv-3qe";
+    });
+  };  
+```
+
+Well I write this function to transfer ICP from the caller account to the other account having principal id = 22oak-uehh2-5fc2j-rdhlb-zypwb-hwgyq-kgrfl-tvait-nwqof-hssiv-3qe... The function execute without any error, but what funny is neither the caller account balance got debited, nor the receiver account got credited.
+What am I doing wrong, and what is the current approach?
+
+-------------------------
+
+Seb | 2022-08-24 18:09:46 UTC | #4
+
+You can only send ICPs between **accounts**. 
+Do not use the principal as sender or receiver. You need to convert the principal to the main account identifier. 
+Take a look a this section : https://internetcomputer.org/docs/current/developer-docs/functionality/ledger/#accounts
+
+You can compute the (main) account programmatically or just take a look on ICScan that does it automatically for you.
+
+https://icscan.io/account/31822f05e22dffe8b6461467ed27efc55c12415b77335078e31868ef307c61b0
+
+-------------------------
+
+Persu | 2022-08-25 06:04:20 UTC | #5
+
+```
+public func transferFunds(){
+    let now = Time.now();
+    var main_account_principal = Principal.fromText("22oak-uehh2-5fc2j-rdhlb-zypwb-hwgyq-kgrfl-tvait-nwqof-hssiv-3qe");
+    let res = Ledger.transfer({
+      amount = { e8s = 2_000_000_000 };
+      created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(now)) };
+      fee = { e8s = 10_000 };
+      from_subaccount = null;
+      memo = 42;
+      to = Account.accountIdentifier(main_account_principal, Account.defaultSubaccount());
+    });
+  };  
+```
+
+Well I have changed my code, but the problem remain the same,, the accounts are not getting updated after the function call.
+Note: I am doing in my local environment.
+
+-------------------------
+
+Severin | 2022-08-25 06:12:30 UTC | #6
+
+Can you inspect the value of `res`? Maybe you can just return it? It should either contain confirmation that everything worked or it should contain an error of some sort. In my experience with the ledger, the error messages were always good explanations what went wrong.
+
+Wild guess since you're developing locally: does your source account even have enough tokens to transfer?
+
+-------------------------
+
+Persu | 2022-08-25 07:05:19 UTC | #7
+
+Well well well!!!!!!!
+what is the command to check the balance of the account?
+Is it "dfx wallet balance" or "dfx ledger balance"?
+
+-------------------------
+
+Severin | 2022-08-25 08:44:04 UTC | #8
+
+The dfx command to check the ICP balance is `dfx ledger balance <account id>` (maybe with `--network ic`).
+
+To figure out the account identifier, use `dfx ledger account-id` to produce the identifier. Use `dfx ledger account-id --help` to see how to use the command.
+
+`dfx wallet balance` shows you the (cycles) balance of your cycles wallet.
+
+-------------------------
+
+Persu | 2022-08-25 10:38:33 UTC | #9
+
+Referring to this [code](https://github.com/dfinity/examples/tree/master/motoko/ledger-transfer) again for clear understanding!
+
+![image|690x175](upload://b4bYS43l2fuaVcYQVicxpgQ2I99.png)
+
+The code runs well. After I hit the command 
+```
+dfx canister call ledger_transfer distributeRewards '()'
+```
+my canister balance get deducted.. But can you tell me which account get credited and how can I check that!?
+
+Got this response after the final command.. 
+```
+dfx canister call test_backend distributeRewards '()'
+(opt principal "2vxsx-fae")
+```
+
+Thanks!
+
+-------------------------
+
+Severin | 2022-08-25 11:29:10 UTC | #10
+
+Looking at the function [distributeRewards](https://github.com/dfinity/examples/blob/master/motoko/ledger-transfer/src/ledger_transfer/main.mo#L66-L116):
+- first it figures out the 'most prolific author' by the number of posts created
+- then it checks the most prolific autor
+  - if it's empty, do nothing (no posts created yet, so noone to tranfer tokens to)
+  - otherwise: transfer tokens to that person
+
+The transfer happens like this:
+```
+// If there is a winner, transfer 1 Token to the winner.
+let res = await Ledger.transfer({
+    memo = Nat64.fromNat(maxPosts);
+    from_subaccount = null;
+    to = Account.accountIdentifier(principal, Account.defaultSubaccount());
+    amount = { e8s = 100_000_000 };
+    fee = { e8s = 10_000 };
+    created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(now)) };
+ })
+```
+and it returns the principal of the most prolific author.
+
+Side note: the principal `2vxsx-fae` is the so-called anonymous identity, which everyone is allowed to use. If you do `dfx identity use anonymous` your requests will be sent using that principal.
+
+To figure out the account that got credited, look at the above code block:
+`to = Account.accountIdentifier(principal, Account.defaultSubaccount());`
+- principal = `2vxsx-fae` (as returned by the function in the end)
+- subaccount = default subaccount = empty string
+- ledger account = `dfx ledger account-id --of-principal "2vxsx-fae"` = `1c7a48ba6a562aa9eaa2481a9049cdf0433b9738c992d698c31d8abf89cadc79`. This is where the tokens get sent to.
+
+-------------------------
+
+Safik | 2022-11-14 07:44:22 UTC | #11
+
+Hi
+My question is closely related
+([Canister financing issues](https://forum.dfinity.org/t/canister-financing-issues/16498))
+
+```
+ public shared({caller}) func ledger_transfer_icp(
+        icp_amount: Nat) : async TransferResult{
+        var amount = Nat64.fromNat(icp_amount);
+        var res: TransferResult = #Err(#TxCreatedInFuture);
+        // let to_ai = Account.principalToSubaccount(Principal.fromText(Const.canister_project_cycles_wallet));
+        let to_ = Account.accountIdentifier(
+            Principal.fromText("3sq5w-t7zis-qf3wl-vgvih-byre2-ttswt-vzupn-6mnpw-mju7l-jhbfi-hae"), Account.defaultSubaccount());
+        try{
+            res := await public_ledger.transfer({
+                to = to_;
+                fee = { e8s = 10_000; };
+                memo = 0;
+                from_subaccount = null;
+                created_at_time = null;
+                amount = { e8s = amount - 10_000 };
+            });
+            return res;
+        }
+        catch(e){ };
+        return res;
+    };
+```
+
+As a result of the error
+
+Below is the output from the command line
+
+![scrin](upload://nCsuioNJtt5eLPacrOrT5HDxLp3)
+
+*ygvtn-qaaaa-aaaan-qa32a-cai - my canister cycles wallet*
+
+*mxjrx-tiaaa-aaaah-aaoxq-cai - my canister where deploy test code*
+
+*mlx7d-nlzwm-jsiyr-txxc2-mlgsf-hafo6-73wnd-du4xx-f2tsd-mjtum-pae - everywhere is conrtroller*
+
+I have replenished the balance wherever possible (on the screen)
+
+I don’t understand where the error is.
+Can I deploy the code in the cycles wallet? (although this is nonsense…)
+
+-------------------------
+

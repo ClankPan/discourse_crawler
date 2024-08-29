@@ -1,0 +1,247 @@
+TaggrX | 2022-03-29 18:57:25 UTC | #1
+
+Dear DFINITY team, 
+
+I maintain a small canister (kind of a toy social network) and I get more and more concerned  about a potential data loss and ZERO support for the canister data backup. So far, I was able to backup the data by serializing the entire canister state and export it via a query, but it obviously doesn't scale. Since recently my canister supports uploading pictures and my poor man's backup solution ran into its limits pretty quickly. So now there is **no way for me anymore to have a full backup of my canister** and it's pretty scary.
+
+Of course I could start implementing my own backup solution — extracting data in chunks (since one query can only return a limited amount of data) and then implement a restoration system, which would consume the backup data via small ingress messages and assemble a full state again, but it feels like I'm starting solving problems which do not even exists on Web 2.0 instead of actually building a decentralized service. 
+
+
+
+My questions are what is DFINITY's roadmap regarding canister backups and deadlines? Thanks!
+
+-------------------------
+
+skilesare | 2022-03-29 20:23:13 UTC | #2
+
+It is better than a toy. It is bad ass. Don't lose my messages! I'm making mad ICP (.07 so far...woot!)
+
+If you run across this message and haven't checked it out, it is at https://6qfxa-ryaaa-aaaai-qbhsq-cai.ic0.app/.  (I understand a desire to not self promote so I'll do it for you) :slight_smile: 
+
+I've thought a good bit about this as well. I've considered wrapping a data class in an object that makes upgrades and backups super easy.  I've been told the ability to upload/download canister state is coming and that should drastically reduce the vulnerability here, but I don't know the timeline.
+
+-------------------------
+
+TaggrX | 2022-03-29 20:32:04 UTC | #3
+
+Haha, @skilesare thanks so much for the kind words! 0.07 ICP is not that much though — Taggr's frequenters made enough money not for just a cup of coffee, but for a good bottle of wine 😁
+
+Back to our problem. I've just did the following:
+
+1. Implement an update function dumping the state to stable memory (in my case - I just call my `pre_upgrade`)
+2. Implement a query reading the stable memory page by page.
+3. Implement an update function writing the stable memory page by page.
+4. Implement an update loading the state from the stable memory (in my case - I just call `post_upgrade`).
+5. Implement a bash script automating all this blasphemy.
+6. Wait for an official way to backup the state 😇
+
+-------------------------
+
+skilesare | 2022-03-29 20:56:18 UTC | #4
+
+Yep...that is what I was thinking.
+
+-------------------------
+
+nomeata | 2022-03-29 21:32:49 UTC | #5
+
+That's actually a pretty neat way, nicely piggy-backing on what's needed for the upgrade story anyways.
+
+If it's not already there I would add safe guards against corruptions (partial writes or reads, dumping to stable memory while downloading etc.). But otherwise a good solution!
+
+-------------------------
+
+skilesare | 2022-03-30 00:45:55 UTC | #6
+
+Yeah….we have a HALT mode that stops all updates other than backup and updateHALT from running. It would work here as well.
+
+-------------------------
+
+TaggrX | 2022-03-30 06:11:34 UTC | #7
+
+Thanks @nomeata! No sure I understand the partial writes concern, but maybe I missing something. My canister only touches the stable memory on upgrades, that's it. So before I call the backup I explicitly call a functions calling `pre_upgrade` which atomically dumps the heap into the stable memory. After that it's not expected to be changed. The restoration is also updating the stable memory first and then atomically deserialising the heap from it in a separate message. So I'm not sure why halting is needed assuming I never upgrade and backup at the same time?
+
+PS: There is obviously a race possible during the restoration that some updates might get lost, but the restoration is not an ordinary operation and is only required when some serious data loss or corruption has happened, so loosing updates is not a real concern here.
+
+-------------------------
+
+GLdev | 2022-03-30 06:20:33 UTC | #8
+
+[quote="TaggrX, post:3, topic:11777"]
+* Implement a bash script automating all this blasphemy.
+* Wait for an official way to backup the state :innocent:
+[/quote]
+
+It sounds to me like you've done most of the work already! Why not take the time and make a small package / lib / blog post out of it, and maybe @skilesare can help out with a bounty from ICDevs for your troubles. win-win ;)
+
+-------------------------
+
+justmythoughts | 2022-03-30 06:35:49 UTC | #9
+
+Sounds like a good grant project…hint hint 😉
+
+-------------------------
+
+TaggrX | 2022-03-30 07:03:57 UTC | #10
+
+I'm not sure it's worth it. It's still a poor man's backup solution: I'm currently reading and writing the stable memory page by page (because query's payloads are limited in size). I've set the page size to about 1Mb. I also need to base64 the strings. Now every query takes about half a second for one page! Restoring of the backup will obviously take even longer. So for canisters with a heap of hundreds of megabytes, let alone gigabytes this won't really work.
+
+-------------------------
+
+GLdev | 2022-03-30 07:11:44 UTC | #11
+
+> I’m currently reading and writing the stable memory page by page [...] I’ve set the page size to about 1Mb
+
+I remember Rick from dscvr saying something among the same lines. I believe they figured that you start at a higher number, and if the call succeeds then you continue, if not you retry the query with lower page size. 
+
+As to converting to base64, is that really necessary? If you go the rust way, you should be able to query a vec of bytes, right?
+
+-------------------------
+
+TaggrX | 2022-03-30 07:22:14 UTC | #12
+
+Yes, that's what I started with. But the problem is that the blob returned by `dfx` is _still_ encoded (to be printable I guess), but the size of the encoding is then larger than what I can send as a command line arg to `dfx` when I use it to restore the state (e.g. on my local replica).
+
+-------------------------
+
+nomeata | 2022-03-30 07:57:01 UTC | #13
+
+Probably worth replacing the shell script with a proper backup client using the rust agent, then no binary data needs to be pretty-printed.
+
+It seems that the interface (`dump_to_stable`, `fetch_page`, `upload_page`, `load_from_stable`) is actually generic enough so that this tool could be used by anyone.
+
+As for safeguards: i'd probably add safeguards where, for example, `dump_to_stable` bumps and returns a counter that's then passed to `fetch_page` to prevent you from accidentally downloading half the pages from an older and the other half from a newer backup. This could happen if you query very quickly after the dumping, or if some other admin dumps or upgrades while you download. Extra bonus points if that token happens to be a hash of the whole stable memory (can be calculated by `dump_to_stable` while writing), then you can check the download image. Similar for uploading.
+
+-------------------------
+
+TaggrX | 2022-03-30 08:47:55 UTC | #14
+
+Great inputs, thanks a lot @nomeata! If I get a bit more time, I'll write a small agent-rs based tool to avoid the encoding issues and definitely add the integrity check. Then I'll open-source it.
+
+-------------------------
+
+AdamS | 2022-03-30 19:51:49 UTC | #15
+
+It may be worth adding the ability for `icx` to stream the data from stdin instead of requiring it be passed as a parameter, for Bash script usability.
+
+-------------------------
+
+jzxchiang | 2022-03-31 01:32:26 UTC | #16
+
+Maybe I'm missing something obvious, but why do you serialize the canister state to stable memory first before reading from and writing to it? Why not just operate on the canister state (in wasm linear memory) directly?
+
+-------------------------
+
+TaggrX | 2022-03-31 06:57:38 UTC | #17
+
+Not sure how you imagine this? Literally reading the heap page by page? But the heap might be changing under your feet while you're doing it, right?
+
+-------------------------
+
+senior.joinu | 2022-03-31 14:03:30 UTC | #18
+
+Hey there!
+Why don't you just use another canister for the backup?
+Your data is already backed up by at least 7 nodes in the subnet. If you think something bad could happen to it, just flush all the data to another canister.
+
+First, it is just more secure (7 nodes on IC vs. 1 EC2 instance on AWS, or even your personal pc).
+Second, it can be done in a permissionless manner. For example, you could enable your users to backup (or even publish in a first place) their articles if they care about their persistance. You could deploy a personal backup canister for each of them (on demand and not for free), where they could store it. 
+
+Moreover, one day you'll definitely come to a moment, when your single-canister setup is not enough to store all the data your app has. This way you could front-run this situation.
+
+-------------------------
+
+skilesare | 2022-03-31 14:54:26 UTC | #19
+
+At some point there was talk of forking canisters . I don’t remember how that ended up, but it would be insanely useful for backups and for scaling. It is much easier to copy a canister and delete the first half of the data on the first and the second half on the other than to do 4GB/2MB= 2000 intercanister calls to move data from one to another.
+
+-------------------------
+
+senior.joinu | 2022-03-31 15:01:25 UTC | #20
+
+It's actually doesn't matter if the platform clones the whole canister to another subnet or if you do that with inter-canister calls. For the network it is the same exact amount of load.
+
+But inter-canister call based cloning is available right now and they allow you to spread that load through time.
+
+-------------------------
+
+skilesare | 2022-03-31 15:04:31 UTC | #21
+
+It isn’t the same in cycle costs though. A one time fork call would not require pushing all the bits through inter canister calls which each have a per byte and ingress charge. 2000*those fees is a good number of cycles.
+
+-------------------------
+
+senior.joinu | 2022-03-31 15:06:56 UTC | #22
+
+There is no public price for that, so I won't argue.
+But since it is the same load, I would speculate that it should cost the same amount of money for nodes.
+
+-------------------------
+
+dymayday | 2022-04-15 18:47:54 UTC | #23
+
+Thanks @jzxchiang , that's exactly what I would like to do !
+
+But I don't know where to begin with to implement it in a canister... 
+Could you please provide some kind of short code example in Rust of how to access and read the wasm linear memory ? I would forever be grateful :bowing_man:
+
+I might buy you a beer if you come at the European Blockchain Convention in June :call_me_hand:
+
+-------------------------
+
+dymayday | 2022-04-15 23:34:50 UTC | #24
+
+To be more specific, I have a struct that lives inside a RefCell that holds all the data that I want to back up off chain, so my best wish is to stream it through queries chunk by chunk.
+
+So my guess on tackling this issue are :
+
+1. Find a way to access the **wasm linear memory** and find the boundaries of my struct in order to chunk and retrieve. My preferred solution as it would imply no extra costly memory allocation on a already resource constrained environment.
+2. Query page by page from stable memory as pointed out earlier, but it would mean data duplication :/
+3. Serializing my struct and then retrieve it chunk by chunk. Again, it would imply data duplication, which I'm trying hard to avoid as it could outgrow the memory limitation of the canister at some no so distant point in the future. 
+
+I would be most grateful if someone could give me some insight on this matter :pray:
+
+-------------------------
+
+skilesare | 2022-04-16 14:34:06 UTC | #25
+
+Hey…If your data is public, you could stream it using the streaming call back and then just curl your state. If it needed to be secret you could add a secret token to the query string. In fact I’m goin to do this now that I’ve thought about it
+
+-------------------------
+
+christian | 2022-05-10 11:29:30 UTC | #26
+
+FWIW I've extended [my fork](https://github.com/chmllr/qu/) of `quill` to support any ingress messages with raw I/O. That means you can use it to read and write stable memory pages as bytes bypassing the pretty-printing by `dfx` and hence read/load up to 2Mb at once.
+
+Here is an example how to read data:
+
+`./qu --pem-file <..> raw <canister_id> <method> --args "<candid_encoded>" --query | ./qu send --yes --raw - > ./data.bin"`
+
+To load the file back:
+
+`./qu --pem-file <..> raw <canister_id> <method> --args-file ./data.bin | IC_URL=http://127.0.0.1:8000 ./qu send --yes -`
+
+(Note that the loading assumes loading to your local replica, that's why it has the `IC_URL` set to `localhost` and that how I suggest to test the backup, obviously)
+
+This can now be easily wrapped with a bash script to read the memory page by page and load it back page by page. The next step would be to get rid of Candid serialization altogether, but I'm still working on a patch for Rust CDK for that.
+
+-------------------------
+
+dymayday | 2022-05-16 15:33:30 UTC | #27
+
+Hey, I shared one of our technique here at [Distrikt.app](https://az5sd-cqaaa-aaaae-aaarq-cai.ic0.app/) in an [other post](https://forum.dfinity.org/t/backup-restore-function-for-a-canister/12849/3?u=dymayday) if anybody is still interested.
+
+-------------------------
+
+bobbylingus | 2022-08-28 15:03:29 UTC | #28
+
+Any news on native canister backups?
+
+-------------------------
+
+Alexandra | 2023-09-18 11:20:30 UTC | #29
+
+Hi! There is a community discussion thread on backup and restore https://forum.dfinity.org/t/canister-backup-and-restore-community-consideration/22597. We would like to hear your thoughts there.
+
+-------------------------
+

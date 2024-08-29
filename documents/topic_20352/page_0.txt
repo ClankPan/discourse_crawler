@@ -1,0 +1,238 @@
+qwertytrewq | 2023-05-31 07:59:01 UTC | #1
+
+I have this code:
+```
+actor {
+  public shared func greet(name : Text) : async Text {
+    Cycles.add(700_000_000_000);
+    let index = await Index.Index();
+    await index.init();
+    
+    let (part, subDBKey) = await index.insertSubDB();
+    await part.insert({subDBKey; sk = "name"; value = #text name});
+    let name2 = await part.get({subDBKey; sk = "name"});
+    let ?#text name3 = name2 else {
+      Debug.trap("error");
+    };
+
+    return "Hello, " # name3 # "!";
+  };
+};
+```
+that is three awaits. By counting seconds in my mind, I estimated that the frontend runs 9 secs from clicking the button to receiving the reply.
+
+3 secs for each await is too slow! Is there any way to make it faster?
+
+-------------------------
+
+qwertytrewq | 2023-05-31 10:23:36 UTC | #2
+
+After I removed creating a canister from my greet code:
+```
+actor {
+  var index : ?Index.Index = null;
+
+  public shared func init() : async () {
+    Cycles.add(700_000_000_000);
+    let index0 = await Index.Index();
+    index := ?index0;
+    await index0.init();
+  };
+
+  public shared func greet(name : Text) : async Text {
+    let ?index0 = index else {
+      Debug.trap("no index canister")
+    };
+    let (part, subDBKey) = await index0.insertSubDB();
+    await part.insert({subDBKey; sk = "name"; value = #text name});
+    let name2 = await part.get({subDBKey; sk = "name"});
+    let ?#text name3 = name2 else {
+      Debug.trap("error");
+    };
+
+    return "Hello, " # name3 # "!";
+  };
+};
+```
+it takes <3 sec (about 3.5 sec). It is still much too slow. Is there a way to connect through WebSocket RPC (like one Ethereum has)?
+
+-------------------------
+
+skilesare | 2023-05-31 11:58:32 UTC | #3
+
+You are awaiting update calls. They typically require a round of consensus(particularly canister creation).(about 2-4 seconds each). Anytime you change data you need to wait for concensus.
+
+>await part.insert({subDBKey; sk = "name"; value = #text name});
+
+If you use query calls to query data from off chain it will be much faster.
+
+Keep in mind that theses calls are 1000x faster than ethereum and 100x cheaper than soloana.
+
+-------------------------
+
+timo | 2023-05-31 12:08:21 UTC | #4
+
+Can you also create the SubDB ahead of time? I am not sure how exactly your index canister works. But it seems surprising that you create a SubDB and then only insert one key. Can you create the SubDB ahead of time, maybe in init(), and then in multiple calls to greet() you can directly call part.insert(), inserting them all into the same SubDB? Or, if you need one SubDB for each entry then you could always keep an empty SubDB around so that you can call part.insert() without delay and then afterwards you asynchronously create a new SubDB for the next greet() call but you don't actually await it, you just return without awaiting it.
+
+Can you replace the part.get with a query call? Maybe you can leave that out of the greet() call and then the frontend has to poll the index directly with query calls to obtain the result of get().
+
+-------------------------
+
+qwertytrewq | 2023-05-31 12:21:00 UTC | #5
+
+[quote="timo, post:4, topic:20352"]
+Can you also create the SubDB ahead of time?
+[/quote]
+
+I can, but I am testing the worse case when needs both to create `SubDB` and insert into it.
+
+`part.get` is already a query call.
+
+-------------------------
+
+qwertytrewq | 2023-05-31 12:22:18 UTC | #6
+
+[quote="skilesare, post:3, topic:20352"]
+You are awaiting update calls. They typically require a round of consensus
+[/quote]
+
+Why consensus on my localhost `dfx`? It is not the real chain.
+
+-------------------------
+
+qwertytrewq | 2023-05-31 12:23:38 UTC | #7
+
+[quote="skilesare, post:3, topic:20352"]
+You are awaiting update calls. They typically require a round of consensus
+[/quote]
+
+`await` calls in Motoko (not JavaScript) require a round of consensus, too, don't they?
+
+-------------------------
+
+timo | 2023-05-31 12:28:38 UTC | #8
+
+[quote="qwertytrewq, post:5, topic:20352"]
+I can, but I am testing the worse case when needs both to create `SubDB` and insert into it.
+[/quote]
+
+Then creating the new SubDB at the end of the previous call instead of at the beginning of the current call will improve the worst case. But you have to not await it at the end of the previous call in order to not prolong the previous call.
+
+-------------------------
+
+timo | 2023-05-31 12:37:46 UTC | #9
+
+[quote="qwertytrewq, post:5, topic:20352"]
+`part.get` is already a query call.
+[/quote]
+
+Yes, it is a query call. But I mean can the frontend make the query call directly to the index canister, via a non-replicated query, which takes 200ms, instead of having this canister call get() on the index canister via a replicated query call, which goes through consensus, and then return the result to the original external caller? I am proposing that your greet() function does await part.insert and nothing else, and returns SubDBKey and sk. Then the frontend calls this canister with greet(), gets some information back like subDBKey and sk, and then makes a non-replicated query to get() directly at the index canister. In fact, it polls, i.e. queries get() every 300ms or so.
+
+However, I think you end result on the real IC for everything will still be 2-3s. Maybe you are seeing faster than real results right now because you are using local dfx.
+
+-------------------------
+
+qwertytrewq | 2023-05-31 13:01:02 UTC | #10
+
+"via a non-replicated query" - So query are replicated or not replicated, aren't they? (This is a new information for me.) What is the difference between these kinds of query calls? In which situations which of the two appear?
+
+-------------------------
+
+bogwar | 2023-05-31 15:00:28 UTC | #11
+
+Methods on canisters are either update methods or query methods.  
+
+Both types of methods can be executed in a replicated way: this requires that the call is delivered to all replicas on the subnet (this requires consensus), and that a majority of replicas on a subnet agree on the answer. 
+
+Query methods can also be executed in an un-replicated way;  in this case, the call to the query method goes to a (randomly chosen) replica on the subnet, and that's the only replica involved in providing the answer. So, for un-replicated execution correctness of the result relies on that replica behaving honestly.  
+
+To sum up: 
+- in replicated execution request and replies are handled by all replicas on a subnet so they go through consensus. This is slow but secure. 
+- in non-replicated execution  request/replies are handled by a single replica do not go through consensus.  This is fast but not secure so if security is paramount you should use additional techniques to deal with potentially malicious replies.
+
+-------------------------
+
+qwertytrewq | 2023-05-31 15:18:20 UTC | #12
+
+But when (in which cases) queries are replicated and when no?
+
+-------------------------
+
+bogwar | 2023-05-31 15:39:14 UTC | #13
+
+It's the choice of the caller to make one type of call or the other.  (NB: all on-chain calls made by canisters are replicated, so it's only external parties like frontends that have this choice). 
+
+To see how to make the calls it should be helpful to look in the specification of the IC interface.  Terminology is not perfect but [here is how to make a replicated call](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-call), and [here is how to make an non-replicated](https://internetcomputer.org/docs/current/references/ic-interface-spec#http-query) call.
+
+This is the "raw" ic interface; perhaps you're asking how to use the ic-agent to make the different type of calls?
+
+-------------------------
+
+qwertytrewq | 2023-05-31 16:47:54 UTC | #14
+
+[quote="bogwar, post:13, topic:20352"]
+perhaps you’re asking how to use the ic-agent to make the different type of calls?
+[/quote]
+
+I'm currently more interested how to do it with JavaScript:
+https://internetcomputer.org/docs/current/developer-docs/agents/javascript-intro
+
+-------------------------
+
+bogwar | 2023-05-31 18:06:42 UTC | #15
+
+I see -- I've pinged the SDK team for help
+
+-------------------------
+
+claudio | 2023-05-31 18:25:13 UTC | #16
+
+I believe `dfx start` has an `--artificial-delay` option to reduce the latency for local testing.
+
+Try
+
+```
+dfx help start
+```
+
+Won't help on the real thing though ;->
+
+-------------------------
+
+infu | 2023-05-31 19:00:21 UTC | #17
+
+It's not slow. It's fast and can even handle SQL joining multiple tables on the fly with hundreds of thousands, soon millions of records.
+
+Here is a demo showing how fast it is <https://yv5hx-rqaaa-aaaam-abj6a-cai.icp0.io/>
+Code: <https://github.com/infu/internetbase-sql-demo>
+
+It's fast enough for me to not bother me at all for any kind of web app.
+
+-------------------------
+
+skilesare | 2023-05-31 19:21:30 UTC | #18
+
+It is simulated...I think there is a command arg to make it not put artificial delays in.
+
+-------------------------
+
+Severin | 2023-06-01 07:28:43 UTC | #19
+
+[quote="qwertytrewq, post:14, topic:20352"]
+I’m currently more interested how to do it with JavaScript
+[/quote]
+
+If you use dfx with the default project setup then `dfx generate` (which gets called as part of `dfx deploy`) will take care of the different call types. If you declare your function as a `query` it will automatically use a query call, if you don't add the `query` keyword (assuming Motoko) then it will automatically make an update call from your frontend.
+
+To see it in action, run `dfx start --clean --background --artificial-delay 2000`, and then `dfx deploy`. This will take a very long time because it makes a lot of update calls and we set rounds to take a full 2 seconds, but it will be very obvious when you use update calls and when query calls. Then try the hello world example. The call will complete instantly because it's a query call. Then remove the `query` keyword in the backend `greet` function (file: `src/<project name>_backend/main.mo`) and `dfx deploy` again. This time if you click `greet` (don't forget to reload the page) it will take a long time because it's an update call
+
+-------------------------
+
+timo | 2023-06-01 07:46:53 UTC | #20
+
+It should also be noted that with dfx you can use the `--query` and `--update` options to override any default behaviour. 
+
+But anyway, it seems like OP wants to do it from javascript.
+
+-------------------------
+

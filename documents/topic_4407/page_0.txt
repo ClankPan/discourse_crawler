@@ -1,0 +1,348 @@
+lastmjs | 2021-05-27 00:05:15 UTC | #1
+
+So I'm using a cross-canister call to get some randomness to generate uuids in my main canister. Here's the Rust code that I'm using to get the randomness:
+
+```rust
+let call_result: Result<(Vec<u8>,), _> = ic_cdk::api::call::call(ic_cdk::export::Principal::management_canister(), "raw_rand", ()).await;
+```
+
+I am retreiving the randomness from update calls, which already take 5 seconds locally. Each time I do the call above, about 5 seconds is added to the call latency. So I am at a minimum waiting about 10 seconds for all of my update calls that use randomness. Adding more cross-canister query calls will continue to add 5 seconds a piece.
+
+Is this a fundamental constraint? It's strange to me that a cross-canister query call has to go through consensus as well.
+
+-------------------------
+
+senior.joinu | 2021-05-27 00:33:52 UTC | #2
+
+The origin of randomness in a subnet is BLS signature. To create such a signature nodes should produce a valid block. To produce a valid block they should reach consensus on it.
+So it just can't work the other way.
+
+What about simple cross-canister calls (without randomness) - I would also like to know the answer.
+
+I believe the local network is somehow throttled to imitate worst case scenarios with some hardcoded thread::sleep magic - otherwise the consensus should be instant. DSCVR works very smoothly, so I don't think these huge delays are an issue in production.
+
+-------------------------
+
+hackape | 2021-05-27 03:59:28 UTC | #3
+
+Thoughts: Is it safe to simply hash the current timestamp in canister code to get a randomness? So to avoid going through consensus
+
+-------------------------
+
+hackape | 2021-05-27 04:05:36 UTC | #4
+
+[quote="senior.joinu, post:2, topic:4407"]
+I believe the local network is somehow throttled to imitate worst case scenarios with some hardcoded thread::sleep magic - otherwise the consensus should be instant.
+[/quote]
+
+I feel things are pretty slow when testing in local network. If this is the case, I surely hope there's a flag to control the throttle timeout.
+
+-------------------------
+
+claudio | 2021-05-27 06:48:18 UTC | #5
+
+Dfx also has a faster emulator that may be good for your testing
+
+```
+dfx start --emulator
+```
+
+It doesn't do cycle accounting yet and may have other limitations  I'm unaware of.
+
+You may need to stop the replica and  'rm -r -f .dfx' before doing this.
+
+-------------------------
+
+claudio | 2021-05-27 06:52:54 UTC | #6
+
+Not if you want cryptographic randomness, but for simple testing of everything else that might be OK.
+
+-------------------------
+
+senior.joinu | 2021-05-27 09:04:57 UTC | #7
+
+Hash of the timestamp is bad, because everybody knows preimages. 
+
+Randomness in a blockchain network is hard to reach. I'm glad that in IC we just have a single function for it.
+
+-------------------------
+
+hackape | 2021-05-27 09:59:33 UTC | #8
+
+[quote="senior.joinu, post:7, topic:4407"]
+everybody knows preimages
+[/quote]
+
+I read in the IC interface spec that canister timestamp is actually local to individual nodes and there's no guarantee of synchronization. Plus it's nanosecond, I don't think anyone can really predict e.g. the last digit.
+
+Based on following assumptions:
+1. it's impossible to predict timestamp down to full precisions
+2. canister private state is indeed opaque
+
+I come up with this implementation, hope you guys can enlighten me on where it falls short.
+
+```
+import Array "mo:base/Array";
+import Time "mo:base/Time";
+import Nat8 "mo:base/Nat8";
+import Nat64 "mo:base/Nat64";
+import Int "mo:base/Int";
+import SHA "SHA256";
+
+actor class Random() {
+  private func toBytes(n: Nat) : [Nat8] {
+    var a : Nat = n;
+    var bytes : [var Nat8] = [var];
+    while (a != 0) {
+      let min = a % 256;
+      bytes := Array.thaw(Array.append(Array.make(Nat8.fromNat(min)), Array.freeze(bytes)));
+      a := a / 256;
+    };
+    return Array.freeze(bytes);
+  };
+
+  private func genSalt(): [Nat8] {
+    let timestamp = Nat64.fromNat(Int.abs(Time.now()));
+    var rem = timestamp % 10;
+    // based on assumption that `rem` is impossible to predict
+    // rotate the Nat64 to sort of "amplify" randomness
+    // does this make sense?
+    let seed = Nat64.toNat(timestamp <<> rem);
+
+    var bytes = SHA.sha256(toBytes(seed));
+    while (rem > 0) {
+      bytes := SHA.sha256(bytes);
+      rem -= 1;
+    };
+    return bytes;
+  };
+
+  private stable var salt = genSalt();
+
+  public func getRandom(): async [Nat8] {
+    let bytes = SHA.sha256(toBytes(Int.abs(Time.now())));
+    // append salt and hash again
+    let rand = SHA.sha256(Array.append(bytes, salt));
+    // update salt
+    salt := SHA.sha256(rand);
+    return rand;
+  };
+};
+```
+
+-------------------------
+
+senior.joinu | 2021-05-27 10:13:38 UTC | #9
+
+Depending on particular application an attacker could just calculate all the possible solutions (there are not that many if you at least know the day when the random number was generated).
+
+Moreover, a node processing your request chooses the timestamp it wants to provide to your canister as an input. So a malicious node doesn't even have to bruteforce it.
+
+As @claudio said - it is fine for testing or for some non-valuable calculations, but bad for an online casino, for example.
+
+-------------------------
+
+senior.joinu | 2021-05-27 10:12:57 UTC | #10
+
+On ethereum you have to boot a whole startup to enable onchain randomness (RanDAO, Chainlink VRF) - so this task is not that easy as it seems on the first glance.
+
+-------------------------
+
+hackape | 2021-05-27 10:35:33 UTC | #11
+
+I probably wouldn't risk it either and would just use the random beacon.
+
+But solely for learning purpose, I'm not fully satisfied with your explanation. Let me try push back:
+
+[quote="senior.joinu, post:9, topic:4407"]
+a node processing your request chooses the timestamp it wants to provide to your canister as an input. So a malicious node doesn’t even have to bruteforce it.
+[/quote]
+
+I think this factor is guarded by IC itself. Otherwise a malicious node should be able to push through adverse transaction of any kind, not just my specific case.
+
+If I understand it right, subnet randomly choose which node to process by its rank, so the malicious node would need to also pretend to be rank-0 node in order to publish the tampered result. This would get caught by consensus protocol.
+
+[quote="senior.joinu, post:9, topic:4407"]
+an attacker could just calculate all the possible solutions
+[/quote]
+
+That's why I add the salt. Say the `getRandom()` has been pulled n times. The attacker would need to guess correctly: a) the salt at contract deployment, and b) each and every timestamp in the n iteractions.
+
+-------------------------
+
+senior.joinu | 2021-05-27 10:42:27 UTC | #12
+
+Yea, you're right. But chances to become a legitimate rank-0 node are quite high (1/7 for... I don't remember the name of the subnet type). So each seventh block could be produced by such a node without consensus even noticing it.
+
+It's not the consensus is bad - it's awesome. The task of secure RNG is tricky and requires care.
+
+If you want to use this function in production, you can. But you have to make sure that the price of the attack execution is higher than the profit the attacker could make with it.
+
+-------------------------
+
+hackape | 2021-05-27 10:55:20 UTC | #13
+
+Wait wat... so the malicious node can just wait till it actually becomes **the valid rank-0 node**  to attack?! This sounds really bad :scream_cat: Doesn't this mean the consensus protocol is broken? And node state in subnet would go out of sync from this point on?
+
+Must be something we're missing here...Unless `Time.now()` actually goes through consensus too. 
+Hope you can explain @claudio
+
+-------------------------
+
+senior.joinu | 2021-05-27 11:03:01 UTC | #14
+
+No. The consensus is not broken. `Time.now()` is allowed to be inaccurate by, I think, 1-2 secs. So any timestamp within this interval is valid for everyone else. This is the place where an attacker could use the value they want to break your RNG. But apart from this - there is nothing they can do with the state.
+
+-------------------------
+
+hackape | 2021-05-27 11:14:20 UTC | #15
+
+No, take a look at this part.
+
+```
+public func getRandom(): async [Nat8] {
+    let bytes = SHA.sha256(toBytes(Int.abs(Time.now())));
+    // append salt and hash again
+    let rand = SHA.sha256(Array.append(bytes, salt));
+    // update salt
+    salt := SHA.sha256(rand);
+    return rand;
+};
+```
+
+The adverse (but valid) message here is the returned `ResponseMessage`, which goes through consensus protocol. It's a response to end user but not feedback into the system as input message. 
+
+All other good nodes will just update independently their internal state (`salt` in this case) base on `CallMessage { func = "getRandom", args = () }`.
+
+In fact, if `Time.now()` is different to each node, it doesn't even need a malicious node in play. The normal scenario will also result in out-of-sync internal state among nodes. I don't think this is allowed.
+
+The only reasonable explanation to me is `Time.now()` is agreed upon among nodes in the same subnet. (But I don't remember reading about this anywhere...)
+
+-------------------------
+
+senior.joinu | 2021-05-27 11:19:32 UTC | #16
+
+I would suggest you to watch a consensus-related video on YT https://www.youtube.com/watch?v=vVLRRYh3JYo&list=PLuhDt1vhGcrfHG_rnRKsqZO1jL_Pd970h&index=3
+
+And read the consensus wp https://drive.google.com/file/d/1SQjyPTHPes4Owfn1UlVE2nmyHMGMBEb8/view
+
+As well as to dig a little deeper into concept of private data on the IC.
+
+-------------------------
+
+hackape | 2021-05-27 11:23:44 UTC | #17
+
+I've already gone through those, and I believe I have a reasonably good understanding of the content. It is based on this knowledge about consensus protocol and message handling that I drew above conclusion.
+
+But thank you for spending time discussing with me. Really appreciate it!
+
+-------------------------
+
+PaulLiu | 2021-05-28 01:49:47 UTC | #18
+
+Yes, if you use the `raw_rand` function, it'll take another round of consensus to receive the randomness. This is because the randomness has to be **unpredictable**, even for replicas that participate in the subnet consensus.
+
+Let's imagine an alternative design where `raw_rand` returns immediately. Where would the randomness come from? Note that this call will run on all replicas, and will have to return the same byte sequence, otherwise we risk divergence. So it would have to come from something already both known and agreed upon by all replicas. A block (of messages) is executed only after the block is finalized. But once a block is finalized, all inputs are decided, and the output should be fully deterministic. This means the randomness would have to be part of the finalized input. If this is the case, there is a chance that a block maker will be able to craft a block to their own benefit, by selecting their own messages (crafted on the spot once they know the randomness bytes) over user messages. So this is insecure.
+
+Depending on your application, you may or may not need secure randomness. If you do need it, the extra latency is the price you pay.
+
+BTW, latency in dfx at the moment is actually worse than on the main network. This was artificially set, and I believe a next release will address this problem soon.
+
+-------------------------
+
+PaulLiu | 2021-05-28 02:10:51 UTC | #19
+
+For UUID, I believe you only need to seed a random number generator (RNG) with some randomness once (e.g. when you first initialize your canister), and then just keep using that RNG. You can also save the RNG as part of your canister state to use in the future.
+
+Unless you need UUIDs to be unpredictable, I think pseudo random is good enough.
+
+-------------------------
+
+hackape | 2021-05-28 03:22:17 UTC | #20
+
+During the same call that runs on multiple replicas, does [`ic0.time()`](https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-time) return the same value?
+
+-------------------------
+
+PaulLiu | 2021-05-28 03:23:30 UTC | #21
+
+Yes, it has to return the same value on all replicas.
+
+-------------------------
+
+hackape | 2021-05-28 03:28:25 UTC | #22
+
+Does this means `ic0.time` also goes through concensus protocol to be agreed upon? If not what mechanism is used to ensure it's the same across the whole subnet?
+
+-------------------------
+
+PaulLiu | 2021-05-28 03:52:24 UTC | #23
+
+Yes, that too. Time is part of the block.
+
+-------------------------
+
+senior.joinu | 2021-05-28 12:51:28 UTC | #24
+
+That's unexpected.
+How do nodes handle network latency in that case?
+
+Let's imagine some abstract time-syncing protocol.
+X wants to sync its clock with Y. 
+They initiate the procedure.
+Y sends its current `time.now()` to X.
+The message flies through the net.
+X receives the message and sees the timestamp.
+What should X do? There is no way for X to tell precisely how much time did RTT take this time. Especially in nanoseconds (since ic's time API operates with nanoseconds).
+
+Could you help me to understand it? I've never heard of such algorithms.
+
+-------------------------
+
+hackape | 2021-05-28 13:17:46 UTC | #25
+
+According to the [spec](https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-time):
+> * within an invocation of one entry point, the time is constant.
+
+Base on this line, my educated guess is:
+1. Timestamp is included in the input block, it marks the *starting point* of current block. It is the system time of the block maker node, and should closely track physical time.
+2. When a replica receives the block and start to process the messages inside, first thing it does is to blindly sync its internal clock to this timestamp. This "clock" is conceptual, doesn't need to be accurate relative to physical time.
+3. The spec says, time is **constant** during processing each message. Thus this conceptual "time" is not continuous in IC, it elapses on a per-message basis.
+4. The elapse interval between two consecutive messages is calculated based on cycles consumed during processing first message.
+
+-------------------------
+
+senior.joinu | 2021-05-28 14:10:04 UTC | #26
+
+Looks like I figured out why we don't understand each other.
+At the beginning of our conversation yesterday you did propose an alternative solution for RNG which would possibly execute faster since it **does not** goes through consensus. 
+So the whole these time I was keeping in mind that we're talking about some abstract 
+```
+"getRandom": () -> (blob) query;
+```
+After this (for some reason) we started to mix contexts of this function, trying to look at it from both `query` and `update` perspectives. At least it seemed like this from my pov.
+
+In my latest post I've made a mistake, thinking that you with @PaulLiu are still discussing `ic0.time` in `query` context. Sorry for that. I agree that during an `update` call the time is constant.
+
+The educated guess you're making completely fits inside my understanding of the process. Moreover one of my previous messages
+
+[quote="senior.joinu, post:14, topic:4407, full:true"]
+No. The consensus is not broken. `Time.now()` is allowed to be inaccurate by, I think, 1-2 secs. So any timestamp within this interval is valid for everyone else. This is the place where an attacker could use the value they want to break your RNG. But apart from this - there is nothing they can do with the state.
+[/quote]
+
+describes the same exact moment in the consensus protocol. The block maker node here could cheat a little and propose a timestamp it likes. Since this clock is conceptual, as you say, nobody would argue if it slightly differs from the real one.
+
+The bad thing about not being fluid with English.
+
+-------------------------
+
+PaulLiu | 2021-05-28 15:36:23 UTC | #27
+
+Good point @senior.joinu ! It is my bad, I missed the point that the original question was about "query" calls, my discussion above all assumed an "update" call context. Sorry for the confusion caused.
+
+Query calls are not allowed to invoke functions that are specified as update calls. Since `raw_rand` is a method of the management canister, and all of management methods are update calls, trying to call `raw_rand` in a query context will trap.
+
+Calling `ic0.time()` on the other hand works fine in both query and update context.
+
+-------------------------
+

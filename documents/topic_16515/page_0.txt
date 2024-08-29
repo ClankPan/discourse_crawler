@@ -1,0 +1,204 @@
+harshbaz | 2022-11-12 08:13:32 UTC | #1
+
+I'm using `@dfinity/auth-client` on my sveltekit frontend for internet identity. Also, I'm deploying my site to cloudflare pages with workers. 
+
+I have two problems (which I guess are related):
+1. When I use the latest version (`0.14.1`) of all the `@dfinity/*` dependencies I get this build error:
+```
+> Using @sveltejs/adapter-cloudflare
+✘ [ERROR] Could not resolve "stream"
+
+    node_modules/cipher-base/index.js:2:24:
+      2 │ var Transform = require('stream').Transform
+        ╵                         ~~~~~~~~
+
+  The package "stream" wasn't found on the file system but is
+  built into node. Are you trying to bundle for node? You can
+  use "platform: 'node'" to do that, which will remove this
+  error.
+
+✘ [ERROR] Could not resolve "assert"
+
+    node_modules/@dfinity/identity/lib/esm/identity/hdkey.js:5:19:
+      5 │ import assert from 'assert';
+        ╵                    ~~~~~~~~
+
+  The package "assert" wasn't found on the file system but is
+  built into node. Are you trying to bundle for node? You can
+  use "platform: 'node'" to do that, which will remove this
+  error.
+
+✘ [ERROR] Could not resolve "events"
+
+    node_modules/readable-stream/lib/_stream_readable.js:32:17:
+      32 │ var EE = require('events').EventEmitter;
+         ╵                  ~~~~~~~~
+
+  The package "events" wasn't found on the file system but is
+  built into node. Are you trying to bundle for node? You can
+  use "platform: 'node'" to do that, which will remove this
+  error.
+
+✘ [ERROR] Could not resolve "events"
+
+    node_modules/readable-stream/lib/internal/streams/stream-browser.js:1:25:
+      1 │ module.exports = require('events').EventEmitter;
+        ╵                          ~~~~~~~~
+
+  The package "events" wasn't found on the file system but is
+  built into node. Are you trying to bundle for node? You can
+  use "platform: 'node'" to do that, which will remove this
+  error.
+```
+
+This is because cloudflare does not support all the node dependencies. How can I fix this?
+Also, this problem goes away if I use `@dfinity/*`: `0.14.0 version for all the deps.
+
+2. The second issue is when I import `AuthClient` in a file, the resulting output file becomes very large, around 300kb with `0.14.0` and around 900kb with the `0.14.1` version:
+![image|690x143](upload://tdzF5C29pNmx9nXdFhhxwm6q3hq.png)
+
+So, how do I optimise for the size and how do I use the latest version of @dfinity dependencies with cloudlflare pages (which use workers under the hood)?
+
+-------------------------
+
+peterparker | 2022-11-12 08:44:30 UTC | #2
+
+Before jumping in the two questions, out of curiosity, you have the same issue with previous version of `@dfinity/*` dependencies too right?
+
+---
+
+> 1. When I use the latest version of all the `@dfinity/*` dependencies I get this build error:
+> ✘ [ERROR] Could not resolve
+
+It's probably because some NodeJS librarires need to be polyfied.
+
+I would try to Node polyfill esbuild (for dev) and rollup (for prod) builds in your vite.config
+
+```
+import { NodeModulesPolyfillPlugin } from "@esbuild-plugins/node-modules-polyfill";
+import rollupNodePolyFill from "rollup-plugin-node-polyfills";
+
+...
+
+   build: {
+    ...
+    rollupOptions: {
+      plugins: [rollupNodePolyFill()],
+    },
+  },
+  ...
+  optimizeDeps: {
+    esbuildOptions: {
+      define: {
+        global: "globalThis",
+      },
+      plugins: [NodeModulesPolyfillPlugin()],
+    },
+  },
+```
+
+Some references and examples:
+
+- https://github.com/dfinity/internet-identity/blob/cb976c1a63b5ebf995de02cbb1047ff2c266e4f1/vite.config.ts#L23
+- https://stackoverflow.com/questions/71744659/how-do-i-deploy-a-sveltekit-app-to-a-dfinity-container
+- https://github.com/papyrs/cycles.watch/blob/3a00c1d37389348dd226de9ef74db6ee7054c810/vite.config.js#L18
+- https://github.com/dfinity/nns-dapp/blob/990c9b998c960864b0f39a73080a6ded959291b5/frontend/vite.config.ts#L50
+
+---
+
+> The second issue is when I import `AuthClient` in a file, the resulting output file becomes very large, around 300kb with `0.14.0` and around 900kb with the `0.14.1` version:
+
+According [changelog](https://github.com/dfinity/agent-js/releases/tag/v0.14.1) there was a new dependency that was added, maybe that's the reason?
+
+Here gonna ping @kpeacock. 
+
+Being said, have you double check that you do not have a wildcard import (`import * from`) in your code? maybe the chunking import the all lib while only part of it would be needed?
+
+Meanwhile, maybe it's safe to stick to v0.14.0 until above is cleared.
+
+-------------------------
+
+harshbaz | 2022-11-12 09:59:18 UTC | #3
+
+> Being said, have you double check that you do not have a wildcard import (import * from) in your code? maybe the chunking import the all lib while only part of it would be needed?
+
+I'm using modular imports everywhere.
+
+> Meanwhile, maybe it’s safe to stick to v0.14.0 until above is cleared.
+
+Yup, I'm going to stay on 0.14.0.
+
+And I'm going to wait for @kpeacock for some more info on this topic.
+
+Thanks for the detailed reply @peterparker 🙏
+
+-------------------------
+
+peterparker | 2022-11-13 10:24:05 UTC | #5
+
+Faced some polyfill issue with v0.14.1 but v0.14.0 too. It seems I solved it that way:
+
+1. installer buffer for the browser
+
+```
+npm i buffer
+```
+
+2. polyfill esbuild
+
+```
+npm i @esbuild-plugins/node-modules-polyfill @esbuild-plugins/node-globals-polyfill @rollup/plugin-inject -D
+```
+
+in vite.config
+
+```
+build: {
+	target: 'es2020',
+	rollupOptions: {
+		// Polyfill Buffer for production build
+		plugins: [
+			inject({
+				modules: { Buffer: ['buffer', 'Buffer'] }
+			})
+		]
+	}
+},
+optimizeDeps: {
+		esbuildOptions: {
+			// Node.js global to browser globalThis
+			define: {
+				global: 'globalThis'
+			},
+			// Enable esbuild polyfill plugins
+			plugins: [NodeGlobalsPolyfillPlugin(), NodeModulesPolyfillPlugin()]
+		}
+	}
+```
+
+-------------------------
+
+kpeacock | 2022-11-14 18:13:05 UTC | #6
+
+Hmm, sounds like an issue that may have been introduced with the new `Secp256k1KeyIdentity.fromSeed` feature. Ideally it would be tree shaken out if you aren't using a `Secp256k1KeyIdentity`, but it's hard to anticipate exactly how a bundler will manage it
+
+Maybe this is an issue with the harmony exports, where you're using the `cjs` instead of `esm` imports because the bundler is using the `main` index instead of the `module`?
+
+I wonder if it may be time to investigate deprecating `commonjs`
+
+https://github.com/dfinity/agent-js/blob/main/packages/identity/package.json#L34
+
+-------------------------
+
+harshbaz | 2022-11-19 11:48:13 UTC | #7
+
+I'm pretty sure I'm not using `cjs`. My `package.json` is set to using `module`. So maybe, it's something else.
+
+-------------------------
+
+kpeacock | 2022-11-22 17:51:11 UTC | #8
+
+I've got a ticket to fix this regression and to add a CI check for package sizes
+
+-------------------------
+

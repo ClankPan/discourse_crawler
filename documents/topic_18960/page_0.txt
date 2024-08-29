@@ -1,0 +1,156 @@
+pramitgaha | 2023-03-16 12:18:54 UTC | #1
+
+hello, I've been facing problem with making async call. my state have some asynchronous methods, and how do you call those method inside the thread local?
+I handled my code this way:
+```rs
+pub async fn pay_loan(note_id: u128, loan_index: u32) -> PayLoanResponse{
+    let caller = ic_cdk::caller();
+    let note_data: Result<NoteData, PayLoanResponse> = NOTE_STATE.with(|state|{
+        let state = state.borrow();
+        match state.note_list.get(&note_id){
+            Some(note_data) => Ok(note_data.clone()),
+            None => Err(PayLoanResponse::InvalidNoteId)
+        }
+    });
+    let mut note_data = match note_data{
+        Err(e) => return e,
+        Ok(note_data) => note_data,
+    };
+    let response = note_data.pay_loan(note_id, loan_index, &caller).await;
+    NOTE_STATE.with(|state|{
+        let state = &mut state.borrow_mut();
+        state.note_list.insert(note_id, note_data);
+    });
+    response
+}
+```
+but my code is re entrancy attack prone. how do you solve it in a better way?
+
+-------------------------
+
+senior.joinu | 2023-03-16 12:58:53 UTC | #2
+
+Your code is valid and yes, it is prone to reentrancy attack. 
+
+The common way to solve this is to never update the state after (async) external calls. You should swap  these two instructions:
+```rust
+let response = note_data.pay_loan(note_id, loan_index, &caller).await;
+NOTE_STATE.with(|state|{
+    let state = &mut state.borrow_mut();
+    state.note_list.insert(note_id, note_data);
+});
+```
+So the call happens after the state update. This approach also reveals another error in your code snippet - you should always check for errors that might happen during an external async call. In your case you can simply revert the state to it's original:
+```rust
+NOTE_STATE.with(|state|{
+    let state = &mut state.borrow_mut();
+    state.note_list.insert(note_id, note_data);
+});
+
+let response = note_data.pay_loan(note_id, loan_index, &caller).await;
+
+if let Err(e) = &response {
+    NOTE_STATE.with(|state|{
+        let state = &mut state.borrow_mut();
+        state.note_list.remove(&note_id);
+    });
+}
+
+response
+```
+
+-------------------------
+
+Severin | 2023-03-16 13:01:08 UTC | #3
+
+Congrats on realising that your code is vulnerable, that alone is already a huge accomplishment. Not many people realise that.
+
+There is no general solution except for 'fix it'. In your case, @senior.joinu already explained very nicely how to fix in your case.
+
+If you want an example of how I do exactly that in the cycles faucet, have a look at [this post](https://forum.dfinity.org/t/how-does-canister-state-change-when-processing-multiple-messages-that-await-inter-canister-calls/17527/5), which explains the process in a lot of detail.
+
+-------------------------
+
+pramitgaha | 2023-03-16 15:27:46 UTC | #5
+
+thanks, will look update the code again.
+
+-------------------------
+
+pramitgaha | 2023-03-16 15:28:14 UTC | #6
+
+thanks, haha. but your answer is based for motoko, isn’t it??
+
+-------------------------
+
+Severin | 2023-03-16 15:40:30 UTC | #7
+
+Yes, I'm trying to show you how to approach the logic, not a copy/paste solution that may or may not fix your situation
+
+-------------------------
+
+pramitgaha | 2023-03-28 10:47:41 UTC | #8
+
+@senior.joinu @Severin what if I do like this
+step 1: change data, also store unchanged data
+step 2: make async call
+if async call fails of doesn't return me the desired output. I will replace with the old unchanged data.
+
+do you see any problem in this?
+
+-------------------------
+
+Severin | 2023-03-28 10:53:01 UTC | #9
+
+I think in this situation it works, assuming that you detect errors correctly. The pattern will fail, however, if you need to do more than just resetting local data if a failure happens. This more complicated case will most appear if you use more than just one `await`.
+
+-------------------------
+
+pramitgaha | 2023-03-28 10:56:32 UTC | #10
+
+ok, so If I have multiple number of `await` and I do check for errors for every `await`. still i'll have the problem?
+
+-------------------------
+
+Severin | 2023-03-28 11:07:19 UTC | #11
+
+It depends on what your `await`s do. If you store your state, then transfer some funds (first `await`), then try to transfer funds to someone else (second `await`), but the second transfer fails, then you can't just restore your initial state. You'd have to revert the first transfer too, otherwise the initial state is not restored.
+
+If you use money transfers (which are (in most cases) not reversible), then you have to find some other way to handle your error. E.g. you assign the receivers some tokens (which I assume you could do without an `await`), then try to disburse funds, and if a transfer fails, you only revert the reduction of assigned tokens, but a previous reduction of tokens would still have to apply. This uses transfers of funds as an example, but it can be any non-local state change.
+
+Do you understand this example or did I do a bad job at explaining?
+
+-------------------------
+
+pramitgaha | 2023-03-28 11:13:05 UTC | #12
+
+You explained it really good. If I had to solve the problem, I'll go like
+step1: store unchanged data, update data
+step2: make async call (1)
+step3: check if the async call failed or the desired output wasn't received
+step4: if I received the desired output: I'll leave the data unchanged. now the change data will act as the unchanged data for second async call. and repeat the step. do you like the idea? and will this solve? or you've a better idea
+
+-------------------------
+
+pramitgaha | 2023-03-28 11:15:46 UTC | #13
+
+beside ```thread_local{..}```, what are the other ways to declare state? are there any other ways?
+
+-------------------------
+
+Severin | 2023-03-28 11:30:59 UTC | #14
+
+[quote="pramitgaha, post:12, topic:18960"]
+I’ll leave the data unchanged. now the change data will act as the unchanged data for second async call. and repeat the step. do you like the idea? and will this solve? or you’ve a better idea
+[/quote]
+
+Yes, this works, but only if your application (or state representation) allow this half-executed state as a valid application state. Example: If your application has tokens to distribute, then you cannot only have states `Initial` and `Distributed`, but you may also have to add `HalfDistributed` as a valid state
+
+[quote="pramitgaha, post:13, topic:18960, full:true"]
+beside `thread_local{..}`, what are the other ways to declare state? are there any other ways?
+[/quote]
+
+AFAIK this is the best we have with ic_cdk. Or you have write a lot of `unsafe` blocks. I know e.g. [ic-kit](https://github.com/psychedelic/ic-kit) has nicer interfaces in some cases, but I'm not very familiar with it. Maybe there's also other ones out there
+
+-------------------------
+

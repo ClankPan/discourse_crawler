@@ -1,0 +1,142 @@
+nomeata | 2021-09-04 11:51:21 UTC | #1
+
+As @diegop [said we can](https://forum.dfinity.org/t/starting-our-own-discussion-threads/6842/3?u=nomeata) create our own community consideration threads, let's start with something simple:
+
+# Allow calls from `canister_init`
+
+The restriction that calls cannot be initiated from `canister_init` is not well motivated, but there are a few use cases where that would be quite useful (e.g. fetching the randomness in the Internet Identity, which currently requires a weird extra method, registering the canister with some other canister, setting up cron calls with a hypothetical cron canister, doing ECDSA stuff once that's there.)
+
+Therefore I suggest to drop that restriction. The canister is considered started even before the calls have been responded to (to avoid confusion about what state a canister is in before the response comes back). Same for `canister_post_upgrade` (but _not_ `canister_pre_upgrade`.)
+
+(If `ic-ref` was open source, or at least the adocs public, I'd include a proposed diff to the spec here. But it's simple enough.)
+
+I hope this can make it in before or with public access to the heartbeat, as otherwise I expect canister developers will resort to abuse that for initialization, which I'd consider a hack.
+
+Implementation-wise I don't expect this to yield any surprises.
+
+-------------------------
+
+skilesare | 2021-09-05 15:32:46 UTC | #2
+
+We just need better specs in cycle limits during init(unless they don’t apply) and it would be great to have a cycle simulation added to the dfx replica.
+
+-------------------------
+
+levi | 2021-09-05 19:27:14 UTC | #3
+
+[quote="nomeata, post:1, topic:6992"]
+The canister is considered started even before the calls have been responded to (to avoid confusion about what state a canister is in before the response comes back).
+[/quote]
+
+Do you mean the canister is considered started before the canister_init function runs, even when there is no inter-canister-calls within the canister_init-function, or if canister_init traps?
+
+-------------------------
+
+nomeata | 2021-09-05 20:21:03 UTC | #4
+
+I think cycle limits and features of the SDK are independent of the proposed change.
+
+Currently, canister installation fails if the `caninster_init` function traps, and succeeds if the function returns. I propose to leave it like that: what matters is whether that _wasm function_ return, and not what the overall “call” (e.g. the callbacks invoked when responses to calls from init come back) does.
+
+-------------------------
+
+levi | 2021-09-05 20:57:45 UTC | #5
+
+I see what you are saying. I think that might be confusing because from the coders perspective, writing a canister_init function, with the proposed-changes, the canister installation status will change in the middle of the function, unless the cdks make a canister_init api with two functions (or if someone is writing a canister in straight wasm). 
+What if the canister is consider start when the call-backs also dont trap. that way the initialization can pend on other canisters if someone wants.
+
+-------------------------
+
+nomeata | 2021-09-07 11:08:00 UTC | #6
+
+We will never be able to hide the complexities of asynchronous messaging from the developer; the same problem (something else happening to the canister when you`await`) is already there and needs to be known by the developer.
+
+In your model, what should happen when someone calls the canister after `canister_init` returned, but not all callbacks are back?
+
+I guess one could consider a state `starting` that behaves like `stopping` (callbacks are processed, but calls are rejected). And maybe that _is_ easier for the developer. But such behavior can easily be implemented by the CDK rather than the system, so I'd suggest to leave it to CDKs to implement it if they so choose.
+
+-------------------------
+
+levi | 2021-09-07 22:30:48 UTC | #7
+
+
+[quote="nomeata, post:6, topic:6992"]
+In your model, what should happen when someone calls the canister after `canister_init` returned, but not all callbacks are back?
+[/quote]
+
+To the outside world, the canister can look the same as it does before the first canister_init wasm functions return: canister is not started yet. No need for another status (as far as I can tell). But yes: 
+[quote="nomeata, post:6, topic:6992"]
+(callbacks are processed, but calls are rejected)
+[/quote]
+
+.
+  
+[quote="nomeata, post:6, topic:6992"]
+But such behavior can easily be implemented by the CDK rather than the system, so I’d suggest to leave it to CDKs to implement it if they so choose.
+[/quote]
+
+I can see how a cdk can make more clear what is going on in the middle of the canister_init function, but what if a canister wants to in the specific not have the start status (not be able to be called) till the data in the cross-canister-calls in the canister_init function comes back?
+
+-------------------------
+
+nomeata | 2021-09-08 05:51:33 UTC | #8
+
+What I mean is: the stopping behavior merely mean that certain calls are rejected right away. It doesn't make much difference whether the system is rejecting them, or wherever the canister (in CDK-provided code) keeps track of “i don't want to handle calls right now” and rejects them right away. In that sense, stopping (or starting) is a convenience feature.
+
+I think the strong argument for _not_ rejecting calls during start up is that it rules out possibly desired behavior. Maybe the call from init simply doesn't need to be waited for? Maybe the call from init to some other canister will require a back call to the calling canister? Maybe some functionality is available right away, and only some features will not work until fully initialized?
+
+It'd just be an unnecessary restriction, and better left to the canister to decide whether and how to handle calls in that phase (see the Internet Identity code for an example, where fetching the secret salt is an init action, and only some update calls fail until it is received).
+
+-------------------------
+
+levi | 2021-09-12 23:48:02 UTC | #9
+
+[quote="nomeata, post:8, topic:6992"]
+better left to the canister to decide whether and how to handle calls in that phase (see the Internet Identity code for an example, where fetching the secret salt is an init action, and only some update calls fail until it is received).
+[/quote]
+
+What then is the benefit of this proposal?
+
+-------------------------
+
+nomeata | 2021-09-13 09:03:50 UTC | #10
+
+[quote="levi, post:9, topic:6992"]
+What then is the benefit of this proposal?
+[/quote]
+
+Right now, you can’t make calls from `canister_init` at all. See the original post for a list of possible use-cases that are not possible right now (and require clutches like a separate user-defined `kick` method that the admin needs to call manually).
+
+-------------------------
+
+levi | 2021-09-13 17:28:35 UTC | #11
+
+In my view: this: 
+
+[quote="nomeata, post:10, topic:6992"]
+a separate user-defined `kick` method that the admin needs to call manual
+[/quote]
+
+Is the way of the structure of these cases: 
+
+[quote="nomeata, post:8, topic:6992"]
+Maybe the call from init simply doesn’t need to be waited for? Maybe the call from init to some other canister will require a back call to the calling canister? Maybe some functionality is available right away, and only some features will not work until fully initialized?
+[/quote]
+
+.
+
+
+In the case of the internet-identity , the canister would still need to hold some init_complete variables in the state that each public method would need to check to let certain calls and block certain calls before the init-cross-canister-calls come back.
+
+-------------------------
+
+nomeata | 2021-09-13 21:22:02 UTC | #12
+
+Correct! But it would no longer have to expose the artificial method. 
+
+And whats more important: the person installing the canister doesn't even need to know that there is an additional step to be taken. This may be relevant when developer and admin are different people (as already commonly the case with off-the-shelf canisters like cycle wallet and asset canister).
+
+Yes, there are workarounds and this feature is not breaking any ground (like, say, ECDSA sigs). It's just an incremental refinement of what we built so far based on our experiences.
+
+-------------------------
+

@@ -1,0 +1,115 @@
+pie-silo | 2020-10-16 18:04:02 UTC | #1
+
+To me one of the most interesting purported features of the IC is that browsers can interact directly with dapps, and that the integrity of the apps does not depend on trusting any single datacenter or trusting Dfinity.
+
+Dominic has written that [the IC can serve HTTP requests directly from cyberspace into browsers](https://www.reddit.com/r/dfinity/comments/iun6u1/couple_of_dfinity_developer_questions/g7tquxd?context=3), and that Dfinity will not be running any HTTPS front-end infrastructure, and that it doesn't depend on any external infrastructure. 
+
+If Dfinity was proxying HTTPS requests into the IC then there'd be a single trust point and it couldn't fulfil its [promises to be censorship-resistant, tamperproof, unstoppable, etc](https://dfinity.org/faq/).
+
+So I'd like to understand more just how this comes about, technically, to get a grasp on the security of the IC. 
+
+Let's take the case of a browser trying to access the LinkedUp app at https://7kncf-oidaa-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-q.ic0.app/ (down at the moment though, but it will do for an example.)
+
+To open the app from a browser a few key things have to happen:
+
+1. Resolve that domain name to an IP address. The browser then opens a TCP connection to that address.
+1. The incoming connection is routed to a server machine somewhere, possibly through some kind of layer 3 load balancer.
+1. TLS negotiation with the server.
+1. Routing the HTTPS request into the actor and sending the results back.
+
+All of these seem pretty challenging to do in a distributed trustless way.
+
+As of today, DNS, LB, TLS and HTTPS all seem to be handled by CloudFlare, but I presume you're going to move away from them before the public launch, to fulfil the promise of not relying on [Big Tech vendors](https://dfinity.org/faq). The SSL Cert is also from CF.
+
+**DNS**: Ultimately the request gets answered by a single authoritative server somewhere. Who runs that? How do you know they don't lie? There is no consensus protocol in DNS.
+
+**Routing to a server**: Only one machine terminates the TCP connection. How do you choose it? If you send it to a DC run by one operator, it seems they can return arbitrary results?
+
+**TLS**: Whichever machine terminates the connection has access to the SSL cert for `*.ic0.app` (or maybe some subdomain?) and can arbitrarily MITM connections to any app hosted in that domain. Whether this is run by Dfinity or some datacenter or by CloudFlare it doesn't seem any more tamperproof than current infrastructure.
+
+**Request routing to actors**: Here too, it's passing through a single machine run by someone, who can arbitrarily change the request and response...
+
+How is the IC going to do any better than CF in any of these stages?
+
+-------------------------
+
+hansl | 2020-10-16 18:17:19 UTC | #2
+
+There are two parts to your question;
+
+1. How do users get the Bootstrap HTML and JS (the ones served by `*.ic0.app`)? and
+2. How do users contact the network (the replicas which are currently behind `gw.dfinity.network`)?
+
+First, I want to point out that both these questions are still in flux and what I'm about to share is our current plans, but those might very well change before the official release.
+
+So I'll elaborate on where we want to go, versus where we are currently (Cloudflare, nginx, etc).
+
+# 1. How do users get the Bootstrap HTML and JS (the ones served by `*.ic0.app`)?
+
+Those HTML and JS are served whichever canister is served, so you could serve that same code from, say, `https://my-awesome-app.example.com` (there needs to be some configurability of canister ID, but that's mostly it). And users can MD5 that code (or just plain string compare) with the one we build from our soon-to-be open source repos and should get the same output.
+
+So by design, whichever node you hit when going to a.ic0.app or b.ic0.app will get the same HTML and JS. Now this is not decentralized yet, and to be honest we still don't have a totally fool proof way of decentralizing frontend servers. There will be a level of trust for them as we get rid of Cloudflare there, and it's unknown if only certain nodes will serve frontends or if all nodes will be able to serve a frontend. 
+
+The issues of HTTPs certificates have been raised in every of the meetings involved in this plan so we are very well aware of it.
+
+This matters for preventing phishing attempts, but the canister data is still protected. Which brings us to the next point;
+
+# 2. How do users contact the network (the replicas which are currently behind `gw.dfinity.network`)?
+
+There are many subnets and canisters will be in a particular subnet. The client code will have to;
+
+- ask the main subnet (which is known) what subnet a canister is in? This step may be cached locally.
+- query a random node in that subnet directly through TCP/IP connection (using HTTPs with a certificate for that single IP address).
+
+The resolution is done by the client, and the node of the subnet being contacted is random. 
+
+Updates always go through consensus so they're not at risk of being MITM. They're also signed by the client so the client can send it to one replica and request status at others, if it doesn't trust it, for example. So if you don't trust the replicas, updates are the way to go (but takes longer). Every query-able function can be called using an update call.
+
+Queries are a bit more complicated. The query is never sent through consensus, so it's impossible to know if a replica is misbehaving. We are working on some certification of data so that clients could check that the data is correct at a certain timestamp. You could also query the data on multiple nodes and if their block heights are the same, the data should match.
+
+Whether or not these strategies are used would depend on the frontend code itself. The Agent libraries will offer many options for developers, but ultimately we will not enforce one route vs the other (as they all have different downsides). If you're building a bank system, maybe updates everytime is the way to go. If you're building a chess game, queries without validation might be good enough for you.
+
+----
+
+I hope this answer some of your questions. Just to recap directly here;
+
+> Ultimately the request gets answered by a single authoritative server somewhere. Who runs that?
+
+We are working on ways that user can keep frontend in checks, AND also having trusted webservers as frontends. We also expect some developers to host their own hostname, and we are still exploring all possibilities here. MITM attacks are well known and documented.
+
+> If you send it to a DC run by one operator, it seems they can return arbitrary results?
+
+No subnet will run on a single DC. It doesn't matter much for update calls andd query calls will have some features to validate that the result is certified.
+
+> Whether this is run by Dfinity or some datacenter or by CloudFlare it doesn’t seem any more tamperproof than current infrastructure.
+
+We are exploring decentralized ways to make this work. Ultimately someone has to own and pay for the domain and its certificate, so the foundation would be the most neutral organization in this case. The important part is to give people all the right tools to validate and keep the owners in check, so that any malicious behaviour get caught.
+
+-------------------------
+
+pie-silo | 2020-10-16 18:37:37 UTC | #3
+
+Hey, thanks very for the thoughtful and detailed answer. It's good to see you're at least aware of the issues here.
+
+[quote="hansl, post:2, topic:1425"]
+[bootstrapping] matters for preventing phishing attempts, but the canister data is still protected. Which brings us to the next point;
+[/quote]
+
+If someone can inject malicious client code they can send malicious requests with the client's credentials and affect the canister state.
+
+[quote="hansl, post:2, topic:1425"]
+Updates always go through consensus so they’re not at risk of being MITM. They’re also signed by the client so the client can send it to one replica and request status at others, if it doesn’t trust it, for example.
+[/quote]
+
+Just to confirm, you're saying that the bootstrap Javascript code is typically going to amplify every server call into multiple calls to different DCs, and then check they're consistent. I guess that works, but it seems likely to make the latency issues even worse...?
+
+[quote="hansl, post:2, topic:1425"]
+We also expect some developers to host their own hostname
+[/quote]
+
+So, that's where I get confused by Dominic's promises that the IC will entirely obsolete all other cloud infrastructure (or at least everything that doesn't require special hardware). 
+
+Yes, if developers have hardware or a cloud service elsewhere that they are happy to use as a trust anchor, they avoid some of these bootstrapping issues. But then, why wouldn't they just run their whole service on that axiomatically-trusted infrastructure?
+
+-------------------------
+

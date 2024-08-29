@@ -1,0 +1,342 @@
+ayazgv | 2021-09-07 14:27:26 UTC | #1
+
+how to dynamically create a canister from compiled wasm module with another canister using rust?
+
+-------------------------
+
+kpeacock | 2021-09-07 15:11:46 UTC | #2
+
+The cycles wallet is a good reference for that
+https://github.com/dfinity/cycles-wallet
+
+-------------------------
+
+ayazgv | 2021-09-09 14:15:53 UTC | #3
+
+This forum is blocked me, I just don't know why
+
+-------------------------
+
+kpeacock | 2021-09-09 15:47:34 UTC | #4
+
+It blocks pasted code pretty often, probably trying to avoid code execution attacks
+
+-------------------------
+
+AliSci | 2023-06-05 07:23:11 UTC | #5
+
+Bro it is 1200 lines of code, people really need minimal examples for each case.
+Can you point out to the place where I can find `dynamically create a canister`
+
+-------------------------
+
+Severin | 2023-06-05 08:11:23 UTC | #6
+
+Creating a canister is [here](https://github.com/dfinity/cycles-wallet/blob/main/wallet/src/lib.rs#L673-L704), wasm gets installed [here](https://github.com/dfinity/cycles-wallet/blob/main/wallet/src/lib.rs#L750-L781)
+
+-------------------------
+
+kpeacock | 2023-06-05 16:42:55 UTC | #7
+
+I agree with @AliSci that this warrants docs
+
+-------------------------
+
+AliSci | 2023-06-10 13:33:54 UTC | #8
+
+what is the difference between `wallet_create_canister128` and `wallet_create_canister`?
+
+-------------------------
+
+AliSci | 2023-06-10 15:10:46 UTC | #9
+
+and how should I run the command? 
+`dfx canister call wallet create_canister "??";`
+
+-------------------------
+
+Severin | 2023-06-12 06:50:45 UTC | #10
+
+[quote="AliSci, post:8, topic:7060, full:true"]
+what is the difference between `wallet_create_canister128` and `wallet_create_canister`?
+[/quote]
+
+No real difference. The one without `128` is a leftover from when cycles were `u64`. Internally it simply turns the amount of cycles into an `u128` and then calls `wallet_create_canister128`.
+
+[quote="AliSci, post:9, topic:7060, full:true"]
+and how should I run the command?
+`dfx canister call wallet create_canister "??";`
+[/quote]
+That depends on the interface of the `wallet` canister. Assuming you're using the default wallet canister, then the interface is [here](https://github.com/dfinity/cycles-wallet/blob/main/wallet_ui/declarations/wallet/wallet.did#L164-L175). You could use e.g. `'(record { cycles = 1000000000000; settings = record { controller = ?principal "\<your principal>"}})'
+
+But it's probably easier to just use `dfx canister create`
+
+-------------------------
+
+AliSci | 2023-06-12 14:26:02 UTC | #13
+
+```rs
+use std::cell::RefCell;
+
+use candid::Principal;
+use ic_cdk::api;
+use ic_cdk::api::call::CallResult;
+use ic_cdk::api::management_canister::main::CanisterSettings;
+use ic_cdk::export::candid::{
+    candid_method, CandidType, check_prog, Deserialize, export_service, IDLProg, TypeEnv,
+};
+
+#[derive(Default)]
+struct WalletWASMBytes(Option<serde_bytes::ByteBuf>);
+
+/// The wallet (this canister's) name.
+#[derive(Default)]
+struct WalletName(pub(crate) Option<String>);
+
+
+thread_local! {
+    static WALLET_NAME: RefCell<WalletName> = Default::default();
+    static WALLET_WASM_BYTES: RefCell<WalletWASMBytes> = Default::default();
+}
+
+
+#[candid_method(query)]
+#[ic_cdk::query]
+fn my_canister_id() -> String {
+    format!("{}", ic_cdk::id())
+}
+
+
+#[derive(CandidType, Deserialize)]
+struct CreateResult {
+    canister_id: Principal,
+}
+
+#[derive(CandidType, Deserialize)]
+struct CanisterInstall {
+    mode: InstallMode,
+    canister_id: Principal,
+    #[serde(with = "serde_bytes")]
+    wasm_module: Vec<u8>,
+    arg: Vec<u8>,
+}
+
+
+#[derive(CandidType, Deserialize)]
+enum InstallMode {
+    #[serde(rename = "install")]
+    Install,
+    #[serde(rename = "reinstall")]
+    Reinstall,
+    #[serde(rename = "upgrade")]
+    Upgrade,
+}
+
+
+#[candid_method(update)]
+#[ic_cdk::update]
+async fn create_canister() -> String {
+    #[derive(CandidType)]
+    struct In {
+        settings: Option<CanisterSettings>,
+    }
+    let settings = CanisterSettings {
+        controllers: Some(vec![ic_cdk::api::id()]),
+        compute_allocation: None,
+        memory_allocation: None,
+        freezing_threshold: None,
+    };
+    let in_arg = In {
+        settings: Some(settings),
+    };
+
+    let (create_result, ): (CreateResult, ) = match api::call::call_with_payment128(
+        Principal::management_canister(),
+        "create_canister",
+        (in_arg, ),
+        400_000_000_000,
+    )
+        .await
+    {
+        Ok(x) => x,
+        Err((code, msg)) => {
+            return format!(
+                "An error happened during the call: {}: {}",
+                code as u8, msg
+            );
+        }
+    };
+
+    // wasm install
+
+    let wasm_module = WALLET_WASM_BYTES.with(|wallet_bytes| match &wallet_bytes.borrow().0 {
+        Some(o) => o.clone().into_vec(),
+        None => {
+            ic_cdk::trap("No wasm module stored.");
+        }
+    });
+
+    let install_config = CanisterInstall {
+        mode: InstallMode::Install,
+        canister_id: ic_cdk::api::id(),
+        wasm_module: wasm_module.clone(),
+        arg: b" ".to_vec(),
+    };
+
+    let (install_res, ): (CreateResult, ) = match api::call::call(
+        Principal::management_canister(),
+        "install_code",
+        (install_config, ),
+    )
+        .await
+    {
+        Ok(x) => x,
+        Err((code, msg)) => {
+            return format!(
+                "An error happened during the call: {}: {}",
+                code as u8, msg
+            );
+        }
+    };
+    format!("{}", create_result.canister_id)
+}
+
+
+```
+I build this now, but I don't know how this wasm thing should work when I call the `create_canister` I got 
+```rs
+Call was rejected:
+Request ID: ccacd6fd84d19be86952a40d1d810b5798f3709934db2ecf244cb222ca849695
+Reject code: 5
+Reject text: Canister bw4dl-smaaa-aaaaa-qaacq-cai trapped explicitly: No wasm module stored.
+```
+
+-------------------------
+
+Severin | 2023-06-12 15:59:26 UTC | #14
+
+You have to have a wasm module that you can install. You can either pass it in the function argument or you can upload it ahead of time (like your example is set up for), but you have to have something available to install
+
+-------------------------
+
+AliSci | 2023-06-14 17:57:38 UTC | #15
+
+Now I am getting this error from the candid UI. 
+```rs
+("An error happened during the call: 3: IC0302: Canister br5f7-7uaaa-aaaaa-qaaca-cai has no update method 'install_code'")
+```
+the should I make and `update` or a `query` named `install_code`?
+
+-------------------------
+
+Severin | 2023-06-15 07:25:17 UTC | #16
+
+It's on you to decide what you want. If you want an `install_code` function in your canister then go ahead and make it. It probably will have to be an update call since you want to modify state. Queries' changes get discarded after execution
+
+-------------------------
+
+domwoe | 2023-06-15 07:55:41 UTC | #17
+
+Or do you want to call the `install_code` method on the management canister?
+
+-------------------------
+
+AliSci | 2023-06-19 08:43:12 UTC | #18
+
+I don't know why would I want `install_code` or not I don't fully understand the process here. I am building this minimal project to see how it work, and to see what are my options.
+
+-------------------------
+
+benji | 2023-06-19 09:30:23 UTC | #19
+
+@Severin Is it true that using this method the wasm size can be 10MB? I understand that ingress is no longer the limiting factor here, but where exactly does this limitation come from?
+
+-------------------------
+
+benji | 2023-06-19 09:31:50 UTC | #20
+
+Also, can the `wasm_module` be gzipped here?
+
+-------------------------
+
+Severin | 2023-06-19 09:39:19 UTC | #21
+
+If the canister you're installing to via the proxy method AND the two canisters live on the same subnet, then yes, you should be able to go up to 10MB WASM. The 10MB is for _unzipped_ wasm, but you can install it gzipped without any problems
+
+-------------------------
+
+abk | 2023-06-19 10:57:06 UTC | #22
+
+Actually we recently made a change that allows the Wasm module to be 30MB uncompressed as long as the code section is still under 10MB: https://github.com/dfinity/ic/commit/a044776ba
+
+-------------------------
+
+infamousdegen | 2023-07-10 11:21:50 UTC | #23
+
+Is there a typescript example for this ? I want to deploy icrc-1 ledger dynamically using from a main canister
+
+-------------------------
+
+Severin | 2023-07-10 11:23:16 UTC | #24
+
+I don't know, I'm not familiar with Azle. Maybe you can find something [here](https://github.com/demergent-labs/azle/tree/main/examples)?
+
+-------------------------
+
+infamousdegen | 2023-07-10 11:50:22 UTC | #25
+
+Yeah went through them but it doesn't have and example which will be suitable for my project . 
+
+Generally speaking how would the code for .wasm module be stored on icp? Is it even possible to do that to store a wasm module of icrc-1 ledger
+
+-------------------------
+
+pramitgaha | 2023-07-10 11:55:30 UTC | #26
+
+[quote="infamousdegen, post:25, topic:7060"]
+Yeah went through them but it doesn’t have
+[/quote]
+
+here is the example of dynamically creating the canister in ts: https://github.com/demergent-labs/azle/blob/main/examples/management_canister/src/management_canister.ts#L29
+
+-------------------------
+
+pramitgaha | 2023-07-10 12:02:26 UTC | #27
+
+[quote="infamousdegen, post:25, topic:7060"]
+Generally speaking how would the code for .wasm module be stored on icp? Is it even possible to do that to store a wasm module of icrc-1 ledger
+[/quote]
+
+seeing their example: https://github.com/demergent-labs/azle/blob/main/examples/management_canister/src/management_canister.ts#L76C21-L76C21
+
+they are wasm as argument:
+```typescript
+$update;
+export async function executeInstallCode(
+    canisterId: Principal,
+    wasmModule: blob
+): Promise<Result<boolean, string>>{
+             ...
+}```
+
+-------------------------
+
+infamousdegen | 2023-07-10 12:04:47 UTC | #28
+
+Yeah went through that. But my issue is with on how to store the wasm module of my child canister in my main canister 
+
+
+How do I do that
+
+-------------------------
+
+pramitgaha | 2023-07-10 12:09:28 UTC | #29
+
+in rust, I do like this:
+```rs
+const WALLET_WASM: &[u8] = std::include_bytes!("./../../../wasm_files/wallet.wasm.gz");
+```
+maybe you can do something similar in ts, if possible..
+
+-------------------------
+

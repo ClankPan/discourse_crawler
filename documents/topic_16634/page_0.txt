@@ -1,0 +1,134 @@
+levi | 2022-11-18 23:23:07 UTC | #1
+
+Hi People,
+I have a canister mq76c-siaaa-aaaao-aarvq-cai that has a method 'canister_global_timer' with a return type [i32] in a module that was installed before the system-api-method went live. Once the system-api-method went live, the canister now traps when trying to upgrade and when calling methods. 
+
+`Wasm module of canister mq76c-siaaa-aaaao-aarvq-cai is not valid: Wasm module has an invalid function signature. Expected return type [] for 'canister_global_timer', got [I32].`
+
+What can we do for a live canister-module with a method of the same name as a future system-api-method but with a different type?
+Maybe a namespace ic0_ for future system-api methods?
+
+Edit: The [spec](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-module) says there is a namespace: `canister_`.
+
+> * It may not export other methods the names of which start with the prefix `canister_` besides the methods allowed above.
+
+However somehow a module with the method `canister_global_timer` with the return type: [i32] (different than the system-api-method-return-type) was successfully installed.
+
+-------------------------
+
+AdamS | 2022-11-18 21:54:43 UTC | #2
+
+A canister method named `canister_global_timer` would be exported as `"canister_update canister_global_timer"` or `"canister_query canister_global_timer"`, not `"canister_global_timer"`. If you export an unmangled symbol starting with `canister_` that isn't an existing known entry point, that is already disallowed by the spec:
+> * It may not export other methods the names of which start with the prefix `canister_` besides the methods allowed above.
+
+I don't think changing this prefix to `ic0_canister_` would help.
+
+-------------------------
+
+levi | 2022-11-18 22:43:52 UTC | #3
+
+Hi Adam,
+it is an unmangled symbol:
+```
+#[no_mangle]
+async fn canister_global_timer() {
+    
+}
+```
+
+[quote="AdamS, post:2, topic:16634"]
+
+
+> * It may not export other methods the names of which start with the prefix `canister_` besides the methods allowed above.
+
+I don’t think changing this prefix to `ic0_canister_` would help.
+[/quote]
+Good to know it is in the spec. The reserved prefix `canister_` works the same. Is it possible there is a mismatch in the implementation?
+The module with the method above was installed successfully before the canister_global_timer-system-api-method replica update. And after the replica-update, the canister stopped working, and cannot upgrade or process messages.
+You can see yourself, try calling the canister: `mq76c-siaaa-aaaao-aarvq-cai`, method_name: `metrics`, I am seeing the response: 
+`CANISTER_ERROR 
+Wasm module of canister mq76c-siaaa-aaaao-aarvq-cai is not valid: Wasm module has an invalid function signature. Expected return type [] for 'canister_global_timer', got [I32].` 
+You can see the canister's module is live https://dashboard.internetcomputer.org/canister/mq76c-siaaa-aaaao-aarvq-cai with the module-hash: bf007255a2a85a320d0d0c9a4fbcdfe6f871ef89911f6a9c934d7c9758241acf
+
+-------------------------
+
+AdamS | 2022-11-19 00:11:36 UTC | #4
+
+```
+#[no_mangle]
+async fn foo() {
+```
+does *not* declare a canister method. The recommended way of declaring a canister method is
+```
+#[ic_cdk_macros::update]
+async fn foo() {
+```
+and manual usage circumventing the CDK's export macros would look like 
+```
+#[export_name = "canister_update foo"]
+extern "C" fn foo() {
+```
+You are right that the replica could automatically reject functions starting with `canister_` that it does not know about yet. But it is ultimately on you to submit correct code (in particular it is unwise to avoid the CDK if you are not familiar with the details of what it wraps); not every edge case can be accounted for. In this case, if the above code was intended to provide a canister method, then it never worked at all for its intended purpose; the error you are getting now is a symptom of the problem, not the problem itself.
+
+-------------------------
+
+levi | 2022-11-19 02:20:25 UTC | #5
+
+[quote="AdamS, post:4, topic:16634"]
+if the above code was intended to provide a canister method
+[/quote]
+The above code was not for a canister method. It was a placeholder for the canister_global_timer function that I knew was coming.
+
+[quote="AdamS, post:4, topic:16634"]
+the replica could automatically reject functions starting with `canister_` that it does not know about yet.
+[/quote]
+I think this is wise, since allowing it can make a canister unusable and unupgradable and not possible to call data-backup methods.
+
+-------------------------
+
+AdamS | 2022-11-19 04:47:29 UTC | #6
+
+So then an ic0 prefix would not have helped at all, because you *deliberately* used the reserved name, and if there was an ic0 prefix you'd have used that too. Having correct lifecycle function names and signatures is a validity constraint on the entire canister; it's not going to be loaded if it's not there. I'll check with the team to see if there's anything that can be done for this particular canister, but writing the wrong code in a lifecycle function on purpose is inadvisable to say the least.
+
+-------------------------
+
+levi | 2022-11-19 18:10:46 UTC | #7
+
+Its not the prefix alone, it is the namespace where the replica rejects a module that has functions in that namespace that are not part of the spec. ic0 was an example. The namespace `canister_` works the same if the replica rejects modules that have functions that start with `canister_` that are not part of the spec. 
+That particular canister is a test canister so no need to recover it. The main purpose of this post is to make sure something like this cannot happen. I rather focus on making the replica reject modules that have functions that start with `canister_` that are not part of the spec.
+
+-------------------------
+
+berestovskyy | 2022-11-22 20:03:52 UTC | #8
+
+hoi Levi,
+Sorry, I just find out about this thread today.
+
+> That particular canister is a test canister so no need to recover it.
+
+I just started to prepare a way to unblock your canister, but it good to know it's not urgent...
+
+We do validate all the `canister_` exports, but ATM we don't fail the module if there is an unknown `canister_` export: https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/embedders/src/wasm_utils/validation.rs?L853
+
+Seems like we should make an announcement, and after some time enforce the validation...
+
+-------------------------
+
+levi | 2022-11-24 19:53:51 UTC | #9
+
+Hi Andriy,
+
+[quote="berestovskyy, post:8, topic:16634"]
+I just started to prepare a way to unblock your canister, but it good to know it’s not urgent…
+[/quote]
+
+I uninstalled the module, I can create new test data, but thank you for the help 🙏. 
+
+[quote="berestovskyy, post:8, topic:16634"]
+Seems like we should make an announcement, and after some time enforce the validation…
+[/quote]
+
+Yes 👍.
+
+-------------------------
+

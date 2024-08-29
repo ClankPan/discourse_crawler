@@ -1,0 +1,184 @@
+timo | 2023-12-02 16:01:58 UTC | #1
+
+I am wondering what possibilities a user has to verify the frontend is served from an asset canister, for example if that frontend is a web wallet application.
+
+I know the standard asset canister has a form of certification which in my understanding is there to protect against a malicious replica manipulating the assets when serving them. Then there are signed queries which protect against malicious boundary nodes. My question here is what protections are there against the controller of the asset canister changing the assets, even only temporarily. For backend canisters we have the module hash and any changes to it are preserved in the history and publicly accessible. What is there for the assets in an asset canister?
+
+What would be nice it to have a way that the user can 
+1) reproduce the build of the assets from a public repo and get to a hash of all the assets
+2) ask the asset canister what hash it is currently serving
+3) verify the wasm module hash of the asset canister
+
+Then the user would know that the asset canister currently serves a specific version of an open-source web app. Is this currently possible, are there best practices to achieve this and are there pre-existing tools?
+
+Of course it is possible to black-hole the asset canister and then it will serve always the same assets and it might be possible to download them once and verify them. That approach is possible but then the app can't be upgraded and I would be interested in a better approach.
+
+-------------------------
+
+Severin | 2023-12-04 10:23:24 UTC | #2
+
+[quote="timo, post:1, topic:25209"]
+My question here is what protections are there against the controller of the asset canister changing the assets, even only temporarily.
+[/quote]
+
+Not all that much right now. The source of truth about existing assets is the [certified data](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-certified-data) that the canister sets. It can be requested from the outside at any time, and it hashes all the possible certified responses, so it should be a solid source of truth. But of course we don't have a convenient way to get that root hash right now... What do you think would be a nice way to do it? Have a `get_recent_hashes` function that returns the last n (maybe 20) root hashes plus their timestamps?
+
+-------------------------
+
+timo | 2023-12-04 11:27:31 UTC | #3
+
+[quote="Severin, post:2, topic:25209"]
+The source of truth about existing assets is the [certified data ](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-certified-data) that the canister sets.
+[/quote]
+
+Do you mean the current Rust implementation of the asset canister _already_ does that? I mean calculate a hash of its assets and set its certified data blob to that hash? Or do you mean we _can_ do that?
+
+-------------------------
+
+Severin | 2023-12-04 12:42:06 UTC | #4
+
+Almost. It does a similar thing and sets the certified data, but it doesn't really expose a user-friendly way to query that hash.
+
+[quote="timo, post:1, topic:25209"]
+I know the standard asset canister has a form of certification which in my understanding is there to protect against a malicious replica manipulating the assets when serving them.
+[/quote]
+The asset canister serves certified assets according to the [HTTP Gateway spec](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec). As the spec demands the root hash is not a hash of all the assets, but a hash of a tree that includes all valid(=certified) responses, so basically a superset of a hash of all assets. I'm saying superset because for v2 certification this means that even headers are included in the hash tree.
+
+-------------------------
+
+timo | 2023-12-04 13:11:58 UTC | #5
+
+And the root hash is calculated inside the canister? Or is it pre-calculated by dfx and uploaded along with the assets?
+
+If calculated in the canister then it would serve my purpose because then it is a trustworthy fingerprint of the assets and can serve as a "version hash" for the web app. Assuming the module hash of the asset canister checks out against a known list.
+
+-------------------------
+
+Severin | 2023-12-04 13:25:07 UTC | #6
+
+It is computed inside the canister (entry point for your auditing desires is [here](https://github.com/dfinity/sdk/blob/master/src/canisters/frontend/ic-certified-assets/src/lib.rs#L258) :slightly_smiling_face:). And we're (sort-of accidentally) starting to build a list of known asset canister hashes [here](https://github.com/dfinity/motoko-playground/blob/main/service/wasm-utils/whitelisted_wasms.txt).
+
+Can I also have your opinion on how you would best like this information to be exposed? I estimate that it wouldn't be hard at all to make the current hash easily accessible and to expose a history of changes
+
+-------------------------
+
+timo | 2023-12-04 13:46:21 UTC | #7
+
+Thanks!
+
+[quote="Severin, post:2, topic:25209"]
+we don’t have a convenient way to get that root hash right now
+[/quote]
+
+We can get it with curl from the gateway interface, or? By "no convenient way" do you mean we can't get it directly from the canister, for example from another canister?
+
+Re. curl. Can you remind we what URL I have to use? I can't seem to be able to put it together from the spec.
+
+-------------------------
+
+Severin | 2023-12-04 14:09:37 UTC | #8
+
+AFAIK you have to use the state tree for that. From the above-linked section on certified data:
+> The certificate is a blob as described in [Certification](https://internetcomputer.org/docs/current/references/ic-interface-spec/#certification) that contains the values at path `/canister/<canister_id>/certified_data` and at path `/time` of [The system state tree](https://internetcomputer.org/docs/current/references/ic-interface-spec/#state-tree).
+
+Yes, I meant a canister-served history
+
+-------------------------
+
+timo | 2023-12-04 15:22:08 UTC | #9
+
+What tools and libraries are there currently to get the canister certified data root hash?
+
+-------------------------
+
+skilesare | 2023-12-04 15:44:40 UTC | #10
+
+This is actually really tough...especially from inside the IC as the certs aren't returned in update calls...since queries are upgraded to updates when calling canister to canister you can't even get the cert....you can manually return the data.  For ICRC3 I'm having to add a get_tip function that returns this so I can do a manual test:
+
+```
+  public type Tip = {
+
+    // Signature of the root of the hash_tree
+    last_block_index : Blob;
+    last_block_hash : Blob;
+
+    // CBOR encoded hash_tree
+    hash_tree : Blob;
+  };
+
+public func get_tip() : Tip {
+      debug if(debug_channel.certificate) D.print("in get tip certificate");
+      switch(environment){
+        case(null){};
+        case(?env){
+          debug if(debug_channel.certificate) D.print("have env");
+          switch(env.get_certificate_store){
+            case(null){};
+            case(?gcs){
+              debug if(debug_channel.certificate) D.print("have gcs");
+              let ct = CertTree.Ops(gcs());
+              let blockWitness = ct.reveal([Text.encodeUtf8("last_block_index")]);
+              let hashWitness = ct.reveal([Text.encodeUtf8("last_block_hash")]);
+              let merge = MTree.merge(blockWitness,hashWitness);
+              let witness = ct.encodeWitness(merge);
+              return {
+                last_block_hash = switch(state.latest_hash){
+                  case(null) D.trap("No root");
+                  case(?val) val;
+                };
+                last_block_index = encodeBigEndian(state.lastIndex);
+                hash_tree = witness;
+              };
+            };
+          };
+        };
+      };
+
+      D.trap("no environment");
+    };
+```
+But there is no way for me to get the current(or last) cert.
+
+-------------------------
+
+levi | 2023-12-04 18:22:24 UTC | #11
+
+[quote="timo, post:9, topic:25209, full:true"]
+What tools and libraries are there currently to get the canister certified data root hash?
+[/quote]
+
+The canister certified data root hash is available to the canister during a non-replicated query execution using the ic0.data_certificate_copy system api. It is not available through an external read_state request (unlike other paths in the state-tree which are). Asset canisters use this system-api to get the certificate with the certified data during an http_request call and returns the certificate with the certified_data path as a response header. In certification-v1 the header key is `IC-Certificate` and the header value is a 
+format!("certificate=:{}:, tree=:{}:", base64(system-api-certificate-cbor-encoded), base64(cbor-encoded-tree)).
+Not sure what it is in certification-v2. 
+So for an asset canister you can get the system-api-certificate by querying the http_request method for an asset. To get the certified-data root hash from the system-api-certificate you can read the path `canister/<canister-id>/certified_data` in the certificate. 
+
+One way to do that in the Dart language is to use the https://pub.dev/documentation/ic_tools/latest/ic_tools/lookup_path_value_in_an_ic_certificate_tree.html and https://pub.dev/documentation/ic_tools/latest/ic_tools/verify_certificate.html methods.
+Here is a sample verifying the the certified-data of the cycles-minting-canister which returns its certified-data certificate in the `certificate` field of the `get_icp_xdr_conversion_rate` method response record.
+
+```dart
+Record r = c_backwards_one(
+    await cycles_mint.call(
+        calltype: CallType.query,
+        method_name: 'get_icp_xdr_conversion_rate',
+    )
+) as Record;
+Uint8List certificate_bytes = (r['certificate'] as Blob).bytes;
+Map certificate = cbor_simple.cbor.decode(certificate_bytes) as Map;
+await verify_certificate(certificate);
+Uint8List certified_data = lookup_path_value_in_an_ic_certificate_tree(certificate['tree'], [utf8.encode('canister'), cycles_mint.principal.bytes, utf8.encode('certified_data')])!;
+```
+
+links: 
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-read-state
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-certified-data
+
+-------------------------
+
+levi | 2023-12-04 23:18:47 UTC | #12
+
+The service-worker in js also implements reading out the certified data root hash from the http_request responses. I have not looked at the code for it though.  
+
+For an option with better types, you can also use the ic-agent rust library's [lookup_path](https://docs.rs/ic-agent/latest/ic_agent/hash_tree/struct.HashTree.html#method.lookup_path) method on the system-state-tree contained in the [certificate](https://docs.rs/ic-agent/latest/ic_agent/type.Certificate.html).
+
+-------------------------
+

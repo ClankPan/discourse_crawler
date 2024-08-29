@@ -1,0 +1,134 @@
+mariop | 2023-05-30 16:19:33 UTC | #1
+
+Hi,
+
+Last Tuesday, the [Ledger&Tokenization working group has started working on ICRC-3](https://forum.dfinity.org/t/announcing-token-standard-as-topic-of-the-first-meeting-of-the-ledger-tokenization-working-group/11925/128), i.e. the standard to access the transaction log of a Ledger. This forum post is a continuation of that meeting. The goal is to collect ideas and discuss proposals for an effective standard.
+
+### Motivation
+
+The ability to read the transaction log is an essential part of any Ledger. It enables verification of payments and balances as well as providing a way to integrate the Ledger with wallets, block explorers and many other tools.
+
+ICRC-3 should be agnostic over the way transactions are stored by Ledgers. It should provide a unified way to access the transaction log of any ICRC Ledger.
+
+### (Tentative) Terminology
+
+* **Transaction**: anything that changes the state of the Ledger and therefore should be visible in the transaction log. For example: [icrc1_transaction](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/README.md#icrc1_transfer-), [icrc2_approve](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-2/README.md#icrc2_approve) and [icrc2_transfer_from](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-2/README.md#icrc2_transfer_from) are all transactions.
+* **Submitted Transaction**: the arguments to a transaction function, e.g. TransferArg in [icrc1_transfer](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/README.md#icrc1_transfer-). This is what the user submits to the Ledger in order to perform the transaction. Submitted transactions are not unique.
+* **Settled Transaction**: the transaction visible in the transaction log. This includes everything in the submitted transaction plus the information added by the Ledger, e.g. the effective fee or the time the transaction was settled. Settled Transactions are unique and uniquely identified by their index in the transaction log.
+* **(Settled) Transaction Hash**: the hash that uniquely identifies a settled transaction. The algorithm to calculate the hash of a transaction must be public and part of the standard.
+* **(Settled) Transaction Log**: the sequence of settled transactions on the Ledger. In order to make the Ledger verifiable, each transaction stores the hash of the parent transaction, i.e. the previous transaction.
+
+### Scope
+
+There are two problems that a standard for accessing the transaction log should solve:
+
+1. Accessing the transaction log itself to verify payments and balances (both on chain and for external clients).
+2. Indexing the transactions of the log for wallets and block explorers.
+
+We should address the two problems separately. In this post we will focus on the first problem.
+
+### Flexibility
+
+Settled Transactions are defined by each standard, e.g. ICRC-1 will define the [icrc1_transaction](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/README.md#icrc1_transfer-) one. Ledgers don’t have to use the Settled Transaction defined in the standards internally. For instance, a Ledger may store additional non-standard fields in the transaction. This is important because the Transaction Hash must be calculated over the full set of fields of the specific Ledger implementation and not only the ones in the standard defining that Transaction type.
+
+ICRC-3 must establish a protocol to exchange the transaction log between Ledgers and clients that supports verifiability. Transactions should be exchanged as raw values:
+
+```
+type Value = variant {
+    Blob : blob;
+    Text : text;
+    Nat : nat;
+    Nat64: nat64;
+    Int : int;
+    Array : vec Value;
+    Map : vec record { text; Value };
+};
+```
+
+A generic [hash function over Value](https://sourcegraph.com/github.com/dfinity/ic@1c2a5ba31c526041b89affa755cec9a4f55d1aa4/-/blob/packages/icrc-ledger-types/src/icrc/generic_value.rs?L34) is proposed as part of ICRC-3.
+
+An ICRC-3 Ledger must also provide a way to map fields from a Value representing a transaction to the Settled Transaction defined in a standard.
+
+### Proposal
+
+### icrc3_get_transactions
+
+```
+// requests a list of transaction ranges
+
+type GetTransactionsArgs = vec record { start : Nat; length : Nat };
+
+type GenericTransaction = record { id : Nat; transaction : Value };
+
+type GetTransactionResult = record {
+    // The total number of transactions in the log.
+    log_length : nat;
+
+    transactions : vec GenericTransaction;
+
+    // Encoding of instructions for fetching archived transactions
+    // whose indices fall into the requested range.
+    archived_transactions : vec record {
+        // The index of the first archived transaction you can
+        // fetch using the [callback].
+        start : TxIndex;
+
+        // The number of transactions you can fetch using the callback.
+        length : nat;
+
+        // The function you should call to fetch the archived transactions.
+       callback : QueryArchiveFn;
+   };
+};
+
+service : {
+    icrc3_get_transactions : (GetTransactionsArgs) -> (GetTransactionsResult) query;
+}
+```
+
+### icrc3_schema
+
+```
+type TransactionSchema = vec record {
+
+  // code of the standard, e.g. ICRC-1
+  standard : text;
+
+  // map from fields of a Value representing a Transactions
+  // to fields of a Settled Transactions.
+  decoder : vec record {
+    // dot-separated path to the field in the GenericTransaction.transaction
+    source : text;
+
+    // dot-separated path to the field in the Standard Settled Transaction
+    target : text;
+  };
+};
+
+service : {
+    icrc3_schema : () -> (TransactionDecoder) query;
+};
+```
+
+-------------------------
+
+skilesare | 2023-05-22 20:34:11 UTC | #2
+
+[quote="mariop, post:1, topic:20167"]
+ICRC-3 must establish a protocol to exchange the transaction log between Ledgers and clients that supports verifiability. Transactions should be exchanged as raw values
+[/quote]
+
+I'd suggest that something like ICRC-16 may provide more flexibility down the line.  It is hard to predict what kinds of transactions will be needed in the future, so providing a large number of tools can help.
+
+https://forum.dfinity.org/t/icrc-16-candyshared-standardizing-unstructured-data-interoperability/18893
+
+We have libraries for both motoko and rust that convert ICRC-16 objects into optimized object for processing/searching.
+
+https://github.com/icdevs/candy_library
+
+https://crates.io/crates/ic_candy
+
+We also have the beginnings of a CandyPath library that might be helpful for the mappings. https://github.com/ZhenyaUsenko/motoko-candy-utils
+
+-------------------------
+

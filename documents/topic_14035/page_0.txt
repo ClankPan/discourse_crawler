@@ -1,0 +1,168 @@
+Jesse | 2022-06-25 15:03:53 UTC | #1
+
+I’m trying to program my main canister to convert ICP to cycles to be consumed. How does one go about doing this? Any references to code samples would be greatly appreciated.
+
+-------------------------
+
+peterparker | 2022-06-25 16:14:46 UTC | #2
+
+In JavaScript? If yes, I might have a code snippet somewhere…
+
+-------------------------
+
+Jesse | 2022-06-25 18:09:19 UTC | #3
+
+[quote="peterparker, post:2, topic:14035"]
+In JavaScript?
+[/quote]
+
+Yep. That would be perfect.
+
+-------------------------
+
+dpdp | 2022-06-25 20:32:42 UTC | #4
+
+You should be able to reverse engineer it by reading the nns-dapp: https://github.com/dfinity/nns-dapp/blob/a05bac7533fa9bef048bc6660ccb33bac750f993/rs/src/periodic_tasks_runner.rs#L199
+
+I suppose you'll have to do two transactions, an ICP transfer, then a notify_top_up to the CMC (cycle minting canister); where you'd specify the canister who will receive the cycles;
+
+-------------------------
+
+coin_master | 2022-06-25 21:04:59 UTC | #5
+
+Here's also an example with XTC (Which is currently way cheaper).
+
+https://github.com/tarek-eg/ic-nodejs-examples/blob/79ba50c3ea090641391b3797989e9228a4ed6e40/src/xtc.ts#L11
+
+And you can combine it with `mint_by_icp`
+https://docs.dank.ooo/xtc/getting-started/#deposit-icp-to-mint-an-xtc-balance-mint_by_icp
+
+-------------------------
+
+peterparker | 2022-06-26 06:39:20 UTC | #6
+
+To convert ICP in cycles in JavaScript you need:
+
+- a function that does the conversion
+- the exchange rate that can be used in that function for the conversion
+
+The exchange rate can be queried in the CMC canister, so you need its `.did` files. You can copy these from my project for example https://github.com/papyrs/ic/tree/main/ic/cycles
+
+Note: I named these files `cycles.xxx` but it's a bit misleading, `cmc.xxx` would be more accurate, I still need to rename these.
+
+In NodeJS you can query the exchange rate as following (source in my project [here](https://github.com/papyrs/ic/blob/main/scripts/services/cycles.services.mjs)).
+
+Note that I add the conversion to trillion ratio within that function for conveniance reason for my scripts.
+
+```
+import pkgAgent from '@dfinity/agent';
+import fetch from 'node-fetch';
+import {idlFactory as nnsIdlFactory} from '../../ic/cycles/cycles.utils.did.mjs';
+import {E8S_PER_ICP, icpToE8s} from '../utils/icp.utils.mjs';
+
+const {HttpAgent, Actor} = pkgAgent;
+
+const icpXdrConversionRate = async () => {
+  const agent = new HttpAgent({fetch, host: 'https://ic0.app'});
+
+  const actor = Actor.createActor(nnsIdlFactory, {
+    agent,
+    canisterId: 'rkp4c-7iaaa-aaaaa-aaaca-cai'
+  });
+
+  const {data} = await actor.get_icp_xdr_conversion_rate();
+  const {xdr_permyriad_per_icp} = data;
+
+  const CYCLES_PER_XDR = BigInt(1_000_000_000_000);
+
+  // trillionRatio
+  return (xdr_permyriad_per_icp * CYCLES_PER_XDR) / BigInt(10_000);
+};
+```
+
+Once you got the function to get the exchange rate you can for example convert icp to cycles as following:
+
+```
+export const icpToCycles = async (amount) => {
+  const trillionRatio = await icpXdrConversionRate();
+
+  const e8ToCycleRatio = trillionRatio / E8S_PER_ICP;
+  const cyclesAmount = icpToE8s(amount) * e8ToCycleRatio;
+
+  const oneTrillion = BigInt(1000000) * BigInt(1000000);
+
+  console.log(
+    `${amount} ICP equals ${Number(cyclesAmount) / Number(oneTrillion)} (${cyclesAmount}) cycles`
+  );
+
+  return cyclesAmount;
+};
+```
+
+Note that in above example the amount of cycle is a `string` (because I call the function from the command line). That's why it uses a function `icpToE8s` that parse it to `bigint`. You can find its source code [here](https://github.com/papyrs/ic/blob/main/scripts/utils/icp.utils.mjs). 
+
+Let me know if that helps?
+
+***
+
+Side notes:
+
+- this is a NodeJS example. if you need something that works in the browser let me know, we've got that in NNS dapp too
+- I also go cycles to ICP if you need that, let me know too
+- we actually literally discussed last week with my colleague the idea of providing such utilities in a JavaScript library too. as we do with [nns-js](https://github.com/dfinity/nns-js/) the idea would be to provide a "cmc-js" or something. not our top priority but we think it could be cool and handy, so might happen some day
+
+-------------------------
+
+peterparker | 2022-07-15 08:20:20 UTC | #7
+
+I have cleaned my above solution and just shared it in a brief blog post:
+
+https://6zvwc-sqaaa-aaaal-aalma-cai.raw.ic0.app/d/icp-to-cycles-in-javascript
+
+-------------------------
+
+Jesse | 2022-10-21 14:25:39 UTC | #8
+
+I'm finally at the part of my project where I'm ready to implement this solution. I'm reading you blog and just wanted to say, well done! on both the article and application where the article is written.
+
+-------------------------
+
+peterparker | 2022-10-21 14:46:01 UTC | #9
+
+Thanks for the flowers Jesse 🙏. Hearing that someone found one of my small blog posts useful make my day!
+
+Since I published the article it is worth to note that we managed to take some time and create that [`cmc-js`](https://github.com/dfinity/ic-js/tree/main/packages/cmc) I mention in the opening paragraph.
+
+Using this library should also be able to get the ICP to cycles conversion rate quite easily:
+
+```
+import { CMCCanister } from "@dfinity/cmc";
+import { createAgent } from "@dfinity/utils";
+
+const agent = await createAgent({
+  identity,
+  host: HOST,
+});
+
+const { getIcpToCyclesConversionRate } = CMCCanister.create({
+  agent,
+  canisterId: CYCLES_MINTING_CANISTER_ID,
+});
+
+const rate = await getIcpToCyclesConversionRate();
+```
+
+-------------------------
+
+peterparker | 2022-10-24 14:01:55 UTC | #11
+
+I cannot help here, never used the Plug Wallet. You might want to start a new thread as it's not really related to this post or ask Plug directly for more visibility.
+
+-------------------------
+
+Safik | 2022-10-24 19:34:35 UTC | #12
+
+Ok. There is nothing more superfluous in this branch. It is important to me how the Identity class object is generated (from where it comes from). Right now I'm busy creating a module for converting ICP into Cycles.
+
+-------------------------
+

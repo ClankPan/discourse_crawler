@@ -1,0 +1,56 @@
+christian | 2023-11-22 13:30:38 UTC | #1
+
+Hey everyone,
+
+here is the post-mortem on the [SNS subnet incident](https://forum.dfinity.org/t/the-sns-subnet-is-down/24644) that occurred on November 13. Me and the consensus team are happy to take your questions in the comments.
+
+# Summary
+
+After proposal 125586 added one node to the SNS subnet x33ed increasing the total membership from 33 to 34 nodes, it also increased the fault tolerance threshold from 11 to 12 (subnet size is always >= 3f+1 with f number of faulty or malicious nodes). This condition activated a consensus bug at the next catch up package height preventing a validation of enough shares of a threshold signature artifacts (random tape and random beacon) and the subnet stalled. The discovered bug was almost a year old.
+
+# Timeline (UTC)
+
+All times are in UTC on 2023-11-13:
+
+* 12:34: The NNS proposal adding a new node to x33ed [was executed](https://dashboard.internetcomputer.org/proposal/125586).
+* 12:44: The x33ed subnet stopped finalizing.
+* 13:02: The primary on-call engineer notified about the dropped FR of x33ed.
+* 13:11: The consensus team at DFINITY was notified about the incident and the investigation was started immediately.
+* 13:20: The consensus team identified the reason why the subnet cannot make progress (random tape and random beacon missing) but there was no understanding yet of the actual root cause.
+* 14:40: The consensus team identified the bug which prevents the validator from validating sufficiently many random beacon and random tape shares when the subnet threshold increases.
+* 15:32: Since no metrics or logs exposed the root cause of missing artifacts after a subnet membership change, the consensus team decides to recover the subnet with the existing membership to investigate the issue later.
+* 15:20: The team noticed that in the meantime one of the subnet nodes that was offline previously, came back online and the subnet made a progress of 5 rounds. This new data led us to understand the problem much better and the realization that we could possibly get the subnet unstuck using just the [DFINITY-owned node](https://dashboard.internetcomputer.org/node/pe2iu-4l3d6-vu4tr-s4e6k-2fgnh-a6xup-ewdph-c2a62-l2scj-rsmou-uae) on that subnet (the details are in the technical details section below).
+* 16:10 The consensus team repeatedly restarts the DFINITY node on subnet x33ed to mimic the behavior of a faulty node, which allowed it to construct the random beacon and random tape artifacts. The subnet makes progress again.
+
+# What went wrong?
+
+* The subnet did not finalize for 18 minutes before anyone noticed.
+* The analysis of the incident was difficult because after recent changes to the observability infrastructure, a lot of old dashboards did not exist anymore.
+* No test has caught the bug in a year. There were automated tests testing membership changes, including with faulty nodes, but not triggering a subnet threshold increase, only a decrease.
+
+# Where did we get lucky?
+
+* One node came back online, triggered a short progress of the subnet which provided new hints in understanding of the problem.
+* We could hit the expected race condition on the second try and avoid a NNS-based subnet recovery.
+
+# What went right?
+
+* Excellent team work resulting in a relatively quick finding of the bug and recovering of the subnet without NNS proposals.
+
+# Technical details
+
+A subnet generates a Random Beacon through each node proposing a Random Beacon Share. These Random Beacon Shares are then aggregated into a Random Beacon. A subnet of size 3f+1, where 'f' represents the maximum number of malicious nodes, requires f+1 Random Beacon Shares at height 'h' to construct a Random Beacon of the same height and to progress further. About a year ago an optimization was introduced that stops validating incoming Random Beacon Shares once there are already f + 1 shares in node's artifact pool. However, this optimization had a bug: The f + 1 threshold in the validator was determined using the subnet size at the last CUP height, but it should have been based on the membership of the current DKG interval.
+
+When the node count in the subnet increased from 33 to 34, the f + 1 threshold increased from 11 nodes to 12. This membership alteration was effective from height 329723000. However, it takes several consensus rounds until the CUP for that height is available (since a CUP requires certification). In the interim, the CUP height remains at 329722800. As a result, although 12 Random Beacon Shares were needed, the nodes would only validate 11, causing the subnet to stall. Note that the same problem applies to the Random Tape as well.
+
+However, a subtle exception to this rule was identified: nodes do not validate their own Random Beacon Shares as they inherently trust themselves, meaning the validation code is not activated when nodes propose their own Random Beacon Share. This led to a race condition: If a node initially receives and validates 11 shares before proposing its own share, it ends up with 12 shares in the pool, enough to create a valid Random Beacon. The node then gossips the aggregated Random Beacon to all other nodes, allowing the subnet to make a slight progress before it gets stuck again. This scenario was discovered purely by chance when a faulty node returned online, causing the subnet's height to jump by 5.
+
+To resolve this issue, the subnet needed to advance a few more heights until a new CUP became available, at which point the bug would no longer be triggered. Since DFINITY had control over one node in the subnet, an attempt was made to recreate the behavior of the faulty node. After two attempts, the expected behavior was successfully triggered, some progress was made, the CUP became accessible, and the subnet was making progress again.
+
+## Action Items Taken
+
+* Bug fixed
+* Testing gap closed
+
+-------------------------
+

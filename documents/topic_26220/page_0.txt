@@ -1,0 +1,205 @@
+luc-blaeser | 2024-01-05 12:22:13 UTC | #1
+
+After a longer beta testing phase and some fine-tuning, we now "bless" the incremental garbage collector, declaring it production ready for the upcoming `dfx` versions 0.15.3 or higher.
+
+This is the next step before finally making the incremental GC the default GC in Motoko.
+
+# DFX Version
+
+Using the incremental GC for production purposes is only recommended with the upcoming `dfx` versions 0.15.3 or higher. Please also consider the usage note and recommendations below.
+
+To activate the incremental GC, the following command-line argument needs to be specified in `dfx.json`:
+
+```
+
+"type" : "motoko"
+
+...
+
+"args" : "--incremental-gc"
+
+```
+
+# Usage Note
+
+The incremental GC is designed to scale for large program heap sizes. While resolving scalability issues with regard to the instruction limit of the GC work, it is now possible to hit other scalability limits:
+
+- _Out of memory_: A program can run out of memory if it fills the entire memory space with live objects.
+
+- _Upgrade limits_: When using stable variables, the current mechanism of serialization and deserialization to and from stable memory can exceed the instruction limit or run out of memory.
+
+# Recommendations
+
+- _Test the upgrade_: Thoroughly test the upgrade mechanism for different data volumes and heap sizes and conservatively determine the amount of stable data that is supported when upgrading the program.
+
+- _Monitor the heap size_: Monitor the memory and heap size of the application in production.
+
+- _Limit the heap size_: Implement a custom limit in the application to keep the heap size and data volume below the scalability limit that has been determined during testing, in particular for the upgrade mechanism.
+
+- _Avoid large allocations per message_: Avoid large allocations of 100 MB or more per message, but rather distribute larger allocations across multiple messages. Large allocations per message extend the duration of the GC increment. Moreover, memory pressure may occur because the GC has a higher reclamation latency than a classical stop-the-world collector.
+
+- _Consider a backup query function_: Depending on the application case, it can be beneficial to offer a privileged _query_ function to extract the critical canister state in several chunks. The runtime system maintains an extra memory reserve for query functions. Of course, such a function has to be implemented with a check that restricts it to authorized callers only. It is also important to test this function well.
+
+- _Last resort if memory would be full_: Assuming the memory is full with objects that have shortly become garbage before the memory space has been exhausted, the canister owner or controllers can call the system-level function `__motoko_gc_trigger()` multiple times to run extra GC increments and complete a GC run, for collecting the latest garbage in a full heap. Up to 100 calls of this function may be needed to complete a GC run in a 4GB memory space with fine-grained object structures. The GC keeps a specific memory reserve to be able to perform its work even if the application has exhausted the memory. Usually, this functionality is not needed in practice but is only useful in such exceptional cases.
+
+# Feedback
+
+We are very happy to receive your feedback. Please do not hesitate to contact us here in the forum or on Motoko GitHub project site: https://github.com/dfinity/motoko
+
+All the best and happy new year!
+
+-------------------------
+
+skilesare | 2024-01-05 14:29:11 UTC | #2
+
+Awesome Luc!!!! Thanks for the hard work.
+
+[quote="luc-blaeser, post:1, topic:26220"]
+the canister owner or controllers can call the system-level function `__motoko_gc_trigger()` multiple times
+[/quote]
+
+Is this exposed from a motoko base library like ExperamentalInternetComputer or something like that?
+
+-------------------------
+
+luc-blaeser | 2024-01-05 15:20:39 UTC | #3
+
+Thank you, Austin.
+
+The special function is currently not yet defined in base library, but we should consider to add it.
+
+It can be invoked for example via `dfx` with:
+```
+dfx canister call <my_canister> __motoko_gc_trigger "()"
+```
+
+My motivation was that this is a rather low-level "last-resort" administrative function that would be externally called by the canister controller/owner in the rare case when memory is full but garbage has been created shortly before the memory has been exhausted.
+
+-------------------------
+
+skilesare | 2024-01-05 16:36:42 UTC | #4
+
+Ahh..I see...it is auto added like the candid definitions. Nice...I think that is probably fine then.
+
+-------------------------
+
+cristinaLoustaunau | 2024-01-05 17:11:02 UTC | #5
+
+Awesome!! Thank you 😃
+
+-------------------------
+
+timo | 2024-01-07 09:13:36 UTC | #6
+
+What algorithm is used by the incremental GC (does it have a Wikipedia page)?
+
+-------------------------
+
+luc-blaeser | 2024-01-08 09:19:07 UTC | #7
+
+Hi Timo,
+
+The incremental GC uses a partitioned heap with incremental snapshot-at-the-beginning marking and incremental evacuation-compaction based on Brooks forwarding pointers, by prioritizing partitions with most garbage space above a threshold (currently 15%). It is very similar to one of the Java's most advanced GCs, the Shenandoah GC. 
+
+The GC algorithm is described in detail in: https://dl.acm.org/doi/pdf/10.1145/3623507.3627672
+
+-------------------------
+
+bitbruce | 2024-01-09 03:34:35 UTC | #8
+
+[quote="luc-blaeser, post:3, topic:26220"]
+My motivation was that this is a rather low-level “last-resort” administrative function that would be externally called by the canister controller/owner in the rare case when memory is full but garbage has been created shortly before the memory has been exhausted.
+[/quote]
+
+It is recommended that __motoko_gc_trigger() be used as a base function so that it can be called explicitly in Motoko code.
+
+-------------------------
+
+luc-blaeser | 2024-01-09 08:21:43 UTC | #9
+
+Thank you for the question.
+
+The administrative function `__motoko_gc_trigger()` is only foreseen for the rare case, where a canister has run out of memory and the program has created garbage shortly before memory was exhausted. Apart from this case, the default GC scheduling heuristics should be sufficient. Therefore, it is not necessary to proactively call this function, as it may even disturb the GC scheduling (i.e. starting new GC runs too eagerly and thus increasing the cycle costs).
+
+-------------------------
+
+rossberg | 2024-01-09 09:38:45 UTC | #10
+
+I'd phrase this even more strongly. Rule of thumb: Whenever we believe it's a good idea to programmatically trigger a GC, we're usually wrong. ;)
+
+-------------------------
+
+bitbruce | 2024-01-10 01:59:20 UTC | #11
+
+[quote="luc-blaeser, post:9, topic:26220"]
+The administrative function `__motoko_gc_trigger()` is only foreseen for the rare case, where a canister has run out of memory and the program has created garbage shortly before memory was exhausted. Apart from this case, the default GC scheduling heuristics should be sufficient. Therefore, it is not necessary to proactively call this function, as it may even disturb the GC scheduling (i.e. starting new GC runs too eagerly and thus increasing the cycle costs).
+[/quote]
+
+I've got a challenge with incremental GC:
+
+we were using trie to store small fine-grained data, and after storing 700,000 records, the memory footprint was 1.5 G. Then the issue arose, continued to write data to the canister (no delete operations)， about 100,000 records, and then the memory growth rate increased significantly, reaching the 4G limit in a few hours. During this process, it seems that the gc cannot catch up with the speed of data writing, resulting in a large amount of garbage buildup. Am I understanding this correctly?
+
+If I use compacting GC, 800,000 records only takes up 1.7G of memory.
+
+I'm testing this in moc 0.9.7, has it improved in version 0.10.3?
+
+What is the best way to deal with this? Would it help if I write an empty update method and keep calling it?
+
+-------------------------
+
+icme | 2024-01-10 04:52:03 UTC | #12
+
+[quote="bitbruce, post:11, topic:26220"]
+we were using trie to store small fine-grained data, and after storing 700,000 records, the memory footprint was 1.5 G.
+[/quote]
+
+I'm surprised that you didn't hit issues with the compacting GC before 1.5GB :sweat_smile:
+
+[quote="bitbruce, post:11, topic:26220"]
+Then the issue arose, continued to write data to the canister (no delete operations)， about 100,000 records, and then the memory growth rate increased significantly, reaching the 4G limit in a few hours.
+[/quote]
+
+Is your heap size actually 4GB when you call `Prim.rts_heap_size()`? Or are you referring to your canister's memory size `Prim.rts_memory_size()`?
+
+[quote="bitbruce, post:11, topic:26220"]
+During this process, it seems that the gc cannot catch up with the speed of data writing, resulting in a large amount of garbage buildup. Am I understanding this correctly?
+[/quote]
+
+If you've gotten to the point where the GC is blocked (too much garbage to collect over a few rounds of DTS consensus), then you're in danger of your canister becoming unresponsive to additional insertions. This is where the incremental GC should shine (allowing you to use the full 4GB heap).
+
+You should be able to activate the incremental GC before the 0.15.3 dfx release by following these instructions - https://forum.dfinity.org/t/incremental-garbage-collector-beta-release-motoko-update-part-12/20066
+
+One additional area of improvement suggestion I might recommend. The TrieMap in motoko base isn't nearly as memory efficient as some of the other libraries out there. https://dfinity.github.io/canister-profiling/collections/#map has statistics on a few of the currently available map libraries out there. Maybe look into a data migration that can save you space while you're at it!
+
+-------------------------
+
+luc-blaeser | 2024-01-10 08:35:12 UTC | #13
+
+Thank you very much for sharing your experience.
+
+Indeed, the beta-version GC used to have quite long scheduling pauses in the memory range of 1 to 3 GB. This could explain the observed behavior. 
+
+We actually tuned the scheduling of the GC to be more conservative in the newer production-ready version. It is therefore recommendable to use `moc` version >= 0.10.3 or upcoming `dfx` >= 0.15.3. We also added a memory reserve such that GC should be able to do its work (evacuation compaction) even if memory is short.
+
+As mentioned by @icme, it is good to observe the heap size, not only the memory size, as the latter may be larger. As usual, extensive testing of the application code with large data sizes is very much recommended to see at to which point the application still scales and the upgrades are still working.
+
+-------------------------
+
+bitbruce | 2024-01-10 09:44:10 UTC | #14
+
+Thanks for your replies.
+
+[quote="icme, post:12, topic:26220"]
+Is your heap size actually 4GB when you call `Prim.rts_heap_size()`? Or are you referring to your canister’s memory size `Prim.rts_memory_size()`?
+[/quote]
+
+I use Prim.rts_memory_size(). Next I'll watch Prim.rts_heap_size().
+
+[quote="icme, post:12, topic:26220"]
+I’m surprised that you didn’t hit issues with the compacting GC before 1.5GB
+[/quote]
+
+Several canister upgrades were experienced during the process, so that may have interfered with the observations.
+
+-------------------------
+

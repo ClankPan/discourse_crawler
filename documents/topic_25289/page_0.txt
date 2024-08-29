@@ -1,0 +1,770 @@
+ktimam | 2023-12-05 17:50:23 UTC | #1
+
+I've been able to get jolt physics sample to run on icp. 
+It gives the following error though after few steps:
+
+The replica returned a replica error: reject code CanisterError, reject message IC0502: Canister bkyz2-fmaaa-aaaaa-qaaaq-cai trapped: heap out of bounds, error code Some("IC0502")
+
+Any thoughts on what might be causing this?
+Latest Sample is over here:
+https://github.com/ktimam/JoltSample
+
+-------------------------
+
+abk | 2023-12-06 11:57:05 UTC | #2
+
+Hi @ktimam,
+I've been working on adding the ability to return backtraces with traps like these and I could try testing it out on your canister to see if it helps narrow down where the error is occurring. Could you provide the compiled Wasm with the `name` custom section included? (That section should be generated at compilation, so just keep it in by not running optimization tools that strip custom sections).
+
+-------------------------
+
+ktimam | 2023-12-06 14:01:29 UTC | #3
+
+I might have some clue on where this might be stemming from.
+In sCollideShapeVsShape, some static functions are being used. Commenting out the code inside the function removes the issue, while decreasing code inside the function causes the simulation to run for a couple of extra lines of code before breaking again. Seems the use of the static functions is eating up the heap which seems to be more limited in size than usual. Appreciate if someone can confirm this finding and whether there's a solution or should all those static functions be replaced by normal functions?
+https://github.com/ktimam/JoltSample/blob/41d9ae4024c5fd5885673483eb35e700642d6e30/Jolt/Physics/Collision/CollisionDispatch.h#L33C22-L33C22
+
+-------------------------
+
+abk | 2023-12-06 15:20:36 UTC | #4
+
+Overflowing the stack could trigger a heap out of bounds error (Wasmtime can't tell that the oob access was actually supposed to be a stack access). I wouldn't expect making the `static` functions normal ones would make a difference though.
+
+If you could send a Wasm module with the name section to test maybe we would see a long chain of these calls which could hint at stack overflow.
+
+-------------------------
+
+ktimam | 2023-12-07 19:34:53 UTC | #5
+
+Thanks for the help. Here is the wasm file I could generate (not sure if it has the name section you need):
+https://www.dropbox.com/scl/fi/c8c3ditrzy7ex9oijcipe/joltsample.wasm?rlkey=9u1xyj9ghxce3grb1w0mksd0l&dl=0
+
+-------------------------
+
+abk | 2023-12-11 10:10:17 UTC | #6
+
+Sorry, that wasm has had the "name" section removed. Is your toolchain using something like [`wasm-strip`](https://github.com/WebAssembly/wabt?tab=readme-ov-file#wabt-the-webassembly-binary-toolkit), [`ic-wasm shrink`](https://github.com/dfinity/ic-wasm?tab=readme-ov-file#shrink), or [`wasm-opt`](https://github.com/WebAssembly/binaryen?tab=readme-ov-file#tools) at the end to make the module smaller? If so, could you provide a copy of the module before any of those tools are run?
+
+One way to verify that the "name" section is present is to install `wasm-objdump` from [WABT](https://github.com/WebAssembly/wabt) and run `wasm-objdump -h` on your Wasm file. If you see a line like:
+```
+Custom start=0x00218d8c end=0x00229def (size=0x00011063) "name"
+```
+then it's still there.
+
+-------------------------
+
+icpp | 2023-12-12 02:44:28 UTC | #7
+
+@abk ,
+
+I am trying to also help out with this issue. Thank you for looking into this!
+
+I do not fully understand what you are asking about. Can you try to explain it further?
+
+The wasm was created with icpp, which uses the wasi-sdk to compile C++ to wasm. 
+
+No stripping of custom sections takes place, but we also do not add any custom sections. 
+
+Where would that "name" section come from and why do you need it?
+
+-------------------------
+
+abk | 2023-12-12 09:16:40 UTC | #8
+
+By default `wasi-sdk` should be creating the name section when it generates a `.wasm` file. For example, if I create this C program `foo.c`:
+```C
+int main {
+    return 5;
+}
+```
+and compile it using the `wasi-sdk` installed by `icpp`:
+```bash
+/home/adam/.icpp/wasi-sdk-20.0/bin/clang --sysroot=/home/adam/.icpp/wasi-sdk-20.0/share/wasi-sysroot foo.c -o foo.wasm
+```
+then the resulting `foo.wasm` will have a name section:
+```
+❯ wasm-objdump -x -j name foo.wasm
+
+foo.wasm:	file format wasm 0x1
+
+Section Details:
+
+Custom:
+ - name: "name"
+ - func[0] <__imported_wasi_snapshot_preview1_proc_exit>
+ - func[1] <__wasm_call_ctors>
+ - func[2] <_start>
+ - func[3] <__original_main>
+ - func[4] <__wasi_proc_exit>
+ - func[5] <dummy>
+ - func[6] <__wasm_call_dtors>
+ - global[0] <__stack_pointer>
+```
+
+I think the `-Wl,--strip-all` linker flag you're passing [here](https://github.com/icppWorld/icpp-pro/blob/a78c2f3cbc47c9b20eac98e6b9fcc90c2f733492/src/icpp/config_default.py#L132C1-L132C13) is telling the linker to skip the name section. If I add that to my example command above:
+```bash
+/home/adam/.icpp/wasi-sdk-20.0/bin/clang --sysroot=/home/adam/.icpp/wasi-sdk-20.0/share/wasi-sysroot -Wl,--strip-all foo.c -o foo.wasm
+```
+then the resulting Wasm no longer has the name section:
+```bash
+❯ wasm-objdump -x -j name foo.wasm
+
+foo.wasm:	file format wasm 0x1
+
+Section Details:
+
+Section not found: name
+```
+
+So @ktimam, what I think you need to do is modify your installed `icpp` to take out that flag, or manually run the link command without that flag.
+
+-------------------------
+
+abk | 2023-12-12 09:24:30 UTC | #9
+
+By the way, @icpp I encountered an error when trying to build the hello world example for `icpp-pro`. Here are the commands I ran:
+```bash
+# create virtualenv and activate it
+python -m venv venv
+source venv/bin/activate
+
+# install icpp-pro and wasi-sdk
+pip install icpp-pro
+icpp install-wasi-sdk
+
+# create and build hello-world
+icpp init
+cd greet/
+icpp build-wasm
+```
+The versions I have are then:
+```
+❯ python --version
+Python 3.8.10
+
+❯ icpp --version
+icpp-pro version: 3.9.0
+wasi-sdk version: wasi-sdk-20.0
+
+```
+And the error I get for the build command is:
+```txt
+╭─────────────────────────────── Traceback (most recent call last) ────────────────────────────────╮
+│ /home/adam/experiments/icpp/venv/lib/python3.8/site-packages/icpp/decorators.py:63 in decorated  │
+│                                                                                                  │
+│    60 │   │   │   │   install_wasi_sdk()                                                         │
+│    61 │   │   │   │   typer.echo("Now that the wasi-sdk is installed, we can build things.")     │
+│    62 │   │   │                                                                                  │
+│ ❱  63 │   │   │   return f(*args, **kwargs)                                                      │
+│    64 │   │                                                                                      │
+│    65 │   │   return decorated                                                                   │
+│    66                                                                                            │
+│                                                                                                  │
+│ ╭────────────────────────── locals ──────────────────────────╮                                   │
+│ │   args = ()                                                │                                   │
+│ │      f = <function build_wasm at 0x7f4a55531790>           │                                   │
+│ │ kwargs = {'to_compile': 'all', 'generate_bindings': 'yes'} │                                   │
+│ ╰────────────────────────────────────────────────────────────╯                                   │
+│                                                                                                  │
+│ /home/adam/experiments/icpp/venv/lib/python3.8/site-packages/icpp/commands_build_wasm.py:53 in   │
+│ build_wasm                                                                                       │
+│                                                                                                  │
+│    50 │                                                                                          │
+│    51 │   Reads icpp.toml in the current folder; Compiles & builds a wasm file.                  │
+│    52 │   """                                                                                    │
+│ ❱  53 │   from icpp import icpp_toml  # pylint: disable = import-outside-toplevel                │
+│    54 │                                                                                          │
+│    55 │   build_path = icpp_toml.icpp_toml_path.parent / "build"                                 │
+│    56 │   typer.echo(f"Build folder: {build_path.resolve()}")                                    │
+│                                                                                                  │
+│ ╭───────── locals ──────────╮                                                                    │
+│ │ generate_bindings = 'yes' │                                                                    │
+│ │        to_compile = 'all' │                                                                    │
+│ ╰───────────────────────────╯                                                                    │
+│                                                                                                  │
+│ /home/adam/experiments/icpp/venv/lib/python3.8/site-packages/icpp/icpp_toml.py:32 in <module>    │
+│                                                                                                  │
+│    29 │   sys.exit(1)                                                                            │
+│    30                                                                                            │
+│    31                                                                                            │
+│ ❱  32 def validate(d_in: dict[Any, Any]) -> None:                                                │
+│    33 │   """Validates if required fields are present"""                                         │
+│    34 │   if "build-wasm" not in d_in.keys():                                                    │
+│    35 │   │   typer.echo(                                                                        │
+│                                                                                                  │
+│ ╭─────────────────────────────────────────── locals ───────────────────────────────────────────╮ │
+│ │            Any = typing.Any                                                                  │ │
+│ │           glob = <module 'glob' from '/usr/lib/python3.8/glob.py'>                           │ │
+│ │ icpp_toml_path = PosixPath('icpp.toml')                                                      │ │
+│ │           Path = <class 'pathlib.Path'>                                                      │ │
+│ │            sys = <module 'sys' (built-in)>                                                   │ │
+│ │        tomllib = <module 'tomli' from                                                        │ │
+│ │                  '/home/adam/experiments/icpp/venv/lib/python3.8/site-packages/tomli/__init… │ │
+│ │          typer = <module 'typer' from                                                        │ │
+│ │                  '/home/adam/experiments/icpp/venv/lib/python3.8/site-packages/typer/__init… │ │
+│ ╰──────────────────────────────────────────────────────────────────────────────────────────────╯ │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+TypeError: 'type' object is not subscriptable
+
+-------------------------
+
+icpp | 2023-12-13 01:09:28 UTC | #10
+
+Thanks for reporting that. I will investigate and fix.
+
+-------------------------
+
+icpp | 2023-12-13 02:46:51 UTC | #11
+
+@ktimam ,
+
+I will also push out a new release later this week or in the weekend to allow you to build without that flag, so we can provide @abk with a wasm that includes the name.
+
+I will post a message in this thread once it is available.
+
+-------------------------
+
+icpp | 2023-12-13 12:29:48 UTC | #12
+
+> I encountered an error when trying to build the hello world example for `icpp-pro` .
+
+@abk,
+
+I tested it, and the error does not happen when you use python 3.9 or higher.
+
+I will investigate if I can back-port to python 3.8, or if I will make python 3.9+ a requirement.
+
+Thanks again for reporting this.
+
+-------------------------
+
+abk | 2023-12-13 13:40:12 UTC | #13
+
+[quote="icpp, post:12, topic:25289"]
+I tested it, and the error does not happen when you use python 3.9 or higher.
+[/quote]
+
+Sounds good. Yeah you probably at least want to give an error that the version isn't compatible.
+
+-------------------------
+
+icpp | 2023-12-16 16:02:51 UTC | #14
+
+@abk,
+icpp-pro 3.10.0 has been released:
+- it works again for python 3.8
+- you cannot install with python 3.7 or earlier
+
+I also updated the ci/cd pipeline to test on python 3.8, so I will not break it again.
+
+Thanks again for reporting the issue!
+
+-------------------------
+
+icpp | 2023-12-18 21:12:44 UTC | #15
+
+@ktimam (CC. @abk )
+
+I have pushed out a release candidate (`icpp-pro 3.11.0rc1`) which provides fine-grained control over the compile & link flags.
+
+I created an example canister, [canister_flags](https://github.com/icppWorld/icpp-pro/tree/main/test/canisters/canister_flags), that uses this `icpp.toml` and it is not stripping out the information from the wasm file:
+
+```toml
+[build-wasm]
+canister = "my_canister"
+did_path = "src/my_canister.did"
+cpp_paths = ["src/*.cpp"]
+cpp_include_dirs = ["src/vendors/*"]
+cpp_compile_flags = ["-D JSON_HAS_FILESYSTEM=0"]
+cpp_link_flags = []
+c_paths = []
+c_include_dirs = []
+c_compile_flags = []
+# if non-empty, these defaults will overwrite internal settings
+# Implemented to support investigation of this issue:
+# https://forum.dfinity.org/t/heap-out-of-bounds-error-code-some-ic0502-on-c-code-run/25289/6?u=icpp
+cpp_compile_flags_defaults = [
+    # "-O3",
+    # "-flto",
+    "-fno-exceptions", # required for IC
+    # "-fvisibility=hidden",
+    "-D NDEBUG",
+    "-D ICPP_VERBOSE=0",
+]
+cpp_link_flags_defaults = [
+    "-nostartfiles",
+    "-Wl,--no-entry",
+    # "-Wl,--lto-O3",
+    # "-Wl,--strip-all",
+    # "-Wl,--strip-debug",
+    "-Wl,--stack-first",
+    "-Wl,--export-dynamic", # required for IC
+]
+c_compile_flags_defaults = [
+    # "-O3",
+    # "-flto",
+    "-fno-exceptions", # required for IC
+    # "-fvisibility=hidden",
+    "-D NDEBUG",
+    "-D ICPP_VERBOSE
+```
+
+NOTES:
+- I verified that the sections are there, using wabt's `wasm-objdump -h`:
+  ```bash
+  $ wasm-objdump -h build/my_canister.wasm
+
+  my_canister.wasm:       file format wasm 0x1
+
+  Sections:
+
+     Type start=0x0000000b end=0x000001a9 (size=0x0000019e) count: 61
+     Import start=0x000001ac end=0x00000252 (size=0x000000a6) count: 8
+   Function start=0x00000256 end=0x0000448d (size=0x00004237) count: 16948
+    Table start=0x0000448f end=0x00004496 (size=0x00000007) count: 1
+   Memory start=0x00004498 end=0x0000449b (size=0x00000003) count: 1
+   Global start=0x0000449e end=0x00004b61 (size=0x000006c3) count: 247
+   Export start=0x00004b65 end=0x000093b7 (size=0x00004852) count: 505
+     Elem start=0x000093ba end=0x00009bce (size=0x00000814) count: 1
+     Code start=0x00009bd3 end=0x00218918 (size=0x0020ed45) count: 16948
+     Data start=0x0021891c end=0x002248c1 (size=0x0000bfa5) count: 2
+   Custom start=0x002248c4 end=0x0022521d (size=0x00000959) ".debug_info"
+   Custom start=0x00225220 end=0x00225b43 (size=0x00000923) ".debug_loc"
+   Custom start=0x00225b45 end=0x00225b73 (size=0x0000002e) ".debug_ranges"
+   Custom start=0x00225b76 end=0x00225ff7 (size=0x00000481) ".debug_abbrev"
+   Custom start=0x00225ffa end=0x002268c1 (size=0x000008c7) ".debug_line"
+   Custom start=0x002268c4 end=0x00226c44 (size=0x00000380) ".debug_str"
+   Custom start=0x00226c49 end=0x0113db75 (size=0x00f16f2c) "name"
+   Custom start=0x0113db77 end=0x0113dbac (size=0x00000035) "producers"
+   Custom start=0x0113dbae end=0x0113dbe7 (size=0x00000039) "target_features"
+  ```
+- The wasm file becomes MUCH bigger, but using gzip brings it down below 2Mb. So, use gzip prior to deploying, as indicated in the dfx.json
+
+-------------------------
+
+abk | 2023-12-19 09:28:26 UTC | #16
+
+That looks great. Would you be able to build a version of your canister with that release @ktimam ?
+
+-------------------------
+
+ktimam | 2023-12-19 11:03:49 UTC | #17
+
+WASM created (its bigger than the limit even after zipping though, so couldn't deploy):
+https://www.dropbox.com/scl/fi/ga3zpawa5lwup3e3c5khd/joltsample.wasm.gz?rlkey=9hmb8nk65wg9gsfnqu6vpoxo3&dl=0
+
+-------------------------
+
+abk | 2023-12-20 15:43:21 UTC | #18
+
+Here's the backtrace I got when executing the "hello" query:
+```
+IC0502: Canister rwlgt-iiaaa-aaaaa-aaaaa-cai trapped: heap out of bounds.
+Backtrace: 
+0: JPH::PhysicsSystem::ProcessBodyPair(JPH::ContactConstraintManager::ContactAllocator&, JPH::BodyPair const&)
+1: JPH::PhysicsSystem::JobFindCollisions(JPH::PhysicsUpdateContext::Step*, int)
+2: JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2::operator()() const
+3: decltype(std::declval<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&>()()) std::__2::__invoke[abi:v160000]<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&>(JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&)
+4: void std::__2::__invoke_void_return_wrapper<void, true>::__call<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&>(JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&)
+5: std::__2::__function::__default_alloc_func<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2, void ()>::operator()[abi:v160000]()
+6: void std::__2::__function::__policy_invoker<void ()>::__call_impl<std::__2::__function::__default_alloc_func<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2, void ()>>(std::__2::__function::__policy_storage const*)
+7: std::__2::__function::__policy_func<void ()>::operator()[abi:v160000]() const
+8: std::__2::function<void ()>::operator()() const
+9: JPH::JobSystem::Job::Execute()
+10: JPH::JobSystemSingleThreaded::QueueJob(JPH::JobSystem::Job*)
+11: JPH::JobSystemSingleThreaded::QueueJobs(JPH::JobSystem::Job**, unsigned int)
+12: JPH::JobSystem::JobHandle::sRemoveDependencies(JPH::JobSystem::JobHandle const*, unsigned int, int)
+13: void JPH::JobSystem::JobHandle::sRemoveDependencies<32u>(JPH::StaticArray<JPH::JobSystem::JobHandle, 32u>&, int)
+14: JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)
+15: canister_query hello
+16: canister_query hello.command_export
+```
+So it looks like the issue is in `ProcessBodyPair`. I can look at it a bit more later.
+
+-------------------------
+
+ktimam | 2023-12-20 21:38:46 UTC | #19
+
+[quote="abk, post:18, topic:25289"]
+`ProcessBodyPair`
+[/quote]
+
+Thanks for the trace. Delving deeper you'll find that it breaks in CollisionDispatch::sCollideShapeVsShape, which is a static function, which won't appear in the trace. When analyzing CollisionDispatch::sCollideShapeVsShape, it is accessing sCollideShape, which is a function pointer table (another use of static functions). All of this use of static functions is my deduction for why it gives out of heap error. 
+Is there a way to run dfx without the heap limitation to check if the program would run fine?
+
+-------------------------
+
+abk | 2023-12-21 09:34:43 UTC | #20
+
+I can see if it's possible to modify dfx to have a larger stack.
+
+But how do you know that the oob access is happening in `sCollideShapeVsShape`? Looking at the generated Wasm that function isn't actually being inlined so I think it should show up in the backtrace if that's where the error occured.
+
+Here's where the call to `sCollideShapeVsShape` happens in `ProcessBodyPair`:
+```
+❯ wasm-objdump -d joltsample.wasm
+
+joltsample.wasm:        file format wasm 0x1
+
+Code Disassembly:
+...
+59425c func[11073] <JPH::PhysicsSystem::ProcessBodyPair(JPH::ContactConstraintManager::ContactAllocator&, JPH::BodyPair const&)>:
+ 59425e: 67 7f                      | local[0..102] type=i32
+ 594260: 01 7d                      | local[103] type=f32
+...
+ 595fea: 20 dd 04                   |         local.get 605
+ 595fed: 20 df 04                   |         local.get 607
+ 595ff0: 10 aa 90 80 80 00          |         call 2090 <JPH::CollisionDispatch::sCollideShapeVsShape(JPH::Shape const*, JPH::Shape const*, JPH::Vec3, JPH::Vec3, JPH::Mat44 const&, JPH::Mat44 const&, JPH::SubSha
+peIDCreator const&, JPH::SubShapeIDCreator const&, JPH::CollideShapeSettings const&, JPH::CollisionCollector<JPH::CollideShapeResult, JPH::CollisionCollectorTraitsCollideShape>&, JPH::ShapeFilter const&)>
+ 595ff6: 41 88 02                   |         i32.const 264
+ 595ff9: 21 e0 04                   |         local.set 608
+ 595ffc: 20 05                      |         local.get 5
+
+-------------------------
+
+ktimam | 2023-12-21 10:19:48 UTC | #21
+
+The function is inlined, correct.
+![image|690x133](upload://redZ5bnDBDzypU3824HFIgsPMmc.png)
+
+I added some logs until i found out the program breaks at this specific part. 
+
+Would be great if dfx could be modified to increase heap limits to verify if it fixes the issue, thanks a lot.
+
+-------------------------
+
+abk | 2023-12-21 15:44:08 UTC | #22
+
+I'm saying `sCollideShapeVsShape` actually is __not__ being inlined and we can see that the oob access is not happening in it because it's not in the backtrace. I also think this isn't related to any dfx/IC limits because I can reproduce the issue in pure `wasmtime`. Here's how you can do that:
+
+1. Apply these changes to your jolt sample to avoid using IC APIs (except `ic0.trap`):
+```
+diff --git a/src/HelloWorld.cpp b/src/HelloWorld.cpp
+index 58a5d8f..b8efbda 100644
+--- a/src/HelloWorld.cpp
++++ b/src/HelloWorld.cpp
+@@ -3,7 +3,7 @@
+ // SPDX-License-Identifier: MIT
+ 
+ #include "HelloWorld.h"
+-#include "ic_api.h"
++// #include "ic_api.h"
+ 
+ // The Jolt headers don't include Jolt.h. Always include Jolt.h before including any other Jolt header.
+ // You can use Jolt.h in your precompiled header to speed up compilation.
+@@ -219,10 +219,10 @@ public:
+ // Program entry point
+ void hello()
+ {
+-       IC_API ic_api(CanisterQuery{std::string(__func__)}, false);
++       // IC_API ic_api(CanisterQuery{std::string(__func__)}, false);
+ 
+-       // Get the principal of the caller, as cryptographically verified by the IC
+-       CandidTypePrincipal caller = ic_api.get_caller();
++       // // Get the principal of the caller, as cryptographically verified by the IC
++       // CandidTypePrincipal caller = ic_api.get_caller();
+ 
+        // Get the name, passed as a Candid parameter to this method
+        // uint64_t seed{0};
+@@ -353,7 +353,7 @@ void hello()
+                Vec3 velocity = body_interface.GetLinearVelocity(sphere_id);
+ 
+                std::string msg_step = "Step " + std::to_string(step) + ": Position = (" + std::to_string(position.GetX()) + ", " + std::to_string(position.GetY()) + ", " + std::to_string(position.GetZ()) + "), Velocity = (" + std::to_string(velocity.GetX()) + ", " + std::to_string(velocity.GetY()) + ", " + std::to_string(velocity.GetZ()) + ")" + "\n";
+-               IC_API::debug_print(msg_step); // print it
++               // IC_API::debug_print(msg_step); // print it
+                msg.append(msg_step);              // msg send back over wire
+ 
+                // If you take larger steps than 1 / 60th of a second you need to do multiple collision steps in order to keep the simulation stable. Do 1 collision step per 1 / 60th of a second (round up).
+@@ -383,6 +383,6 @@ void hello()
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Create a msg, to be passed back as Candid over the wire
+ 
+-       // Send the response back
+-       ic_api.to_wire(CandidTypeText{msg});
++       // // Send the response back
++       // ic_api.to_wire(CandidTypeText{msg});
+ }
+```
+2. Make these changes to `icpp.toml` so that we can get debug symbols with @icpp 's rc release:
+```
+diff --git a/icpp.toml b/icpp.toml
+index 3d75854..f2bb359 100644
+--- a/icpp.toml
++++ b/icpp.toml
+@@ -15,6 +15,31 @@ cpp_compile_flags = [
+     "-D JPH_PLATFORM_SINGLE_THREAD",
+ ]
+ cpp_link_flags = []
++cpp_compile_flags_defaults = [
++    # "-O3",
++    # "-flto",
++    "-fno-exceptions", # required for IC
++    # "-fvisibility=hidden",
++    "-D NDEBUG",
++    "-D ICPP_VERBOSE=0",
++]
++cpp_link_flags_defaults = [
++    "-nostartfiles",
++    "-Wl,--no-entry",
++    # "-Wl,--lto-O3",
++    # "-Wl,--strip-all",
++    # "-Wl,--strip-debug",
++    "-Wl,--stack-first",
++    "-Wl,--export-dynamic", # required for IC
++]
++c_compile_flags_defaults = [
++    # "-O3",
++    # "-flto",
++    "-fno-exceptions", # required for IC
++    # "-fvisibility=hidden",
++    "-D NDEBUG",
++    "-D ICPP_VERBOSE",
++]
+ c_paths = []
+ c_header_paths = []
+ c_compile_flags = []
+```
+3. Create a file `ic0.wat` which can provide a stub for the `ic0.trap` API:
+```
+❯ cat ic0.wat
+(module
+  (func (export "trap") (param i32) (param i32) unreachable)
+)
+``` 
+4. Install the icpp rc version with `pip install icpp-pro==3.11.0rc1` and build your project with `icpp wasm-build`.
+5. We can now run your example in pure `wasmtime` and see that we hit the same oob access in `ProcessBodyPair` (this is using `wasmtime` version 15.0.0):
+```
+❯ wasmtime run --preload ic0=ic0.wat --invoke 'canister_query hello' build/joltsample.wasm
+Error: failed to run main module `build/joltsample.wasm`
+
+Caused by:
+    0: failed to invoke `canister_query hello`
+    1: error while executing at wasm backtrace:
+           0: 0x566f10 - <unknown>!JPH::PhysicsSystem::ProcessBodyPair(JPH::ContactConstraintManager::ContactAllocator&, JPH::BodyPair const&)
+           1: 0x566ac4 - <unknown>!JPH::PhysicsSystem::JobFindCollisions(JPH::PhysicsUpdateContext::Step*, int)
+           2: 0x57f437 - <unknown>!JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2::operator()() const
+           3: 0x57f3c6 - <unknown>!decltype(std::declval<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&>()()) std::__2::__invoke[abi:v160000]<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&>(JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&)
+           4: 0x57f37c - <unknown>!void std::__2::__invoke_void_return_wrapper<void, true>::__call<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&>(JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2&)
+           5: 0x57f332 - <unknown>!std::__2::__function::__default_alloc_func<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2, void ()>::operator()[abi:v160000]()
+           6: 0x57f2c6 - <unknown>!void std::__2::__function::__policy_invoker<void ()>::__call_impl<std::__2::__function::__default_alloc_func<JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)::$_2, void ()>>(std::__2::__function::__policy_storage const*)
+           7: 0x3b4d9d - <unknown>!std::__2::__function::__policy_func<void ()>::operator()[abi:v160000]() const
+           8: 0x3b40d4 - <unknown>!std::__2::function<void ()>::operator()() const
+           9: 0x3b3c57 - <unknown>!JPH::JobSystem::Job::Execute()
+          10: 0x3b388a - <unknown>!JPH::JobSystemSingleThreaded::QueueJob(JPH::JobSystem::Job*)
+          11: 0x3b4283 - <unknown>!JPH::JobSystemSingleThreaded::QueueJobs(JPH::JobSystem::Job**, unsigned int)
+          12: 0x5618ba - <unknown>!JPH::JobSystem::JobHandle::sRemoveDependencies(JPH::JobSystem::JobHandle const*, unsigned int, int)
+          13: 0x55ff66 - <unknown>!void JPH::JobSystem::JobHandle::sRemoveDependencies<32u>(JPH::StaticArray<JPH::JobSystem::JobHandle, 32u>&, int)
+          14: 0x55d6a4 - <unknown>!JPH::PhysicsSystem::Update(float, int, JPH::TempAllocator*, JPH::JobSystem*)
+          15: 0x384a16 - <unknown>!canister_query hello
+          16: 0x83a6bd - <unknown>!canister_query hello.command_export
+       note: using the `WASMTIME_BACKTRACE_DETAILS=1` environment variable may show more debugging information
+    2: memory fault at wasm address 0x10000cd6c in linear memory of size 0xad0000
+    3: wasm trap: out of bounds memory access
+```
+So this makes me think the problem is somewhere in the compilation/build process.
+
+When playing around with this a couple things I noticed are:
+  - Increasing the stack size with something like `wasmtime run --preload ic0=ic0.wat --invoke 'canister_query hello' -W max-wasm-stack=4000000000 build/joltsample.wasm` doesn't change anything, so I doubt we have a stack overflow.
+- Looking at the `wasm` where the oob access occurs, we can see that it's happening in the function setup:
+```
+start of Wasm code for ProcessBodyPair:
+ 566eef: 23 80 80 80 80 00          | global.get 0 <__stack_pointer>
+ 566ef5: 21 03                      | local.set 3
+ 566ef7: 41 c0 a5 04                | i32.const 70336
+ 566efb: 21 04                      | local.set 4
+ 566efd: 20 03                      | local.get 3
+ 566eff: 20 04                      | local.get 4
+ 566f01: 6b                         | i32.sub
+ 566f02: 21 05                      | local.set 5
+ 566f04: 20 05                      | local.get 5
+ 566f06: 24 80 80 80 80 00          | global.set 0 <__stack_pointer>
+ 566f0c: 20 05                      | local.get 5
+ 566f0e: 20 00                      | local.get 0
+ 566f10: 36 02 9c 9e 04             | i32.store 2 69404 <--OOB occurs here
+ 566f15: 20 05                      | local.get 5
+ 566f17: 20 01                      | local.get 1
+ 566f19: 36 02 98 9e 04             | i32.store 2 69400
+ 566f1e: 20 05                      | local.get 5
+ 566f20: 20 02                      | local.get 2
+ 566f22: 36 02 94 9e 04             | i32.store 2 69396
+ 566f27: 20 05                      | local.get 5
+ 566f29: 28 02 9c 9e 04             | i32.load 2 69404
+ 566f2e: 21 06                      | local.set 6
+ 566f30: 41 08                      | i32.const 8
+ 566f32: 21 07                      | local.set 7
+ 566f34: 20 06                      | local.get 6
+ 566f36: 20 07                      | local.get 7
+ 566f38: 6a                         | i32.add
+ 566f39: 21 08                      | local.set 8
+ 566f3b: 20 05                      | local.get 5
+ 566f3d: 28 02 94 9e 04             | i32.load 2 69396
+ 566f42: 21 09                      | local.set 9
+ 566f44: 20 08                      | local.get 8
+ 566f46: 20 09                      | local.get 9
+ 566f48: 10 b7 8b 80 80 00          | call 1463 <JPH::BodyManager::GetBody(JPH::BodyID const&)>
+
+```
+
+Anyway, we probably need something that can run by itself in wasmtime before it will work on the IC.
+
+-------------------------
+
+icpp | 2023-12-22 01:44:28 UTC | #23
+
+@abk,
+Thank you so much for doing this investigation and giving your summary. Good to hear it is not the IC, and we now have a path to dig deeper trying to find the cause.
+
+-------------------------
+
+ktimam | 2023-12-26 11:06:38 UTC | #24
+
+@abk thanks a lot for all the details and info.
+@icpp any thoughts on what might be causing this?
+
+-------------------------
+
+icpp | 2023-12-27 01:09:58 UTC | #25
+
+@ktimam ,
+I do not yet have a clue what it could be, but from above experiment we learned that:
+
+- it is not the IC, because it happens in regular wasmtime too
+- it is not the C++ Candid, because that was stripped out
+
+What's remaining as the potential cause of this issue:
+- the C++ code itself might have an issue that is only happening when compiling to wasm
+- perhaps the compiler is doing something wrong or we use a wrong combination of compile and link flags
+
+We should to try to further simplify the test case to the point where we are 100% sure there is nothing wrong with the C++ code, and we can then reach out to the wasi-sdk community. I opened issues in that github repo before and they're very responsive.
+https://github.com/WebAssembly/wasi-sdk
+
+-------------------------
+
+icpp | 2023-12-27 01:15:52 UTC | #26
+
+I also noticed there ia a pre-release of wasi-sdk 21, which upgrades the backend to LLVM 17.
+
+It is worth to do a quick test with that version. You just never know....
+
+-------------------------
+
+icpp | 2023-12-28 20:43:17 UTC | #27
+
+@ktimam , @abk ,
+
+Today, I ran into the heap out-of-bounds error while implementing the http_request_update method.
+
+In my case, the issue was introduced when I used Orthogonal Persistence for a variable stored in the static/global memory, like this:
+
+```C++
+// This leads to heap out-of-bounds after call the http_request_update
+...
+// Orthogonally Persisted counter
+uint64_t counter{0};
+
+...
+void http_request_update() {
+  ...
+  ++counter;
+  ...
+}
+```
+
+I have used Orthogonal Persistence for much more complex cases, so I was really surprised by this error.
+In all my other cases though, I only stored a pointer in the static/global memory, and dynamically allocate the memory in canister_init.
+
+I updated my code to use that same approach, and then the heap out-of-bound error went away.
+
+This is how the code looks that works:
+
+**file: canister.h**
+```C++
+#pragma once
+#include "wasm_symbol.h"
+#include <memory>
+
+// Self managed pointer to a wrapped uint64_t
+class Counter {
+public:
+  uint64_t counter;
+};
+
+extern Counter *p_counter;
+
+void canister_init() WASM_SYMBOL_EXPORTED("canister_init");
+```
+
+**file: canister.cpp**
+```C++
+// Initialization of the canister
+#include "canister.h"
+
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <variant>
+
+#include "ic_api.h"
+
+// Orthogonally Persisted counter
+
+Counter *p_counter{nullptr};
+
+void canister_init() {
+  IC_API ic_api(CanisterInit{std::string(__func__)}, false);
+
+  // Create a Counter instance
+  if (p_counter == nullptr) {
+    IC_API::debug_print(std::string(__func__) + ": Creating Counter Instance.");
+    p_counter = new (std::nothrow) Counter();
+    if (p_counter == nullptr) {
+      IC_API::trap("Allocation of p_counter failed");
+    }
+  }
+}
+```
+
+**file: ...cpp**
+```C++
+#include "canister.h"
+...
+void http_request_update() {
+  ...
+  if (p_counter) {
+    ++p_counter->counter;
+  }
+  ...
+}
+```
+
+
+This does not explain what you are seeing, but perhaps sharing this example, related to use of the static/global memory for orthogonal persistence provides hints towards the solution.
+
+-------------------------
+
+icpp | 2023-12-28 20:46:21 UTC | #28
+
+@ktimam 
+In your C++ code, are you storing any variables in static/global memory, similar to the counter?
+
+If yes, can you replace it with a pointer approach, like p_counter?
+
+-------------------------
+
+ktimam | 2023-12-28 23:01:33 UTC | #29
+
+Got it finally, "-Wl,-z,stack-size=1048576" was added to cpp_link_flags_defaults to increase stack size (clang defaults to a limited stack size when building wasm).
+Many thanks @abk & @icpp , now we have a fully working physics engine running on ICP :fire:
+
+-------------------------
+
+icpp | 2023-12-29 11:23:56 UTC | #30
+
+Awesome!!! :tada:
+
+Congratulations @ktimam, to get the physics engine running on the IC. That is a huge milestone.
+
+I am truly impressed with the grit you showed to battle through these hurdles. It takes that when you're the first trying to do something, and we all learned a lot more about WASM along the way :slightly_smiling_face:
+
+-------------------------
+

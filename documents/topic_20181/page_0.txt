@@ -1,0 +1,62 @@
+icme | 2023-05-23 01:31:18 UTC | #1
+
+If you are a Motoko developer, the [Incremental GC](https://forum.dfinity.org/t/incremental-garbage-collector-beta-release-motoko-update-part-12/20066) may be the biggest IC scalability improvement since Genesis.
+
+A big shout out to @luc-blaeser, @claudio, @dfx-json, and the entire Motoko team for this undertaking.
+
+## Preliminary Results
+
+I've been running @quint's [CanDB benchmarks](https://github.com/internet-computer/candb-benchmarks) with the incremental GC.
+
+With the previous (copying) GC Key, Value -> `<Text, Nat>` (small entries), I could only insert up to 1.1GB per canister into CanDB (an opinionated BTree) before hitting the message instruction limit. (This was a limit that existed within most data structures in Motoko) 
+
+With the new incremental GC (Beta release), it looks like I can now insert up to 4.1GB into CanDB, after which the canister is unresponsive. 
+
+![Screenshot 2023-05-22 at 18.20.40|623x61](upload://mIQuGu2IVMN1Fh6oAgPcfhi0Wbm.png)
+
+This type of error is expected (full heap). It has been reachable in Rust canisters since genesis, but until the incremental GC, Motoko developers were seldom able to hit it! 
+
+This is great news :slight_smile:, but to anyone reading this, make sure to prevent yourself from hitting this limit, or your canister will no longer be responsive. DFINITY is working on a https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794 proposed by @ulan, which should hopefully be released in the near future and prevent developers from hitting this heap limit.
+
+The chart below was generated while batch inserting 5k entries into CanDB per update call and looking at heap size as a function of entries inserted.
+![Screenshot 2023-05-22 at 18.28.34|690x343](upload://numBVuu9iXB4m7oCycNWNxpkYG0.png)
+
+
+There's some funny looking peaks, but definitely not as jerky as before.
+
+Here's what the instruction count and cycles used for each of these batch inserts look like as a function of the number of total entries in the data structure. You can see the local peaks for heap size, instruction count, and cycles used line up pretty clearly.
+
+![Screenshot 2023-05-22 at 18.28.48|690x349](upload://tMlS645f4JjQANHPKTDCNurN0VQ.png)
+
+
+<br/>
+
+![Screenshot 2023-05-22 at 18.28.57|690x347](upload://xaokYPytW3NiiYEFPGeLK10iZX5.png)
+
+
+Curious if these local peaks are part of the design of the incremental GC, or if this should look smoother overall? 
+
+Also keep in mind that this example is slightly manipulated with batch inserts of small records, as inserting just one item at a time would take a rediculous amount of time.
+
+---
+
+Note: The other tests take far too long and are running in the background, but everything is working great so far. I'll release more results as the job finishes.
+
+-------------------------
+
+luc-blaeser | 2023-05-23 13:05:05 UTC | #2
+
+Thank you very much for trying out the incremental GC and sharing these very interesting measurements.
+I am happy to hear that it scales in memory usage to around 4GB.
+
+The spikes are actually intended by the current GC design, although it could be easily reconfigured.
+The GC increments perform limited amount of work, however, each increment still has a relatively high limit of a few hundred million instructions, here around 300 million instructions. With this configuration, the GC operates with lowest possible latency, however, in a way that each message is able to complete without exceeding the instruction limit, independent of the heap size. This can be seen by the spikes that have somehow similar heights and span over a few subsequent instructions. 
+
+Of course, it would be easily possible to internally configure the GC increment limits to adjust to the mutator work and thus appear smoother in the charts. The downside would be that the GC work would take longer, being distributed across more messages. This would increase the latency in memory reclamation and to a certain extent, also the total instruction costs (more barriers are likely to be active).
+
+I am interested in your opinion: Do you think a smoother instruction curve would be something that could be desired in practice? If so, we could also consider adding an option to configure the incremental GC.
+
+Many thanks again.
+
+-------------------------
+

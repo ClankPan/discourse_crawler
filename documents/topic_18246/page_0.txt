@@ -1,0 +1,153 @@
+alejandrade | 2023-01-28 22:03:34 UTC | #1
+
+I'm deploying some canisters with another canister and I need to generate DID files from those canisters. 
+
+In production I can go to IC scan. Is there a solution i can deploy in my local that does this for me? can dfx do this for me?
+
+Then there is another product that lets me turn DID files into javascript/typescript
+
+-------------------------
+
+skilesare | 2023-01-28 22:07:53 UTC | #2
+
+Looked them up in icscan and click "view" candid. It even gives you the motoko and rust bindings.
+
+-------------------------
+
+alejandrade | 2023-01-28 22:09:01 UTC | #3
+
+Can i deploy IC scan locally or do I really need to deploy to the IC to do it.
+
+-------------------------
+
+skilesare | 2023-01-29 00:29:49 UTC | #4
+
+For example: https://icscan.io/canister/zfcdd-tqaaa-aaaaq-aaaga-cai
+
+Just click view .did file. If you want to retrieve it dynamically from a canister in real time it is a bit more tricky...but this should suffice for most use cases. Just save the .mo or .rs and reference it.
+
+-------------------------
+
+Gekctek | 2023-01-29 00:34:05 UTC | #5
+
+@alejandrade 
+Technical but I do it with the library I made (but its C#)
+`GenerateClientFromCanisterAsync` in https://github.com/edjCase/ICP.NET/blob/main/src/ClientGenerator/ClientFileGenerator.cs
+
+its doing a 'readstate' call on the canister with the path of `canister/{canisterId}/metadata/candid:service`
+See https://internetcomputer.org/docs/current/references/ic-interface-spec#http-read-state
+
+-------------------------
+
+skilesare | 2023-01-29 00:40:23 UTC | #6
+
+☝️this is awesome!  2020202020
+
+Edit: ahhh...this is c# ...still awesome. If you wanted your motoko canister to do something like this you might be able to pull it off with some mix o @Gekctek 's canid motoko and @tomijaga 's serde. There is an endpoint endpoint that publishes the candid as text. Then use call_raw.
+
+-------------------------
+
+chenyan | 2023-01-29 02:17:31 UTC | #7
+
+In Rust, you can fetch the did file from deployed canister via this function: https://docs.rs/ic-agent/0.23.0/ic_agent/agent/struct.Agent.html#method.read_state_canister_metadata
+
+To convert the did file to specific language bindings, you can run `didc bind a.did -t js/ts/rs/mo`.
+
+It doesn't make much sense to do this in Motoko, as the metadata endpoint is for consumers outside of IC. Motoko code already runs inside of IC.
+
+-------------------------
+
+skilesare | 2023-01-29 22:58:19 UTC | #8
+
+[quote="chenyan, post:7, topic:18246"]
+It doesn’t make much sense to do this in Motoko, as the metadata endpoint is for consumers outside of IC. Motoko code already runs inside of IC.
+[/quote]
+
+It does if you want to consume and deal with canisters that are deployed after your canister with new did types.
+
+We've hacked together virtual reflection with serde and motoko candid. Someone has to feed in known object keys and variant names, but it kind of works. It would be great if it was supported in a more motoko-native way.
+
+-------------------------
+
+chenyan | 2023-01-29 23:56:46 UTC | #9
+
+The whole point of Candid is to allow upgrade to be backward compatible, so that you can call canisters as long as the upgrade follows subtyping. If the target canister upgrade doesn't follow the subtyping relation, even reflection won't work. I'm curious to see an example where the Candid subtyping is not enough.
+
+-------------------------
+
+skilesare | 2023-01-30 03:22:26 UTC | #10
+
+The use case is a blackholed wallet canister that needs to/wants to interact with canisters that have been deployed with types that originated after the wallet canister was blackholed.
+
+If you want to do things like create a language that permits/blocks specific calls that meet certain thresholds, it would be nice to inspect and reason about the bytes coming over the wire to you.
+
+If we want to add a feature to axon that lets you block function calls where a candid parameter is above a certain threshold(say ICRC-6 adds some NFT statistic parameter that I can't know about in my wallet that I am blackholing today).
+
+I want to tell the wallet to allow a function called where mint_nft_with_stat(record { token_id: Nat; stat: Nat}) as long as stat is <= 15....but disallow if the stat is above.  It would be much easier to reason with this if I have a native way to call
+
+```
+ let reflective_type : reflective_candid = to_reflective_candid(args, cheat_list_of_keys);
+```
+
+I can keep cheat_list_of keys by uploading new candid files and just holding a buffer of items that I'm concerned about in my wallet.
+
+It is just simple reflection that many other languages have.  We're close to figuring it out on our own, but it would be nice if we had some formal guidance or support on what we're missing/how to get there.  @Gekctek and @tomijaga are the heroes that have gotten us this far.
+
+https://github.com/NatLabs/serde
+https://github.com/edjCase/motoko_candid
+
+
+I've even started messing with it in candy_library.
+
+https://github.com/icdevs/candy_library/blob/main/src/candid.mo
+
+-------------------------
+
+chenyan | 2023-01-30 04:49:28 UTC | #11
+
+Let me try to rephrase your use case: The wallet canister wants to inspect the Candid arguments before forwarding the calls. In the example, you want to forward any arguments that contains the `stat` field with `stat <= 15`. Then the following should work?
+
+```
+do ? {
+  let reflective_type = from_candid(blob, ?{ stat : Nat })!;
+  if (reflective_type.stat <= 15) { ... }
+}
+
+```
+
+-------------------------
+
+skilesare | 2023-01-30 13:26:01 UTC | #12
+
+Yes...but it would be more like(ignoring compiler warnings and good type handling):
+
+```
+do ? {
+  let reflective_type = from_candid(blob, ?{ stat : Nat })!;
+  let #nat(val) = #numberreflective_type.find(thisFilterConfig.field) ;
+  if (val <= thisFilterConfig.max ) { ... }
+}
+```
+
+-------------------------
+
+chenyan | 2023-01-31 05:30:49 UTC | #13
+
+Is `thisFilterConfig` an input argument given at runtime? In the code, you are already assuming the result is `#nat(val)`, why not pass in `Nat` directly?
+
+-------------------------
+
+skilesare | 2023-01-31 12:57:44 UTC | #14
+
+I'm assuming a condition builder/rules engine.
+
+Imagine the user comstruting something like https://github.com/NRules/NRules/wiki/Getting-Started#creating-rules but with variants.
+
+Tttt he ui would be simplier...but we'd compile to a rules object.
+
+Ultinarly we want to say:
+
+"Allow the DAO to call transfer if amount is less than or equal to 1000000 and the last send was more than one week ago"
+
+-------------------------
+

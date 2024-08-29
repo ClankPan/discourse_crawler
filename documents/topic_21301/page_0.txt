@@ -1,0 +1,57 @@
+msumme | 2023-07-11 22:07:48 UTC | #1
+
+On Sunday, July 9, a neuron was reported with an age of 52 years, which indicated there was a bug somewhere in the NNS that allowed an erroneous adjustment of Neuron Ages.
+
+## Cause
+
+The issue is caused by a conflict between how  [`increase_dissolve_delay`](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/sns/governance/src/neuron.rs?L294:8) affects [`aging_since_timestamp_seconds`](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/sns/governance/src/gen/ic_sns_governance.pb.v1.rs?L97) field  in some cases and the change applied in [`NeuronDeltas`](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/nns/governance/src/governance/manage_neuron_request/neuron_mutation/mod.rs?L173:12) that applies an additional change to the same field.
+
+The `NeuronDelta` value of `aging_since_timestamp_seconds` is generated based on the current `aging_since_timestamp_seconds` value of the `Neuron`, which in the case of a dissolved or dissolving neuron is `u64::MAX`.  
+
+However, when the target `Neuron` in the `Merge` command has a dissolve delay less than the source neuron,  an increased dissolve delay is also applied.
+
+When the target neuron's dissolve delay is increased to match the source neuron, it is done so through `increase_dissolve_delay`.  If the neuron is already dissolved (i.e. a state of `WhenDissolvedTimestampSeconds(t)` where `t < now`) this changes the neuron from `Dissolved` to `NotDissolving`, and applies a change to `aging_since_timestamp_seconds`, changing it from `u64::MAX` to a value that would allow it to age.   The other change, calculated to reduce the value from `u64::MAX` to the combined age of the two neurons, is applied after that, which results in zeroing out `aging_since_timestamp_seconds` (through `.saturating_sub`) which results in a neuron with the long age that was observed, since it is now aging since the unix epoch.  This happens because the delta of `aging_since_timestamp_seconds` is calculated based on the original value of `u64::MAX`.
+
+`increase_dissolve_delay` does not change the value of `aging_since_timestamp_seconds` when both neurons have `dissolve_state` set to `DissolveDelaySeconds(t)` where `t > 0` or when `WhenDissolvedTimestampSeconds(t)` has `t > now`, however, which is why the ManageNeuron::Merge command normally succeeded as designed.  So only in the case of a neuron that successfully dissolved would the erroneous transformation be applied.
+
+While there were extensive existing tests in place covering the complex rules around merging neurons, there were none that covered this exact edge case, and this was missed by the team.
+
+## Mitigation and Re-enabling of Merge in Limited Circumstances
+
+The mitigation is to limit the states of both source and target  neurons operated on during the `ManageNeuron::Merge` command to only be applicable to the code path where the neurons are in a NotDissolving state, which means that they both have a dissolve_state of `DissolveDelaySeconds(t) where `t > 0`.  
+
+The team decided this was an acceptable interim state based on the following.
+1. In that state, both neurons have a normal behavior of `aging_since_timestamp_seconds` where the field means exactly what it says.
+2. Both neurons can have `increase_dissolve_delay` called without also changing `aging_since_timestamp_seconds` in that function.
+3. There are no significant use cases for merging neurons that cannot be handled by `stop_dissolving` then `merge`, or simply disbursing ICP to the other neuron's account.  There may be some cases where this results in an inconvenience, but ultimately merging neurons is largely a convenience feature.
+
+The proposed mitigations are visible here:
+https://github.com/dfinity/ic/commit/5bb826253617600dd59fd1233991f675d1bdb370 (re-enables merging neurons in limited circumstances)
+https://github.com/dfinity/ic/commit/5d526deb2e145622fdb1a4a81b0406591182c7f1 (partially resets age for neurons)
+
+## Cleanup of Existing Neurons
+
+Our proposed cleanup is to find any neuron that has a longer-than-possible age based on genesis and neuron-pre-aging of the genesis neurons, and to set those neurons to have an age equal to genesis.  
+
+We chose this route because 1) it is not easily possible to find the exact age of the neurons affected by this issue before they were affected, and 2) most neurons were not affected, and 3) the affected neurons have relatively small stakes.
+
+While this solution is not ideal, the effort to exactly fix the affected neurons would be large, and would take our focus away from a lot of other important work.  We are currently investigating the effort needed to do a more thorough fix in the future.
+
+## Long-Term Solution
+
+In the longer-term, a more systematic review of Neuron logic and invariants is underway, and a restructuring of code to make those assumptions more explicit and easier to maintain is being planned.  
+
+We plan to add some safeguards and checks on neurons to ensure that every modification results in changes between expected bounds and ensure that each Neuron maintains its implicit invariants explicitly.  We will add add additional test cases to prevent regressions, and continue to improve this code.
+
+When these code changes happen, we will evaluate further relaxing the proposed restrictions on merging neurons together.
+
+-------------------------
+
+msumme | 2023-07-12 16:26:37 UTC | #2
+
+I wanted to clarify something that wasn't mentioned here - the release of these two changes will go out in a proposal planned for Friday, and voted in on Monday.
+
+Any additional feedback from the community is appreciated before then.
+
+-------------------------
+

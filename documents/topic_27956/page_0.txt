@@ -1,0 +1,604 @@
+oleksiivinogradov | 2024-02-28 10:36:44 UTC | #1
+
+I done local deploy
+>    "icp_ledger_canister": {
+>         "type": "custom",
+>         "candid": "NO LINK ledger.did",
+>         "wasm": "NO LINK  ic/d87954601e4b22972899e9957e800406a0a6b929/canisters/ledger-canister.wasm.gz",
+>         "remote": {
+>           "id": {
+>             "ic": "ryjl3-tyaaa-aaaaa-aaaba-cai"
+>           }
+>         }
+>       },
+>       "internet_identity" : {
+>         "type": "pull",
+>         "id": "rdmx6-jaaaa-aaaaa-aaadq-cai"
+>       }
+
+and done appoval
+dfx canister call --identity alice icp_ledger_canister icrc2_approve '(record{
+spender= record {
+             owner = principal "'$MOTODEX_ADDRESS'";
+           };
+amount= 1_000_000_000_000_000_000: nat;
+})'
+
+but this function call:
+pub async fn  purchase(type_nft: u8, referral: Option<Account>, attached_deposit: u128)  {
+    let owner =  STATE.with(|s| s.borrow_mut().contract.get_game_server());
+    let p = owner.owner;
+    let price_for_type = value_in_main_coin(type_nft);
+    ic_cdk::print(format!("price_for_type {}",price_for_type));
+    let caller = ic_cdk::caller();
+    let caller_acc = Account::from(caller);
+
+    ic_cdk::print(format!("caller {}",caller));
+    ic_cdk::print(format!("caller_acc {}",caller_acc));
+
+
+    transfer(
+        Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),//MAINNET_LEDGER_CANISTER_ID,
+        TransferArgs {
+            memo: Memo(0),
+            amount: Tokens::from_e8s(price_for_type as u64),
+            fee: Tokens::from_e8s(0),//DEFAULT_FEE,//Tokens::from_e8s(0)
+            from_subaccount: None,
+            to: AccountIdentifier::new(&p, &DEFAULT_SUBACCOUNT),
+            created_at_time: None,
+        }
+    ).await.expect("call to ledger failed").expect("transfer failed");
+
+show no balance:
+2024-02-28 10:16:37.646674 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] Panicked at 'transfer failed: InsufficientFunds { balance: Tokens { e8s: 0 } }', motodex/src/update_method.rs:85:45
+
+balance here:
+
+Can anybody help?
+
+-------------------------
+
+cryptoschindler | 2024-02-28 14:01:05 UTC | #2
+
+what is the value of `$MOTODEX_ADDRESS` and what is the balance of `alice` on the local `icp_ledger_canister`?
+
+do you have a repo with the minimal steps to reproduce this?
+
+-------------------------
+
+oleksiivinogradov | 2024-02-28 18:30:52 UTC | #3
+
+MOTODEX_ADDRESS  be2us-64aaa-aaaaa-qaabq-cai
+
+icrcl_balance_of: (record {owner:principal; subaccount:opt vec nat8}) → (nat) query
+
+owner
+
+xopkt-er5ls-7douf-nic2h-u7ch3-1
+
+subaccount
+
+QUERY
+
+RANDOM
+
+(999999999999990000)
+
+I can;t attach images for proof
+
+-------------------------
+
+oleksiivinogradov | 2024-02-28 18:31:34 UTC | #4
+
+[quote="cryptoschindler, post:2, topic:27956"]
+do you have a repo with the minimal steps to reproduce this?
+[/quote]
+
+I have, but it private. Opened for grants team if u in
+
+-------------------------
+
+cryptoschindler | 2024-02-29 10:34:33 UTC | #5
+
+We updated the [example](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/tokens_transfer), let me know if that helps.
+
+-------------------------
+
+oleksiivinogradov | 2024-02-29 13:28:04 UTC | #6
+
+error[E0277]: the `?` operator can only be used in an async function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+   --> motodex/src/update_method.rs:97:64
+    |
+65  |   pub async fn  purchase(type_nft: u8, referral: Option<Account>, attached_deposit: u128)  {
+    |  __________________________________________________________________________________________-
+66  | |     let owner =  STATE.with(|s| s.borrow_mut().contract.get_game_server());
+67  | |     let to_principal = owner.owner;
+68  | |     let price_for_type = value_in_main_coin(type_nft);
+...   |
+97  | |         .map_err(|e| format!("failed to call ledger: {:?}", e))?
+    | |                                                                ^ cannot use the `?` operator in an async function that returns `()`
+
+-------------------------
+
+oleksiivinogradov | 2024-02-29 13:40:09 UTC | #7
+
+I MUST use canister account to receive money first and then transfer from canister to wallet?
+
+-------------------------
+
+cryptoschindler | 2024-02-29 13:43:55 UTC | #8
+
+The error you're encountering, `error[E0277]: the ? operator can only be used in an async function that returns Result or Option (or another type that implements FromResidual)`, is due to a misuse of the `?` operator in Rust.
+
+The `?` operator in Rust is a convenient shorthand for error handling. It is used to either unwrap the value inside an `Ok` variant of a `Result`, or return the error (`Err` variant) from the current function. This operator can only be used in functions that return a `Result`, `Option`, or any other type that implements the `std::ops::Try` trait (through the `FromResidual` trait in Rust 2021 edition and onwards).
+
+In your case, the function `purchase` is an `async` function that implicitly returns `()`, the unit type, because there's no explicit return type specified. Since `()` does not implement the `FromResidual` trait for the `Result` or `Option` types, you cannot use the `?` operator within this function.
+
+To fix this error, you have a couple of options:
+
+1. **Change the Return Type of the Function to `Result` or `Option`:** If your function is intended to perform operations that might fail, you should change its return type to `Result<T, E>` (where `T` is the success type and `E` is the error type) or `Option<T>` (if the function might not return a value). For example, if the function should return nothing on success but might fail with a string error, you could change the signature to:
+
+    ```rust
+    pub async fn purchase(type_nft: u8, referral: Option<u8>, attached_deposit: u128) -> Result<(), String> {
+        // Function body
+    }
+    ```
+
+    Then, you can use the `?` operator as intended, and if there's an error, return it from the function. For successful execution, return `Ok(())`.
+
+2. **Handle the Error Without the `?` Operator:** If changing the function's return type is not desirable, you will need to handle the error without using the `?` operator. This typically involves using pattern matching or methods like `match` or `if let`. For example:
+
+    ```rust
+    .map_err(|e| format!("failed to call ledger: {:?}", e))
+    .map(|_| ()) // Convert the Ok variant to ()
+    .unwrap_or_else(|e| {
+        // Handle the error e, for example, by logging it
+        eprintln!("{}", e);
+    });
+    ```
+
+This way, you explicitly handle both the success and error cases without relying on the `?` operator, thus avoiding the need for the function to return a `Result` or `Option`.
+
+-------------------------
+
+cryptoschindler | 2024-02-29 13:48:09 UTC | #9
+
+No,  you can use an approval as well. The ICP ledger supports the ICRC-2 standard, you can read more [here](https://internetcomputer.org/docs/current/developer-docs/defi/icrc-1/using-icrc1-ledger/#icrc-2-endpoints) and [here](https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-2).
+
+-------------------------
+
+oleksiivinogradov | 2024-02-29 13:49:18 UTC | #10
+
+follow your example:
+
+pub async fn  purchase(type_nft: u8, referral: Option<Account>, attached_deposit: u64)  {
+    let owner =  STATE.with(|s| s.borrow_mut().contract.get_game_server());
+
+
+    let canister_id = ic_cdk::id();
+    let canister_account = AccountIdentifier::new(&canister_id, &DEFAULT_SUBACCOUNT);
+
+    let to_principal = owner.owner;
+    let price_for_type = value_in_main_coin(type_nft);
+    ic_cdk::print(format!("price_for_type {}",price_for_type));
+    let caller = ic_cdk::caller();
+    let caller_acc = Account::from(caller);
+
+    ic_cdk::print(format!("caller {}",caller));
+    ic_cdk::print(format!("caller_acc {}",caller_acc));
+
+    let to_subaccount = DEFAULT_SUBACCOUNT;
+
+    ic_cdk::println!(
+        "Transferring {} tokens to principal {} subaccount {:?}",
+        &price_for_type,
+        &to_principal,
+        &to_subaccount
+    );
+    let transfer_args = ic_ledger_types::TransferArgs {
+        memo: Memo(0),
+        amount: Tokens::from_e8s(price_for_type),
+        fee: Tokens::from_e8s(10_000),
+        // The subaccount of the account identifier that will be used to withdraw tokens and send them
+        // to another account identifier. If set to None then the default subaccount will be used.
+        // See the [Ledger doc](https://internetcomputer.org/docs/current/developer-docs/integrations/ledger/#accounts).
+        from_subaccount: None,
+        to: canister_account,
+        created_at_time: None,
+    };
+    ic_ledger_types::transfer(MAINNET_LEDGER_CANISTER_ID, transfer_args)
+        .await.expect("TODO: panic message 1 ").expect("TODO: panic message 2");
+
+2024-02-29 13:42:15.570881 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] price_for_type 71428571
+2024-02-29 13:42:15.570881 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] caller bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe
+2024-02-29 13:42:15.570881 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] caller_acc bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe
+2024-02-29 13:42:15.570881 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] Transferring 71428571 tokens to principal dx64y-jtncv-qjwys-cpqa6-rc7sn-4bmgi-4a6m2-o5cv2-lijbd-kvkzi-uqe subaccount Subaccount([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+2024-02-29 13:42:15.570881 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] Panicked at 'TODO: panic message 2: InsufficientFunds { balance: Tokens { e8s: 0 } }', motodex/src/update_method.rs:101:49
+
+
+but
+
+› icrc1_balance_of(record {owner=principal "bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe"; subaccount=null})
+
+(1000000000000000000)
+
+Your query in example to check balance doesn't work:
+
+Alexs-MBP:icrc7-main alex$ dfx canister call icp_ledger_canister account_balance '(record { account = '$(python3 -c 'print("vec{" + ";".join([str(b) for b in bytes.fromhex("bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe")]) + "}")')'})'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ValueError: non-hexadecimal number found in fromhex() arg at position 1
+error: parser error
+  ┌─ Candid argument:1:21
+  │
+1 │ (record { account = })
+  │                     ^ Unexpected token
+  │
+  = Expects one of "(", "blob", "bool", "decimal", "float", "func", "hex",
+    "null", "opt", "principal", "record", "service", "sign", "text",
+    "variant", "vec"
+
+Error: Failed to create argument blob.
+Caused by: Failed to create argument blob.
+  Invalid data: Unable to serialize Candid values: Invalid argument: Invalid Candid values: Candid parser error: Unrecognized token `RBrace` found at 20:21
+Expected one of "(", "blob", "bool", "decimal", "float", "func", "hex", "null",
+
+-------------------------
+
+oleksiivinogradov | 2024-02-29 13:50:46 UTC | #11
+
+[quote="cryptoschindler, post:9, topic:27956, full:true"]
+No, you can use an approval as well. The ICP ledger supports the ICRC-2 standard, you can read more.
+[/quote]
+
+I try approval with no success too, it was first code mentioned. (and I still can't use links in answer, even if I quote your message )))
+
+-------------------------
+
+cryptoschindler | 2024-03-04 08:51:31 UTC | #12
+
+[quote="oleksiivinogradov, post:10, topic:27956"]
+```
+    to: canister_account,
+```
+[/quote]
+with this, you are transferring to the same account you are transferring from, which doesn't make sense.
+
+Note that `Account` and `AccountIdentifier` are two **different** concepts that you can't mix up. You can read more about the differences [here](https://internetcomputer.org/docs/current/developer-docs/defi/icp-tokens/overview). In short, `AccountIdentifiers` are used by the ICP ledger standard, `Accounts` are used by the ICRC1 standard.
+
+If you want to transfer funds from the canisters account to the owners account, you have to use
+`to: AccountIdentifier::new(&to_principal, &DEFAULT_SUBACCOUNT)` in `ic_ledger_types::TransferArgs`.
+
+Note that you are trying to transfer funds **from the canister**, not from **bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe**. This is why you transfer fails, because if you would check the **canisters** balance with `icrc1_balance_of(record {owner=principal “be2us-64aaa-aaaaa-qaabq-cai”; subaccount=null})` it would be `0`. So you have to transfer funds from `bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe` to `be2us-64aaa-aaaaa-qaabq-cai` first to send funds to the canister, then you can call `transfer` to send them from the canister.
+
+[quote="oleksiivinogradov, post:10, topic:27956"]
+Alexs-MBP:icrc7-main alex$ dfx canister call icp_ledger_canister account_balance ‘(record { account = ‘$(python3 -c ‘print(“vec{” + “;”.join([str(b) for b in bytes.fromhex(“bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe”)]) + “}”)’)’})’
+[/quote]
+
+The python script here is not intended to be used with principals, but with `AccountIdentifiers`. You can get your current identies `AccountIdentifier` using `dfx ledger account-id` like in this [step](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/tokens_transfer#step-8-verify-that-the-ledger-canister-is-healthy-and-working-as-expected-by-using-the-command).
+
+-------------------------
+
+oleksiivinogradov | 2024-03-04 14:07:30 UTC | #13
+
+[quote="cryptoschindler, post:12, topic:27956"]
+with this, you are transferring to the same account you are transferring from, which doesn’t make sense.
+[/quote]
+
+    let canister_id = ic_cdk::id();
+    let canister_account = AccountIdentifier::new(&canister_id, &DEFAULT_SUBACCOUNT);
+
+This is how I grab canister id to where I try send money. Looks like its a sender account, bcs you are telling me that i send to the same address? I so, how to grab own canister id and account to send money from sender wallet to canister?
+
+-------------------------
+
+oleksiivinogradov | 2024-03-04 14:08:09 UTC | #14
+
+[quote="cryptoschindler, post:12, topic:27956"]
+If you want to transfer funds from the canisters account to the owners account, you have to use
+`to: AccountIdentifier::new(&to_principal, &DEFAULT_SUBACCOUNT)` in `ic_ledger_types::TransferArgs`.
+[/quote]
+
+ left: `Tokens { e8s: 10000 }`,\n right: `Tokens { e8s: 0 }`: Fee for burning should be zero'
+
+Not sure that we expect burning?
+
+-------------------------
+
+oleksiivinogradov | 2024-03-04 14:08:47 UTC | #15
+
+[quote="cryptoschindler, post:12, topic:27956"]
+So you have to transfer funds from `bzyds-lsngb-2hsp6-cctoq-2mttx-mw6dj-glyta-nl4p2-yenlc-udrvc-yqe` to `be2us-64aaa-aaaaa-qaabq-cai` first to send funds to the canister, then you can call `transfer` to send them from the canister.
+[/quote]
+
+How to grab correct canister AccountIdentifier to send money to canister?
+
+-------------------------
+
+oleksiivinogradov | 2024-03-04 14:11:56 UTC | #16
+
+[quote="cryptoschindler, post:12, topic:27956"]
+If you want to transfer funds from the canisters account to the owners account, you have to use
+`to: AccountIdentifier::new(&to_principal, &DEFAULT_SUBACCOUNT)` in `ic_ledger_types::TransferArgs`.
+[/quote]
+
+
+2024-03-04 14:10:46.425471 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] Transferring 71428571 tokens to principal kittb-2snro-3ct6c-hvamc-cmjse-iv63f-5kweq-2r3ja-sfe5y-b5iz5-kae subaccount Subaccount([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+2024-03-04 14:10:46.425471 UTC: [Canister be2us-64aaa-aaaaa-qaabq-cai] Panicked at 'TODO: panic message 2: InsufficientFunds { balance: Tokens { e8s: 0 } }', motodex/src/update_method.rs:101:49
+
+-------------------------
+
+cryptoschindler | 2024-03-05 15:08:54 UTC | #17
+
+[quote="oleksiivinogradov, post:13, topic:27956"]
+This is how I grab canister id to where I try send money. Looks like its a sender account, bcs you are telling me that i send to the same address? I so, how to grab own canister id and account to send money from sender wallet to canister?
+[/quote]
+
+Follow the [steps](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#token-transfer) here, especially [step 12](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#step-12-transfer-funds-to-your-canister).
+
+-------------------------
+
+cryptoschindler | 2024-03-05 15:09:37 UTC | #18
+
+I dont know what that means
+
+-------------------------
+
+cryptoschindler | 2024-03-05 15:10:27 UTC | #19
+
+[quote="oleksiivinogradov, post:15, topic:27956"]
+How to grab correct canister AccountIdentifier to send money to canister?
+[/quote]
+
+See [step 11](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#step-11-determine-out-the-address-of-your-canister).
+
+-------------------------
+
+cryptoschindler | 2024-03-05 15:11:17 UTC | #20
+
+This again indicates that you have *not* transferred any tokens to your canister yet. If the canister doesn't hold any tokens, you cannot call `transfer` on it.
+
+-------------------------
+
+oleksiivinogradov | 2024-03-05 15:35:00 UTC | #21
+
+[quote="cryptoschindler, post:17, topic:27956"]
+Follow the [steps](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#token-transfer) here, especially [step 12 ](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#step-12-transfer-funds-to-your-canister).
+[/quote]
+
+this example show cli way, but I am looking do same from Rust code. Please share rust example?
+
+-------------------------
+
+oleksiivinogradov | 2024-03-05 15:35:35 UTC | #22
+
+[quote="cryptoschindler, post:19, topic:27956"]
+See [step 11](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#step-11-determine-out-the-address-of-your-canister).
+[/quote]
+
+unfortunately, im lookin Rust example too.
+
+-------------------------
+
+oleksiivinogradov | 2024-03-05 15:38:35 UTC | #23
+
+[quote="cryptoschindler, post:20, topic:27956, full:true"]
+This again indicates that you have *not* transferred any tokens to your canister yet. If the canister doesn’t hold any tokens, you cannot call `transfer` on it.
+[/quote]
+
+I'm looking for a way to do it directly in Rust while call one purchase function. Is it impossible? Players must send amount to address, type by hands canister id and amount?
+
+-------------------------
+
+cryptoschindler | 2024-03-05 19:09:57 UTC | #24
+
+Somehow you have to get the ICP into your canister, the common way to do this locally is to have a minter account that mints tokens to the canister. You can also add another entry to `initial_values` that you set to the canisters default `AccountIdentifer` in [step 7](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#step-7-deploy-the-ledger-canister-to-your-network), this way you don't have to transfer funds to it via the cli. 
+
+You can get the canisters `AccountIdentifier` with `dfx ledger account-id --of-canister <your_canisters_name>`.
+
+-------------------------
+
+oleksiivinogradov | 2024-03-06 08:23:51 UTC | #25
+
+[quote="cryptoschindler, post:24, topic:27956"]
+Somehow you have to get the ICP into your canister, the common way to do this locally is to have a minter account that mints tokens to the canister.
+[/quote]
+
+This way can't reproduce real life transaction flow, which i try to avoid. Testnet build must cover common case on mainnet to save time for development/tests
+
+-------------------------
+
+cryptoschindler | 2024-03-06 08:53:06 UTC | #26
+
+[quote="cryptoschindler, post:24, topic:27956"]
+You can also add another entry to `initial_values` that you set to the canisters default `AccountIdentifer` in [step 7](https://github.com/dfinity/examples/tree/fix/tokens_transfer/rust/icp_transfer#step-7-deploy-the-ledger-canister-to-your-network), this way you don’t have to transfer funds to it via the cli.
+
+You can get the canisters `AccountIdentifier` with `dfx ledger account-id --of-canister <your_canisters_name>`.
+[/quote]
+
+This is the alternative.
+
+-------------------------
+
+oleksiivinogradov | 2024-03-06 09:14:29 UTC | #27
+
+[quote="cryptoschindler, post:26, topic:27956"]
+This is the alternative.
+[/quote]
+
+Isn't, unfortunately. Issue not in get AccountIdentifer to where money send - I can grab it from client side while. Issue in general errors during simple transaction from client balance to canister balance. And still no solution in docs and here in answers.
+
+-------------------------
+
+cryptoschindler | 2024-03-06 11:04:30 UTC | #28
+
+Did you clone the repo and follow the steps outlined? I just tested them and they should work. From there you can adapt and move to your desired project
+
+-------------------------
+
+oleksiivinogradov | 2024-03-06 11:48:26 UTC | #29
+
+It may works on your repo but doesn't work at mine. This is a problem.
+
+-------------------------
+
+cryptoschindler | 2024-03-06 15:24:45 UTC | #30
+
+Then do as I said, start from the example repo and work your way to the desired outcome. Somewhere along the way you're making a mistake. 
+What you are trying to do is definitely possible, maybe you take some time to reread our thread and play around with it a bit more?
+Another possibility is that your provide a repository with a small example showing how to reproduce your issue.
+
+-------------------------
+
+oleksiivinogradov | 2024-03-06 18:13:33 UTC | #31
+
+[quote="cryptoschindler, post:30, topic:27956"]
+Another possibility is that your provide a repository with a small example showing how to reproduce your issue.
+[/quote]
+
+please share your github username
+
+-------------------------
+
+oleksiivinogradov | 2024-03-12 09:13:42 UTC | #32
+
+[quote="cryptoschindler, post:30, topic:27956"]
+Another possibility is that your provide a repository with a small example showing how to reproduce your issue.
+[/quote]
+
+after deploy done with demo.sh i call:
+
+dfx canister call --identity alice motodex purchase '(0, null , 100_000: nat64)'
+
+-------------------------
+
+cryptoschindler | 2024-04-02 09:30:15 UTC | #33
+
+I fixed your code in [this branch](https://github.com/oleksiivinogradov/motodex_icp_contracts/tree/fix/transfer-from). As the code is not publicly available I will try to walk others through the steps.
+
+we use the following steps to deploy the ICP ledger locally:
+```
+# we create a new identity for alice
+dfx identity new alice --disable-encryption || true
+
+# we store allice account identifier in a variable
+ALICE_ACCOUNT_ID=$(dfx --identity alice ledger account-id)
+
+# we deploy the ledger and assign an initial balance of 10_000_000_000 ICP to alice
+dfx deploy --specified-id ryjl3-tyaaa-aaaaa-aaaba-cai icp_ledger_canister --argument "
+  (variant {
+    Init = record {
+      minting_account = \"$MINTER_ACCOUNT_ID\";
+      initial_values = vec {
+        record {
+          \"$ALICE_ACCOUNT_ID\";
+          record {
+            e8s = 1_000_000_000_000_000_000 : nat64;
+          };
+        };
+      };
+      send_whitelist = vec {};
+      transfer_fee = opt record {
+        e8s = 10_000 : nat64;
+      };
+      token_symbol = opt \"LICP\";
+      token_name = opt \"Local ICP\";
+      feature_flags = opt record {
+        icrc2 = true;
+      };
+    }
+  })
+"
+
+# alice approves the motodex canister default account to spend 100 ICP on her behalf
+dfx canister call --identity alice icp_ledger_canister icrc2_approve "(
+  record {
+    spender= record {
+      owner = principal \"$MOTODEX_ADDRESS\";
+    };
+    amount = 10_000_000_000: nat;
+  }
+)"
+
+# alice calls the motodex canister to purchase an NFT
+dfx canister call --identity alice motodex purchase "(1, null, 10_000_000_000: nat64)"
+``` 
+
+the implementation of `purchase` looks like this
+```rust
+pub async fn purchase(
+    type_nft: u8,
+    referral: Option<Account>,
+    attached_deposit: u64,
+) -> Result<Nat, String> {
+    let owner = STATE.with(|s| s.borrow_mut().contract.get_game_server());
+
+    let to_principal = owner.owner;
+    ic_cdk::print(format!("to_principal: {}", to_principal));
+
+    let price_for_type = value_in_main_coin(type_nft);
+    ic_cdk::print(format!("price_for_type {}", price_for_type));
+
+    let caller_acc = Account::from(ic_cdk::caller());
+    ic_cdk::print(format!("caller_acc {}", caller_acc));
+
+    ic_cdk::println!(
+        "Transferring {} tokens from {} to {}",
+        &price_for_type,
+        &caller_acc,
+        &to_principal,
+    );
+
+    let transfer_from_args = TransferFromArgs {
+        from: caller_acc,
+        to: Account::from(to_principal),
+        amount: price_for_type.into(),
+        fee: None,
+        memo: None,
+        spender_subaccount: None,
+        created_at_time: None,
+    };
+    // Attempt the asynchronous call to another canister function.
+    let transfer_result =
+        ic_cdk::call::<(TransferFromArgs,), (Result<BlockIndex, TransferFromError>,)>(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai")
+                .expect("Could not decode the principal."),
+            "icrc2_transfer_from",
+            (transfer_from_args,),
+        )
+        .await
+        .map_err(|e| format!("failed to call ledger: {:?}", e))?
+        .0;
+
+    // Check the result of the transfer.
+    match transfer_result {
+        Ok(block_index) => {
+            // If the transfer was successful, execute the additional code.
+            // STATE.with(|s| {
+            //     s.borrow_mut()
+            //         .contract
+            //         .purchase(type_nft, referral, attached_deposit);
+            // });
+            ic_cdk::print(format!("transfer successfull in block {}", block_index));
+            Ok(block_index)
+        }
+        Err(e) => {
+            // If there was an error with the transfer, handle it accordingly.
+            // For example, you might log the error or return it.
+            Err(format!("ledger transfer error: {:?}", e))
+        }
+    }
+}
+```
+
+the crucial points are that we have to use `TransferFromArgs` and not `TransferArgs` and the `icrc2_transfer_from` method instead of `icrc1_transfer`. the reason being is that we approved the motodex canister to spend funds on behalf of alice, which does not work using `icrc1_transfer` as there is no way of specifying which account we want to transfer from.
+to get the correct types for `TransferFromArgs` and `TransferFromError` we use the [`icrc_ledger_types`](https://docs.rs/icrc-ledger-types/latest/icrc_ledger_types/index.html) crate.
+
+-------------------------
+
+oleksiivinogradov | 2024-04-03 08:41:37 UTC | #34
+
+thanks a lot, its amazing and works well now
+
+-------------------------
+

@@ -1,0 +1,131 @@
+shalexbas | 2021-10-13 19:30:17 UTC | #1
+
+Hey,
+
+I just want to know if it is possible to catch a panic/trap produced by calling another canister which traps (in Motoko it should be possible with a try-catch). 
+I tried out **catch_unwind** but my caller canister still traps. 
+
+Here is the panic message:
+ *[Canister r7inp-6aaaa-aaaaa-aaabq-cai] Panicked at 'called `Result::unwrap()` on an `Err` value: (
+CanisterError, "IC0503: Canister ryjl3-tyaaa-aaaaa-aaaba-cai trapped explicitly: assertion failed*
+
+Here is the code:
+```
+use futures::FutureExt;
+
+#[import(
+        candid_path = ".dfx/local/canisters/counter/counter.did",
+        canister_id = "ryjl3-tyaaa-aaaaa-aaaba-cai"
+    )]
+    pub struct CounterCanister;
+
+let result: std::result::Result<
+            (ic_cdk::export::candid::Nat,),
+            std::boxed::Box<dyn std::any::Any + std::marker::Send>,
+        > = CounterCanister::increment().catch_unwind().await;
+```
+
+I think the generated code (CounterCanister) calls the following method in ic_cdk:
+```
+pub async fn call<T: ArgumentEncoder, R: for<'a> ArgumentDecoder<'a>>(
+    id: Principal,
+    method: &str,
+    args: T,
+) -> CallResult<R> {
+    let args_raw = encode_args(args).expect("Failed to encode arguments.");
+    let bytes = call_raw(id, method, args_raw, 0).await?;
+    decode_args(&bytes).map_err(|err| trap(&format!("{:?}", err)))
+}
+```
+So on error trap function is called. Is it why I can't catch the panic with *catch_unwind()*? How to catch the panic then?
+
+Thanks
+
+-------------------------
+
+Maxfinity | 2021-10-13 23:22:35 UTC | #2
+
+It should be possible to catch the error if another canister is calling into the trapping canister. The trapping canister should return an error type to the outer canister.
+
+So just pattern match the error rather than catch unwind.
+
+-------------------------
+
+rckprtr | 2021-10-14 00:49:06 UTC | #3
+
+I asked a similar question before and it does not appear its possible to catch this error:
+
+Here is my code:
+https://github.com/dscvr-one/ic-drip/blob/better-props/src/ic_loot_rs/lib.rs#L540
+
+-------------------------
+
+shalexbas | 2021-10-14 07:22:38 UTC | #4
+
+I don't know how to pattern match it because the generated code (with *import* macro from *ic-cdk-macros*) doesn't produce any error result when calling. If I call the other canister like `CounterCanister::increment().await`, the compiler says that the result is a tupel `(ic_cdk::export::candid::Nat,)`, so there is nothing I can pattern match
+
+-------------------------
+
+shalexbas | 2021-10-14 07:43:15 UTC | #5
+
+It looks like this is the code that produce the generated code (ic-cdk-macros-0.3.2\src\import.rs):
+```
+fn actor_function_body(
+        &self,
+        name: &str,
+        arguments: &[(String, String)],
+        _returns: &str,
+        _is_query: bool,
+    ) -> Result<String, candid::error::Error> {
+      ...
+
+        let call = "ic_cdk::call";
+
+        // We check the validity of the canister_id early so it fails if the
+        // ID isn't in the right text format.
+        let principal: ic_cdk::export::Principal =
+            ic_cdk::export::Principal::from_text(canister_id).unwrap();
+
+        Ok(format!(
+            r#"
+            {{
+                {call}(
+                  ic_cdk::export::Principal::from_text("{principal}").unwrap() as ic_cdk::export::Principal,
+                  "{name}",
+                  {arguments}
+                 )
+                 .await
+                 .unwrap()
+            }}
+        "#,
+            call = call,
+            principal = &principal.to_text(),
+            name = name.escape_debug(),
+            arguments = arguments,
+        ))
+    }
+```
+It directly calls `await.unwrap()`...
+
+-------------------------
+
+shalexbas | 2021-10-14 07:56:05 UTC | #6
+
+I can catch the error with
+```
+let principal =
+            ic_cdk::export::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+let result = ic_cdk::api::call::call(principal, "increment()", ()).await
+            as CallResult<(ic_cdk::export::candid::Nat,)>;
+
+if result.is_ok() {
+           ...
+        } else {
+           ...
+        }
+```
+
+Unfortunately it just works with *call()* function but not with the **import** macro where the candid-file can be utilized
+
+-------------------------
+

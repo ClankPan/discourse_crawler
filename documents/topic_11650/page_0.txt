@@ -1,0 +1,123 @@
+senior.joinu | 2022-03-23 15:14:55 UTC | #1
+
+Imagine we have a `can.did` file like this:
+```
+type X = record {
+    x : vec Y;
+};
+
+type Y = variant {
+    A;
+    B;
+    C;
+};
+
+service : {
+  "test" : (X) -> ();
+}
+```
+
+If we'd run `didc` with the following arguments:
+```
+didc encode '(record { x = vec {} })' -d ../can.did -m test
+```
+We would get the following result:
+`4449444c036c0178016d026b03417f427f437f010000`
+
+But, if instead we would try to inline these types like this (which IMO shouldn't make any difference):
+```
+didc encode '(record { x = vec {} } : record { x : vec variant { A; B; C; } })'
+```
+We would get the following result:
+`4449444c026c0178016d7f010000`
+
+I don't know for sure, but it looks like the first blob contains three types in a type table, while the second one contains only two.
+
+This issue makes it impossible to pass an empty vec to a canister with unknown `.did` via `dfx`. It says something like `vec null is not a subtype of vec variant { A; B; C; }`
+
+@chenyan, please help.
+
+-------------------------
+
+chenyan | 2022-03-24 18:42:12 UTC | #2
+
+Yes, we are aware of this problem. It should be fixed once https://github.com/dfinity/candid/pull/311 gets implemented.
+
+-------------------------
+
+nomeata | 2022-03-25 05:30:26 UTC | #3
+
+I don't think a fix for this depends on the spec change, and it could be fixed right away, if `didc` would encode the latter empty vector as `vec empty` instead of `vec null`:
+```
+4449444c026c0178016d6f010000
+```
+
+Then this would be accepted by the receiver even with the current Candid rules.
+
+-------------------------
+
+chenyan | 2022-03-25 16:05:33 UTC | #4
+
+Good point! Let me just do that.
+
+-------------------------
+
+senior.joinu | 2022-03-31 11:35:32 UTC | #5
+
+Looks like the problem is not only about empty vecs.
+
+```
+$ didc encode '(vec { variant { A }; variant { B = 10 } } : vec variant { A; B : nat16; C : nat32; })'
+4449444c026d016b01417f01000200010a00
+
+$ didc decode 4449444c026d016b01417f01000200010a00
+Error: Fail to decode argument 0 from table0 to unknown
+
+Caused by:
+    0: input: 4449444c026d016b01417f0100020001_0a00
+       table: type table0 = vec table1
+       type table1 = variant { 65 }
+       wire_type: variant { 65 }, expect_type: variant { 65 }
+    1: Variant index 1 larger than length 1
+```
+
+-------------------------
+
+nomeata | 2022-03-31 16:38:27 UTC | #6
+
+Good catch. Probably 
+
+https://github.com/dfinity/candid/blob/e7abc462fd54e72e3449999169c12e9f5209d091/rust/candid/src/parser/value.rs#L314
+
+needs not just take the type of the first value, but the join of the types of all the values (which, incidentally, would be `empty` when the list is empty, so no need to handle the empty list specially). Or it'd need full bidirectional typing, given that there is an explicit type annotation in your example, which is ignored (it seems?).
+
+-------------------------
+
+chenyan | 2022-03-31 17:01:01 UTC | #7
+
+Right, serializing untyped values is best effort only. The type annotation is not part of the IDLValue AST, so the annotation on the vector type gets ignored. 
+
+On the other hand, as we embed did files into the Wasm module, there should be fewer and fewer use cases that need untyped values. Even with didc, it's recommended to use the `-d` flag to import a did file for type annotation.
+
+-------------------------
+
+senior.joinu | 2022-03-31 17:10:28 UTC | #8
+
+My use-case is that I have a canister that lets its users to call other arbitrary canisters. I could download a canister's candid beforehand and use it to encode arguments correctly, but is there a 100% working way to do so?
+
+Yes, there is `export_candid`, but it is optional (and may not contain all the exported functions) and I want to be sure that the canister is able to call any other canister's method, if it exists. 
+
+Another option for me is to ask a user to upload `.did` file for the call. It might work, but it looks too complicated for such a simple task.
+
+-------------------------
+
+chenyan | 2022-04-02 19:49:46 UTC | #9
+
+We are working on embedding the did file into the canister for all canisters, so in the future, you can query an HTTP endpoint to get most canisters' did file, unless the user makes the interface private, or it's an old canister that never gets updated.
+
+The coverage cannot be 100%. If the user explicitly makes the interface private, not sure if it's desirable for other people to call it.
+
+Another option in `didc` is to annotation the whole argument type with `-t` flag instead of inlined type annotations. This way the serializer will always use the provided type, but the whole type can be sometime verbose. That's why I recommend using the did file when possible.
+
+-------------------------
+

@@ -1,0 +1,331 @@
+senior.joinu | 2022-09-12 12:43:01 UTC | #1
+
+# Intro
+
+Hello, everyone.
+
+I’m working on ways to enable data certification in [ic-stable-memory](https://github.com/seniorjoinu/ic-stable-memory) library. I want to achieve a flow, when a user puts data into a stable collection and it just gets automatically certified, so later the user would ask for the data and receive it alongside the authenticating certificate. 
+
+During past couple of weeks I was reading and thinking a lot about different ways of data authentication on IC and came to a conclusion that for now there are only two options:
+
+- to use any kind of Merkle tree inside the canister;
+- to add an alternative implementation of query calls.
+
+In this thread I want to share with you why I think so, discuss some other options and why they wouldn’t work within the IC, and **exchange opinions**. Please, feel free to add any feedback you want: 
+
+- maybe you want to share about other authenticated data structures;
+- maybe you have thoughts about the certified by default query calls;
+- maybe I made a mistake somewhere in my research;
+- maybe something else.
+
+My posts are divided in two main sections: an overview of some authenticated data structures (cryptographic accumulators or set membership proof systems - call it as you like) and a draft proposal for a new kind of certified by default query calls.
+
+# Authenticated data structures
+
+## The task
+
+For each data entry we store in a canister we want to be able to generate a certificate that is impossible to forge by a man-in-the-middle: a subnet node or a boundary node.
+
+The only source of authentication we have is the `set_certified_data()` method, that accepts only 32 bytes of data as input and generates a certificate that can be retrieved with `data_certificate()` method. `set_certified_data()` can only be called during an `UPDATE` call, while `data_certificate()` can only be called during `QUERY` call, which means that there is always a time gap between the moment we certify the data and the moment we retrieve the certificate. 
+
+Our canisters can store up to 8GB of data. Since we can only certify 32 bytes of data, our task is to find a proper way of compressing 8GBs of data into 32 bytes fingerprint, so later it would be possible to tell whether this particular piece of data belongs to the fingerprint or not, without anyone being able to forge a false result.
+
+- We want to be able to certify all the data stored in a canister, not just some small subset.
+- We want this solution to be able to continue working properly, without hitting gas/message size limits, even if it is full of data.
+- We want this solution to add as little space and performance overhead, as possible. So we could utilize our memory more efficient by storing more meaningful data.
+
+## Options we have
+
+### Merkle trees
+
+The idea is simple: we just form a tree, where each node has a hash that is calculated by hashing the concatenation of this node’s children hashes. The only variable here is how we store data in such a tree.
+
+The classic Merkle tree is the following data structure:
+
+![merkle-tree.drawio|690x379](upload://tpKQ1rYzs9QMZmLsQqKoqLGFXsY.png)
+
+The data is stored in leaves - all other nodes only store hashes and pointers to children. In order to use this tree as a source of data authentication we need to put the root hash `hr` into the subnet’s state tree with `set_certified_data()`. After that, each time a user queries our canister for data, we return it alongside the **witness**, which is the part of the tree a user would need in order to locally calculate the root hash, and the certificate we get from `data_certificate()`:
+
+![merkle-tree.drawio (1)|690x379](upload://otVyXlUQ67BNbr2bPK7LQ9sbAsx.png)
+
+Let’s add some numbers. It is a binary tree, so if we have `N` data entries, the total number of nodes is `2*N + 1` and the size of any witness is `log2(N)`. As you can see, if the average size of each data entry is the same as the size of an intermediate node, which is very possible for some simple use-cases, like token balances, 50% of the memory used by our tree would be occupied by these intermediate nodes, instead of useful data.
+
+But these intermediate nodes are important. They represent witnesses for every possible data combination you might want to retrieve from the tree in a very compact way. If you want to retrieve not a single data entry, but a group of entries instead, you can do that by simply including more subtrees into your witness:
+
+![merkle-tree.drawio (2)|690x379](upload://AmHHBRbbezejIRuenPxrEGBjBtU.png)
+
+What’s even more exiting, is that the size of such a group witness is limited by `N/2 + 1` - it can’t grow more than that! It means that if you want to retrieve a certificate for a half of your data at once, this certificate will only contain `N/2 + 1` nodes. If you want to retrieve a certificate for more than half of your data, the size of the witness will shrink, since the data itself can be used to recalculate all the missing nodes.
+
+Each update always affects only a single subtree of the Merkle tree, so for an already issued witness each update is just a single changed hash. This means that witnesses can be cached client-side and updated with deltas in order to waste bandwidth more efficiently.
+
+**Variations**
+
+Any tree can be modified so it becomes a Merkle tree: 
+
+- [cdk-rs/certified-map](https://github.com/dfinity/cdk-rs/tree/main/src/ic-certified-map) uses a modified Red-Black tree, where each node is also annotated with a hash.
+- Ethereum uses a [Merkle Patricia trie](https://github.com/paritytech/trie), which it is a prefix tree annotated with hashes.
+
+Both these options provide better memory utilization, but with an additional computational cost. And you can efficiently search for data in these data structures, unlike the classic Merkle tree.
+
+But it is not always a good idea. You can imagine a BTree also being annotated with hashes, and adding a branching factor to a binary tree seems like a natural intention for performance improvement, but in fact this will have a negative impact on witness size, since now you also have to include all the neighbor hashes and the witness would have the size of `K * log2(N)`, where `K` is the branching factor. 
+
+One idea is to implement a Merkle BTree without this drawback by using a homomorphic hash function. There are [implementations](https://github.com/benwr/bromberg_sl2) of such a function, but this is a bleeding-edge topic with a lot of unknown vulnerabilities, which is bad for security-sensitive software. 
+Another idea is to use vector commitments for that - more on that below.
+
+**Conclusion**
+
+Merkle trees are great for the job, but it would be a better deal, if they were more efficient.
+
+### Bloom filter and Cukoo filter
+
+These are tricky hash maps, which only store some bits of information per each data entry, therefore greatly reducing memory consumption. 
+
+I won’t go into details for these two. The most important thing to know, is that they are **probabilistic** data structures: they may return a false-positive result (but not a false-negative one). And they are mostly used for optimizations, rather than for security-sensitive applications. Ethereum uses Bloom filters to [make logs processing faster](https://ethereum.stackexchange.com/questions/3418/how-does-ethereum-make-use-of-bloom-filters).
+
+[Bloom filter](https://en.wikipedia.org/wiki/Bloom_filter#Counting_Bloom_filters) is just a bit-array and it works by applying multiple hash functions on your data in order to determine what bits should be flipped. Bit positions calculated with different data may overlap - this is why you can get a false-positive. By default, you can’t remove data from a Bloom filter, but [there are solutions](https://en.wikipedia.org/wiki/Bloom_filter#Counting_Bloom_filters) to this problem.
+
+[Cukoo filter](https://en.wikipedia.org/wiki/Cuckoo_filter) has the same idea, but uses a common hash map with [Cukoo hashing](https://en.wikipedia.org/wiki/Cuckoo_hashing) instead of a bit-array, which makes it more efficient and provides a way to easily remove data from it.
+
+**Conclusion**
+
+Filters won’t do the job, since it is easy for a MITM to forge the response they want.
+
+### Cryptographic accumulators, vector commitments and Verkle trees
+
+Imagine you have a function that can map any unique data entry to a unique prime number. So you have many data entries each of which maps to a prime number. If you multiply all these prime numbers the result would work like a cryptographic accumulator. You can sign this accumulator value and when a user asks you to provide a set membership proof for some data entry, you can simply send them this value as a proof - if the user knows the same mapping function, they can simply map the data entry to a prime number and take a modulo of the proof by the prime number they have. If this modulo is 0 - the data entry is in the set, otherwise it is not.
+
+This is the simplest possible example I can give for what is a cryptographic accumulator. And it would be a perfect solution, because it only requires the data itself. The only problem is that there is no such a mapping function. Real accumulators work similar in idea - an accumulator is just a number or a coordinate and there exists a set of mathematical operations that allows us to modify this number so it persists the properties we want. But real accumulators work by utilizing mathematical properties of encryption systems. There are RSA-based cryptographic accumulators and EC-based ones. 
+
+I’m not a cryptographer, so I won’t even try to explain to you something I don’t understand myself, but the key point here is that - since these algorithms are based on encryption, they require a secret key to work properly. On the IC we can’t have a secret key in a canister, since this key can easily leak. 
+
+The only possibility to use these accumulators is if the Hardware Encryption will be enabled. In that case maybe it would be possible to privately generate a secret key, that nobody can get access to, within a canister. Because other properties of these cryptographic primitives are insane:
+
+- they are constant-size - the size of the proof does not depend on the amount of data we store inside;
+- some operations (which ones - depends on the chosen algorithm) are constant-time.
+
+The same is applicable to [vector commitments](https://eprint.iacr.org/2011/495.pdf). They allow to not only prove that a particular data entry is indeed a member of a set, but to also prove that it has some distinct position within this set. These commitments require `N` secret keys, where `N` is the size of the set, in order to manage them. 
+
+There is one more data structure from this space which came viral last year - a [Verkle tree](https://vitalik.ca/general/2021/06/18/verkle.html). The idea is pretty simple - let’s just make a k-ary Merkle tree, by making each node of it into a vector commitment - this will enable us to generate much smaller witnesses. 
+
+**Conclusion**
+
+Could be a perfect candidate for a solution, but requires a secret key.
+
+# Certified query calls
+
+Up to this point I was talking about some techniques which could be applied on a canister-developer level. But what if we somehow could update the protocol itself in order to make responses we get from a canister automatically certified?
+
+Some time ago, I already had [a little conversation](https://forum.dfinity.org/t/why-did-they-choose-to-make-variable-certification-optional/6785/5?u=senior.joinu) with @nomeata about this idea, but now I want to elaborate on it, providing algorithms, diagrams and more context. This solution eliminates the need in any additional authentication, making all `QUERY` responses from the IC authenticated by default. Also, as I will be obvious later, this solution may be used to charge canisters for query request execution, which, as far as I know, is [somewhere on the roadmap](https://forum.dfinity.org/t/computation-and-storage-cost-documentation/6085/10?u=senior.joinu) for Dfinity.
+
+*I tried to make a simple illustrative implementation of this flow, but since the only threshold BLS signatures implementation I know lives in dfinity/ic and it is pretty hard to extract it from there, I gave up. If someone helps me with getting this code working locally on my machine, I can also provide you with such an example. Or you can just explain me how to adapt [some other BLS implementation](https://github.com/sigp/milagro_bls) to make it support the threshold scheme, this will also be enough.* 
+
+### Top level sequence diagram
+
+For simplicity, the algorithm does not include a boundary node, but it is possible to imagine, how it will fit into this flow and improve it.
+
+![query-2.0.drawio (1) (1)|532x500](upload://5nsZr3qs4xOdII4KelKwoJnh5pJ.png)
+
+### Textual description
+
+If states of honest nodes are synchronized, they will always respond with the same output to the same input. If a user knows how many nodes there are in a subnet (which is not a secret), they know how many faulty responses they may get back after querying all of them.
+
+Let’s use this in our advantage. Let’s make all nodes in a subnet return a response for a query call and then let’s find responses which were produced by honest nodes, by simply counting how much copies of each unique response alternative we got back.
+
+The algorithm is straightforward:
+
+1. A user prepares a query request - serializes the arguments.
+2. A user sends a copy of the request to each node in the subnet their target canister lives in.
+3. Each node executes the request and finds out the result. The result should be the same.
+4. Each node forms a response from the result and signs it with it’s own BLS key share.
+5. Each node sends the signed response alongside with the subnet Chain Key delegation to the user.
+6. The user aggregates all received threshold BLS signatures and validates them against the subnet public key they get from the delegation.
+7. The user looks through all the responses they got from this query call. The responses may not all be the same, if there are malicious nodes. The user knows about this fact and also they know, they should be able to find out what response is the real one, by simply counting how much copies of each alternative they got back. If there are at least `2/3 * N + 1` copies of some alternative - this alternative is the real one.
+
+This flow has several problems which we have to address.
+
+### Problem #1 - Correct state copy selection
+
+When a user sends query copies to each node (*step 2*), this operation is asynchronous - nodes will receive these requests at different moments in time. This is a problem, since they have to respond with the same state, but their current (default to respond) state may differ.
+
+**Solution**
+
+Subnet nodes may store several copies of the state during the consensus protocol. We can make users to also provide a current timestamp each time they send a query request. If some of these state copies are finalized, it will be possible for nodes to choose the state the user wants to receive. This problem cannot be solved completely. The timestamp will only improve user’s chance to receive at least some valid state back, even if there are networking problems. 
+
+This chances can also be improved by making a boundary node do this repeated requests from a user to subnet nodes. Also, there is a possible improvement which will be covered in **problem #3**. 
+
+This timestamp, if also included into the response, can serve as a great protection against replay attacks. A user can just compare the timestamp they sent with the one they received to make sure they received a fresh response. 
+
+### Problem #2 - Response bandwidth control
+
+Up to this point I was talking about some abstract query requests. Let’s add some numbers now. Imagine a user want to download a 1MB file via query request from an application-type subnet. This subnet has 7 nodes, so in order to download and validate the file, a user would have to download 7MB (or 5MB if they are lucky) of data instead of 1MB. 
+
+Imagine a user now wants to download the same 1MB file, but from the NNS subnet. This subnet has 151 nodes. The user would have to download a minimum of 100MB of additional data in order to validate this file. 
+
+As you can see, the numbers are bad, but we have a well established solution for this kind of problems - [error correction codes](https://en.wikipedia.org/wiki/Error_correction_code) (ECC).
+
+**Solution**
+
+ECCs (*don’t confuse with Elliptic Curve Cryptography*) are a set of algorithms which allow to excessively encode data, so when some parts of this encoded data are missing or damaged it is still possible to decode the original back. There are many ECC algorithms with different properties, but for our use-case even the most basic one called [Reed-Solomon encoding](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction) (the one they use in barcodes) will do the trick.
+
+When you want to encode the data with Reed-Solomon encoding you have to provide two parameters: 
+
+- how many original chunks of data you will feed into the algorithm;
+- how many parity chunks (the excess) you want the algorithm to generate for you.
+
+By carefully choosing these two parameters we can manage the size overhead / damage resistance trade-off. We know, that our subnet can have at most `1/3 * N - 1` malicious node which means that if each node will only send back a chunk of data, at most this number of chunks can be malformed or not present at all. 
+
+So, let’s make subnet nodes split the result they get from executing the request (*step 3*) into `2/3 * N + 1` chunks and apply Reed-Solomon encoding with the number of parity chunks equal to `1/3 * N - 1` on them. After that each node will have total `N` chunks, only a super-majority of which is enough to regenerate the data back.
+
+Then a node will choose a chunk it wants to send to the user by simply looking at its rank during the consensus round when the requested state copy was produced. This is a deterministic procedure and all honest nodes should here choose a different chunk to send.
+
+To this chunk a node would also attach the hash of the original (not encoded) data and its rank that indexes the chunk - these three pieces of info is the response, that gets signed with the BLS key and sent to the user.
+
+When the user receives (*step 6*) at least `2/3 * N + 1` responses with identical data hashes, they can start decoding of the original data. Malicious nodes can cheat here in many ways, but the only meaningful one is to lie about their rank (about the position of their chunk) - all other attacks are simply resolved by signatures, error correction and rejecting a node if it tries to send more than one response.
+
+Let’s say, the rank of a malicious node was 3, but it said that it was 1. Now the user has two chunks, both of which have index 1. The user doesn’t know what chunk is the right one, before he actually decodes the data. In this situation the best solution for a user is to simply try different combinations of chunks at the same position, in order to recover the data and to compare its hash. In worst case scenario (when all malicious nodes chose different indices which are already occupied by some honest nodes, so each of such index will have two alternatives) this is `2^(1/3 * N - 1)` combinations, which is 2^50 for the NNS subnet. 
+
+But we can easily solve this problem, by making nodes include a hash of the chunk, that comes right after their chunk, into the response. This way the user will receive an implicit blockchain of chunks and all they have to do now is to simply choose the longest chain if there is a conflict. This way in the worst case scenario the user would have to only check `1` combination.
+
+By using ECC our total bandwidth consumption reduced from `S * N` to around `4/3 * S`, and each node now only has to send `4/3 * S / N`, where `S` is the data size. For `2MB` response each node in an application subnet will only have to transfer `~400KB` of data. For the same response in the NNS subnet each node would have to only transfer `~20KB` of data. The total bandwidth usage in both cases is around `2.8MB`.
+
+This will also have a great effect on performance of such query calls, since now users download the data via multiple connections, in parallel, like in BitTorrent.
+
+### Problem #3 - Request bandwidth control
+
+Okay, this is great, but what if the user now wants to send a big request? Now, in order to upload `1MB` query request it has to also upload it to all other nodes, which again increases bandwidth usage `N` times.
+
+**Solution 1**
+
+Let’s just lower the maximum message size for such requests. So the maximum query message size for application subnet would be `~400KB` and for the NNS subnet - `~20KB`. It would still be possible to implement a lot of use-cases even with such a low limit and this is very easy to do.
+
+**Solution 2**
+
+Let’s implement the same idea of Reed-Solomon encoding, but for requests also. A user would have to split their request into chunks, apply the encoding with the same parameters and then send each node only a single chunk with some additional data.
+
+But this solution has a negative impact on performance, since nodes now have to gossip chunks to each other in order to reconstruct the original request. This gossiping should be implemented in batches, in order to control node resource usage, which will greatly increase latency of getting the response back to the user.
+
+This will return bandwidth consumption back to normal with only a `1/3 * S` of overhead.
+
+Both these solutions will have a positive impact on **Problem #1**, since the user now has to transfer less data to each node, which increase the chance of hitting the state snapshot while it is still present in memory.
+
+### Additional feature - Charge canisters for query calls
+
+Obviously, since all nodes are participating in these new query calls, they can simply measure cycle consumption of such a query call and include the charging transaction into a next block. 
+
+There is not much to add, I hope it is clear.
+
+### Conclusion
+
+After applying all problem solutions, the sequence diagram will look like this:
+
+![query-2.0.drawio (1).drawio|358x500](upload://1IrYAA4TvKbjZIiljFwLR0fmhxg.png)
+
+It is a great question - whether this solution should be implemented as a replacement of existing `QUERY` calls, or instead as a new type of call (e.g. `CERTIFIED QUERY`). Together, these three types of call will provide a user with more precise trade-off balancing mechanism:
+
+- want to change the state - use slow, but reliable `UPDATE` calls;
+- want to read state without latency - use fast and unreliable `QUERY` calls;
+- want to read state and be sure about it - use slightly slower, but reliable `CERTIFIED QUERY` calls.
+
+But maybe there are techniques I’m not aware of, that will help reducing the latency of these `CERTIFIED QUERY` calls, and make it possible to just swap common queries with this more reliable version, leaving us with only two call types as before.
+
+# In total
+
+I did this research in order to find a solution for data certification in `ic-stable-memory` and after all of this it seems like there is simply nothing more promising than to just stick with Merkle trees on the application level. Maybe it is reasonable to try to adapt some balanced binary tree (e.g. [AVL](https://en.wikipedia.org/wiki/AVL_tree)) to make it always stay [complete](https://www.programiz.com/dsa/complete-binary-tree#:~:text=A%20complete%20binary%20tree%20is,must%20lean%20towards%20the%20left). In that case it would be possible to implement this tree on top of a vector (exactly how a binary heap is implemented), which will provide both: better performance since “computers love arrays” and better space-efficiency since we won’t store tree node pointers anymore.
+
+The idea of certified by default query calls also seems cool to me, but there are challenges to overcome first. If it would be possible to implement such a techniques without loosing performance - this could be very profitable for each of us. For newcomers such an abstraction could make IC even simpler to jump in, for everybody else - this is just a great thing to not think about the certification and how to implement it for your use-case at all - everything coming from the IC would be certified auto-magically.
+
+In any ways, thanks for reading this far. Feel free to comment on anything.
+
+-------------------------
+
+cryptoschindler | 2022-09-17 16:07:50 UTC | #3
+
+Thank you for this detailed writeup, it was a pleasure to read.
+
+If certified queries come with the overhead of the gossip introduced by chunking the request, wouldn't it be possible that those certified queries talk almost as long as (or longer) than an update call, which basically also certifies the data (at least to my understanding)?
+
+-------------------------
+
+Zane | 2022-09-17 16:16:06 UTC | #4
+
+From my understanding you only have to certify it once, so unless the data constantly changes it's worth it to certify and then serve it with a query.
+
+-------------------------
+
+paulyoung | 2022-09-17 17:13:57 UTC | #5
+
+[quote="senior.joinu, post:1, topic:15379"]
+`set_certified_data()` can only be called during an `UPDATE` call, while `data_certificate()` can only be called during `QUERY` call, which means that there is always a time gap between the moment we certify the data and the moment we retrieve the certificate
+[/quote]
+
+Have you tried calling `data_certificate()` during an update call?
+
+When I tried this for the asset canister specifically it [trapped](https://github.com/dfinity/sdk/blob/80cefec1e56144db294d635e2cd6581376674523/src/canisters/frontend/ic-certified-assets/src/lib.rs#L170), but that should be something specific to this canister.
+
+Generally `query` methods can be called as `update`.
+
+So, I’m wondering if “`data_certificate()` can only be called during `QUERY` call” is an assumption or if it’s been tried in practice.
+
+The code I used is here:
+
+https://github.com/dfinity/sdk/issues/2551
+
+-------------------------
+
+cryptoschindler | 2022-09-17 20:12:54 UTC | #6
+
+For the current certification scheme this is true, but if I understood @senior.joinu correctly, this won't be the case for his proposed solution.
+
+[quote="senior.joinu, post:1, topic:15379"]
+This solution eliminates the need in any additional authentication, making all `QUERY` responses from the IC authenticated by default.
+[/quote]
+
+-------------------------
+
+senior.joinu | 2022-09-18 11:22:32 UTC | #7
+
+[quote="cryptoschindler, post:3, topic:15379"]
+If certified queries come with the overhead of the gossip introduced by chunking the request, wouldn’t it be possible that those certified queries talk almost as long as (or longer) than an update call, which basically also certifies the data (at least to my understanding)?
+[/quote]
+
+I just double-checked page 17 of [Internet Computer For Geeks](https://internetcomputer.org/whitepaper.pdf) and Update Calls are not that simple:
+1. There is an initial gossip of ingress message.
+2. Then there is consensus.
+3. Then there is finalization.
+4. Then there is maybe a cross-canister action.
+Etc.
+
+But for certified query calls it is only:
+1. Gossip and accumulate chunks.
+2. Calculate and return the result.
+
+So, the performance of such query calls should be better than of update calls.
+
+[quote="paulyoung, post:5, topic:15379"]
+Have you tried calling `data_certificate()` during an update call?
+...
+Generally `query` methods can be called as `update` .
+[/quote]
+
+Data certification (state tree root signature) can only happen AFTER your transaction is executed, because replicas sign blocks after executing all the messages inside it. So it is important to wait at least one consensus round after you `set_certified_data()`. 
+
+As I understand, this mechanic you mentioned is implemented not because there is some system-wide inability to execute `data_certificate()` method during an `update` call, but because this way it forces you to use two separate calls to get a certificate for some data. Which prevents you from accidentally reading an old certificate. 
+
+This is just a speculation, though. 
+
+[quote="Zane, post:4, topic:15379, full:true"]
+From my understanding you only have to certify it once, so unless the data constantly changes it’s worth it to certify and then serve it with a query.
+[/quote]
+
+@cryptoschindler is right. Each such query response will be a fresh one, certified on-the-fly specially for you. At least, this is the idea.
+
+So developers won't think about certification at all - it will just work by itself on the system-level.
+
+-------------------------
+
+cryptoschindler | 2022-09-19 14:21:34 UTC | #8
+
+Would be very interesting to get some numbers on how long a certified query response would take to reach the caller! In general I'm very much in favor of making certification transparent for developers.
+
+-------------------------
+

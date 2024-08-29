@@ -1,0 +1,246 @@
+skilesare | 2023-01-08 00:34:04 UTC | #1
+
+@timo @quint 
+
+I've seen a couple of hash libraries and they were both written and adapted by you all, so I'm sorry for the tag, but I think you all are most qualified to answer.
+
+If I do:
+
+```
+let h = sha256();
+h.sum(2048000 bytes);
+h.sum(2048000 bytes);
+h.sum(2048000 bytes);
+h.sum(4567 bytes);
+```
+
+Will my hash be the same as if I did 
+
+```
+let h = sha256();
+h.sum(8196567 bytes);
+```
+Where the 8196567 are the same in both instances(just chunked in the first). If not, is there a certain number of bytes that chunking would produce the same hash(I'd imagine some 2^x).
+
+Use case:  As files come into a canister in chunks I want to keep track of both the hash of each chunk and a hash of the whole file.
+
+-------------------------
+
+skilesare | 2023-01-08 02:54:14 UTC | #2
+
+Answering my own question here:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=6323755
+
+It looks like the answer is yes.  
+
+```
+let z = SHA.New();
+    z.write(gb3);
+    let result2 = z.sum([]);
+
+and 
+
+let h = SHA.New();
+    h.write(gb1);
+    h.write(gb1);
+    h.write(gb1a);
+    let result = h.sum([]);
+```
+
+Give the same hash if write them out.
+
+The issue is that I'm only able to write 64000 bytes at time with the current aviate-labs SHA256 function.  I'm not sure if @timo 's that is hanging around is faster or not.  It looks like I can do 128,000 bytes per round if I hold the sha accumulator in memory and write and sum each time(see **progressive_write_sum**).
+
+This needs to be better.  It looks like the current one uses a bunch of array functions...maybe those can be switched to buffer?
+
+I'm assuming this works much better in rust as the asset canister hashes the items as they come in and adds them to the certified asset tree(unless it is just trusting the hash passed in and relying on the service worker to invalidate it on the way out).
+
+Can anyone that understands the asset canisters confirm or deny?  I'm trying to sha256 large files coming into the Origyn_nft so that we can certify them on the way out.
+
+-------------------------
+
+mparikh | 2023-01-08 03:52:04 UTC | #3
+
+In the effort to  back up a stable memory (comprising of chunks of 1024 WASM pages), I hit execution limit around 20ish WASM pages for computing the sha256. So I use a "loop" through timer iterating 16 WASM pages at a time (WASM page size = 65536). So I can do roughly 1048576 bytes per round give or take .... in rust.
+
+
+The Cargo dep is 
+sha2 = "0.10.6"
+
+-------------------------
+
+timo | 2023-01-08 08:41:27 UTC | #4
+
+[quote="skilesare, post:2, topic:17853"]
+It looks like the answer is yes.
+
+```
+
+```
+[/quote]
+
+Yes, but once you have called `h.sum` you can't call `h.write` again because the state has changed ("is finalized").
+
+[quote="skilesare, post:1, topic:17853"]
+Use case: As files come into a canister in chunks I want to keep track of both the hash of each chunk and a hash of the whole file.
+[/quote]
+
+If you are thinking to get both hashes, chunk and whole, for free (i.e. at once without doubling the work) then it won't work. But I don't fully understand the requirements of your use case, so can't tell if there's a work-around. 
+
+[quote="skilesare, post:2, topic:17853"]
+The issue is that I’m only able to write 64000 bytes at time with the current aviate-labs SHA256 function.
+[/quote]
+
+You mean because of the cycle limit or some other limit of the library? In terms of cycles you should be able to get around ~2MB hashed in one round.
+
+-------------------------
+
+timo | 2023-01-08 08:56:02 UTC | #5
+
+I see https://github.com/aviate-labs/crypto.mo/blob/main/src/SHA/SHA2.mo has the same quadratic complexity bug that https://github.com/enzoh/motoko-sha/blob/master/src/SHA256.mo has, from which it was probably derived.
+
+The problem is in this line: https://github.com/aviate-labs/crypto.mo/blob/daddf4e03e2f224f2b27b1119f95c4791364767f/src/SHA/SHA2.mo#L130
+where the majority of the whole message to be hashed gets copied. Instead of copying arrays around it has to work by moving pointer to positions in the original array.
+
+A fix is here: https://github.com/enzoh/motoko-sha/pull/11
+
+-------------------------
+
+skilesare | 2023-01-08 13:09:25 UTC | #6
+
+Great data point. I'll have to take a look and see if there is any optimization that can be done.
+
+-------------------------
+
+skilesare | 2023-01-08 13:11:18 UTC | #7
+
+Thank you! I'll do a pull to @quint 's library and I'll see how the performance improves.
+
+-------------------------
+
+skilesare | 2023-01-08 16:21:38 UTC | #8
+
+[quote="timo, post:5, topic:17853"]
+Timo/fix quadr complexity by timohanke · Pull Request #11 · enzoh/motoko-sha · GitHub
+[/quote]
+
+There was also a performance hit on the writes as it was using Array.tabulate.  Basically don't do that.😂
+
+There are likely more updates to take out more Array.tabluate that would be helpful here, especially for the HMAC hash as I didn't do much there.
+
+I can now write up to 12 blocks of 2MB data into a Hash object and then call sum and it generally seems to always return(up to 144 blocks tested).
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=637638194
+
+The test pass, but they don't check much past a few bytes of data and I'd recommend a test that checks the validity of the has for a very large file > 2MB.
+
+I've created a pull request: https://github.com/aviate-labs/crypto.mo/pull/2
+
+-------------------------
+
+timo | 2023-01-08 20:55:08 UTC | #9
+
+[quote="skilesare, post:8, topic:17853"]
+I can now write up to 12 blocks of 2MB data into a Hash object and then call sum and it generally seems to always return
+[/quote]
+
+You mean you can hash 24 MB in one message? With DTS, or?
+
+-------------------------
+
+skilesare | 2023-01-08 21:08:50 UTC | #10
+
+[quote="timo, post:9, topic:17853"]
+You mean you can hash 24 MB in one message? With DTS, or?
+[/quote]
+
+I assume DTS is running on Motoko playground.  I can write 24MB into a Hash Handling object in one round.  I do the actual sum in the another function. See the motoko playground link and these functions:
+
+```
+
+public shared func store4() : async (){
+    var tracker = 0;
+    var subtracker : Nat8 = 0;
+    let b1 = Buffer.Buffer<Nat8>(1);
+
+    while(tracker < 2048000){
+      b1.add(subtracker);
+      if(subtracker == 255) subtracker := 0;
+      subtracker += 1;
+      tracker += 1;
+    };
+
+    gbPrgressive := b1.toArray();
+  };
+var continual_sum = SHA.New();
+  var progressive_tracker = 0;
+  
+  public shared func progressive_write(number : Nat) : async Nat{
+    for(i in Iter.range(0,number -1)){
+      continual_sum.write(gbPrgressive); //add 2 more MB.
+      progressive_tracker += 1;
+    };
+    progressive_tracker
+  };
+
+  public shared func progressive_sum() : async [Nat8]{
+    let result = continual_sum.sum([]); //get the hash
+    continual_sum := SHA.New();
+    progressive_tracker := 0;
+    result;
+  };
+
+```
+
+To simulate goto https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1239614396 , deploy, and then call store4, then progressive_write, then progressive_sum.
+
+It is possible I've completely bumbled this.  But the tests are passing up to some non-trivial number of bytes....it would be great to have a large test added.
+
+-------------------------
+
+timo | 2023-02-05 06:15:40 UTC | #11
+
+I have written a new cycle-optimized Sha2 library. You can find it in here: https://github.com/research-ag/motoko-lib
+
+Benchmark will follow.
+
+-------------------------
+
+timo | 2023-02-06 09:18:47 UTC | #12
+
+Benchmarked were these libraries:
+
+1. research-ag/motoko-lib
+2. enzoh/motoko-sha
+3. aviate-labs/crypto.mo
+4. timohanke/motoko-sha2
+
+Since the original 2. and 3. still have the quadratic complexity bug in them I used these PRs for them:
+
+2. https://github.com/enzoh/motoko-sha/pull/11
+3. https://github.com/aviate-labs/crypto.mo/pull/2
+
+
+The cycle cost of sha256 per block (64 bytes) based on the average taken over 1,000 blocks is:
+```
+research-ag/motoko-lib  34.6k
+enzoh/motoko-sha        51.9k
+aviate-labs/crypto.mo   48.2k
+timohanke/motoko-sha2   49.8k
+```
+The cycle cost for the empty message (demonstrating per-message overhead) is:
+```
+research-ag/motoko-lib  37k
+enzoh/motoko-sha        96k
+aviate-labs/crypto.mo   107k
+timohanke/motoko-sha2   503k
+```
+The cycle cost of sha512 per block (128 bytes) based on the average taken over 1,000 blocks is:
+```
+research-ag/motoko-lib  53.9k
+```
+The numbers for motoko-lib translate to 541 cycles/byte for sha256 and 421 cycles/byte for sha512.
+
+-------------------------
+

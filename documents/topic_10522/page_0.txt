@@ -1,0 +1,125 @@
+ArjaanBuijk | 2022-01-27 13:31:40 UTC | #1
+
+I am able to use the [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) to write C++ apps that run in a canister, and send data in & out over Candid.
+
+I learned that I have to compile the wasi-sdk, llvm-project & wasi-libc with some special flags, `-DLIBCXXABI_BAREMETAL=ON and -DLIBCXXABI_ENABLE_ASSERTIONS=OFF`,  to avoid getting unsupported imports in the WebAssembly, like these ones:
+```bash
+(module
+  (type (;0;) (func (param i32 i32) (result i32)))
+  ...
+  (type (;42;) (func (param i32 i64 i64 i64 i64)))
+  (import "ic0" "debug_print" (func (;0;) (type 10)))
+  (import "wasi_snapshot_preview1" "fd_close" (func (;1;) (type 1)))
+  (import "wasi_snapshot_preview1" "fd_seek" (func (;2;) (type 11)))
+  (import "wasi_snapshot_preview1" "fd_write" (func (;3;) (type 7)))
+```
+
+However, I have to be very careful not to use certain capabilities of the std library that trigger those types of imports.
+
+I described one of these cases to the wasi-sdk team in [this issue](https://github.com/WebAssembly/wasi-sdk/issues/220), and they provided some tips on how to track down the cause. I am still working on that...
+
+They also asked [this question](https://github.com/WebAssembly/wasi-sdk/issues/220#issuecomment-1022489499) though that I like to ask here:
+
+> *"Out of interest is there some fundamental reason why you don't use those `wasi_snapshot_preview1` imports? It is just code size or are you trying to target an environment that doesn't support WASI? If its the latter, it seems rather odd to be using WASI SDK at all. Obviously we always want to generate the smallest possible binaries but targeting non-WASI host environments is probably out of scope of wasi-sdk."*
+
+I did not answer it yet, because I am not sure what the answer is. I am using the `wasi-sdk` because I explored all these options:
+
+1. Use clang++-12, targeting wasm
+2. Use emscripten, targeting standalone wasm
+3. Use wasi-sdk, out-of-the-box
+4. Use wasi-sdk, build from source, with flags to avoid external imports that IC does not support
+
+and only option 4 allowed me to use the C++ standard library.
+
+So, after a long story, my question is:
+
+Are the IC canisters actually a non-WASI host environment and I am just going down a wrong path, or does my approach make sense, and I just have to push on and overcome some of these initial hurdles and figure out the best practices of writing C++ code for IC?
+
+-------------------------
+
+paulyoung | 2022-01-27 14:12:48 UTC | #2
+
+In case it helps, in Rust I am targeting `wasm32-unknown-unknown` as opposed to `wasm32-wasi` or something else.
+
+-------------------------
+
+ArjaanBuijk | 2022-01-27 14:51:26 UTC | #3
+
+[quote="paulyoung, post:2, topic:10522"]
+wasm32-unknown-unknown
+[/quote]
+
+Thanks for pointing that out. From reading the description of that flag (https://docs.wasmtime.dev/wasm-rust.html), it appears that you are not able to use the rust standard library:
+>"*`wasm32-unknown-unknown` - this target, like the WASI one, is focused on producing single `*.wasm` binaries. The standard library, however, is largely stubbed out since the "unknown" part of the target means libstd can't assume anything. This means that while binaries will likely work in `wasmtime` , common conveniences like `println!` or `panic!` won't work.*"
+
+Is that correct?
+
+I ended up trying out the `wasi-sdk` for C++, because it is linked to from this page, https://docs.wasmtime.dev/wasm-c.html. The `wasi-sdk` provides an implementation of the standard library that works well, except that it sometimes creates these imports for file io that are not supported by the canister runtime. The spurious file io always seems to be caused by asserts & writing to stderr if things fail. These can be largely avoided with the proper compile flags that optimize away these calls, but not always...
+
+As far as I understand, the IC canisters do run the wasmtime environment. (I am not sure though...)
+
+-------------------------
+
+roman-kashitsyn | 2022-01-27 20:17:20 UTC | #4
+
+[quote="ArjaanBuijk, post:1, topic:10522"]
+Are the IC canisters actually a non-WASI host environment and I am just going down a wrong path, or does my approach make sense, and I just have to push on and overcome some of these initial hurdles and figure out the best practices of writing C++ code for IC?
+[/quote]
+
+Yes, IC canisters run in a non-WASI environment. There is no file system, no locks, no synchronous randomness, etc. The IC execution environment provides it's own API that is quite different from Wasi: https://smartcontracts.org/docs/interface-spec/index.html#system-api
+
+-------------------------
+
+ArjaanBuijk | 2022-01-27 20:28:11 UTC | #5
+
+[quote="roman-kashitsyn, post:4, topic:10522"]
+Yes, IC canisters run in a non-WASI environment. There is no file system, no locks, no synchronous randomness, etc. The IC execution environment provides it’s own API that is quite different from Wasi: [The Internet Computer Interface Specification :: Internet Computer ](https://smartcontracts.org/docs/interface-spec/index.html#system-api)
+[/quote]
+
+Thanks for that explanation.
+
+Even though IC canisters run in a non-WASI environment, I am still quite succesfull in using the `wasi-sdk` in compiling C++ code to wasm that runs on the IC canisters. I found it to be the most complete environment so far.
+
+If I can get the wasm deployed to an IC canister, mainly by making sure it is not importing any wasi specific functions, like io related things, is it ok to do it that way or do you advice against it?
+
+-------------------------
+
+roman-kashitsyn | 2022-01-27 21:15:10 UTC | #6
+
+[quote="ArjaanBuijk, post:5, topic:10522"]
+If I can get the wasm deployed to an IC canister, mainly by making sure it is not importing any wasi specific functions, like io related things, is it ok to do it that way or do you advice against it?
+[/quote]
+
+Wasm is Wasm, as long as it adheres to the interface specification, it should be fine.
+The only downside is that DFINITY devs have very little experience with using `wasi-sdk`, so we probably won't be able to help much with building C++ canisters that use the standard library.
+
+-------------------------
+
+jzxchiang | 2022-01-28 22:53:30 UTC | #7
+
+> Even though IC canisters run in a non-WASI environment, I am still quite succesfull in using the `wasi-sdk` in compiling C++ code to wasm that runs on the IC canisters. I found it to be the most complete environment so far.
+
+This is interesting. Do you mean that you were able to deploy a wasm canister that was compiled from C++ to `wasm-wasi` and successfully call some of its methods? If your method tries to call any part of the WASI API outside of logging, I believe your canister may trap.
+
+This [thread](https://forum.dfinity.org/t/how-to-use-more-c-c-functions/8354/2?u=jzxchiang) might be helpful.
+
+-------------------------
+
+ArjaanBuijk | 2022-01-29 04:04:36 UTC | #8
+
+Thanks for that link. I was indeed inspired by the C examples for sqlite and counter to dive into C++.
+
+I was able to deploy some simple C++ code, and receive mesaages, do some logging, call other class methods, and return data. I am using the wasi-sdk that I build from code, with two additional flags when it builds the llvm-project. The issue I refer to in my original post explains the details, but I plan to make a better write up.
+
+Basically, using a custom build of the llvm-project, and then compiling my C++ code with 03 and LTO optimization, it does not call any wasi things. 
+
+I have not experienced any traps at runtime, because if there are wasi things in the .wasm, it is not possible to deploy it to the canister. 
+
+I did learn that I need to be careful not to do certain things, like std::string manipulation, because that triggers wasi calls to fd_close.
+
+But as long as I avoid that, it seems to work.
+
+Still learning and exploring, but if it indeed works out, I will write up a better summary somewhere.
+
+-------------------------
+

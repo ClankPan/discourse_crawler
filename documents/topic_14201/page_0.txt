@@ -1,0 +1,1167 @@
+ulan | 2022-07-07 13:51:03 UTC | #1
+
+## Background
+
+Heartbeat is a mechanism that allows canisters to perform periodic tasks without relying on incoming messages to trigger the execution. If a canister exports a Wasm method named `canister_heartbeat`, then the canister is considered as active even if it doesn’t have any incoming messages and the heartbeat method will be invoked in every round in which the canister is scheduled to run (the schedule depends on how busy the subnet is).
+
+## The problem
+
+One drawback of the current design of heartbeat is that it is impossible to configure the frequency of heartbeat invocation. There is also no way to disable heartbeat without upgrading the canister. This “all or nothing” design wastes resources and cycles. See for example: https://forum.dfinity.org/t/cycle-burn-rate-heartbeat/12090
+
+This post summarizes solutions to this problem proposed by different people: @Alexandra, @berestovskyy, @christian, @Manu, @roman-kashitsyn, and others. The proposed function names are not final and are up to discussion/bikeshedding. The engineering cost is roughly similar for all options.
+
+## Proposal 1: Timers
+
+A timer is *“an automatic mechanism for activating a device at a preset time.”* All major operating systems support some timer API. For example, Linux has `getitimer()/setitimer()`. The idea of this proposal is to support a minimal timer API that allows building arbitrarily complex and efficient timers on top of it.
+The proposal:
+* Add a new System API `ic0.set_global_timer(interval_in_seconds)` function.
+* The function schedules a call to the exported `canister_global_timer()` Wasm method in some round after `ic0.time() + interval_in_seconds`.
+* The function returns the previous value of the timer relative to the current time. The getter can be implemented in a library by calling the setter twice because the time doesn’t change within the same execution.
+
+**Pros**
+
+* Intuitive and known from other platforms.
+* A library can support multiple timers and heartbeats of arbitrary complexity by maintaining a queue.
+
+**Cons**
+
+* A completely new API. If this proposal is accepted, then it might make sense to deprecate the existing heartbeat API.
+* Periodic timers and heartbeats should be implemented in a library. Direct usage of the API for such cases requires careful programming if the execution traps after scheduling the next timer. In such a case the timer would not be scheduled. The library can easily work around this by calling the user code in a separate message.
+
+## Proposal 2: Pause heartbeat using absolute time
+
+* Add a new System API `ic0.pause_heartbeat_until(absolute_time)` function.
+* The function prevents heartbeat invocations until `ic0.time() >= absolute_time`.
+* The function returns the previously set time, so there is no need for a separate getter.
+* The function can be called in any context (not only in heartbeats).
+* If the heartbeat doesn’t call the function again to postpone the next heartbeat, then it falls back to the current behavior (calling the heartbeat every round).
+
+**Pros**
+
+* A library can support multiple timers and heartbeats of arbitrary complexity by maintaining a queue.
+
+**Cons**
+
+* Requires a call to `ic0.time()` to compute the absolute time.
+* Requires careful programming to properly handle code that traps. Ideally that is wrapped in a library similar to Proposal 1.
+
+## Proposal 3: Set heartbeat interval
+
+* Add a new System API `ic0.set_heartbeat_interval(duration_in_seconds)` function.
+* The function sets the minimum interval between two heartbeat invocations.
+* The function returns the previously set value, so there is no need for a separate getter.
+* The function can be called in any context (not only in heartbeats).
+
+**Pros**
+
+* The interval needs to be set once and no action is required from the heartbeat to keep it.
+
+**Cons**
+
+* A bit more difficult to implement a generic library for arbitrary timers because the API is tailored for heartbeats.
+
+## Proposal 4: Set heartbeat interval in canister settings
+
+* Add a new `heartbeat_interval_in_seconds` field in the canister settings.
+* The controller of the canister can change the field by calling the `update_settings` method of the IC management canister.
+
+**Pros**
+
+* No new System API
+* The controller can adjust the interval without any code changes
+
+**Cons**
+
+* Difficult to support general programmatic timers because only controllers can update the field and update requires an inter-canister call. This might be okay if only coarse grained timing is required (e.g. order of 5 - 10 seconds).
+
+A similar but less flexible idea would be to specify the heartbeat interval in a custom section of Wasm module.
+
+-------------------------
+
+Manu | 2022-07-07 19:18:06 UTC | #2
+
+Thanks for the nice writeup @ulan! 
+
+@lastmjs and @bob11, i know you are interested in this topic, so I'm curious to hear your thoughts!
+
+-------------------------
+
+ulan | 2022-07-07 19:42:14 UTC | #3
+
+Adding more folks who might be interested in this topic: @bjoern, @claudio, @domwoe, @ggreif, @hpeebles
+
+-------------------------
+
+marcio | 2022-07-07 21:21:18 UTC | #4
+
+I think proposal 1 makes most sense. Thanks!
+
+-------------------------
+
+hpeebles | 2022-07-07 21:47:41 UTC | #5
+
+Yessssssss! We could really do with this within OpenChat!
+
+We have tens of thousands of user canisters so we can't use heartbeat in them since queueing all of those canisters on every round would be insanely expensive + would take execution time away from other canisters. But we have lots of cases where we need to be able to trigger tasks to run in the future, for example retrying an inter canister update call if it failed the first time or marking a poll as ended.
+
+To solve these issues we have built a 'callback canister' which we use to trigger callbacks at chosen times in the future. With this functionality we could simplify things massively and remove this canister entirely. 
+
+In terms of implementation, I like option 1, it seems like it would fit all use cases whereas the other options would be an improvement but would still not handle many use cases.
+
+Edit: Actually option 2 does provide all of the functionality provided by option 1 but I prefer the API of option 1.
+
+-------------------------
+
+ggreif | 2022-07-08 06:37:32 UTC | #6
+
+[quote="ulan, post:1, topic:14201"]
+canister_heartbeat
+[/quote]
+
+Did you consider the simplest option, namely examining the **type** of `canister_heartbeat` and if it returns an `(u32)`, interpret that as _rounds that should pass before being called again_? While at observing the function's type, from here it should be trivial to interpret returning a `(f32)` as _the seconds to pass_ (absolute timespan). This solution is still backwards compatible, just check for a `()` return.
+
+-------------------------
+
+christian | 2022-07-08 07:25:25 UTC | #7
+
+I definitely vote for Proposal 1 as is it the most clean and powerful way of dealing with schedules. I'd rather prefer to go through the pain of deprecation than building upon or extending a problematic solution.
+
+Btw, don't fully understand this paragraph:
+
+> The function returns the previous value of the timer relative to the current time. The getter can be implemented in a library by calling the setter twice because the time doesn’t change within the same execution.
+
+-------------------------
+
+christian | 2022-07-08 07:32:01 UTC | #8
+
+Rounds have no relation with the wall time, their frequency can change any time and AFAIK they aren't visible in the programming model (and I think this is great).
+
+-------------------------
+
+ulan | 2022-07-08 08:01:43 UTC | #9
+
+Yes, we considered this idea of heartbeat specifying the time of the next invocation. The main blocker was that it is impossible to change the scheduled time outside of the heartbeat. The use case: the heartbeat schedules the next call in 1 day, then some message arrives and the canister needs to do work in 10 minutes.
+
+-------------------------
+
+ulan | 2022-07-08 08:07:03 UTC | #10
+
+[quote="christian, post:7, topic:14201"]
+Btw, don’t fully understand this paragraph:
+
+> The function returns the previous value of the timer relative to the current time. The getter can be implemented in a library by calling the setter twice because the time doesn’t change within the same execution.
+[/quote]
+
+The idea was that CDK can implement a getter function like this:
+```
+fn get_global_timer() -> Duration {
+   let seconds = ic0.set_global_timer(0);
+   ic0.set_global_timer(seconds);
+   Duration::from_secs(seconds)
+}
+```
+So there is no need for the System API to support getter. But that's a minor pont and we might want to add the getter for symmetry.
+
+-------------------------
+
+Safik | 2022-07-08 08:48:49 UTC | #11
+
+I want to see:
+1)Resetting the system instruction counter in long-running operations (in the function body).
+2)System notification of a new round. It is the system time, since the time in nanoseconds is always different anyway.
+
+It is even possible to leave a simple heartbeat and add a new (similar) instruction.  
+Thanks!
+
+-------------------------
+
+ggreif | 2022-07-08 08:56:35 UTC | #12
+
+That sounds like a rather theoretical obstacle. Why not do the cleanup immediately (or with a small delay of 1 round for a self send)? Did you actually encounter a real use case for a message needing (scheduling) a heartbeat whose delay depends on an incoming message?
+
+-------------------------
+
+ggreif | 2022-07-08 09:00:48 UTC | #13
+
+Yes, I know, but that `u32` is just a hint. 1 would mean I want to be called as soon as possible, 2 means twice that, etc.
+
+-------------------------
+
+ulan | 2022-07-08 09:04:53 UTC | #14
+
+I think the use case is real rather than theoretical because:
+1) A canister might want to disable heartbeat (to save cycles) until some event occurs that activates it again. Disabling can be done by setting a large delay like 1 month.
+2) A canister might have multiple different jobs with different intervals and activations.
+3) In general, we want to enable support for arbitrary many timers and heartbeats as a library.
+
+-------------------------
+
+domwoe | 2022-07-08 09:11:32 UTC | #15
+
+Thank you ulan!
+
+In general I like the first proposal because its intuitive and expressive, but wonder about the following:
+
+[quote="ulan, post:1, topic:14201"]
+If this proposal is accepted, then it might make sense to deprecate the existing heartbeat API.
+[/quote]
+
+Would deprecate mean eventually removing the heartbeat API or just telling people that this functionality is deprecated? There might be non-upgradable canisters relying on this API...
+
+-------------------------
+
+ggreif | 2022-07-08 09:16:33 UTC | #16
+
+[quote="ulan, post:14, topic:14201"]
+In general, we want to enable support for arbitrary many timers and heartbeats as a library.
+[/quote]
+
+If you go the timer route you have to think about the payment mode. Each timer becomes a replica-side resource, and thus need bookkeeping (a queue) there. Canisters might DoS that facility.
+
+-------------------------
+
+ulan | 2022-07-08 09:19:03 UTC | #17
+
+[quote="Safik, post:11, topic:14201"]
+1)Resetting the system instruction counter in long-running operations (in the function body).
+[/quote]
+
+Deterministic-time slicing will help to support longer running operations without resetting the instruction counter: https://forum.dfinity.org/t/deterministic-time-slicing/10635 
+
+Implementing a heartbeat/timer like functionality based on long-running operations is not feasible for two reasons: 1) the operation runs in the context of the original round, so `ic0.time()` will return the same value (we cannot change that) 2) the operation uses CPU cycles while it is running so it is going to be much more expensive compared to timers/hearbeats.
+
+-------------------------
+
+ulan | 2022-07-08 09:24:45 UTC | #18
+
+[quote="ggreif, post:16, topic:14201"]
+If you go the timer route you have to think about the payment mode. Each timer becomes a replica-side resource, and thus need bookkeeping (a queue) there. Canisters might DoS that facility.
+[/quote]
+
+The idea is that we have one global timer per canister. A library within the canister then supports arbitrary many timers built on top of that global timer with queues in the Wasm memory.
+
+One the replica side, we actually wouldn't have any real timers. The implementation would be very similar to the existing heartbeat implementation and an additional check of the current block time and the scheduled time of the canister. (The implementation can be optimized further if we see that it becomes an issue.)
+
+-------------------------
+
+ulan | 2022-07-08 09:28:58 UTC | #19
+
+[quote="domwoe, post:15, topic:14201"]
+Would deprecate mean eventually removing the heartbeat API or just telling people that this functionality is deprecated? There might be non-upgradable canisters relying on this API…
+[/quote]
+
+How exactly we deprecate APIs is an open question. Different people have different opinions here. So far we've been following the approach of telling but not removing, but that might change in the future.
+
+-------------------------
+
+lastmjs | 2022-07-09 20:15:35 UTC | #20
+
+I generally feel similarly to most others, option 1 is seeming like the best option.
+
+I do have a concern though, and that is the fact that the current heartbeat functionality and option 1 only allow 1 exported canister method to be called on an interval, in the case of option 1 just `canister_global_timer()`. I would like to be able to hook up arbitrarily many callback functions and arbitrarily many timers, similar to the http streaming capabilities in the asset canister.
+
+One use case I have in mind for this is cycle sharing for open source libraries. The idea is that when a user installs an OS library into their canister, that OS library could hook up a new "heartbeat" method that is designed to send a few cycles back to the author of the OS library on a regular basis, perhaps once per day, week, or month. The problem with the current heartbeat implementation is 1. that it is very expensive and 2. that you can only export one heartbeat function, making it difficult for other libraries to generically add functionality to a canister. The developer would have to explicitly/manually update the one exported heartbeat function to allow the cycle sharing. We want it to be transparent to the developer's source code entirely, and only configured at the `package.json`, `dfx.json` etc level.
+
+-------------------------
+
+icme | 2022-07-10 05:55:28 UTC | #21
+
+[quote="ulan, post:1, topic:14201"]
+Add a new System API `ic0.set_global_timer(interval_in_seconds)` function.
+[/quote]
+
+Am I reading this right that each canister would be able to set one single heartbeat at a time?
+
+<br/>
+
+
+One follow-up thought, that might be a terrible idea ¯\\\_(ツ)_/¯
+
+Many of the current cloud platforms have a variety of different services that are well suited to a specific use case or set of use cases. On AWS, scheduling lambda triggers revolves around using [Cloudwatch events](https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/RunLambdaSchedule.html). Many applications will want to set up not just one-off triggers, but eventually use cron for monitoring and canaries.
+
+Why does DFINITY think that the canister should be the one-size fits all for every type of computation on the Internet Computer? Why can't specific types of canisters be built for specific purposes - especially since I'm of the opinion that larger applications on the IC will eventually need to be multi-canister and composed of horizontally scalable micro-services.
+
+What if DFINITY built a new type of canister that would have one purpose - to schedule and execute inter-canister triggers/calls to other canisters? This canister could be of type "cron", and would be much more "time-aware", allowing any application to store all of their "cron-job" type of calls on a variety of different timers. This canister would be incompatible with what we currently think of as a canister (replica), but would be able to communicate and call the public APIs of other canisters via inter-canister calls.
+
+This way, any deprecation fears where a canister may have been blackholed, like:
+
+[quote="domwoe, post:15, topic:14201"]
+Would deprecate mean eventually removing the heartbeat API or just telling people that this functionality is deprecated? There might be non-upgradable canisters relying on this API…
+[/quote]
+
+Are no longer a worry. 
+
+The old heartbeat API remains, but now we have a specific type of canister that is always wearing a watch and can act as a conductor for an orchestra of canisters in a multi-canister application.
+
+This also makes it much easier for DFINITY to develop new features and avoid backwards compatibility, deciding the which group of features go into what we currently think of canisters as being used for (APIs & storage), vs. different types of canister "services" like event scheduling & monitoring. One can also imagine canisters built with the capability to injest higher ingress load and be used solely as queues, that the cron canisters can use to have our current canister type process and reduce data from the queues.
+
+Thoughts?
+
+-------------------------
+
+skilesare | 2022-07-10 22:47:50 UTC | #22
+
+I'd like a set_timeout(interval, metadata:nat64, (nat64) -> async ()) -> nat64;
+
+This lets me schedule multple activities in a single round and track a piece of metadata that I can use to look up what I wanted to do during that particular call. Also, I get async functionality.
+
+It would be nice to also be returned. Nat64 that I can use later to cancel_timeout if it is no longer needed.
+
+-------------------------
+
+hpeebles | 2022-07-11 13:53:03 UTC | #23
+
+The reason option 1 only exposes a single time is to make the check for which canisters need to be scheduled extremely fast.
+
+But by building libraries on top of this single timer you can have as many different functions execute at as many different times / intervals as you'd like.
+
+The only thing that needs to be exposed to the replica is when the _next_ job needs to run, then once that job has finished the time can be set to when the next job should run and so on.
+
+-------------------------
+
+domwoe | 2022-07-11 13:56:18 UTC | #24
+
+I'd like to tag a few more people for their opinions:
+
+@senior.joinu, because of his experience implementing [ic-cron](https://github.com/seniorjoinu/ic-cron).
+@raydeck, because of his experience implementing [DeTi](https://devpost.com/software/decentralized-time).
+
+-------------------------
+
+icme | 2022-07-11 17:30:44 UTC | #25
+
+[quote="hpeebles, post:23, topic:14201"]
+But by building libraries on top of this single timer you can have as many different functions execute at as many different times / intervals as you’d like.
+[/quote]
+
+I'm assuming this is the case as long as separate invocations don't occur at the same time, or interfere with one another in terms of throwing off another "scheduled" time.
+
+Since a canister is single threaded and "time" within a single message execution is constant, if the heartbeat trigger results in any significant amount of computation or awaits an asynchronous call, would this push back the canister A's idea of what time it is?
+
+For example, at t=20 heartbeat on canister A triggers function F that makes:
+* an asynchronous call to canister B, which takes 2 seconds to complete
+* and then an additional 0.5 is required to perform the remaining computation using the returned result from canister B within canister A. 
+
+What time does canister A think it is *exactly* after the heartbeat trigger (invoking function F) finishes?
+
+-------------------------
+
+senior.joinu | 2022-07-11 19:06:50 UTC | #26
+
+For ic-cron there is actually no problem in the current design. This library already abstracts away timers and does almost everything it can in order to keep the cost as low as possible.
+
+The only thing I've noticed is that some people want to have more control over the "precision/cost" trade-off. So, from this point of view, proposals #3 and #4 seem like the most logical solution for the ic-cron. If that gets implemented, then there is no change required for the users of ic-cron (and for the library itself); but those, who want more control, can have it.
+
+If choosing between proposals #3 and #4, I believe proposal #3 is more flexible (and, btw, does not require you to implement new dfx commands).
+
+-------------------------
+
+jzxchiang | 2022-07-12 06:17:39 UTC | #27
+
+> This library already abstracts away timers and does almost everything it can in order to keep the cost as low as possible.
+
+My understanding is with the replica's current implementation of heartbeat, a canister's exported heartbeat method will be called in every block, and that incurred cost cannot be avoided.
+
+-------------------------
+
+senior.joinu | 2022-07-12 14:20:40 UTC | #28
+
+This does not depend on the library, so I wasn't referring to this with the quote you've mentioned.
+
+As far as I understand, heartbeat improvements proposed in this thread are addressing this issue.
+
+-------------------------
+
+ulan | 2022-07-12 17:16:15 UTC | #29
+
+[quote="lastmjs, post:20, topic:14201"]
+I do have a concern though, and that is the fact that the current heartbeat functionality and option 1 only allow 1 exported canister method to be called on an interval, in the case of option 1 just `canister_global_timer()`. I would like to be able to hook up arbitrarily many callback functions and arbitrarily many timers, similar to the http streaming capabilities in the asset canister.
+[/quote]
+
+[quote="icme, post:21, topic:14201"]
+Am I reading this right that each canister would be able to set one single heartbeat at a time?
+[/quote]
+
+Ideally the support for arbitrary many timers is implemented in the CDK allowing the System API to remain as simple as possible. As long as the different libraries use the same CDK, they shouldn't interfere with each other.  Perhaps, we shouldn't expose the low-level `canister_global_timer()` to user code at all, so that only CDK can call it and user code must go through CDK. 
+
+[quote="icme, post:25, topic:14201"]
+For example, at t=20 heartbeat on canister A triggers function F that makes:
+
+* an asynchronous call to canister B, which takes 2 seconds to complete
+* and then an additional 0.5 is required to perform the remaining computation using the returned result from canister B within canister A.
+
+What time does canister A think it is *exactly* after the heartbeat trigger (invoking function F) finishes?
+[/quote]
+After the async call to B, canister A cannot predict when function F finishes. That's because scheduling of both canisters depends on how busy the subnet is. 
+
+In all proposed APIs the canister specifies the *minimum* time/duration before the time/heartbeat function invocation, but there is no way to specify the *maximum* because execution of a canister may be delayed if the subnet is busy. In other words, when the function is invoked, the canister can query the current time using `ic0.time()` and it is guaranteed that `ic0.time() >= initially_scheduled_time`.
+
+-------------------------
+
+icme | 2022-07-14 11:09:40 UTC | #30
+
+[quote="ulan, post:29, topic:14201"]
+In all proposed APIs the canister specifies the *minimum* time/duration before the time/heartbeat function invocation, but there is no way to specify the *maximum* because execution of a canister may be delayed if the subnet is busy.
+[/quote]
+
+Got it, makes perfect sense - so canisters still have no sense of absolute time, they just are aware of relative time since the previous call finished.
+
+[quote="icme, post:25, topic:14201"]
+For example, at t=20 heartbeat on canister A triggers function F that makes:
+
+* an asynchronous call to canister B, which takes 2 seconds to complete
+* and then an additional 0.5 is required to perform the remaining computation using the returned result from canister B within canister A.
+
+What time does canister A think it is *exactly* after the heartbeat trigger (invoking function F) finishes?
+[/quote]
+
+So in this example, canister A would still think it is t=20.
+
+I guess HTTP requests might help with this, allowing a canister to update/sync their absolute sense of time with the outside world on a regular cadence (maybe also defined by heartbeat :wink:), combined with a relative sense of time within the canister.
+
+-------------------------
+
+levi | 2022-07-14 19:08:23 UTC | #31
+
+I like #3 and #4. set the heartbeat interval within the canister or in the canister-settings.
+
+-------------------------
+
+ulan | 2022-07-15 06:43:40 UTC | #32
+
+[quote="icme, post:30, topic:14201"]
+So in this example, canister A would still think it is t=20.
+[/quote]
+
+Canister A can always get the time of current round/block by calling `ic0.time()`. To be concrete, in the following example `t1` and `t2` may be different because the part of F after the await block will be a separate message (a response message) which may execute in a subsequent round/block:
+```
+fn F(..) {
+  t1 = ic0.time();
+  await call_canister_B();
+  t2 = ic0.time();
+}
+```
+
+-------------------------
+
+icme | 2022-07-15 12:31:31 UTC | #33
+
+Got it, makes sense this is very helpful!
+
+Is calling `ic0.time()` an expensive operation in terms of cycles/latency? I’m not as familiar with this API.
+
+-------------------------
+
+ulan | 2022-07-15 13:15:29 UTC | #34
+
+You're welcome! `ic0.time()` is one of the cheapest System APIs. I think it should cost less then 10 cycles currently.
+
+-------------------------
+
+ulan | 2022-07-20 19:32:32 UTC | #35
+
+Thanks all for the feedback! It was very helpful. I went through the comments and counted:
+* 5 votes for proposal #1,
+* 2 votes for proposal #3 and #4.
+
+Many engineers I talked with offline also expressed preference for proposal #1.
+
+I think we can declare proposal #1 a clear winner. The next step would be to get a prototype implementation in both the replica and CDK with the goal of confirming our expectations: it should be easy to use, efficient, and should support arbitrary many timers.
+
+-------------------------
+
+jzxchiang | 2022-08-25 06:16:58 UTC | #36
+
+Are there any updates on this?
+
+-------------------------
+
+ulan | 2022-08-25 08:37:10 UTC | #37
+
+We are currently busy with finishing the deterministic time slicing and are planning to start working on this in 2-3 weeks.
+
+-------------------------
+
+berestovskyy | 2022-09-28 20:50:22 UTC | #38
+
+We've started to work over the timers! At the moment, we're considering to make the timers awaitable just like calls, i.e. to be able to do something like:
+```
+#[update]
+async fn handle_message(req: Request) -> Response {
+  ic_cdk::sleep(Duration::from_sec(1)).await;
+  Response::ok()
+}
+```
+Putting the final design pieces together. Stay tuned!
+
+-------------------------
+
+skilesare | 2022-09-28 21:13:51 UTC | #39
+
+Please loop in the motoko team. If we could await a timer it would be amazing.(but maybe a memory hog).
+
+-------------------------
+
+paulyoung | 2022-09-29 05:36:40 UTC | #40
+
+I’m thinking this might introduce the possibility of awaiting across upgrade boundaries.
+
+My concern is with the following scenario:
+
+```
+#[update]
+async fn handle_message(req: Request) -> Response {
+    let response = …;
+    // While waiting an upgrade happens
+    ic_cdk::sleep(Duration::from_sec(…)).await;
+    // response is now invalid due to a change to Response as part of the upgrade
+    response
+}```
+
+-------------------------
+
+berestovskyy | 2022-09-29 06:37:21 UTC | #41
+
+Right, there will be the same upgrade challenges as with the normal calls. We could block the upgrade until there are no more pending timers, or we could cancel the timers, allowing the canisters to handle the situation in `pre_` and `post_upgrade` functions...
+
+-------------------------
+
+berestovskyy | 2022-09-29 06:40:41 UTC | #42
+
+Of course, SDK and Motoko teams will be in the loop. We'll share the design once it's ready.
+
+-------------------------
+
+saikatdas0790 | 2022-10-05 10:15:58 UTC | #43
+
+Just chiming in my 2 cents here.
+
+We are building a dapp that uses heartbeats extensively. Our current architecture has us spinning up canisters for every logged in individual where the canister acts as a proxy for all interaction that they do with the app.
+
+A couple of distinct scenarios where we use heartbeat are:
+- A logged in user creates a new post. This post has a score that gets calculated on creation. There are multiple parameters that contribute to the score. One of them is freshness/staleness. The older a post is, the lower this component is. Currently, we recalculate this component every hour and update the score. After 48 hours has passed, the freshness component reaches 0, and doesn't need to be recalculated. So, for this, essentially, we need a setInterval (JS lingo) that stops after 48 hours
+- There are contest/tournaments that are started by end users and they can choose an arbitrary time in the future for this contest to end. This would ideally need some sort of setTimeout (JS lingo) that should fire once at the time specified
+- The user created content is synced with "cache" canisters that aggregate and rank posts sent to them  by the individual canisters talked about earlier. They are periodically updated by the individual canisers with the top posts from their repositories as scores get recalculated. They run indefinitely on an interval. Needs a setInterval that never expires.
+
+Currently we use ic-cron by the brilliant @senior.joinu for everything but our cycle costs are insane.
+
+We just started this week and we estimate it will cost us around 2T cycles for every user canister every week. That amounts to around 10$ for every user every month. And will come to around $100,000 in cycle costs for 10,000 users every month.
+We expect at least 10,000 users a month for this app owing to our MVP app having reached 8,000 active users while we were actively maintaining it.
+
+Our main point of contention with the current heartbeat implementation is that our canisters should not be billed for the IC choosing to call into them on every block. Rather, they should only be billed for the times our canister has explicitly asked to be called.
+
+-------------------------
+
+berestovskyy | 2022-10-05 22:36:25 UTC | #44
+
+Thanks for sharing, @saikatdas0790, very insightful.
+
+-------------------------
+
+GLdev | 2022-10-06 07:33:43 UTC | #45
+
+It would make sense for this kind of a project to have a central cron canister that runs heartbeat, and calls into the other canisters with timers. I started working on this but paused the project when dfinity announced they'd re-do the heartbeat implementation. I've made the project public, feel free to take a look at it and adapt it for your implementation. There was still a lot to do, like access lists & stuff, but as far as I can remember the flow of adding yourself to the queue and receiving remote_heartbeat worked. 
+
+https://github.com/GLicDEV/cron-heartbeat
+
+-------------------------
+
+saikatdas0790 | 2022-10-06 12:22:03 UTC | #46
+
+I'm not sure I completely agree. We did consider doing this, but this will not scale beyond a certain point.
+
+Here's some napkin calculations:
+Let's consider heartbeat executes every second. That's 86,400 executions a day. Let's also consider it will pick up a single task during each execution not to go over the single round cycle limit, tasks being things like recalculating scores or syncing posts to a cache canister among others. And they usually run twice every hour for example.
+
+That way you have 4 tasks for each user every hour -> which is 4*24(hours a day) = 96 tasks for a user every day. That caps your users to a limit of 86,400(max tasks in a single day) /96(tasks for a single user) = 900 for a single heartbeat canister. Which means now you need to shard these heartbeat canisters as well if you have more than a 1000 users
+
+There is also a matter of orchestrating which canisters need to be called by these heartbeat canisters and adding and removing from their respective collections as well as calling between them which makes for quite a complicated project by itself.
+
+On the other hand, having the simplicity of colocating each canisters' periodic functions within itself is much simpler and doesn't involve the above song and dance.
+
+In case I misunderstood your suggestion, please feel free to correct me.
+
+-------------------------
+
+GLdev | 2022-10-06 12:27:28 UTC | #47
+
+I meant instead of running heartbeat() on every user canister, you'd have the same functionality but run it from a remote_heartbeat() function. Then, using my example above, you'd "register" each client-canister with a remote_heartbeat at say 30 minutes. Or whatever interval you need.
+
+Then the main heartbeat canister will call each client canister with remote_heartbeat() at the set interval. This way you have all the implementation canister-side and also can use a much cheaper version of heartbeat - you only pay for heartbeat on one main canister, and for each remote_heartbeat() you just pay what you need (e.g. once every 30 minutes)
+
+-------------------------
+
+LightningLad91 | 2022-10-06 14:45:33 UTC | #48
+
+FWIW this is what i'm doing on my project while I wait for Dfinity's timer. It's working well so far.
+
+-------------------------
+
+berestovskyy | 2022-10-11 10:33:54 UTC | #49
+
+Hey guys,
+Just to update you, we've aligned across teams on the following.
+
+On the IC side there will be a single one-off global timer.
+On the Motoko and SDK sides there will be a standard library support for multiple and interval timers.
+
+# IC side changes:
+
+1. Add a new System API `ic0.set_global_timer(time: i64) -> i64` function (not exposed to the users).
+2. The function schedules a call to the exported `canister_global_timer` Wasm method in some round after the specified time (similar to the `canister_heartbeat` method we have now).
+3. The function returns the previous value of the timer.
+
+# Motoko/Rust CDK changes:
+
+Note: the API is not final, feel free to suggest.
+
+1. Add a timer library with the following interface:
+
+   1. `timer_id = set_timer(delay, fun);`
+– one-off execution of the fun after a minimum delay in seconds.
+   2. `timer_id = set_timer_interval(delay, fun);`
+– periodic execution of the fun with a minimum delay in seconds.
+   3. `clear_timer(timer_id);`
+– clear the previously set one-off or periodic timer_id.
+
+# Other details:
+
+1. The `canister_global_timer` will be called with the Heartbeat SystemAPI type, so the same restrictions apply as for the heartbeats.
+2. The timers will be canceled during the upgrade, so the canister is expected to serialize the timers library state and later restore it and set the timer in the `canister_post_upgrade`.
+
+We're starting to implement the IC side changes, the library support will follow shortly...
+
+-------------------------
+
+saikatdas0790 | 2022-10-13 18:02:31 UTC | #50
+
+For the 
+2. `timer_id = set_timer_interval(delay, fun);`
+
+Could we add an optional_parameter for something like `stop_after` which could either be `n` executions or `t` (milli)seconds?
+
+-------------------------
+
+berestovskyy | 2022-10-14 09:21:36 UTC | #51
+
+A valid point, and I don’t have a good answer yet :disappointed:
+
+The generic solution would be to allow the timer handler to cancel itself based on some conditions, but I guess there might be issues with borrow checker in Rust...
+
+Maybe the timer handler could return a boolean to stop the periodic calls?
+
+-------------------------
+
+saikatdas0790 | 2022-10-14 11:02:40 UTC | #52
+
+I think being able to declaratively specify it during the timer creation is a better, convenient and safer API as opposed to writing cleanup logic separately and messing up there :slight_smile:
+
+-------------------------
+
+berestovskyy | 2022-10-14 11:46:55 UTC | #53
+
+True, it's much simpler in this case. I'm just not sure if it would cover all the use cases...
+
+Say, if we want to stop the timer on some error, or when the post is deleted and we don't need to recalculate its score anymore...
+
+-------------------------
+
+saikatdas0790 | 2022-10-14 13:18:43 UTC | #54
+
+[quote="berestovskyy, post:49, topic:14201"]
+`clear_timer(timer_id);`
+– clear the previously set one-off or periodic timer_id.
+[/quote]
+
+But couldn't we just use the `clear_timer` for those cases where there's additional business logic that needs to be run
+
+-------------------------
+
+hpeebles | 2022-10-14 22:37:07 UTC | #55
+
+The API surface should remain as simple as possible so I think the proposed API is really good.
+
+To cancel an interval timer after a certain time you can simply set another timer which does the cancellation. There is no need to add complexity to the API.
+
+-------------------------
+
+saikatdas0790 | 2022-10-15 05:29:53 UTC | #56
+
+Sure, I think it's fine since this is a lower level API and we can have wrapper libraries that handle these cases
+
+-------------------------
+
+paulyoung | 2022-10-26 06:59:21 UTC | #57
+
+[quote="berestovskyy, post:49, topic:14201"]
+Add a new System API `ic0.set_global_timer(time: i64) -> i64` function (not exposed to the users).
+[/quote]
+
+Is this a typo, or is there a reason for using `i64` instead of `u64`?
+
+-------------------------
+
+berestovskyy | 2022-10-26 08:14:40 UTC | #58
+
+Sure, [it is u64](https://github.com/dfinity/ic/commit/1766a35c5888d6d5f7c0a8f0c12e9df209cb7261), but it's not a typo. It's just the way our specification [describes the system API calls](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-imports).
+
+-------------------------
+
+Manu | 2022-10-26 08:49:22 UTC | #59
+
+The motion proposal for canister timers is now live: [88293](https://dashboard.internetcomputer.org/proposal/88293)
+
+-------------------------
+
+ulan | 2022-10-26 09:33:31 UTC | #60
+
+That's because of the [WebAssembly type system](https://webassembly.github.io/spec/core/syntax/types.html#number-types): *"Integers are not inherently signed or unsigned, their interpretation is determined by individual operations."*
+
+Even though the System API uses `i64` it will be interpreted as an unsigned number similar to how the existing `ic0.time : () -> (timestamp : i64);` does it.
+
+It is also worth noting that the `ic0.set_global_timer()` will not be directly exposed by Rust CDK. Instead we will have a higher level library operates on proper time types.
+
+-------------------------
+
+berestovskyy | 2022-11-01 15:44:01 UTC | #61
+
+hoi guys,
+A small update. The timers has been implemented on the IC side. The final piece was merged yesterday, and the functionality will be rolled out ~next week. We're focusing now on implementing Rust and Motoko CDK libraries.
+
+If you're a CDK developer and plan to implement the timers for your CDK, please read the details below. Otherwise, we'll keep you posted!
+
+### CDK Implementation Details
+
+A new System API call was just added: `ic0.global_timer_set(timestamp: i64)`. It adds support for a *single* global timer, and the support for *multiple* and *interval* timers will be implemented as CDK libraries for Rust/Motoko.
+
+Here is an example implementation of the `set_timer()` in rusty pseudocode:
+
+```
+struct Task {
+  id: u32,
+  time_to_schedule: u64,
+  fun: Fn,
+}
+
+struct TimersLib {
+  tasks: MinBinaryHeap<Task>;
+}
+
+static GLOBAL_TIMERS: TimersLib = TimersLib{};
+static GLOBAL_TIMER_ID: u32 = 0;
+
+impl TimersLib {
+  /// One-off execution of the fun after a minimum `delay` in seconds.
+  pub fn set_timer(delay: u64, fun: Fn) -> u32 {
+    GLOBAL_TIMER_ID += 1;
+    let id = GLOBAL_TIMER_ID;
+
+    let now = ic0.time();
+    let time_to_schedule = now + delay;
+
+    GLOBAL_TIMERS.tasks.push(Task{id, time_to_schedule, fun});
+
+    let next_task = GLOBAL_TIMERS.tasks.peek();
+    // Schedule the timer for the next task
+    ic0.global_timer_set(next_task.time_to_schedule);
+    return id;
+  }
+}
+
+
+#[global_timer]
+fn global_timer() {
+  let now = ic0.time();
+  for task in GLOBAL_TIMERS.tasks {
+    if task.time_to_schedule <= now {
+      // Execute the task
+      let fun = GLOBAL_TIMERS.tasks.pop().fun;
+      // IMPORTANT: call ourself (see the details below)
+      ic0.call(SELF, “global_task_executor”, fun);
+    } else {
+      // Schedule the timer for a next task
+      ic0.global_timer_set(task.time_to_schedule);
+      break;
+    }
+  }
+}
+
+#[update]
+async fn global_task_executor(fun: Fn) {
+  // IMPORTANT: check the caller (see the details below)
+  if ic0.caller_id() == SELF {
+    // It’s ok for the user function to trap here
+    fun.call();
+  }
+}
+
+```
+
+There are a few important details:
+
+1. If the `global_timer()` traps, all the changes are reverted. So if we set the next timer and then execute some code which traps, the timer will be lost.\
+Instead, the timer library in `global_timer()` should just `ic0.call()` itself, and then do the `ic0.global_timer_set()`. Now when the execution in `ic0.call()` traps, the timer is still properly set.
+
+2. The `global_task_executor()` is a normal canister update function, so it might be called by other canisters or a user. **This is potentially insecure.**\
+The timer library in `global_task_executor()` should either check again that the timer is expired, or (as in the example above) should check that the caller is this canister.
+
+Hope that helps, and if you have questions, we're here to help!
+
+-------------------------
+
+h1teshtr1path1 | 2022-11-18 08:15:38 UTC | #62
+
+Ping Ping. No updates on Motoko side? Please can anyone refer me to Motoko implementation or example.
+
+-------------------------
+
+ggreif | 2022-11-18 09:50:51 UTC | #63
+
+It is being worked on.
+
+-------------------------
+
+saikatdas0790 | 2022-11-22 06:28:46 UTC | #65
+
+Hey there,
+
+Any updates on availability of these methods for the Rust CDK? 
+
+Would really help with our canister cycle burn situation which has been linearly increasing with new user signup for some time now.
+
+-------------------------
+
+dfx-json | 2022-11-22 15:24:51 UTC | #66
+
+it is currently in review: https://github.com/dfinity/cdk-rs/pull/342
+
+-------------------------
+
+dfx-json | 2022-11-22 15:42:53 UTC | #67
+
+the motoko implementation is still in progress: https://github.com/dfinity/motoko/pull/3542
+
+-------------------------
+
+lastmjs | 2022-11-29 17:21:17 UTC | #68
+
+Is this in a version of dfx yet?
+
+-------------------------
+
+dansteren | 2022-11-29 18:13:23 UTC | #69
+
+I'm not seeing `ic0.global_timer_set(timestamp: i64)` reflected in the [interface spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-imports). Does that just need to be updated, or is this not actually live?
+
+-------------------------
+
+LightningLad91 | 2022-11-30 00:09:58 UTC | #70
+
+[quote="ulan, post:1, topic:14201"]
+A completely new API. If this proposal is accepted, then it might make sense to deprecate the existing heartbeat API.
+[/quote]
+
+Hi @ulan . I have not participated in this thread so I apologize if this has already been addressed; but, I would really appreciate it if the current system heartbeat function was left in place. All of my designs use multiple canisters that all share a common heartbeat source and I prefer to keep it this way for simplicity and reliability sake.
+
+I hope this is not too controversial of an ask. I just prefer to have all my canisters run on the same frequency and not worry about how the timer is implemented on each one. I think what y'all have come up with here is going to be really useful for a lot of applications. I also think it is different enough in how it works to not be redundant with the system heartbeat.
+
+-------------------------
+
+bogwar | 2022-11-30 00:35:24 UTC | #71
+
+I believe the plan is to keep the heartbeat as is, precisely not to break existing applications
+
+-------------------------
+
+LightningLad91 | 2022-11-30 00:42:46 UTC | #72
+
+That's wonderful news. Thank you sir
+
+-------------------------
+
+Severin | 2022-11-30 10:08:22 UTC | #73
+
+The new timers are in dfx 0.12.1, but not 0.12.0
+
+-------------------------
+
+berestovskyy | 2022-11-30 10:59:18 UTC | #74
+
+The `global_timer_set()` is in the spec on the [master branch](https://github.com/dfinity/interface-spec/blob/master/spec/index.adoc). Will be published on the `internetcomputer.org` soon.
+
+-------------------------
+
+peterparker | 2022-12-03 11:21:56 UTC | #75
+
+I am super confused about how to import this [timer crate](https://docs.rs/ic-cdk/latest/ic_cdk/timer/index.html).
+
+1. when I try to import `set_timer` I get an error
+
+```
+use ic_cdk::timer::{set_timer};
+```
+
+lead to
+
+> error[E0432]: unresolved import `ic_cdk::timer`
+  --> src/console/src/lib.rs:22:13
+   |
+22 | use ic_cdk::timer::{set_timer};
+   |             ^^^^^ could not find `timer` in `ic_cdk`
+
+Double checked lock file and ic_cdk local source code, there are some timer code - I do use ic_cdk 0.6.8 - but it seems to need a flag or something
+
+2. shouldn't `#[global_timer]` be an [attribute macro](https://docs.rs/ic-cdk/latest/ic_cdk/#attributes)? don't find it neither
+
+-------------------------
+
+hpeebles | 2022-12-03 18:13:27 UTC | #76
+
+You need to enable the ‘timers’ feature.
+
+See here - https://github.com/open-ic/open-chat/blob/master/backend/canisters/group/impl/Cargo.toml#L25
+
+-------------------------
+
+peterparker | 2022-12-03 18:18:59 UTC | #77
+
+Ah gotcha, thanks @hpeebles !
+
+-------------------------
+
+saikatdas0790 | 2022-12-09 13:02:41 UTC | #78
+
+I am running into this error when I enable the timers feature. Any ideas?
+
+![image|668x168](upload://6LPR7eOSKS1FZQqD4heGjfCWf0S.png)
+
+@Severin @berestovskyy
+
+EDIT: Some more context. I have enabled the timer's feature in my Cargo.toml for the crate requiring this feature. Hence, my imports work.
+
+If you look at the error message, it seems to be breaking because an internal dependency of `ic_cdk`, `ic0::global_timer_set` is not resolved.
+
+Other things I tried:
+- nuked my target directory and tried building again
+- enabled the feature in both the workspace cargo toml and the crate using it
+
+-------------------------
+
+berestovskyy | 2022-12-09 13:23:20 UTC | #80
+
+[quote="saikatdas0790, post:78, topic:14201"]
+EDIT: Some more context. I have enabled the timer’s feature in my Cargo.toml for the crate requiring this feature. Hence, my imports work.
+[/quote]
+
+So it's all good now, or there is still an issue?
+
+-------------------------
+
+saikatdas0790 | 2022-12-09 13:36:08 UTC | #81
+
+I managed to solve it.
+
+When I had posted I had already enabled the timer's feature.
+
+What solved it was running `cargo update` after enabling the timer feature.
+That was the missing piece.
+
+-------------------------
+
+skilesare | 2022-12-09 21:04:54 UTC | #82
+
+Are timers in motoko 0.7.4? If not, when is the plan?
+
+-------------------------
+
+berestovskyy | 2022-12-12 18:18:24 UTC | #83
+
+Motoko Canister Timers are in the code review, as the target for the feature is Q1 2023. Hopefully, it will be finished sooner, but let's not rush and allow the guys finish their job...
+
+We'll update this thread once there are news.
+
+-------------------------
+
+mparikh | 2022-12-22 01:11:31 UTC | #84
+
+Is there a way to call async functions (i.e. raw_rand())  within the function invoked by set_timer/set_timer_interval?
+
+-------------------------
+
+domwoe | 2022-12-22 09:15:44 UTC | #85
+
+@berestovskyy gave an example here: https://github.com/dfinity/cdk-rs/issues/351
+
+-------------------------
+
+berestovskyy | 2022-12-22 13:10:44 UTC | #86
+
+It might make sense to make the handler async, WDYT @AdamS ?
+
+-------------------------
+
+AdamS | 2022-12-23 13:50:09 UTC | #87
+
+It might make things more ergonomic if it was, but since most of the time you won't need to, I elected to remove the overhead for users who don't need it. You can always `ic_cdk::spawn` a future from a sync context.
+
+-------------------------
+
+rabbithole | 2022-12-25 09:00:02 UTC | #88
+
+I finally waited for the release of timers feature in the motoko 0.7.5, but after updating the version of moc in vessel I still get an error.
+
+I use this command for updating vessel moc compiler:
+```
+vessel verify --version 0.7.5
+```
+I also updated motoko-base in package-set.dhall:
+```
+    { name = "base"
+    , repo = "https://github.com/dfinity/motoko-base"
+    , version = "moc-0.7.5"
+    , dependencies = [] : List Text
+    },
+```
+Despite these steps, I can't import functions with
+```
+import { cancelTimer; setTimer } = "mo:⛔";
+```
+What else should I do to take advantage of the timer functionality?
+
+-------------------------
+
+ZhenyaUsenko | 2022-12-25 14:27:04 UTC | #89
+
+@rabbithole Haven't tried it yet but here is an example
+https://github.com/dfinity/motoko/pull/3542#:~:text=be%20coded%20as-,import,-Time%20%22mo%3Abase/Time
+
+-------------------------
+
+rabbithole | 2022-12-25 16:49:18 UTC | #90
+
+There are no problems with examples, I looked at different examples, including in tests. The problem is that I can't compile the code with the latest motoko 0.7.5. What am I doing wrong?
+
+-------------------------
+
+claudio | 2022-12-28 00:57:44 UTC | #91
+
+I'm not sure what is going on with 0.7.5. Either there is a bug and the feature was not fully enabled, or the changelog is slightly misleading because the release only includes the internal compiler support, with the matching base library exposing the feature to follow in the next release.
+
+@ggreif would know the answer but might be on holiday still.
+
+I'll try to investigate tomorrow.
+
+If you are using dfx to build the sources, you may still need to tell dfx to actually use moc 0.7.5 using environment variable DFX_MOC_PATH (or similar, I may be misremembering the name)
+
+
+https://forum.dfinity.org/t/dfx-deploy-with-custom-motoko-version/7665/5?u=claudio
+
+-------------------------
+
+ggreif | 2022-12-28 10:26:11 UTC | #92
+
+[quote="rabbithole, post:88, topic:14201"]
+`import { cancelTimer; setTimer } = "mo:⛔";`
+[/quote]
+
+This should work with the latest released `moc`. What compile error do you get for this?
+
+--------
+Please note also that this is merely accessing the compiler internals, and there is still a pending PR for the base library: https://github.com/dfinity/motoko-base/pull/474/files. Your updated `package-set.dhall` won't change anything.
+
+-------------------------
+
+ZhenyaUsenko | 2022-12-28 12:02:13 UTC | #93
+
+@ggreif I don't see `cancelTimer` and `setTimer` listed here
+https://github.com/dfinity/motoko/blob/master/src/prelude/prim.mo
+
+-------------------------
+
+ggreif | 2022-12-28 12:10:45 UTC | #94
+
+[quote="ZhenyaUsenko, post:93, topic:14201"]
+@ggreif I don’t see `cancelTimer` and `setTimer` listed here
+
+https://github.com/dfinity/motoko/blob/master/src/prelude/prim.mo
+[/quote]
+
+Because they are separated away in https://github.com/dfinity/motoko/blob/master/src/prelude/timers-api.mo, and `-no-timer` suppresses them.
+
+-------------------------
+
+ZhenyaUsenko | 2022-12-28 12:29:11 UTC | #95
+
+Oh, I see. Just checked `setTimer`, works fine for me, no compiler errors
+
+-------------------------
+
+rabbithole | 2022-12-28 13:59:50 UTC | #96
+
+```
+Caused by: Failed while trying to build all canisters.
+  The build step failed for canister 'ryjl3-tyaaa-aaaaa-aaaba-cai' (journal) with an embedded error: Failed to build Motoko canister 'journal'.: Failed to compile Motoko.: Failed to run 'moc'.: The command '"/Users/khalik/.cache/dfinity/versions/0.12.2-beta.0/moc" "/Users/khalik/Documents/projects/ng-storage/src/backend/journal/main.mo" "-o" "/Users/khalik/Documents/projects/ng-storage/.dfx/local/canisters/journal/journal.wasm" "-c" "--debug" "--idl" "--stable-types" "--public-metadata" "candid:service" "--actor-idl" "/Users/khalik/Documents/projects/ng-storage/.dfx/local/canisters/idl/" "--actor-alias" "journal" "ryjl3-tyaaa-aaaaa-aaaba-cai" "--package" "array" ".vessel/array/v0.2.1/src" "--package" "base" ".vessel/base/moc-0.7.5/src" "--package" "base-0.7.3" ".vessel/base-0.7.3/aafcdee0c8328087aeed506e64aa2ff4ed329b47/src" "--package" "bimap" ".vessel/bimap/main/src" "--package" "encoding" ".vessel/encoding/v0.4.1/src" "--package" "io" ".vessel/io/v0.3.1/src" "--package" "uuid" ".vessel/uuid/main/src"' failed with exit status 'exit status: 1'.
+...
+type error [M0119], object field cancelTimer is not contained in expected type
+  module {}
+```
+@claudio are right, in my error you can see that the compilation uses moc from `.cache/dfinity/versions/0.12.2-beta.0/moc`, not the one that comes with vessel
+`DFX_MOC_PATH="$(vessel bin)/moc"` works! But I don't know how to tell the VS Code linter also the compiler version.
+@ggreif I should wait for the public api with PR #474
+
+I saw the description of the compiler release and decided that the timers would be hidden in primitives without a public API, but I'm glad I was wrong.
+
+P.S. I'm embarrassed that I drew the attention of the team during the holidays, thank you!
+
+-------------------------
+
+ggreif | 2022-12-28 14:14:36 UTC | #97
+
+No worries! Let the questions come!
+
+-------------------------
+
+Iceypee | 2022-12-28 23:29:05 UTC | #98
+
+Does awaiting pause the timer or mess with the intervals like with the heartbeat?
+
+-------------------------
+
+rvanasa | 2022-12-29 01:36:47 UTC | #99
+
+[quote="rabbithole, post:96, topic:14201"]
+But I don’t know how to tell the VS Code linter also the compiler version.
+[/quote]
+
+This should work out-of-the-box in the latest version of the VS Code extension (updated today). 
+
+Happy holidays!
+
+-------------------------
+
+ggreif | 2022-12-29 10:51:39 UTC | #100
+
+[quote="Iceypee, post:98, topic:14201, full:true"]
+Does awaiting pause the timer or mess with the intervals like with the heartbeat?
+[/quote]
+
+It shouldn't. And I doubt that heartbeat does get paused when there are futures being awaited either. Did you read that somewhere or is it empirical (by you)?
+
+-------------------------
+
+ggreif | 2022-12-29 12:09:27 UTC | #101
+
+[quote="rabbithole, post:96, topic:14201"]
+@ggreif I should wait for the public api with PR #474
+[/quote]
+
+https://github.com/dfinity/motoko-base/pull/474 is merged now. Feel free to drop `Timer.mo` into your base folder and test. The upcoming release (no ETA yet) will contain it. Happy new year and have fun!
+
+-------------------------
+
+rabbithole | 2022-12-29 12:36:59 UTC | #102
+
+You are magicians, this is great, thank you! Happy New Year!
+
+-------------------------
+

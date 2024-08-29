@@ -1,0 +1,126 @@
+AnonymousCoder | 2022-05-02 06:28:15 UTC | #1
+
+I am wondering (since I am currently looking at the "encrypted notes dapp") what is the biggest possible "safe" storage on a single canister? Is it 2GB? Since, I am guessing if the top limit is 4GB and we need to copy over data to stable variables in pre-upgrade process, that would actually double our used up storage during that process. Ie: if we have 1.9 GB stored already and canister is in the process of "copying" data from our vars to stable vars it would, while in that process be at a top limit of 3.8 GB (just like when using our regular local storage when copying over files - we need to have the double amount of space as the file is only moved and removed from it's initial location after it has already been copied)? This really seems like a very low amount... 
+
+2GB would mean creating so many new canisters with the same code if we have a dapp that requires a lot of space, then storing references to the principals of those deployed canisters so we know which canisters hold data we need, but also, if there are so many of the "expansion" canisters deployed, even canister holding string values of references to those canisters so it knows where to read data from would pile up and potentially have to be expanded into a new canister and it would become a huge mess. Or am I missing something? How would you take care of an issue when you know there is going to be a lot of data needed to be stored and a lot of canisters deployed to accommodate for the storage needs ?
+
+-------------------------
+
+jzxchiang | 2022-05-05 21:14:13 UTC | #2
+
+I think currently it is 2 GB but this should change in the future with recent work on the Motoko compiler. Perhaps @claudio or @ggreif can comment on this.
+
+-------------------------
+
+Zane | 2022-05-05 22:01:36 UTC | #3
+
+Furthermore is there any ETA for when WebAssembly commitee will approve the memory64 proposal? How long does it usually take? Months? Years?
+
+-------------------------
+
+claudio | 2022-05-06 08:32:55 UTC | #4
+
+The 2GB limit is due to the default, semi-space, copying garbage collector, which roughly requires twice the heap space to perform GC, but conveniently leaves the second half available for stable variable serialization.
+
+In moc [0.6.27](https://github.com/dfinity/motoko/releases/tag/0.6.27), we've implemented streaming serialization of stable variables to stable memory, avoiding the need for all but a smallish buffer in wasm memory. 
+
+The hope is that streaming would allow people to more safely select the alternative `mark-compact` gc, which can utilize much more of wasm memory for the Motoko heap since it doesn't require a separate semi-space (the other 2GB) to evacuate live data to.
+
+However, expanding the usable heap does the raise the question whether a GC will be able to complete within a single message without exceeding the cycle budget.
+
+I'm hoping the ongoing work on so-called Deterministic Time Slicing, which will allow a single (e.g. GC) message to span several rounds, and not be limited by a small cycle budget, will finally free us of these concerns.
+
+For an app like encrypted notes, I think it would actually make sense to consider storing the encrypted data as blobs in stable memory, reducing the pressure on the GC and utilizing the currently up to 8GB of additional memory available as raw stable memory. But I don't know the details of that particular app.
+
+-------------------------
+
+jzxchiang | 2022-05-07 05:18:17 UTC | #5
+
+This is huge! I can't wait for the 0.6.27 release.
+
+To be clear, can I enable the mark-compact GC using the existing `--compacting-gc` build flag? Not sure what the difference is.
+
+Also, I'm a little confused about why stable variable serialization is performed by the GC after every message. I thought it was performed once during canister upgrade. Why is the GC involved? Or is it just the nature of the stable variable implementation that the GC is responsible for it?
+
+-------------------------
+
+claudio | 2022-05-08 11:15:11 UTC | #6
+
+Yes, that is the correct flag.
+
+Stabilisation only happens during upgrades, not on GC. It's just convenient that with the current semi-space collector you are likely to have up to 2GB free for the original, non-streaming stabilization to do its work. 
+
+This would not be the case with the compacting GC, making upgrades riskier. 
+
+With 0.6.27 streaming stabilization, we don't need so much space overhead and can more safely recommend trying the compacting GC.
+
+But there are still, sadly, no guarantees, e.g. that the upgrade or some gc won't run out of cycles. DTS should mitigate those risks, when it comes online.
+
+-------------------------
+
+jzxchiang | 2022-05-08 16:24:59 UTC | #7
+
+Would you say that until DTS is available it is probably safer to not use the new GC? I'm guessing that the default copying GC doesn't need DTS to work properly.
+
+-------------------------
+
+AnonymousCoder | 2022-05-08 18:00:51 UTC | #8
+
+I wonder how is one then able to create scalable applications that require a lot of space with the current ICP architecture ?
+
+-------------------------
+
+claudio | 2022-05-09 12:46:26 UTC | #9
+
+The truth is that we'd need to run some experiments to gain confidence, but haven't had the time to do that yet (for either GC).
+
+It might be easier now that dfx supports cycle accounting locally.
+
+-------------------------
+
+claudio | 2022-05-09 12:52:20 UTC | #10
+
+I would try to test as much as possible, and perhaps reduce pressure on the GC by making selective use of ExperimentalStableMemory to offload data from the GC.
+
+And remember, Rust doesn't have these issues because it doesn't require a GC. But it does have other issues.
+
+Also, these problems are not fundamental problems with the architecture, but rather problems with Motoko's current GC implementation. One way to improve the situation would be to adopt an incremental GC, that interleaves computation with collection, reducing the size of each collection. The other is to wait for DTS to solve the problem for us.
+
+In any case, garbage collection is an abstraction thus we are free to replace it by other implementations as needs (and resources) arise.
+
+-------------------------
+
+AnonymousCoder | 2022-05-09 15:17:04 UTC | #11
+
+[quote="claudio, post:10, topic:12623"]
+And remember, Rust doesn’t have these issues because it doesn’t require a GC. But it does have other issues.
+[/quote]
+
+Regarding languages used on ICP I am only familiar with Motoko so Rust is a no-go for me as I think it would be a lot of time wasted to start learning it now.
+
+[quote="claudio, post:10, topic:12623"]
+Also, these problems are not fundamental problems with the architecture, but rather problems with Motoko’s current GC implementation. One way to improve the situation would be to adopt an incremental GC, that interleaves computation with collection, reducing the size of each collection. The other is to wait for DTS to solve the problem for us.
+[/quote]
+
+This sounded pretty high level for me and probably outside of my reach right now. It's too abstract, don't even know where I would start and since there's very little educational material about ICP dev in general for the things we have set and working properly, I can't imagine how difficult it would be to do this on my own without knowing what the hell is going on.
+
+-------------------------
+
+jzxchiang | 2022-05-09 20:23:01 UTC | #12
+
+I wonder what kind of error would even be thrown if you used the mark-compact GC *without* streaming stabilization in 0.6.27, and you tried storing >2 GB of stable variables...
+
+-------------------------
+
+ggreif | 2022-05-17 20:53:28 UTC | #13
+
+To just post a heads-up here: DTS is on its way via https://dashboard.internetcomputer.org/proposal/60222.
+
+-------------------------
+
+jzxchiang | 2022-05-18 01:11:43 UTC | #14
+
+Really cool! It only says that the heartbeat is being refactored for DTS though. It doesn't look like a general release for DTS just yet (although I hope it is).
+
+-------------------------
+

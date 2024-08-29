@@ -1,0 +1,196 @@
+skilesare | 2022-07-19 14:28:28 UTC | #1
+
+What is the binary representation used to deserialize?
+
+Use case:  I want to push in binary from outside a canister and then use from_candid to decode it.  Ideally, I'd be able to use something in the agent(agent-s) to encode a structure into a Blob and call a canister with that blob.  
+
+Reason:  Perhaps I want to encrypt something that my canister can decrypt using ECDSA and then load into one of my known structures.
+
+@claudio @chenyan
+
+-------------------------
+
+LightningLad91 | 2022-07-19 17:14:54 UTC | #2
+
+I'm not sure decrypt with ECDSA is a good use case ;)
+
+-------------------------
+
+LightningLad91 | 2022-07-19 18:02:27 UTC | #3
+
++1 on @skilesare question. 
+
+For my part, I'd like to encode a `Buffer<ComplexType>` into a `Blob`, send it to another canister, and have that canister decode the `Blob` back into a `Buffer<ComplexType>`. If there is a way to do this so that the data fits into an existing binary representation then that would be great.
+
+Otherwise, I was thinking of building a class for each data type I care about. The class would maintain a Buffer of said type and would provide methods for encoding/decoding that buffer into a TLV structure similar to how ASN.1 structures are encoded.
+
+Use case: I am building a constellation of canisters that all need to send their logged events back to a single log aggregator. It would be nice if I could send these events in a single update call.
+
+Edit: Edited to clarify that I was referring to complex types.
+
+-------------------------
+
+paulyoung | 2022-07-19 17:55:30 UTC | #4
+
+@matthewhammer implemented `from_candid` in:
+
+https://github.com/dfinity/motoko/pull/3155
+
+It appears to defer to the existing `deserialize_from_blob`:
+
+https://github.com/dfinity/motoko/blob/ed88d7636d7dd1fc1378d7000f0bb5f42d380a86/src/codegen/compile.ml#L5842
+
+-------------------------
+
+LightningLad91 | 2022-07-19 18:01:47 UTC | #5
+
+Thank you Paul! 
+
+I also just finished reading this thread which was very insightful:
+
+https://forum.dfinity.org/t/motoko-serialization/9954?u=lightninglad91
+
+-------------------------
+
+paulyoung | 2022-12-15 08:20:48 UTC | #6
+
+I think the following is relevant to both questions.
+
+https://github.com/NatLabs/serde/blob/564ce06d1f8b45a2d7b15dcfd2df74d05cd698e6/src/Candid/Encoder.mo#L34-L34
+
+https://github.com/NatLabs/serde/blob/564ce06d1f8b45a2d7b15dcfd2df74d05cd698e6/src/Candid/Decoder.mo#L24-L24
+
+
+
+I’m so impressed by this package and think more people need to be aware if it.
+
+https://github.com/NatLabs/serde
+
+```
+import serdeJson "mo:serde/JSON";
+    
+type User = {
+    name: Text;
+    id: Nat;
+};
+
+let blob = serdeJson.fromText("{\"name\": \"bar\", \"id\": 112}");
+let user : ?User = from_candid(blob);
+
+assert user == ?{ name = "bar"; id = 112 };
+```
+
+-------------------------
+
+skilesare | 2022-12-15 14:54:13 UTC | #8
+
+Ahhhh!!!! Sometimes something so close to what you need appears out of the ether and just absolutely f-ing makes your day!!
+
+@tomijaga Looks like it might be pretty easy to modify this a bit to handle raw candid text like issued in the DFX command.  Why would you want this?  So you can encode a candid object that can be passed in and used in call_raw without having to have the candid type encoded in your canister.  Looks like what is needed is:
+
+1. Use https://github.com/aviate-labs/json.mo/blob/main/src/JSON.mo as a pattern to parse candid.  A couple gotcchas are parsing the ": datatype" to coerce values to the right number byte lengths and handling a variant of type "principal" in quotes.
+2. Add the variant pattern in to your Candid type and handle it (looks like you have it commented out...I'm guessing because it is very hard to represent variants in json ... maybe we come up with some standard for that like 
+
+```
+{"__variant:User": {"first" : "John", "last" : "Smith", "age" : 6}}
+```
+
+3. Add a fromText function to the Candid Encode file that takes text and outputs a Candid Type and recordkeys(maybe you need variant keys as well?) Maybe this currently only supports one dimensional arrays...not sure if those recordkeys need to be passed in in order or not.
+
+@avi and @3oltan, if we are able to pull that off we should be able to add a query to the axon that takes raw candid text and returns the blob needed to pass to the call raw command.
+
+Anyone want to take a stab at adding it.😬. I may not have any time to do so until later next week.
+
+-------------------------
+
+skilesare | 2022-12-15 15:05:58 UTC | #9
+
+In the mean time we can test with didc I think: https://github.com/dfinity/candid/tree/master/tools/didc
+
+```
+didc encode '("text")' -d hello.did -m greet
+4449444c0001710474657874
+```
+
+We just have to figure out what exactly is going to be passed in...if it is vec[nat8] then we'd need to convert that hex output to the array.
+
+https://forum.dfinity.org/t/didc-install-script/6140
+
+-------------------------
+
+tomijaga | 2022-12-16 18:03:09 UTC | #10
+
+Hi @skilesare,
+I'm glad you are as excited about the library as I am!
+I like your suggestion to add support for candid text and I'm sure it would be a useful feature for many people. It would be easy to add it to Candid module via `fromText` and `toText` fns. The parser for it would be similar to the one in the [JSON](https://github.com/aviate-labs/json.mo/blob/main/src/JSON.mo) lib but would need some modifications to support the candid specific syntax.
+
+I'm curious to know why generating candid text from outside your canister and adding it to your canister is better for the `call_raw` function than having the type defined in your canister. Would you not have to generate it each time you want to make a different call to the `call_raw` fn?
+
+[quote="skilesare, post:8, topic:14401"]
+Add the variant pattern in to your Candid type and handle it (looks like you have it commented out…I’m guessing because it is very hard to represent variants in json … maybe we come up with some standard for that like
+[/quote]
+Yes, I commented it out for that exact reason. There wasn't specific syntax for it in JSON. I like the format you suggested but would like to suggest a format that's a little more concise.
+What do you think about using motoko's style of naming variants?
+```
+{"#User": {"first" : "John", "last" : "Smith", "age" : 6}}
+```
+
+[quote="skilesare, post:8, topic:14401"]
+Add a fromText function to the Candid Encode file that takes text and outputs a Candid Type and recordkeys(maybe you need variant keys as well?) Maybe this currently only supports one dimensional arrays…not sure if those recordkeys need to be passed in in order or not.
+[/quote]
+Yes, you'll need to pass in variant keys as well if not it will display the hash. The hash for each field is preserved in the encoded data so the texts from the record keys are used to match and replace them.
+The record keys is converted into a TrieMap so the texts don't need to be in order or placed in multi-dimensional arrays.
+
+I've found that the lib returns errors for empty arrays and nested objects.
+So I will be working on fixing those and also adding support for variants.
+
+The candid text support will be implemented after this but if it's needed urgently, you are welcome to make a PR request to the repo.
+
+Thanks for sharing your thoughts and ideas!
+
+-------------------------
+
+skilesare | 2022-12-16 21:40:18 UTC | #11
+
+[quote="tomijaga, post:10, topic:14401"]
+I’m curious to know why generating candid text from outside your canister and adding it to your canister is better for the `call_raw` function than having the type defined in your canister. Would you not have to generate it each time you want to make a different call to the `call_raw` fn?
+[/quote]
+
+The idea is to use it for a canister based wallet and/or DAO platform that may need to call things in the future that we don't know about now. Take ICRC5. What is it? I don't know! But I don't want to have to upgrade my wallet to use it.  Using call_raw the wallet can call anything as long as it is handed the right encoding of the params.
+
+>What do you think about using motoko’s style of naming variants?
+
+Perfect!
+
+>Yes, you’ll need to pass in variant keys as well if not it will display the hash. The hash for each field is preserved in the encoded data so the texts from the record keys are used to match and replace them.
+The record keys is converted into a TrieMap so the texts don’t need to be in order or placed in multi-dimensional arrays.
+
+I figure that was the case...nice.  Long term you could put an async feature in that compared them against a list of know hashes...you could scan ic scan and pull the .did files from all canisters to build the DB.  It would be a luxury feature. :slight_smile:
+
+-------------------------
+
+paulyoung | 2022-12-16 22:32:04 UTC | #12
+
+I’ve worked on programming languages and written JSON codecs for them.
+
+My go-to solution has usually ended up being something like:
+
+```
+{
+  "tag": "name",
+  "args": [ … ]
+}
+```
+
+Where you would use an empty array for tags with no arguments like `#true` and `#false`, an array of one element for tags with a single argument like `#ok x` and `#err y`, and an array for tags that take a tuple, like `#cons (head, tail)`.
+
+***
+
+I’d also look at what the `serde_json` crate does for enums in Rust. It could be useful to use the same format and be compatible with it. It’s probably also found problems with other formats.
+
+https://github.com/serde-rs/json/blob/ecad462c8e966b7f9c059b8aa3362bcf676b776c/tests/test.rs#L68-L73
+
+https://github.com/serde-rs/json/blob/ecad462c8e966b7f9c059b8aa3362bcf676b776c/tests/test.rs#L482-L508
+
+-------------------------
+

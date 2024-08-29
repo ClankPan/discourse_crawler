@@ -1,0 +1,166 @@
+NS01 | 2023-08-10 18:38:59 UTC | #1
+
+Question for the mega-brains out there...
+
+I'm trying to work out if it's possible to ditch my mongo DB and move everything on chain. To do this I'm going to have to index the whole ICP ledger and continually compute account values. I've got a test canister running which indexes the ICP ledger for all accounts and keeps their running balances and count of transactions - each account is stored in a struct in a BtreeMap. The issue is with over 1million accounts I've completely smashed through the ICP instruction limit just doing a simple lookup on the Btreemap. My canister is still running but I can't query the data. 
+
+So... I'm thinking of carving up the data-set into multiple Btreemaps. For ease I've be looking to have these as  Vec<BtreeMap<u32, MyStruct>> where each Btreemap covers a specific account range and as such lookups can just slice into the right Vec index. 
+
+ I believe it is possible to have Btree's inside a vec using heap memory but isn't very scalable due to the 4GB limit. So..
+
+Can you put a BtreeMap inside a Vec in stable memory using ic-stable-structures? 
+
+What are your thoughts on chunking a very large dataset in this way to dodge the instruction limit? Will it work? 
+
+My thoughts on data processing flow at the moment is: 
+
+1. Pull the tx from ledger = 10 calls to ICP ledger, download about 10k transactions in 1k chunks and save in temp array. Then set timer to init next part of the process - (to dodge instruction limit).
+2. Process the transactions - calculating specific data points. (3-4 function calls per account - heavy processing!!). Set timer to init next part. 
+3. Lookup which tree an account belongs to and then update the account in the Btreemap with the processed data. 
+
+This is clearly a bit of a nightmare and realistically the instruction limit would have to go up 10x to do this on-the-fly or in one go like we do using our trad-servers. 
+
+Really interested in people's thoughts! How best to do heavy data-processing on the IC and dodge the instruction limit? Will setting timers to chunk computation eat a crazy amount of cycles? Is there any other way?  
+
+Thanks in advance! 
+
+Nathan.
+
+-------------------------
+
+icme | 2023-08-10 20:30:43 UTC | #2
+
+[quote="NS01, post:1, topic:22070"]
+The issue is with over 1million accounts I’ve completely smashed through the ICP instruction limit just doing a simple lookup on the Btreemap.
+[/quote]
+
+Lookups in a BTree are O(log(n)). You shouldn’t be hitting any instruction limits unless you’re looping through the entire map. Check that your each item in your map has a key that supports your data access patterns
+
+
+[quote="NS01, post:1, topic:22070"]
+For ease I’ve be looking to have these as Vec<BtreeMap<u32, MyStruct>> where each Btreemap covers a specific account range
+[/quote]
+
+Since a BTree is a sorted map, you can also use hierarchical and delimited keys to more easily find and paginate through the data you’re looking for.
+
+Many databases utilize BTrees for range/sort ordering. Here’s an example of how you can construct your keys to support range queries and hierarchical data https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-sort-keys.html
+
+-------------------------
+
+NS01 | 2023-08-10 20:58:26 UTC | #3
+
+Thank you - shouldn't be looping through the entire map.  I'm hitting the instruction limit all the time on lots of calculations. I'll double check the keys and try and break down each calculation into smaller bit to see where it's getting hungry. 
+
+I'll have a read into hierarchical and delimited keys. 
+
+Thank you! :slight_smile:
+
+-------------------------
+
+NS01 | 2023-08-10 21:41:02 UTC | #4
+
+Ok so a couple of issue in my code - wasteful copying of data instead of referencing and for some reason there was an iter() thrown into one of the Btree lookups. I also wasn't paying too much attention to Ord, Partial Ord, Eq in structs which could also throw things off.. I think. 
+
+I'll give those things a bash and see how I get on :slight_smile:
+
+-------------------------
+
+lastmjs | 2023-08-10 21:46:45 UTC | #5
+
+To become a general-purpose would computer I imagine the IC will need to overcome these instruction limits
+
+-------------------------
+
+NS01 | 2023-08-10 22:49:53 UTC | #6
+
+To be fair - I've not been very lean in my coding approach and I'm quite new to rust. But I do think it needs to be raised by about 5x-10x to be a real alternative for most things... the force directed stuff I've got running on trad servers can take a couple of minutes to smash together a map for a big batch of transactions (over a couple of tokens).. I don't think we're anywhere near that kind of compute on ICP. 
+
+I've said it before.. I'd love a non-replicated 'data smashing' area on ICP which perhaps picks a node at random and trusts it to do a bit of work. Of course this shouldn't be used for mission critical stuff.
+
+-------------------------
+
+icpp | 2023-08-11 02:17:07 UTC | #7
+
+I agree that this limit will need to be addressed and I expect it will be.
+
+I am hitting this limit too when running inference on AI models, which simply takes a lot of matrix multiplications.
+
+-------------------------
+
+icpp | 2023-08-11 02:25:21 UTC | #8
+
+@NS01 ,
+btw... I have no suggestions for you, but just want to thank you for sharing this pain point.
+
+-------------------------
+
+Sormarler | 2023-08-11 06:22:58 UTC | #9
+
+[quote="NS01, post:6, topic:22070"]
+I’ve said it before… I’d love a non-replicated ‘data smashing’ area on ICP which perhaps picks a node at random and trusts it to do a bit of work. Of course this shouldn’t be used for mission critical stuff.
+[/quote]
+
+I would love to see the internet computer become more flexible with respect to subnet configurations.
+
+-------------------------
+
+free | 2023-08-11 08:47:31 UTC | #10
+
+One aspect of the IC architecture that pretty much requires instruction limits is the fact that canisters are (single-threaded) actors. If instruction limits were removed or just greatly increased, a canister could be stuck executing one message for very, very long (especially if it doesn't have reserved compute and competes for CPU cores with other canisters). So at best one could apply higher instruction limits to "batch processing subnets", where latency is explicitly not a core requirement.
+
+Then there are all the nitty-gritty details of the implementation, such as checkpointing and it being impossible (or at least very, very hard) to preserve the state of an ongoing execution across a checkpoint (so that a newly added or catching up replica can resume computation from half-way through). And allowing a message execution to take something like 100+ rounds with a 500 round checkpoint interval when the canister is not guaranteed to be scheduled for at least 1 out of every 5 rounds will just lead to aborting and restarting the execution after every checkpoint.
+
+Introducing concurrency within canisters would likely not help much: if you had a background execution reindexing all (or much) of your data, it would likely lock you out of accessing that same data concurrently. I.e. canister concurrency would pretty much only help with transactions that touch disjoint data / memory areas. So it would be useful for increasing the throughput of something like independent ledger transactions; but not for heavy computation.
+
+[quote="Sormarler, post:9, topic:22070"]
+I would love to see the internet computer become more flexible with respect to subnet configurations.
+[/quote]
+
+"Renting" a subnet (even for a short period of time) might allow one to set it up as desired (arbitrarily high instruction limit, arbitrarily high checkpoint interval, etc.). This may not e.g. lead to the expected outcome (e.g. if one sets up a 4-replica subnet with a one hour checkpoint interval and two replicas fail within the same hour, at least one of them would have to redo most of one hour's worth of computation before the subnet can make progress; by which time another replica may fail and the whole process would have to start again).
+
+-------------------------
+
+NS01 | 2023-08-11 09:37:13 UTC | #11
+
+Yeah that sounds tough.. and way beyond my mere mortal brain! 
+
+I take it combining replicated and non-replicated compute areas is a strict no-no? 
+
+I understand that if a node fails all is lost.. but this is the same with a trad server? I totally get why replication is a must for mission critical compute (financial, medical etc) but I think there are a lot of use cases for saying - I'd trust a single (random) ICP node to process this big chunk of data for 10minutes. If it fails, all will be lost and the compute will just have to start again. 
+
+Just a thought.
+
+-------------------------
+
+free | 2023-08-11 12:17:33 UTC | #12
+
+Technically, there is no reason why you couldn't have a single-node subnet. We use those in tests and (beyond the limitations you point out) they run just fine. If we had single-node subnets that could be rented and configured at will, then you would get exactly the behavior you describe.
+
+Thing is, we don't have support for "renting" subnets. And, probably a bigger hurdle, I don't know whether anyone has had a really hard think on how a heterogeneous collection of subnets is supposed to work together reliably and securely. A single-replica subnet would be entirely within the control of a single node operator. Any canister hosted on such a subnet could be trivially hijacked by the node operator (or someone who hacked them); and the hijacker could send arbitrary messages on behalf of said canister. So we may e.g. have to define explicit subnet trust levels and prevent lower trust subnets from calling out to higher trust subnets. That way it may (or may not) be that the only possible interaction between the different layers would be that a higher trust level subnet might make a call out to a lower trust level one asking it to do some work (with the explicit understanding that it should not blindly trust the result). But as said, this is just an idea off the top of my head, as I personally have definitely not put much thought into this.
+
+-------------------------
+
+NS01 | 2023-08-11 13:11:59 UTC | #13
+
+I like the idea! Certainly making it unable to call other subnets makes sense. Of course the risk is lazy developers start passing mission critical stuff to it and introduce a weak link. 
+
+The other alternative is to allow non-replicated HTTPS outcalls. Then I could simply pass heavy compute out to a Heroku server or similar and poll it for a result. Again HTTPS outcalls for oracles etc need to be trusted.. but not all data being passed between ICP and other servers will need to be this trustworthy. 
+
+Thinking about it some more... I imagine single HTTPS outcalls would suit more projects and help projects onboard as they know that they can still use their trad stack and pass information between the two easily.
+
+-------------------------
+
+lastmjs | 2023-08-11 14:19:32 UTC | #14
+
+One possible future here is that the IC abandons replicated compute as a core means of achieving BFT applications. Validity technologies allow us to abandon replicated compute and embrace consensus only around inputs, proof, and output.
+
+In that world, I imagine much of the limitations of the IC around compute could be lifted, as consensus would become much simpler.
+
+-------------------------
+
+lastmjs | 2023-08-11 14:20:28 UTC | #15
+
+This would be years out, but it's the future I'm hoping for, and is seeming more and more likely as validity rollups on Ethereum mature. Of course there is a lot of maturation and unknowns left.
+
+-------------------------
+

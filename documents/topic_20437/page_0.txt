@@ -1,0 +1,179 @@
+qwertytrewq | 2023-06-04 13:35:14 UTC | #1
+
+From https://github.com/dfinity/motoko/issues/4017:
+
+We often have a situation when we need two shared methods to accomplish one action:
+```
+public shared func f(/*args*/) {
+  // f code
+};
+public shared func g() {
+  // g code
+};
+```
+
+`f` initializes the action to be done and `g` accomplishes it.
+
+It would be good to rewrite it as:
+
+```
+public shared func f(/*args*/) {
+  // f code
+  g();
+};
+public shared func g() {
+  // g code
+};
+```
+to have only `f` call in the "normal" (no errors) situation. But this way, we won't know whether the error happened in `f` or in `g`.
+
+To remove this trouble, I propose _channels_:
+
+```
+public shared func f(/*args*/) {
+  // f code
+  channel_write("f succeeded");
+  g();
+};
+public shared func g() {
+  // g code
+};
+```
+
+The API caller would be able to read the channel to determine, whether the error was in `f` or in `g`.
+
+I leave for community discussion whether channel values be typed (and of which types), Motoko syntax support, and implementation. I will also post this to the forum.
+
+-------------------------
+
+qwertytrewq | 2023-06-04 13:38:24 UTC | #2
+
+A possible syntax is
+```
+public shared func f(/*args*/) : Channel<Nat> {
+  // f code
+  channel_write(22);
+  g();
+};
+```
+
+-------------------------
+
+qwertytrewq | 2023-06-04 13:50:35 UTC | #3
+
+I realized that what I proposed has a name: It is a generator function.
+
+-------------------------
+
+Severin | 2023-06-05 06:36:09 UTC | #4
+
+[quote="qwertytrewq, post:1, topic:20437"]
+But this way, we won’t know whether the error happened in `f` or in `g`.
+[/quote]
+
+Isn't this a positive thing? As someone using this interface I don't care about which function of the implementation returned an error. I just want to handle the error, and if you have different error causes, then give me an enum so I can match on that
+
+-------------------------
+
+qwertytrewq | 2023-06-05 06:50:30 UTC | #5
+
+@Severin How can I return the enum if my execution flow is interrupted? The whole problem is that the current architecture does not allow me to return a value that classifies the error.
+
+-------------------------
+
+Severin | 2023-06-05 06:55:04 UTC | #6
+
+If you have a result return type on both functions(I'm not sure about Motoko syntax, but in Rust that would be e.g. `Result<(), MyErrorEnum>` you can forward g's error as an error by f
+
+-------------------------
+
+qwertytrewq | 2023-06-05 07:09:55 UTC | #7
+
+That does not work for "system" errors like canister calls queue overflow. But to be useful, error handling needs to work in all cases.
+
+-------------------------
+
+ggreif | 2023-06-05 09:59:48 UTC | #8
+
+I can't see how an extra mechanism could automatically take care of errors originating from the platform. The "obvious" way to keep errors from different sources apart is by tagging them distinctly (i.e. as a variant type) and return them from the function as a `Result<>`. For system methods you'll have to catch the error (in the queue overflow case) and convert it to your error variant. @paulyoung has come up with a neat pattern that allows one to automatically widen the error type with new causes: https://youtu.be/GFenqSGhj7I?t=1948 I cannot recommend it enough!
+
+-------------------------
+
+qwertytrewq | 2023-06-05 11:09:41 UTC | #9
+
+So,
+```
+function m() : async () {
+  try {
+    f();
+  }
+  catch (e) {
+    return #err1;
+  }
+  try {
+    g();
+  }
+  catch (e) {
+    return #err2;
+  }
+};
+```
+
+Does the above reliably detect all errors distinctly?
+
+I think it does: If entrance to `m` fails, it return that error. If anything fails in `f` or `g` (including system errors), it returns `#err1` or `#err2`.
+
+Right?
+
+-------------------------
+
+claudio | 2023-06-05 20:26:31 UTC | #10
+
+[quote="qwertytrewq, post:1, topic:20437"]
+types
+[/quote]
+
+You would need to at least change m to return an 'async  {#err1; #err2}',
+
+
+Also 'f' and 'g' are implicilty *one-way* methods, with no result, since they have no return type at all. This means that the caller will send the message without waiting for any response.
+
+Perhaps you meant 'async ()' for both, and wanted to await both calls?
+
+-------------------------
+
+qwertytrewq | 2023-06-05 21:08:42 UTC | #11
+
+[quote="claudio, post:10, topic:20437"]
+Perhaps you meant ‘async ()’ for both, and wanted to await both calls?
+[/quote]
+
+Yes. Await first `f` then `g`.
+
+-------------------------
+
+ggreif | 2023-06-06 08:34:09 UTC | #12
+
+[quote="qwertytrewq, post:9, topic:20437"]
+returns `#err1` or `#err2`
+[/quote]
+
+Also you might want to pass some of the information in the caught `e` to the `#err1` or `#err2`. Variants can carry (here shareable) payload.
+
+-------------------------
+
+qwertytrewq | 2023-06-06 12:52:55 UTC | #13
+
+Unfortunately, this try...catch won't work:
+
+https://forum.dfinity.org/t/when-does-the-catch-block-of-try-catch-run-in-motoko/12464/2:
+> Note that message sends can, in rare cases, trap synchronously, before the message body is even queued and executed, which falls into the case of the previous paragraph.
+
+Not working a call inside `try` is indistinguishable from failure of calling the entire my shared method.
+
+So, my "channels" idea still makes sense.
+
+Therefore, I still need two calls from frontend (like invoice and payment), unfortunately.
+
+-------------------------
+

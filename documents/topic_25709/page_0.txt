@@ -1,0 +1,378 @@
+iamenochchirima | 2023-12-19 08:38:09 UTC | #1
+
+I am getting some weird behavior  and errors in my projects I just switched from webpack to vite, using react. 
+
+When I authenticate for the first time with II in the project, everything is working fine, all the functions are being called well. But when I refresh then I'm getting this error:
+
+![Screenshot from 2023-12-19 10-16-41|690x89](upload://hJjBaYsZyfJzWDnIVrBSdUzHLRI.png)
+
+Some times I'm also getting this one:
+
+![Screenshot from 2023-12-19 10-28-44|690x105](upload://cp0ZNqbtNHRdKM67wEOemKg9Hvr.png)
+
+
+It's behaving so weird, like I can stop dfx and start everything afresh, it works for moment, even after refreshing the page, and then when I stop and start dfx again and deploy everything again, the error is back, it's behaving so randomly.
+
+I have this context wrapper:
+
+```
+const Context: FC<LayoutProps> = ({ children }) => {
+  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [backendActor, setBackendActor] = useState<ActorSubclass | null>(null);
+  const [ws, setWs] = useState<IcWebSocket<_SERVICE, AppMessage> | null>(null);
+
+  const login = async () => {
+    await authClient.login({
+      identityProvider:
+        process.env.DFX_NETWORK === "ic"
+          ? "https://identity.ic0.app"
+          : `http://127.0.0.1:4943/?canisterId=${iiCanId}`,
+      onSuccess: () => {
+        checkAuth();
+      },
+      onError: (err) => alert(err),
+    });
+  };
+
+  const checkAuth = async () => {
+    try {
+      if (await authClient.isAuthenticated()) {
+        const _identity = authClient.getIdentity();
+        setIdentity(_identity);
+
+        let agent = new HttpAgent({
+          host: network === "local" ? localhost : host,
+          identity: _identity,
+        });
+        agent.fetchRootKey();
+
+        const _backendActor = Actor.createActor(idlFactory, {
+          agent,
+          canisterId: canisterId,
+        });
+        setBackendActor(_backendActor);
+
+        const _ws = new IcWebSocket(gatewayUrl, undefined, {
+          canisterId: canisterId,
+          canisterActor: backend,
+          identity: _identity as SignIdentity,
+          networkUrl: icUrl,
+        });
+        setWs(_ws);
+        setIsAuthenticated(true);
+      }
+    } catch (error) {
+      console.log("Error in checkAuth", error);
+    }
+  };
+
+  const logout = async () => {
+    await authClient.logout();
+    setIsAuthenticated(false);
+    setIdentity(null);
+  };
+
+  return (
+    <ContextWrapper.Provider
+      value={{
+        identity,
+        backendActor,
+        isAuthenticated,
+        ws,
+        login,
+        logout,
+        checkAuth,
+      }}
+    >
+      {children}
+    </ContextWrapper.Provider>
+  );
+};
+
+export default Context;
+``` 
+And then in another component I am accessing the context info like this:
+
+```
+ const { isAuthenticated, login, checkAuth, backendActor } = useAuth();
+
+  useEffect(() => {
+    checkAuth();
+  }, []);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      callBackend();
+    }
+  }, [isAuthenticated]);
+
+  const callBackend = async () => {
+    const result = await backendActor.getAllConnectedClients();
+    console.log(result);
+  };
+```
+
+This same implementation in webpack it's working fine, here in vite it's working soon after login in, and some other few random times. What could be causing this?
+
+-------------------------
+
+NathanosDev | 2023-12-19 10:11:40 UTC | #2
+
+The first thing that comes to mind for me when switching between Webpack and Vite is that the enviornment variables are not working correctly. My guess is that maybe the root key is being fetched from the wrong network.
+
+On a side note, `agent.fetchRootKey()` is extremely dangerous code to use on `mainnet`. Please put it behind a condition so that it only runs locally. This API call will fetch a root key for verification of update calls from a single replica, so it's possible for that replica to respond with a malicious key. A verified mainnet root key is already embedded into agent-js, so this only needs to be called on your local replica, which will have a different key from mainnet that agent-js does not know ahead of time.
+
+My working vite config looks like this, you can cross reference that with yours to see if there's anything missing:
+```
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import checker from 'vite-plugin-checker';
+import { viteStaticCopy } from 'vite-plugin-static-copy';
+import tsconfigPaths from 'vite-tsconfig-paths';
+import { resolve } from 'path';
+import dotenv from 'dotenv';
+
+dotenv.config({
+  path: resolve(process.cwd(), '..', '..', '.env'),
+});
+
+const UI_ENV_VARS = ['DFX_NETWORK', 'BACKEND_CANISTER_ID'];
+
+process.env = {
+  ...process.env,
+  ...UI_ENV_VARS.reduce(
+    (accum, entry) => ({
+      ...accum,
+      [`VITE_${entry}`]: process.env[entry],
+    }),
+    {},
+  ),
+};
+
+export default defineConfig({
+  plugins: [
+    react(),
+    checker({ typescript: true }),
+    tsconfigPaths(),
+    viteStaticCopy({
+      targets: [
+        {
+          src: 'src/.ic-assets.json',
+          dest: '.',
+        },
+      ],
+    }),
+  ],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: id => {
+          if (id.includes('@dfinity')) {
+            return 'dfinity-vendor';
+          }
+
+          if (id.includes('@mui')) {
+            return 'mui-vendor';
+          }
+        },
+      },
+    },
+  },
+  worker: {
+    format: 'es',
+  },
+  test: {
+    globals: true,
+    environment: 'happy-dom',
+    setupFiles: './src/test-setup',
+    coverage: {
+      provider: 'v8',
+      all: true,
+      include: ['src/**/*'],
+    },
+  },
+  optimizeDeps: {
+    esbuildOptions: {
+      define: {
+        global: 'globalThis',
+      },
+    },
+  },
+  define: {
+    'process.env': {
+      DFX_NETWORK: process.env.DFX_NETWORK,
+      BACKEND_CANISTER_ID: process.env.BACKEND_CANISTER_ID,
+    },
+  },
+  server: {
+    proxy: {
+      '/api': 'http://127.0.0.1:8080',
+    },
+  },
+});
+```
+
+-------------------------
+
+iamenochchirima | 2023-12-20 06:35:28 UTC | #3
+
+Hi @NathanosDev , I tried using cross checking your config with mine, but I am getting this:
+
+```
+ ERROR: [plugin: externalize-deps] "vite-plugin-static-copy" resolved to an ESM file. ESM file cannot be loaded by `require`. See https://vitejs.dev/guide/troubleshooting.html#this-package-is-esm-only for more details.
+```
+I think this library got some dependancies that are not ESM compatible. But anyway, my vite config seems to have been working on environmental variables, it's importing them I'm accessing them in the frontend. Here is my config, I'm not sure if there is something important missng:
+
+```
+/// <reference types="vitest" />
+import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite';
+import environment from 'vite-plugin-environment';
+import dotenv from 'dotenv';
+import topLevelAwait from "vite-plugin-top-level-await";
+
+dotenv.config();
+
+export default defineConfig({
+  root: 'src',
+  build: {
+    outDir: '../dist',
+    emptyOutDir: true,
+  },
+  optimizeDeps: {
+    esbuildOptions: {
+      define: {
+        global: 'globalThis',
+      },
+    },
+  },
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:4943',
+        changeOrigin: true,
+      },
+    },
+  },
+  plugins: [
+    react(),
+    environment('all'),
+    topLevelAwait({
+      promiseExportName: "__tla",
+      promiseImportName: i => `__tla_${i}`
+    })
+  ],
+  test: {
+    environment: 'jsdom',
+    cache: { dir: '../node_modules/.vitest' },
+  },
+});
+``` 
+
+But the error is still persisting, it's like something is breaking along the way and it's working for sometime and then the next it's not.
+I also noticed something when it's not working, it's saying it can't find path for the subnet:
+
+![Screenshot from 2023-12-20 08-32-20|690x108](upload://89DPSsgxH6S5YgcBRVqbYD0IViM.png)
+
+Could still be related to the vite-config or something else?
+
+-------------------------
+
+NathanosDev | 2023-12-20 14:37:12 UTC | #4
+
+What version of agent-js and DFX are you using?
+
+-------------------------
+
+iamenochchirima | 2023-12-20 15:01:21 UTC | #5
+
+Agent-js version 0.20.2, dfx version 0.15.2
+
+-------------------------
+
+NathanosDev | 2023-12-20 15:15:36 UTC | #6
+
+Sorry I'm not sure what's happening then. If you were on an older version of DFX then this could happen. Also if you're making a request to the wrong network (mainnet vs localhsot). I can't think of anything else.
+
+-------------------------
+
+NathanosDev | 2023-12-20 15:16:20 UTC | #7
+
+@kpeacock do you have any other ideas?
+
+-------------------------
+
+kpeacock | 2023-12-20 18:16:23 UTC | #8
+
+Okay, this one is odd, but in practice the `/subnet` error message is something you get back when the canister you're trying to call doesn't exist. You may be mixing up calls intended for local vs mainnet development as one part of the problem. This happens during the setup for the query verification feature.
+
+I can't tell what's going on with the authclient and reloading from what you've provided. Could you share the `useAuth` hook?
+
+-------------------------
+
+iamenochchirima | 2023-12-20 18:39:18 UTC | #9
+
+Okay sure, here:
+
+```
+const initialContext: Context = {
+  identity: null,
+  backendActor: null,
+  isAuthenticated: false,
+  ws: null,
+  login: (): void => {
+    throw new Error("login function must be overridden");
+  },
+  logout: (): void => {
+    throw new Error("logout function must be overridden");
+  },
+  checkAuth: (): void => {
+    throw new Error("checkAuth function must be overridden");
+  },
+};
+
+const ContextWrapper = createContext<Context>(initialContext);
+
+export const useAuth = () => {
+  return useContext(ContextWrapper);
+};
+```
+
+-------------------------
+
+kpeacock | 2023-12-20 19:35:10 UTC | #10
+
+How are you constructing the authClient?
+
+-------------------------
+
+iamenochchirima | 2023-12-20 19:56:50 UTC | #11
+
+Lilke this:
+
+const authClient = await AuthClient.create({
+  idleOptions: {
+    idleTimeout: 1000 * 60 * 30, 
+    disableDefaultIdleCallback: true, 
+  },
+});
+
+At top level
+
+-------------------------
+
+kpeacock | 2023-12-20 23:53:17 UTC | #12
+
+Is it inside the body of your main App class? Maybe there's some odd async behavior happening - could you try initializing it inside a `useEffect` hook and keeping a reference to it in `useState`? That's what I generally do inside my `useAuth` hooks. See here for an example: 
+
+https://github.com/krpeacock/auth-client-demo/blob/main/src/auth_client_demo_assets/react/use-auth-client.jsx#L42
+
+-------------------------
+
+iamenochchirima | 2023-12-21 06:40:09 UTC | #13
+
+Fixed now, I followed this and made some changes, now it's working, thank you very much :fire:
+
+-------------------------
+

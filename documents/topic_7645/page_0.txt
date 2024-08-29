@@ -1,0 +1,214 @@
+kevinli | 2021-10-01 06:47:00 UTC | #1
+
+I'm looking at the ext standard for erc721 tokens and the TokenIdentifier type, which is needed to query for metadata for tokens. The only thing I see regarding the tokens is:
+```
+// \x0Atid" + canisterId + 32 bit index
+type TokenIdentifier  = Text;
+```
+I'm confused on how to formulate the token identifier to query the canister.
+Let's say I want to create a TokenIdentifier for token index 2.
+Is it not just something like "rrkah-fqaaa-aaaaa-aaaaq-cai-2"
+
+-------------------------
+
+pk34 | 2021-12-31 23:00:36 UTC | #3
+
+Hello!
+
+Did you ever solve this?
+I'm trying to implement EXT and i'm stuck at this :c
+
+-------------------------
+
+karim | 2022-03-05 12:53:21 UTC | #4
+
+I'm currently trying to solve this as well using this code: https://github.com/Toniq-Labs/ext-js but I'm a noob in JS. Didn't even know what NPM is a couple of hours ago :smiley: 
+
+If anyone here knows how to compute the TokenIdentifier according to this function, please reach out to us:
+
+```
+const tokenIdentifier = (principal, index) => {
+  const padding = Buffer("\x0Atid");
+  const array = new Uint8Array([
+      ...padding,
+      ...Principal.fromText(principal).toUint8Array(),
+      ...to32bits(index),
+  ]);
+  return Principal.fromUint8Array(array).toText();
+};
+const decodeTokenId = (tid) => {
+  var p = [...Principal.fromText(tid).toUint8Array()];
+  var padding = p.splice(0, 4);
+  if (toHexString(padding) !== toHexString(Buffer("\x0Atid"))) {
+    return {
+      index : 0,
+      canister : tid,
+      token : tokenIdentifier(tid, 0)
+    };
+  } else {
+    return {
+      index : from32bits(p.splice(-4)), 
+      canister : Principal.fromUint8Array(p).toText(),
+      token : tid
+    };
+  }
+};
+```
+
+-------------------------
+
+karim | 2022-03-05 13:30:16 UTC | #5
+
+Alright I've got it. So for anybody wondering: The TokenIdentifier is a representation of the canister's ID, the index of the token within the canister, and a domain seperator so it needs to be computed from the token index and the canister ID of the smart contract that minted the token. You can do this using this JS code:
+
+```
+import { Principal } from '@dfinity/principal';
+
+const to32bits = num => {
+    let b = new ArrayBuffer(4);
+    new DataView(b).setUint32(0, num);
+    return Array.from(new Uint8Array(b));
+  }
+
+const computeTokenIdentifier = (principal, index) => {
+    const padding = Buffer("\x0Atid");
+    const array = new Uint8Array([
+        ...padding,
+        ...Principal.fromText(principal).toUint8Array(),
+        ...to32bits(index)
+    ])
+
+    console.log(array);
+}
+
+// Insert the canister ID and the token index as arguments
+// This will print the result to console
+// Result should look something like this: cso6j-aaaaa-uwiaa-aaaaa-amcay-maqca-aaaad-c
+computeTokenIdentifier('CANISTER-ID', 0);
+```
+
+-------------------------
+
+skilesare | 2022-03-05 16:24:06 UTC | #6
+
+[quote="karim, post:5, topic:7645"]
+console.log(array);
+[/quote]
+
+This logs the array but doesn't return anything.  I get undefined. How do I turn the array into the text you mentioned?
+
+-------------------------
+
+skilesare | 2022-03-05 16:39:23 UTC | #7
+
+I did:
+    
+    return Principal.fromUint8Array(array).toText();
+
+That looks right.  It still doesn't work in stoic.
+
+-------------------------
+
+karim | 2022-03-09 11:48:44 UTC | #8
+
+Sorry for my late response. So, yeah I was looking for a way to compute the TokenIdentifier when working with the Candid UI or dfx. That's why I just log the array.
+
+-------------------------
+
+MCLYang | 2022-06-09 10:42:28 UTC | #9
+
+After replace `return Principal.fromUint8Array(array).toText();
+` it works for me. I might just submit a PR on EXT. It would be great just have encode function in utility.
+
+-------------------------
+
+sardariuss | 2022-07-12 22:21:28 UTC | #10
+
+I came up with a solution in motoko if somebody's ever interested. I haven't tested it much though, so use it at your own risks!
+
+
+```
+public query func computeExtTokenIdentifier(principal: Principal, index: Nat32) : async Text {
+    var identifier : [Nat8] = [10, 116, 105, 100]; //b"\x0Atid"
+    identifier := Array.append(identifier, Blob.toArray(Principal.toBlob(principal)));
+    var rest : Nat32 = index;
+    for (i in Iter.revRange(3, 0)) {
+      let power2 = Nat32.fromNat(Int.abs(Int.pow(2, (i * 8))));
+      let val : Nat32 = rest / power2;
+      identifier := Array.append(identifier, [Nat8.fromNat(Nat32.toNat(val))]);
+      rest := rest - (val * power2);
+    };
+    return Principal.toText(Principal.fromBlob(Blob.fromArray(identifier)));
+  };
+```
+
+-------------------------
+
+rckprtr | 2022-07-12 23:57:53 UTC | #11
+
+In Rust to have them both in the same thread.
+
+```
+pub fn get_token_hash(canister_id: &Principal, token_id: &u64) -> Principal {
+        let mut result = [0u8; 18];
+        result[0..4].copy_from_slice(b"\x0Atid");
+        result[4..14].copy_from_slice(canister_id.as_slice());
+        result[14..18].copy_from_slice(&(token_id.clone() as u32).to_be_bytes());
+        return Principal::try_from(&result.to_vec()).unwrap();
+    }
+```
+
+Also warning, any Principal that ends in a 4 will blow up :slight_smile:
+
+-------------------------
+
+Severin | 2022-07-14 06:05:11 UTC | #12
+
+[quote="rckprtr, post:11, topic:7645"]
+Also warning, any Principal that ends in a 4 will blow up :slight_smile:
+[/quote]
+
+Thanks for pointing this out. This was fixed a while ago, but not released yet for some reason. @lwshang just did a new release of `ic-types` that now allows Principals ending in 4.
+
+-------------------------
+
+rckprtr | 2022-07-14 14:50:11 UTC | #13
+
+That would be great!
+
+-------------------------
+
+rckprtr | 2022-08-02 01:17:03 UTC | #14
+
+Any status on this?  Just hit this again really hard :slight_smile:
+
+-------------------------
+
+diegop | 2022-08-02 02:02:02 UTC | #15
+
+Good question. Let me ping folks
+
+-------------------------
+
+lwshang | 2022-08-02 02:31:29 UTC | #16
+
+Hi @rckprtr,
+
+We have published `ic-types` v0.4.0 which fixed the problem.
+So update your `Cargo.toml` with `ic-types = 0.4.0`.
+FYI, the changelog: https://github.com/dfinity/ic-types/blob/main/CHANGELOG.md#fixed
+
+If you are using `Principal` via `candid`, you will need `candid = 0.7.15`.
+
+-------------------------
+
+rckprtr | 2022-08-09 17:55:06 UTC | #17
+
+Confirm this works
+
+https://dscvr.one/u/EasySteve
+
+This NFT just so happens to end in 4 and its being confirmed on our system.
+
+-------------------------
+

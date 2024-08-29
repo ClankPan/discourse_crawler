@@ -1,0 +1,294 @@
+icme | 2022-05-27 09:03:23 UTC | #1
+
+I don't know what's going to happen once I hit the memory heap limit, and am curious if anyone here has  hit the heap limit or tested out what it's like to tip-toe on the edge and see what happens right when one goes over (4GB).
+
+A few questions.
+
+1. What happens to the existing data in the canister?
+2. What happens to the state of the canister from that call (trap & rollback)? 
+  a. What happens if I'm attempting not to add to, but to modify a number (say increment a counter) and I hit the cycles limit?
+  b. What happens if I query a canister and the intermediate data structures produced by that query makes that canister hit the heap size limit.
+3. Is this error catchable?
+4. What happens if a canister hits the heap size limit during an upgrade (i.e. wasm is larger than previous wasm)?
+
+
+I'm building IC data storage tooling for applications, so I'd like to both enable and protect/guard developers from having to face these scenarios. Before starting the cycle burn to do this testing, any tips or stories from the community or internal DFINITY team members that have experienced or tested this out would be super helpful.
+
+-------------------------
+
+jzxchiang | 2022-05-25 15:50:44 UTC | #2
+
+I'd like to know the answer to this too!
+
+-------------------------
+
+bitdivine | 2022-05-25 16:20:35 UTC | #3
+
+Expectation:  If an update call would take the canister over the limit, the update call will simply fail, so the user who made the update call will get a reject.
+
+It would be cool if someone could test this with a toy canister.
+
+I did make a similar test for numbers rolling over and there the behaviour was also that the update call would be rejected and the data would remain valid.
+
+https://stackoverflow.com/questions/69593890/what-is-the-meaning-of-trap-in-relation-to-integer-underflow-overflow
+
+-------------------------
+
+dymayday | 2022-05-25 16:28:21 UTC | #4
+
+From a Rust perspective :
+
+You are actually limited to around 2Gb of heap memory if you want to use the upgrade hooks. As it needs around 2 times the memory space taken by your actual data in order to function properly during the deserialize process. So if your canister state has more than ~2Gb it will render your canister unable to upgrade because it will fail during the `post_upgrade`.
+
+Memory error like so are not catchable as they are unrecoverable panics from the runtime. From what I tested so far, the canister just roll back to it previous working state.
+
+-------------------------
+
+icme | 2022-05-26 00:43:34 UTC | #5
+
+In looking at the docs for [create_canister](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-create_canister), it looks like one can attempt to avoid this by setting the `memory_allocation` parameter.
+
+From the docs:
+
+>     memory_allocation (nat)
+> 
+> Must be a number between 0 and 2^48^ (i.e 256TB), inclusively. It indicates how much memory the canister is allowed to use in total. Any attempt to grow memory usage beyond this allocation will fail. If the IC cannot provide the requested allocation, for example because it is oversubscribed, the call will be rejected. If set to 0, then memory growth of the canister will be best-effort and subject to the available memory on the IC.
+> 
+>     Default value: 0
+
+
+Therefore, it looks like calls are **rejected** if the memory_allocation threshold is set and passed, but calls **trap + fail** if this is not set and the canister heap memory capacity is exceeded.
+
+I do have a few follow-up questions though so that I can use the `memory_allocation` parameter most effectively. 
+
+Is `memory_allocation` more directly related to the `Prim.rts_heap_size`, `Prim.rts_memory_size`, or something else entirely like the management canister's `canister_status` method?
+
+I'm trying to figure out a good way to monitor when a canister will hit this `memory_allocation` or run out of canister/heap memory entirely. For the time being, let's simplify things and say that subnet itself is not a limiting factor (i.e. there is more canister space available on the particular subnet).
+
+Also, Is it possible to derive the remaining canister memory from within the canister (i.e. through prim)? I'd prefer not to involve inter-canister calls if possible, and would also prefer not to have to keep a running count of all the bytes that enter my canister via update calls.
+
+-------------------------
+
+Gabriel | 2022-05-26 07:36:32 UTC | #6
+
+Actually the memory_allocation docs are a bit misleading. 
+
+
+**As Roman replied to the other question about compute allocation, it accumulates over time like storage cost. Therefore, if you set a higher value for compute allocation, it’s expected that your canister will run out of cycles sooner than if you use the default 0 (which means best effort scheduling for your canister). Even more so if you’re doing some load test where you also presumably burn a bunch of cycles.**
+
+**Similar things can be said if you set a high memory allocation. Even if you don’t use all the memory you’ve set as your allocation, the system will charge your canister for it (because we’ve reserved it on your behalf and will not be taken by anyone else).**
+
+**If no memory allocation is set, then we fall back to best effort, meaning that if your canister attempts to increase its memory usage, it’ll succeed if there’s enough memory capacity left in the subnet. Your canister will be charged for the memory it’s using at any given time, with the risk that if the subnet is quite full, you might not be able to claim the memory you need at some later point.**
+
+From here: https://forum.dfinity.org/t/bug-compute-allocation-memory-allocation-freezes-canister/5796
+
+So the initial canister memory is not 4gb, it's tiny (don't know exactly) and setting a value for memory_allocation means that you actually reserve and pay for it from the beginning.
+
+-------------------------
+
+dymayday | 2022-05-26 19:58:18 UTC | #7
+
+We have issue with one of our asset canister here, its heap memory is full (more than 4.2Gb) and now it is un-responding. So I'm afraid that we have effectively lost all the assets that are on this canister, as even light queries don't work. (Only status from dfx works)
+
+![image|690x18](upload://pelvmaILsMWwYjTtNZ6768X6MD5.png)
+
+So I guess  you have your definitive answer.
+What ever you do, do not fill up your canister heap memory.
+
+-------------------------
+
+icme | 2022-05-26 20:43:50 UTC | #8
+
+[quote="dymayday, post:7, topic:13279"]
+We have issue with one of our asset canister here, its heap memory is full (more than 4.2Gb) and now it is un-responding. So I’m afraid that we have effectively lost all the assets that are on this canister
+[/quote]
+
+Thank you for your sacrifice and contributions to the community. This canister will not have died in vain.
+
+
+Curious though, it sounds like the unresponsive mess is due to overflowing the heap during an upgrade, and not during an update/query call (which would have just trapped).
+
+It sounds then like all Motoko devs should monitor the `Prim.rts_heap_size` inside a canister and ensure it never surpasses 2GB.
+
+@claudio @chenyan is this accurate?
+
+-------------------------
+
+dymayday | 2022-05-26 21:45:00 UTC | #9
+
+Rest in peace lil canister :pray: 
+
+There is no upgrade involved here. The canister is a data bucket from a modified [Rust bigmap-poc](https://github.com/dfinity/bigmap-poc) implementation. For our current needs, it is not supposed to be upgraded.
+
+-------------------------
+
+claudio | 2022-05-26 21:57:22 UTC | #10
+
+So was this Rust or Motoko code?
+
+-------------------------
+
+dymayday | 2022-05-26 21:58:49 UTC | #11
+
+If you are talking to me, we only use Rust.
+
+-------------------------
+
+sat | 2022-05-27 09:02:35 UTC | #12
+
+There is support for "splitting" a data canister in bigmap-poc. It's not the most optimal split, but it exists.
+Seems like there is a bug in the code that calculates the canister size and thus the splitting never started?
+Or you don't run the periodic maintenance checks within the bigmap-poc @dymayday ?
+
+-------------------------
+
+dsarlis | 2022-05-27 10:54:00 UTC | #13
+
+[quote="icme, post:8, topic:13279"]
+Curious though, it sounds like the unresponsive mess is due to overflowing the heap during an upgrade, and not during an update/query call (which would have just trapped).
+[/quote]
+
+I'm not sure I understand how the heap would overflow during an upgrade and you wouldn't get a trap. If you ever try to access more than 4GiB of heap, there should be a trap no matter what (as the Wasm heap is limited to 4GiB at the moment). Essentially, any message execution that somehow attempts to access beyond 4GiB should trap, regardless of this being an update/query call or upgrading the canister.
+
+-------------------------
+
+dymayday | 2022-05-27 11:56:40 UTC | #14
+
+@sat 
+The `maintenance` method is apparently not working on the amount of data we have in our canisters because of cycles limitations.
+
+Was the periodic maintenance supposed to be run periodically enough so it will manage to always complete despite cycle limitations ?
+
+-------------------------
+
+sat | 2022-05-27 13:29:43 UTC | #15
+
+@dymayday well that's unfortunate. Without the "maintenance" call running, this is bound to happen, since the amount of data in the canister will keep growing forever, until this limit is hit.
+I wasn't aware that the cycle limit is being hit. Back when the code was developed (and that was *a while* ago), the cycle limits were quite different.
+It would probably be worth fixing the maintenance method before anything else. Do you know what needs to be done to fix it, or do you need help?
+If it's not a secret, which app is this?
+
+-------------------------
+
+dymayday | 2022-05-27 14:10:08 UTC | #16
+
+I'm working on [Distrikt.app](https://az5sd-cqaaa-aaaae-aaarq-cai.ic0.app/).
+I'm picking up where the previous dev left so I'm still fuzzy on the implementation tbh. But I would much appreciate your help on the matter for sure !
+
+-------------------------
+
+icme | 2022-05-29 03:25:03 UTC | #17
+
+I haven't had this happen or tested it out, but I've had several discussions with others that mention the dangers of an error occuring during the `preupgrade` system method, which could result in a canister no longer being upgrade-able.
+
+I don't know anything about @dymayday's issue, but from what he's said my hypothesis (not verified) is that this cycles overflow originally occurred during the maintenance method, meaning that the canister was no longer being reparitioned. Still live and functioning, the canister then kept filing up with data until it surpassed the heap memory limit, at which point it was no longer responsive.
+
+Another thing that could of happened (but didn't in this case) is that the canister could have overflowed the heap and trapped during the `preupgrade method`. This would mean that the data serialization process during upgrades was overflowing the heap meaning every upgrade attempt would trap, resulting in a canister that was longer upgrade-able. The canister would then keep filling up until it is no longer responsive.
+
+It would be great if there was some canister data recovery mechanism such that canister which is no longer upgrade-able due to heap overflow limitations can have it's entire state downloaded by a controlling principal of the canister.
+
+This is probably something that should be abstracted and native to the replica and not a library or method that is included after the fact, as I would imagine many developers will find themselves in this exact same state as @dymayday somewhere down the line.
+
+-------------------------
+
+dsarlis | 2022-05-30 07:20:41 UTC | #18
+
+[quote="icme, post:17, topic:13279"]
+It would be great if there was some canister data recovery mechanism such that canister which is no longer upgrade-able due to heap overflow limitations can have it’s entire state downloaded by a controlling principal of the canister.
+[/quote]
+
+This is something that has been discussed internally in the past and we even have a feature request about it. Unfortunately, we haven't been able to prioritise it given other work that has been occupying the relevant teams but it's something I hope we can get higher on the list in the not so far future.
+
+-------------------------
+
+goose | 2022-06-06 10:00:44 UTC | #19
+
+https://forum.dfinity.org/t/rust-stable-memory-manage/11877     rust use 8GB stable memory
+
+-------------------------
+
+jzxchiang | 2022-06-06 05:31:05 UTC | #20
+
++1 to this idea, I think downloading (and uploading) a canister's an entire state would be a very useful feature.
+
+-------------------------
+
+PeanutNJam | 2022-07-05 07:50:36 UTC | #21
+
+I had the same error as you did, and got an unresponsive canister which when I tried to ``` dfx canister --network ic install --mode reinstall <canister> ```, I could get the successful reinstall but still not get my canister to work correctly (it was a frontend canister which had a large file I thought I deleted but was put back with a commit from my teammate). I then went to NNS where I made this canister. I then detached it assuming I would get the cycles back but did not. I thus have some questions:
+
+Q1 -> Could someone please tell me how I can get my cycles back? Or if this is at all possible? 
+
+Q2 -> How do I switch off another one of my canisters? I have two canisters currently running and deployed on ic (just backend Motoko). How can I do this without losing control of the canister as well as my cycles? Note I have two principals on all the canisters I made (I made 3 of them initially). I never remove my principals, as I wish to control all from the terminal. These two backend canisters are not giving me problems, but I refactored them to operate as a single canister so I don't need the other ic canister. Any advice would be appreciated. Thanks in advance.
+
+-------------------------
+
+Severin | 2022-07-05 08:31:33 UTC | #22
+
+[quote="PeanutNJam, post:21, topic:13279"]
+Could someone please tell me how I can get my cycles back? Or if this is at all possible?
+[/quote]
+
+To get cycles out of a canister you're deleting, you have to withdraw them before you delete the canister. This is why `dfx canister delete` takes so long: it first installs a cycles wallet wasm into the canister-to-be-deleted, withdraws (almost) all cycles, stops the canister, and then deletes it.
+
+If you're still a controller of the canister and haven't lost the ID, you can run `dfx canister delete` on it and it'll do the whole withdrawal process to your cycles wallet.
+
+[quote="PeanutNJam, post:21, topic:13279"]
+How do I switch off another one of my canisters? I have two canisters currently running and deployed on ic (just backend Motoko). How can I do this without losing control of the canister as well as my cycles?
+[/quote]
+
+Does `dfx canister stop` fit your use case? This will make the canister unresponsive, but you'll also not have to pay for update call costs.
+
+-------------------------
+
+PeanutNJam | 2022-07-05 09:26:48 UTC | #23
+
+Thanks for the reply. 
+
+I did this initially to get my cycles back but always got errors including the following error (i tried again now and got the same): 
+
+```
+Error: Encountered an error while trying to fetch the root key.
+Caused by:
+  An error happened during communication with the replica: error sending request for url (http://127.0.0.1:8000/api/v2/status): error trying to connect: tcp connect error: Connection refused (os error 111)  
+
+```
+
+Actually I should mention before I detached that canister (I was silly and frustrated), i exhausted all the dfx canister commands  ``` stop, uninstall-code, request-status, delete, update-settings ```. Do I need to have the local replica running when interacting with the ic? I normally can interact with my other working canisters on ic without the local running. 
+
+After the call to  ```dfx canister stop <working canister> ```, how would I get this canister up again should I choose to do so? Could I perhaps transfer my cycles to another canister (say from y to x) since x will be doing the job of (x+y) canister going forward? Thanks again for your insights and speedy replies.
+
+-------------------------
+
+Severin | 2022-07-05 09:34:54 UTC | #24
+
+[quote="PeanutNJam, post:23, topic:13279"]
+`Error: Encountered an error while trying to fetch the root key.`
+[/quote]
+
+This means you're trying to connect to the local replica and it's not running. `dfx canister --network ic stop` will talk to the real IC.
+
+[quote="PeanutNJam, post:23, topic:13279"]
+After the call to `dfx canister stop <working canister> `, how would I get this canister up again should I choose to do so?
+[/quote]
+
+`dfx canister (maybe --network ic) start` will do the reverse of `stop`.
+
+[quote="PeanutNJam, post:23, topic:13279"]
+Could I perhaps transfer my cycles to another canister (say from y to x) since x will be doing the job of (x+y) canister going forward?
+[/quote]
+
+Yes, but you need some way to send the cycles. You do this by calling some code in the canister that attaches cycles to a message. If you just want to decommission canister y, it's probably easiest to stop it, then `dfx canister delete y` (which will withdraw the cycles to your cycles wallet) and then send the cycles from your wallet to x.
+
+-------------------------
+
+PeanutNJam | 2022-07-05 10:02:15 UTC | #25
+
+I'm an idiot, of course this it why its not working ... hehe :sweat_smile: Me standing too close to an elephant thinking its a mountain.
+
+OK, thanks I see, this makes perfect sense to stop then delete. Thanks I will give it a go.
+
+Cheers for the help!!
+
+-------------------------
+

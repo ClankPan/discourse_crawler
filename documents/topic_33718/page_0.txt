@@ -1,0 +1,211 @@
+milowelch | 2024-07-30 15:52:10 UTC | #1
+
+Hello,
+
+I am working on a dapp with internet identity connection. I have implemented the connection method and transfer methods but have found that if I close my dapp and come back after some time, I am still connected but when I try and do a transfer this fails. 
+
+The error message I get is as follows:
+```
+Gse: Server returned an error:
+Code: 403 () Body: Failed to authenticate request
+0x4498957473d2820676c86b72119e0f09f
+due to: Invalid signature: Invalid
+basic signature: EcdsaP256
+signature could not be verified:
+public key
+04485e4d0e0f719el3491ede846467e6bc3
+signature
+618196f9eefa7c709077b008f9fb2d213d0e
+error: verification failed
+```
+
+I believe this is because there is a timeout after which I need to retrigger the login to II to allow authentication of transfers again.
+
+Can anyone tell me how long the time period is before which I need to retrigger authentication, and if there is a standard method for doing this with II?
+
+Thanks!
+
+-------------------------
+
+lmuntaner | 2024-07-31 08:02:30 UTC | #2
+
+Hi!
+
+Dfinity has an open source library to connect with Internet Identity: [auth-client](https://github.com/dfinity/agent-js/tree/main/packages/auth-client).
+
+The library exposes a parameter to specify how long you want the session to be `maxTimeToLive`.
+
+Does that solve your question?
+
+-------------------------
+
+milowelch | 2024-07-31 11:23:34 UTC | #3
+
+Hi @lmuntaner, thank you for the reply. That makes sense, so I can extend the client session with maxTimeToLive. If this time has elapsed I should then run disconnect and warn the user their session has expired.
+
+I wonder if you can also help me with setting the derivationOrigin. I want to have the same principal generated when connecting with II to my frontend running locally as when it is deployed to a canister. I have tried to do this by setting the derivationOrigin to my deployed canister and adding this in my alternativeOrigins as detailed here https://internetcomputer.org/docs/current/developer-docs/identity/internet-identity/alternative-origins.
+
+Here is my II connection code
+```
+import { Actor, HttpAgent } from '@dfinity/agent';
+import type { Identity } from '@dfinity/agent';
+import { AuthClient, IdbStorage } from '@dfinity/auth-client';
+import { persistentAtom } from '@nanostores/persistent';
+
+import internetIdentityIcon from '../../../assets/icons/connectors/internet-identity.svg';
+import { ConnectorType } from './connector-type.enum';
+import {
+  ConnectorMetadata,
+  CreateActorArgs,
+  IConnector,
+  WalletConnectorConfig,
+} from './connector.interface';
+
+const EXPIRE_TIME_MS = 7 * 24 * 3600 * 1000; // 7 days
+
+const $expiry = persistentAtom<string | undefined>('ii-expire-time', undefined);
+
+export class InternetIdentityConnector extends IConnector<ConnectorType.INTERNET_IDENTITY> {
+  private identity?: Identity;
+
+  private principal?: string;
+
+  private client?: AuthClient;
+
+  static type = ConnectorType.INTERNET_IDENTITY;
+
+  static meta: ConnectorMetadata = {
+    name: 'Internet Identity',
+    logo: internetIdentityIcon,
+    deviceType: 'both',
+  };
+
+  public get getPrincipal() {
+    return this.principal;
+  }
+
+  constructor(config: WalletConnectorConfig) {
+    super(config);
+    this.config.providerUrl = 'https://identity.ic0.app';
+  }
+
+  async isConnected(): Promise<boolean> {
+    return Boolean(await this.client?.isAuthenticated());
+  }
+
+  async createActor<Service>({ canisterId, interfaceFactory }: CreateActorArgs) {
+    if (!this.identity) {
+      throw new Error('Identity not found');
+    }
+    const agent = new HttpAgent({
+      ...this.config,
+      identity: this.identity,
+    });
+
+    if (this.config.dev) {
+      // Fetch root key for certificate validation during development
+      agent.fetchRootKey().catch(err => {
+        console.warn(
+          'Unable to fetch root key. Check to ensure that your local replica is running',
+        );
+        console.error(err);
+      });
+    }
+
+    return Actor.createActor<Service>(interfaceFactory, {
+      agent,
+      canisterId,
+    });
+  }
+
+  async init() {
+    if (!this.client) {
+      this.client = await AuthClient.create({
+        storage: new IdbStorage(),
+        idleOptions: {
+          disableDefaultIdleCallback: true,
+        },
+      });
+    }
+  }
+
+  async connect() {
+    if (!this.client) {
+      throw new Error('[Internet Identity] AuthClient not initialized');
+    }
+
+    const isConnected = await this.isConnected();
+
+    if (isConnected) {
+      this.identity = this.client.getIdentity();
+      this.principal = this.identity?.getPrincipal().toString();
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      this.client?.login({
+        identityProvider: this.config.providerUrl,
+        derivationOrigin: 'https://laskf-jkdsd-aaaan-itwoi-cai.ic0.app',
+        onSuccess: () => resolve(),
+        onError: reject,
+        maxTimeToLive: BigInt(EXPIRE_TIME_MS * 1000 * 1000), // in nanoseconds
+      });
+    });
+
+    $expiry.set((new Date().getTime() + EXPIRE_TIME_MS).toString());
+    this.identity = this.client.getIdentity();
+    this.principal = this.identity.getPrincipal().toString();
+  }
+
+  async disconnect() {
+    await this.client?.logout();
+  }
+
+  async expired() {
+    const iiExpireTime = $expiry.get();
+    if (!iiExpireTime) return true;
+    return new Date().getTime() >= Number(iiExpireTime);
+  }
+}
+
+```
+
+
+with my alternativeOrigin set as so 
+![image|690x233](upload://4A710SzKze1BuMOwM1QRJFvIV4J.png)
+
+and ic-assets-json
+![image|690x350](upload://bUiQDd8en0Hh0lWvWfDGnzRAwV8.png)
+
+
+but the II login page that opens in a new tab gives the following error:
+
+> Invalid Derivation Origin
+"https://laskf-jkdsd-aaaan-itwoi-cai.ic0.app" is not a valid derivation origin for "https://localhost:5173"
+Error details:
+An error occurred while validating the derivationOrigin "https://laskf-jkdsd-aaaan-itwoi-cai.ic0.app": Unexpected token '<', "<!doctype "... is not valid JSON
+
+Any ideas why this is? I want to set a custom domain to my derivation origin so that I can have different canisters all generate the same principal for II login as well as locally.
+
+Thanks again
+
+-------------------------
+
+peterparker | 2024-08-01 15:25:18 UTC | #4
+
+[quote="milowelch, post:3, topic:33718"]
+I want to have the same principal generated when connecting with II to my frontend running locally as when it is deployed to a canister.
+[/quote]
+
+I don't think it's possible. Assuming you are referring to II production mainnet, not a local copy. 
+
+II performs several checks to ensure it is safe to derive an origin. One of those checks is verifying the `ii-alternative-origins` content, which, in your case, points to an url exposed locally only. i.e. II cannot call `localhost:5173`.
+
+-------------------------
+
+milowelch | 2024-08-05 12:05:23 UTC | #5
+
+Okay, thank you for the clarification
+
+-------------------------
+

@@ -1,0 +1,223 @@
+bdemann | 2023-12-19 21:49:34 UTC | #1
+
+I have found a couple of weird cases with encoding and decoding candid that has both recursive elements and blobs. 
+
+I get the following error:
+```
+      throw new Error('type index out of range');
+            ^
+Error: type index out of range
+    at getType (node_modules/@dfinity/candid/src/idl.ts:1738:13)
+    at buildType (node_modules/@dfinity/candid/src/idl.ts:1770:26)
+    at node_modules/@dfinity/candid/src/idl.ts:1813:17
+    at Array.forEach (<anonymous>)
+    at Object.decode (node_modules/@dfinity/candid/src/idl.ts:1811:12)
+    at Object.<anonymous> (src/index.ts:23:5)
+    at Module._compile (node:internal/modules/cjs/loader:1256:14)
+    at Module.m._compile (node_modules/ts-node/src/index.ts:1618:23)
+    at Module._extensions..js (node:internal/modules/cjs/loader:1310:10)
+    at Object.require.extensions.<computed> [as .ts] (node_modules/ts-node/src/index.ts:1621:12)
+```
+
+From running the following code.
+
+```javascript
+import { IDL } from '@dfinity/candid';
+
+const node = IDL.Rec();
+const recBlob = IDL.Rec();
+const recVarBlob = IDL.Rec();
+
+recBlob.fill(IDL.Vec(IDL.Nat8));
+recVarBlob.fill(
+    IDL.Variant({
+        Blob: IDL.Vec(IDL.Nat8)
+    })
+);
+
+node.fill(
+    IDL.Variant({
+        Node: node,
+        Leaf: recBlob,
+        ANode7: recVarBlob
+    })
+);
+
+const encodedBroken = IDL.encode([node], [{ Leaf: new Uint8Array() }]);
+IDL.decode([node], encodedBroken);
+```
+
+There are a number of odd things I can do to this code snippet to make it work. The oddest one is if I rename ANode7 to ANode, Node7 or ode7 it works fine, but shortening it even further to de7 or even to just e causes it to break again.
+
+Removing some of the recursion that isn't strictly needed in this particular case also causes the error to vanish. For example 
+```
+const recBlob = IDL.Vec(IDL.Nat8)
+```
+Or if I change both recBlob and recVarBlob to be:
+```
+const recBlob = IDL.Rec();
+const recVarBlob = IDL.Rec();
+
+recBlob.fill(IDL.Vec(IDL.Nat8));
+recVarBlob.fill(IDL.Vec(IDL.Nat8));
+```
+That also works.
+
+It's kind of weird and any insight into why this is happening would be greatly appreciated.
+
+-------------------------
+
+bdemann | 2023-12-19 22:08:39 UTC | #2
+
+@chenyan I would be curious in particular for your insight into this
+
+-------------------------
+
+chenyan | 2023-12-19 22:38:45 UTC | #3
+
+Could be a bug somewhere. Can you print the raw bytes of `encodedBroken`?
+
+The behavior about changing field names is because fields are sorted by a hash function, when you change the field name, the order also changes.
+
+-------------------------
+
+bdemann | 2023-12-19 22:46:21 UTC | #4
+
+```
+Uint8Array(39) [
+   68,  73,  68,  76,   3, 107,   3, 244, 183, 250,
+  128,   3,   1, 190, 223, 164, 148,   3,   3, 162,
+  236, 140, 159,   3,   0, 107,   1, 253, 210, 201,
+  223,   2,   2, 109, 123,   1,   0,   1,   0
+]
+```
+
+-------------------------
+
+chenyan | 2023-12-20 00:13:32 UTC | #5
+
+Thanks for the report. This is definitely a bug in the encoder. Recursion somehow caused the encoder to generate the wrong type index. I will try to fix it soon.
+
+-------------------------
+
+bdemann | 2023-12-20 16:28:06 UTC | #6
+
+Thank you so much for looking into this!
+
+-------------------------
+
+bdemann | 2023-12-20 23:59:32 UTC | #7
+
+I'm guessing this is the same bug, but with tuples instead of blobs, hopefully it's another good test case for debugging the issue
+```javascript
+import { IDL } from '@dfinity/candid';
+
+const myRecTup = IDL.Rec();
+myRecTup.fill(IDL.Tuple(IDL.Int64));
+
+const myRecOpt = IDL.Rec();
+myRecOpt.fill(IDL.Opt(IDL.Nat));
+
+const myRecVar = IDL.Rec();
+myRecVar.fill(
+    IDL.Variant({
+        tup: myRecTup,
+        rec: IDL.Record({ optNat: IDL.Opt(IDL.Nat) })
+    })
+);
+
+const myS = IDL.Tuple(
+    IDL.Tuple(myRecVar, IDL.Opt(IDL.Tuple(IDL.Principal))),
+    IDL.Tuple(myRecOpt)
+);
+
+const toEncode = [
+    [
+        {
+            tup: [23912971008635299n]
+        },
+        []
+    ],
+    [[]]
+];
+const encoded = IDL.encode([myS], [toEncode]);
+console.log(encoded);
+const decoded = IDL.decode([myS], encoded);
+console.log(decoded);
+```
+Here is the encoded output
+```
+Uint8Array(66) [68, 73, 68, 76, 9, 107, 2, 208, 178, 219, 2, 2, 207, 215, 225, 2, 3, 108, 1, 238, 148, 153, 219, 2, 1, 108, 1, 0, 116, 108, 1, 0, 104, 110, 4, 108, 2, 0, 0, 1, 5, 110, 125, 108, 1, 0, 7, 108, 2, 0, 6, 1, 7, 1, 8, 1, 163, 113, 126, 110, 184, 244, 84, 0, 0, 0, buffer: ArrayBuffer(66), byteLength: 66, byteOffset: 0, length: 66, Symbol(Symbol.toStringTag): 'Uint8Array']
+```
+The error I get is
+```
+node_modules/@dfinity/candid/src/idl.ts:1130
+      throw new Error('not a tuple type');
+```
+
+-------------------------
+
+bdemann | 2023-12-21 16:34:29 UTC | #8
+
+Here is one more example I ran into. Since it runs into a different error I thought I would include it here, but it's with decoding recs that have blobs so I'm guessing its a related error. I'm guessing that they are all the same problem with the encoder that is manifested differently when I attempt to decode the corrupt encoded value.
+```javascript
+import { IDL } from '@dfinity/candid';
+
+const recursive_blob = IDL.Rec();
+recursive_blob.fill(IDL.Vec(IDL.Nat8));
+const uses_recursive_blob = IDL.Rec();
+uses_recursive_blob.fill(
+    IDL.Record({
+        myBlob: recursive_blob
+    })
+);
+const recursive_record = IDL.Rec();
+recursive_record.fill(
+    IDL.Record({
+        field1: IDL.Vec(IDL.Nat8),
+        field2: IDL.Vec(IDL.Nat8)
+    })
+);
+const rec_return = IDL.Rec();
+rec_return.fill(
+    IDL.Opt(
+        IDL.Record({
+            rec_rec: recursive_record,
+            rec_blob: uses_recursive_blob
+        })
+    )
+);
+
+const encoded = IDL.encode([rec_return], [[]]);
+console.log(encoded);
+const decoded = IDL.decode([rec_return], encoded);
+console.log(decoded);
+console.log('finish');
+```
+The encoded output:
+```
+Uint8Array(46) [68, 73, 68, 76, 5, 110, 4, 108, 2, 183, 156, 186, 132, 8, 2, 184, 156, 186, 132, 8, 2, 108, 1, 233, 221, 211, 226, 6, 4, 108, 2, 161, 191, 159, 179, 2, 1, 236, 251, 182, 207, 6, 3, 1, 0, 0, buffer: ArrayBuffer(46), byteLength: 46, byteOffset: 0, length: 46, Symbol(Symbol.toStringTag): 'Uint8Array']
+```
+The error:
+```
+node_modules/@dfinity/candid/src/idl.ts:1674
+          throw new Error('Illegal op_code: ' + ty);
+                ^
+source-map-support.js:590
+Error: Illegal op_code: 1
+    at readTypeTable (node_modules/@dfinity/candid/src/idl.ts:1674:17)
+    at Object.decode (node_modules/@dfinity/candid/src/idl.ts:1685:32)
+    at Object.<anonymous> (src/index.ts:30:21)
+    at Module._compile (node:internal/modules/cjs/loader:1256:14)
+    at Module._compile (node_modules/ts-node/src/index.ts:1365:23)
+    at node:internal/modules/cjs/loader:1310:10
+    at Object..ts (node_modules/ts-node/src/index.ts:1368:12)
+    at Module.load (node:internal/modules/cjs/loader:1119:32)
+    at Function._load (node:internal/modules/cjs/loader:960:12)
+    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:86:12)
+source-map-support.js:594
+Process exited with code 1
+```
+
+-------------------------
+

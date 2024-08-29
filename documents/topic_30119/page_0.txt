@@ -1,0 +1,250 @@
+gravity_vi | 2024-04-29 12:08:06 UTC | #1
+
+We have a dapp canister registered with sns which handles upgrades for other canisters. There is generic function in the canister to take wasm and upgrade respective canisters. While generating the payload for `ExecuteGenericFunction` didc encode fails to encode the wasm and results into `argument too long`. Is there a way to provide a file to `didc encode`.
+
+didc command used:
+
+```sh
+didc encode --defs ".dfx/ic/canisters/platform_orchestrator/service.did" --method platform_orchestrator_generic_function "(variant {UpgradeSubnetCanisters = $(cat argument)})" --format blob'
+```
+
+argument file contains the wasm file encode in blob.
+
+error:
+
+`Argument list too long`
+
+
+This is the whole script that I use to upgrade one of our canisters `post_cache` using platform_orchestrator which is controlled by sns.
+
+
+```sh
+          CANISTER_NAME=post_cache
+          mkdir -p "proposals/${CANISTER_NAME}"
+          touch "proposals/${CANISTER_NAME}/upgrade.json"
+          WASM=".dfx/ic/canisters/${CANISTER_NAME}/${CANISTER_NAME}.wasm.gz"
+          CHAR=$(hexdump -ve '1/1 "%.2x"' "$WASM")
+          CHAR_ESCAPED=$(printf "%s" "$CHAR" | sed 's/../\\&/g')
+          touch argument
+          printf "(record {canister = variant {PostCacheWasm}; version = \"${{ github.ref_name }}\"; wasm_blob = blob \"%s\"})"  "$CHAR_ESCAPED" > argument
+          PAYLOAD=$(nix-shell --run 'didc encode --defs ".dfx/ic/canisters/platform_orchestrator/service.did" --method platform_orchestrator_generic_function "(variant {UpgradeSubnetCanisters = $(cat argument)})" --format blob')
+          ./quill sns \
+          --canister-ids-file ./sns/sns_canister_ids.json \
+          --pem-file actions_identity.pem \
+          make-proposal \
+          --proposal "(
+              record {
+                  title=\"Upgrade ${CANISTER_NAME}\";
+                  url=\"https://yral.com\";
+                  summary=\"# Upgrade ${CANISTER_NAME}
+                  ${{ steps.changelog.outputs.changes}}
+                  \";
+                  action=opt variant {
+                      ExecuteGenericNervousSystemFunction = record {
+                          function_id = 4002: nat64;
+                          payload = $PAYLOAD;
+                      }
+                  }
+              
+              }
+          )" $NEURON_ID > "proposals/${CANISTER_NAME}/upgrade.json"
+          ./quill send proposals/${CANISTER_NAME}/upgrade.json --yes
+```
+
+-------------------------
+
+chenyan | 2024-04-30 17:10:35 UTC | #2
+
+I would recommend you to try [ic-repl](https://github.com/dfinity/ic-repl). In there, you can use `file("argument")` to load a blob from file.
+
+The whole didc command can be simplified to 
+```
+encode <platform_orchestrator_canister_id>.platform_orchestrator_generic_function(variant {UpgradeSubnetCanisters = file("argument")})
+```
+
+Furuthermore, the whole bash script can be rewritten in ic-repl, and with the offline mode in ic-repl, you don't even need quill.
+
+-------------------------
+
+gravity_vi | 2024-05-13 04:09:18 UTC | #3
+
+Hey @chenyan, Thanks for response. Will it be possible to submit an Execute generic function proposal using `ic-repl`? Could you direct me to any documentation that I can refer to for this?
+
+-------------------------
+
+chenyan | 2024-05-13 04:59:43 UTC | #4
+
+Certainly possible. We don't have a lot documentations. The syntax and built-in functions are all listed in the readme file. There is also a few example scripts: https://github.com/dfinity/ic-repl/tree/master/examples. 
+
+Do you want to just replicate the bash script you posted? It seems it's just a canister call to the SNS canister. The syntax for the Candid argument is the same as in quill. So roughly, it looks like this:
+```
+identity action "actions_identity.pem";
+call "sns-canister-id".manage_neuron
+```
+The candid assist feature should guide you through to fill in the arguments for manage_neuron method.
+
+-------------------------
+
+gravity_vi | 2024-05-14 04:34:21 UTC | #5
+
+Yes I just wanted to replicate the bash script. I wrote the script using ic-repl. Thanks for the suggestion is much cleaner approach. But I am running into the issue when using `CANISTER_NAME` from env variable. The script seems to work fine when `CANISTER_NAME = post_cache | user_index` but gives error when  `CANISTER_NAME = individual_user_template`. Let me know if I am doing something wrong in the script. 
+
+```
+#!/usr/bin/ic-repl -o
+import platform_orchestrator_canister = "74zq4-iqaaa-aaaam-ab53a-cai";
+import governance_canister="6wcax-haaaa-aaaaq-aaava-cai";
+
+function generate_payload() {
+
+
+    let canister_type = variant {IndividualUserWasm};
+
+    if eq("${CANISTER_NAME}", "post_cache") {
+        let canister_type = variant {PostCacheWasm};
+    } else {
+    };
+    if eq("${CANISTER_NAME}", "user_index") {
+        let canister_type = variant {SubnetOrchestratorWasm};
+    } else {
+        
+    };
+    if eq("${CANISTER_NAME}", "individual_user_template") {
+        let canister_type = variant {IndividualUserWasm};
+    } else {
+        
+    };
+
+    encode platform_orchestrator_canister.platform_orchestrator_generic_function(
+            variant {
+                UpgradeSubnetCanisters = record {
+                    version = "v1.0.0"; 
+                    canister = canister_type; 
+                    wasm_blob = file("../.dfx/ic/canisters/$CANISTER_NAME/$CANISTER_NAME.wasm.gz");
+                }
+            }
+    )
+   
+};
+
+
+let summary = "${SUMMARY}";
+let res = encode governance_canister.manage_neuron(
+    record {
+        subaccount = encode ("a990d55e65186d5b4f38912c9a10748bf2e6626fb582a2b1d6442e087db56b10");
+        command = opt variant {MakeProposal = record {
+            title = "upgrade canister";
+            url = "yral.com";
+            summary = summary;
+            action = opt variant {ExecuteGenericNervousSystemFunction = record {
+                function_id = 4002;
+                payload = generate_payload();
+            }}
+        }}
+    }
+)
+```
+
+-------------------------
+
+chenyan | 2024-05-13 19:32:05 UTC | #6
+
+What errors do you get? The script seems fine. At the end of `generate_payload` function, `wasm_blob = file(...)`, I think you need to use `${CANISTER_NAME}` as well?
+
+-------------------------
+
+chenyan | 2024-05-13 21:21:43 UTC | #7
+
+[quote="gravity_vi, post:5, topic:30119"]
+```
+subaccount = encode ("a990d55e65186d5b4f38912c9a10748bf2e6626fb582a2b1d6442e087db56b10");
+```
+[/quote]
+
+This line is also strange. I think it should be `blob "\a9\90\d5\5e..."`
+
+-------------------------
+
+gravity_vi | 2024-05-14 04:15:49 UTC | #8
+
+@chenyan if I set `CANISTER_NAME = individual_user_template` I get this error:
+
+```
+thread 'main' panicked at src/command.rs:181:45:
+byte index 1591 is out of bounds of `
+import platform_orchestrator_canister = "74zq4-iqaaa-aaaam-ab53a-cai";
+import governance_canister="6wcax-haaaa-aaaaq-aaava-cai";
+
+function generate_payload() {
+
+
+    let canister_type = variant {IndividualUserWasm};
+
+    if eq("${CANISTER_NAME}", "post_ca`[...]
+stack backtrace:
+   0:        0x1032f9385 - <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt::h46bc8e86d021398c
+   1:        0x10331fd53 - core::fmt::write::h1c24e945c7ef8357
+   2:        0x1032f52ae - std::io::Write::write_fmt::hd9fe01a40900d808
+   3:        0x1032f9159 - std::sys_common::backtrace::print::hdbfcabb7d363540a
+   4:        0x1032fa735 - std::panicking::default_hook::{{closure}}::hecb24382dfeeea98
+   5:        0x1032fa4ae - std::panicking::default_hook::h78dca947ab9e89eb
+   6:        0x1032faba3 - std::panicking::rust_panic_with_hook::hb83cee65df04957a
+   7:        0x1032faab4 - std::panicking::begin_panic_handler::{{closure}}::hbe6e44d88f82bc77
+   8:        0x1032f9879 - std::sys_common::backtrace::__rust_end_short_backtrace::h6560cb9c1f1224c1
+   9:        0x1032fa7f6 - _rust_begin_unwind
+  10:        0x103359935 - core::panicking::panic_fmt::h2aac8cf45f7ae617
+  11:        0x103323636 - core::str::slice_error_fail_rt::h4d9a57249966a0ef
+  12:        0x10335a139 - core::str::slice_error_fail::h82e5c6802f33005a
+  13:        0x102b1995e - ic_repl::command::Command::run::h2d4c66b3d365e35d
+  14:        0x102ae5947 - ic_repl::main::hb06971eee4e8f42a
+  15:        0x102ac7dd6 - std::sys_common::backtrace::__rust_begin_short_backtrace::h1fa2fb319d8f789b
+  16:        0x102ab22a1 - std::rt::lang_start::{{closure}}::h0d70c3b73be83c25
+  17:        0x1032ecd10 - std::rt::lang_start_internal::h963c626e0d7ddd6e
+  18:        0x102aebbdc - _main
+```
+
+-------------------------
+
+gravity_vi | 2024-05-14 15:50:36 UTC | #9
+
+Hey @chenyan, I made all the suggested changes still facing the same issue :cry:
+
+-------------------------
+
+chenyan | 2024-05-14 17:31:52 UTC | #10
+
+I see. It's a bug on my end for resolving environment variables. Will fix it soon.
+
+-------------------------
+
+chenyan | 2024-05-14 18:06:44 UTC | #11
+
+Should be fixed after this PR is merged: https://github.com/dfinity/ic-repl/pull/93
+
+-------------------------
+
+chenyan | 2024-05-14 21:38:39 UTC | #12
+
+Should be fixed with the latest release: https://github.com/dfinity/ic-repl/releases/tag/0.7.3
+
+-------------------------
+
+gravity_vi | 2024-05-15 04:22:14 UTC | #13
+
+Thank you so much @chenyan. This fixed the issue :slightly_smiling_face:
+
+-------------------------
+
+gravity_vi | 2024-05-17 10:41:18 UTC | #14
+
+Hey, is there way in ic-repl to programmatically convert neuron-id text to blob format as you mentioned in this comment. I tried `("a990d55e65186d5b4f38912c9a10748bf2e6626fb582a2b1d6442e087db56b10" : blob);` but it didn't work
+
+-------------------------
+
+chenyan | 2024-05-17 16:15:39 UTC | #15
+
+No, you need to insert the escape character, e.g., `blob "\a9\90\d5..."`. 
+
+Just curious, where do you get the neuron-id text, instead of a blob? I could add a `hex` function to do the conversion, but want to see if there are other workaround.
+
+-------------------------
+

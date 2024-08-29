@@ -1,0 +1,160 @@
+RMCS | 2021-08-30 19:46:06 UTC | #1
+
+Can somebody explain this to me,
+ 
+I have a type like so;
+```
+public type MemberWithProfile = {
+  member: User.User;
+  profile: Profile.Profile;
+};
+```
+
+in the function i have a empty list;
+```
+var membersWithProfiles: List.List<Response.MemberWithProfile> = List.nil();
+```
+
+When iterating over the `Array` with values to fill up the `membersWithProfiles` list;
+```
+var usersList = Trie.toArray<Principal, User.User, ()>(users, func (k, v) {
+var profile = ProfileHelper.getProfileByPrincipal(k, profiles);
+  switch(profile) {
+    case(null) {
+      return;
+    };
+    case(?profile) {
+      var memberWithProfile: Response.MemberWithProfile = {
+        member = v;
+        profile = profile;
+    };
+    membersWithProfiles := List.push(memberWithProfile, membersWithProfiles) ;
+  };
+}
+```
+
+Everything works fine and i get the candid code as;
+
+```
+export interface MemberWithProfile { 'member' : User, 'profile' : Profile }
+export type MemberWithProfileResponse = { 'ok' : Array<MemberWithProfile> } | { 'err' : Error };
+
+```
+
+But when i change the properties of `MemberWithProfileResponse` to be nullable like so (and change the iterate function accordingly by prefixing the values with a `?`);
+```
+public type MemberWithProfile = {
+  member: ?User.User;
+  profile: ?Profile.Profile;
+};
+
+```
+I get this candid code? (the member and profile are both an array)?
+```
+export interface MemberWithProfile {
+  'member' : [] | [User],
+  'profile' : [] | [Profile],
+}
+export type MemberWithProfileResponse = { 'ok' : Array<MemberWithProfile> } |
+  { 'err' : Error };
+```
+
+Is there some explanation to this or is it a bug?
+
+-------------------------
+
+rossberg | 2021-08-30 20:09:51 UTC | #2
+
+A type `?T` in Motoko isn't a "nullable" type, it is a proper option type. The difference being that it composes properly: for example, the type `?Nat` has values `null`, `?0`, `?1`, and so on. The type `?(?Nat)` on the other hand has `null`, `?null`, `?(?0)`, `?(?1)` and so on. Notably, `null` is different from `?null`, something that "nullable" types confuse. That is relevant e.g. when you have generic abstractions. For example, consider a table class:
+```
+class Table<A> {
+  public func lookup(key : Text) : ?A
+  ...
+};
+```
+When the table is used to store options itself, i.e., you have a `Table<?Nat>`, then it is quite relevant whether `lookup` returns `null` or `?null`.
+
+This distinction needs to be expressible on the JS side as well, which is why it cannot simply encode options as `null | T`. Instead, it uses an array of 0 or 1 element (though that's just a choice we made, e.g., `null | [T]` would have worked as well).
+
+-------------------------
+
+peterparker | 2021-08-30 20:51:42 UTC | #3
+
+[quote="rossberg, post:2, topic:6820"]
+This distinction needs to be expressible on the JS side as well, which is why it cannot simply encode options as `null | T` . Instead, it uses an array of 0 or 1 element (though that’s just a choice we made, e.g., `null | [T]` would have worked as well).
+[/quote]
+
+Thanks for the explanation! In that case, wouldn't had it worked out using `undefined` in addition to `null` and the proper value? 
+
+```
+export interface MemberWithProfile {
+  member? : null | User;
+}
+```
+
+P.S.: I've got a similar [question / feed](https://forum.dfinity.org/t/incorrect-optional-typescript-declaration-generation/6045/5) about the same topic.
+
+-------------------------
+
+rossberg | 2021-09-01 12:18:47 UTC | #4
+
+Well, my explanation applies to Candid as well: in Candid, `null ≠ opt null`. The JS binding needs to define a mapping that can faithfully represent this distinction. And it can only define this mapping uniformly, without knowing any context.
+
+Throwing in `undefined` as a secondary nullish value, like JS did, does not solve the basic problem anyway. It still does not compose and just kicks the can down the road. For example, someone might happen to need type `?(?(?T))` somewhere.
+
+(FWIW, these observations apply to union types in general: unions are fundamentally non-compositional and thus a poor basis for composing data structures. This is in contrast to variants, of which options are a special case.)
+
+-------------------------
+
+peterparker | 2021-08-31 18:30:14 UTC | #5
+
+I see your point, thanks for the feedback. As I may have spend too much time developing frontend apps, it was kind "weird" and felt uncommon to use the JS binding `[] | [T]` (in term of developer experience). I'll probably get use to it after a while I guess 😉.
+
+-------------------------
+
+Ori | 2021-09-01 10:26:38 UTC | #6
+
+You might find it useful to create small helper functions to wrap/unwrap these optional values in your frontend Javascript, so you don’t handle this array format everywhere in your code. It’d also then be simple to swap out if changes are made to the js library in the future.
+
+-------------------------
+
+RMCS | 2021-09-01 12:20:15 UTC | #7
+
+Yeah this is the way i do it for everything, i just thought that it's kind of weird to assume that i was getting a `Profile | undefined` and not a `[Profile]`, but the explanation from @rossberg is pretty clear
+
+-------------------------
+
+peterparker | 2021-09-01 15:44:39 UTC | #8
+
+[quote="Ori, post:6, topic:6820"]
+create small helper functions to wrap/unwrap
+[/quote]
+
+Of course I did (shared [here](https://forum.dfinity.org/t/incorrect-optional-typescript-declaration-generation/6045/7?u=peterparker)). Nevertheless, the less code I wrote because the platform supports it, the better 😉.
+
+-------------------------
+
+nomeata | 2021-09-01 16:54:53 UTC | #9
+
+Given that these TS bindings are generated from the Candid description, and that that tool sees the type `t` inside the `opt t`, I think it wouldn't be unreasonable to make different mapping choices for, say, `opt record {…}` and `opt opt …`: as long as the `t` cannot be `undefined`, use `… | undefined`, if that's the idiomatic way to handle that in TypeScript. I suggest to open an issue in the Candid repo.
+
+Similarly (maybe a bit more contentious) the tool could map records with fields that have an optional type to TS objects where the field may be omitted. Again, if that's idiomatic; I don't know TS well enough.
+
+It's a trade off between idiomatic types and a uniform translation. (And it may require changes to the JS Candid library in case it currently assumes that it can recover the Candid type from just the JS type.)
+
+-------------------------
+
+rossberg | 2021-09-02 08:58:05 UTC | #10
+
+@nomeata, I'm not sure such a non-compositional conversion would be wise on the binding level. Then possible generic code consuming this would have to make a case distinction somehow – which might be difficult in general due to local loss of information. Likewise, the client would have to interconvert wherever it wanted to compose the value with something else and feed it back into another IC call.
+
+-------------------------
+
+nomeata | 2021-09-03 10:27:30 UTC | #11
+
+We have such non-composibility all over the place already, e.g. to map records-that-look-like-tuples to real tuples in those host languages that have tuples. So I assume it would work reasonably well.
+
+But yes, it probably works better with binding generators (that produce encoders/decoders for the given interface) than with purely host-type-driven generic converters (like in Motoko or Haskell).
+
+-------------------------
+

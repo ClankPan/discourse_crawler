@@ -1,0 +1,241 @@
+saikatdas0790 | 2023-06-07 08:56:49 UTC | #1
+
+Currently we are in the process of testing our repo for moving to the SNS way of doing things. We have an upgrade script [here](https://github.com/go-bazzinga/hot-or-not-backend-canister/blob/main/scripts/canisters/local_deploy/upgrade_all_canisters.sh)
+
+We need help to adapt this part specifically:
+https://github.com/go-bazzinga/hot-or-not-backend-canister/blob/ecab36ab2638234b581bf8a7a441377538ddd677/scripts/canisters/local_deploy/upgrade_all_canisters.sh#LL45C1-L49C87
+
+To provide some more context, we have 2 types of canisters. We have top level canisters that need to directly be upgraded. And then we have these child canisters that are upgraded by the top level canisters on a call to a specific endpoint on the top level canister. There's also access control that needs to be added to the top level canister so that only an authorized caller is allowed to call the upgrade on the top level canister.
+
+Basically  what we're trying to figure out is 
+- how do we submit an SNS proposal to the SNS governance canister to upgrade a canister and also pass an argument along? What would the payload look like?
+- How do we make the governance canister call an endpoint on the top level canister passing along a payload?
+
+Difficulties that we are currently facing testing this with the [sns-testing repo](https://github.com/dfinity/sns-testing) is that the [upgrade_dapp script](https://github.com/dfinity/sns-testing/blob/main/upgrade_dapp.sh) expects to be run from the testing repo but our upgrade script calls `dfx` which expects to be run from the project directory.
+
+Thoughts?
+
+@lara @mraszyk @Severin
+
+-------------------------
+
+mraszyk | 2023-06-07 20:27:27 UTC | #2
+
+> how do we submit an SNS proposal to the SNS governance canister to upgrade a canister and also pass an argument along?
+
+You can use `quill sns make-upgrade-canister-proposal` for that.
+
+> What would the payload look like?
+
+I suppose you refer to a post-upgrade argument: that can be passed in its textual Candid form using the flag `--canister-upgrade-arg` or in its binary form stored in a file specified via the flag `--canister-upgrade-arg-path`.
+
+> How do we make the governance canister call an endpoint on the top level canister passing along a payload?
+
+You can find instructions on that here (https://internetcomputer.org/docs/current/developer-docs/integrations/sns/get-sns/testflight#test-executing-code-on-sns-managed-canisters-via-sns-proposals) and in the Test canister section of the sns-testing README (https://github.com/dfinity/sns-testing#test-canister). You can think of the test canister from the sns-testing as a placeholder for one of your top-level canisters.
+
+The payload is embedded in the SNS proposal created by `quill sns make-proposal` and specified either in its textual Candid form using the flag `--proposal` or in its binary form stored in a file specified via the flag `--proposal-path`. Note that in both cases we need to pass a Candid value for the entire SNS proposal incl. title, summary, and action (`AddGenericNervousSystemFunction` to register the functions or `ExecuteGenericNervousSystemFunction` to execute them).
+
+> the upgrade_dapp script expects to be run from the testing repo but our upgrade script calls dfx which expects to be run from the project directory
+
+You can try out the branch [mraszyk/change-script-dir](https://github.com/dfinity/sns-testing/tree/mraszyk/change-script-dir) from this [PR](https://github.com/dfinity/sns-testing/pull/9) and the Docker container `martin2718/sns-testing-multidir` that I built from that branch.
+
+Then `upgrade_dapp.sh` can also be invoked from the `/dapp` directory:
+
+```
+# empty 2nd argument of upgrade_dapp.sh means that `dfx build` is executed to build the canister's WASM
+/dapp# ~/upgrade_dapp.sh dapp_backend "" "(opt record {sns_governance = opt principal\"si2b5-pyaaa-aaaaa-aaaja-cai\"; greeting = opt \"Hoi\";})"
+
+# it is also possible to pass a binary argument stored in a file (can also be produced by Candid encoding a Rust struct into a file)
+/dapp# ~/bin/didc encode "(opt record {sns_governance = opt principal\"si2b5-pyaaa-aaaaa-aaaja-cai\"; greeting = opt \"Hoi\";})" | xxd -r -p > a.bin
+/dapp# ~/upgrade_dapp.sh dapp_backend "" ./a.bin
+```
+Here is a concrete example of using the generic functions on the test canister from the `/dapp` directory:
+```
+# for the generic functions, we need to set up `IC_URL` for `quill`
+/dapp# export IC_URL="http://localhost:8080"
+
+# and also the developer SNS neuron ID (only works on an sns-testing dev branch)
+/dapp# DEVELOPER_NEURON_ID=$(~/developer_neuron_id.sh)
+
+# note that `--pem-file` must be an absolute path
+/dapp# ~/bin/quill sns  \
+   --canister-ids-file "~/sns_canister_ids.json"  \
+   --pem-file "/home/sns/.config/dfx/identity/default/identity.pem"  \
+   make-proposal --proposal "(record { title=\"Register generic functions for test canister.\"; url=\"https://example.com/\"; summary=\"This proposals registers generic functions for test canister.\"; action=opt variant {AddGenericNervousSystemFunction = record {id=2000:nat64; name=\"execute\"; description=\"set parameters of test canisters\"; function_type=opt variant {GenericNervousSystemFunction=record{validator_canister_id=opt principal\"$(dfx canister id dapp_backend)\"; target_canister_id=opt principal\"$(dfx canister id dapp_backend)\"; validator_method_name=opt\"validate\"; target_method_name=opt\"execute\"}}}}})" $DEVELOPER_NEURON_ID > msg.json
+/dapp# ~/bin/quill --insecure-local-dev-mode send --yes msg.json
+
+# the payload (here of type `String`) passed to the function of the test canister is Candid encoded into a blob
+/dapp# ~/bin/quill sns  \
+   --canister-ids-file "~/sns_canister_ids.json"  \
+   --pem-file "/home/sns/.config/dfx/identity/default/identity.pem"  \
+   make-proposal --proposal "(record { title=\"Execute generic functions for test canister.\"; url=\"https://example.com/\"; summary=\"This proposal executes generic functions for test canister.\"; action=opt variant {ExecuteGenericNervousSystemFunction = record {function_id=2000:nat64; payload=$(didc encode --format blob "(\"Hoi\")")}}})" $DEVELOPER_NEURON_ID > msg.json
+/dapp# ~/bin/quill --insecure-local-dev-mode send --yes msg.json
+```
+
+-------------------------
+
+saikatdas0790 | 2023-06-08 11:48:32 UTC | #3
+
+[quote="mraszyk, post:2, topic:20507"]
+You can use `quill sns make-upgrade-canister-proposal` for that
+[/quote]
+
+Hi @mraszyk 
+
+I'm running into this when I run the following:
+```bash
+quill sns make-upgrade-canister-proposal \
+--target-canister-id $(dfx canister id configuration) \
+--wasm-path ./target/wasm32-unknown-unknown/release/configuration.wasm.gz \
+--canister-upgrade-arg "(record {})" \
+8474081407935031357
+```
+
+![image|690x123](upload://qZp479hHoFKrwEq8J7l0Hd3txnQ.png)
+
+
+I'm quite certain I copied the neuron ID correctly. Here:
+![image|690x263](upload://xigkPqce7nvZyI3hQdIlvJLj9MX.png)
+
+Thoughts on what I'm doing wrong?
+
+-------------------------
+
+mraszyk | 2023-06-08 12:03:44 UTC | #4
+
+> Thoughts on what I’m doing wrong?
+
+The neuron ID must be **hex encoded**:
+
+```
+ARGS:
+    <PROPOSER_NEURON_ID>    The id of the neuron making the proposal. A **hex encoded** string
+```
+
+A suitable representation can be derived by listing all SNS neurons:
+```
+dfx canister --network "${NETWORK}" call sns_governance list_neurons "(record {of_principal = null; limit = 0})"
+```
+finding the ID represented as a Candid-encoded blob and then convert it to hex (`tail -c +21` strips the Candid prefix before the encoding of the actual blob):
+```
+didc encode '(blob "\c7\d6\12|\e8\93\83\b2\b7w\86C~\9a\e9\95\98\cc\0f\16\1a\a7T\bc\ecRr\ba\c0T\aa\01")' | tail -c +21
+```
+
+-------------------------
+
+saikatdas0790 | 2023-06-08 15:18:20 UTC | #5
+
+[quote="mraszyk, post:4, topic:20507"]
+`didc encode '(blob "\c7\d6\12|\e8\93\83\b2\b7w\86C~\9a\e9\95\98\cc\0f\16\1a\a7T\bc\ecRr\ba\c0T\aa\01")' | tail -c +21`
+[/quote]
+
+@mraszyk 
+
+What's the easiest way to get the neuron information running from the project folder? So, that I can make it part of my upgrade script?
+
+I wouldn't be able to call this:
+```
+dfx canister --network "${NETWORK}" call sns_governance list_neurons
+```
+
+from my own upgrade script inside my project folder. Thoughts?
+
+-------------------------
+
+saikatdas0790 | 2023-06-08 15:19:37 UTC | #6
+
+@mraszyk 
+I have also tried running the Mac instructions to be able to just run these commands locally but stuck on the first step of starting the replica and getting this:
+![image|527x500](upload://crT0gEaA3MjSBclqDxVd1EDXbLo.png)
+
+
+Thoughts?
+
+-------------------------
+
+mraszyk | 2023-06-08 15:48:55 UTC | #7
+
+I'm not sure if you have all the required dynamic library dependencies on your nixos? Could you please try `ldd ./bin/dfx` and check if a dynamic library is missing?
+
+-------------------------
+
+saikatdas0790 | 2023-06-08 15:53:05 UTC | #8
+
+[quote="mraszyk, post:7, topic:20507"]
+ldd ./bin/dfx
+[/quote]
+
+@mraszyk This is what I get
+
+![image|690x85](upload://NzMin0XZRkOOkAR5M5qthkP4b2.png)
+
+Thoughts?
+
+-------------------------
+
+mraszyk | 2023-06-08 16:01:36 UTC | #9
+
+I'm not sure why you cannot run dfx on your system then. I'd also check if the binary is marked executable, who's the owner etc. But it's difficult to tell from the screenshots (and I couldn't reproduce the issue myself).
+
+-------------------------
+
+saikatdas0790 | 2023-06-08 16:08:20 UTC | #10
+
+@mraszyk 
+I checked permissions. This is what I see
+
+![image|690x34](upload://3CCmwA7xjD4iYgDPZeH945Eo4ek.png)
+
+[quote="mraszyk, post:9, topic:20507"]
+I couldn’t reproduce the issue myself
+[/quote]
+
+I will try the docker way of things in that case. But I'm stuck trying to figure [this](https://forum.dfinity.org/t/sns-how-do-we-adapt-a-script-thats-been-depoying-to-a-replica-to-now-submit-an-sns-proposal-instead/20507/5?u=saikatdas0790) out.
+
+Thoughts on the above?
+
+-------------------------
+
+mraszyk | 2023-06-08 18:32:22 UTC | #11
+
+[quote="saikatdas0790, post:5, topic:20507"]
+What’s the easiest way to get the neuron information running from the project folder? So, that I can make it part of my upgrade script?
+[/quote]
+
+On the branch mraszyk/change-script-dir (or the corresponding docker image martin2718/sns-testing-multidir), you can invoke the script `developer_neuron_id.sh` from anywhere and it will print to stdout the SNS neuron id for the default DFX identity.
+
+-------------------------
+
+levi | 2023-06-09 05:00:24 UTC | #12
+
+Hi @saikatdas0790,
+
+First here is a link to the open-chat sns governance canister: https://dashboard.internetcomputer.org/canister/2jvtu-yqaaa-aaaaq-aaama-cai. click on the `manage_neuron` method and look at the payload configurations to see the structure of the payload. Put a checkmark in the `command` option, then click on the variant dropdown and select `MakeProposal`. Put a checkmark where it says `action`, then click on the new variant dropdown within the action box and you can view the proposal action types and their payloads configurations.
+
+[quote="saikatdas0790, post:1, topic:20507"]
+how do we submit an SNS proposal to the SNS governance canister to upgrade a canister and also pass an argument along? What would the payload look like?
+[/quote]
+The proposal action for upgrading an sns controlled canister is:  `UpgradeSnsControlledCanister`.
+In the `UpgradeSnsControlledCanister` variant value you can specify the `new_canister_wasm`, the canister install `mode` (represented as an int32. check [here for the int32 values that represent the modes](https://github.com/dfinity/ic/blob/089612a41c853b40f47de0ddb02f9f3fe48c379d/rs/protobuf/src/gen/types/types.v1.rs#L5). ) (if you put a None value for the `mode` [it will be](https://github.com/dfinity/ic/blob/089612a41c853b40f47de0ddb02f9f3fe48c379d/rs/sns/governance/src/governance.rs#L2468) the `upgrade` mode), the `canister_id` that you want to upgrade, and the `canister_upgrade_arg`.
+
+[quote="saikatdas0790, post:1, topic:20507"]
+How do we make the governance canister call an endpoint on the top level canister passing along a payload?
+[/quote]
+This one requires a first proposal to set up the governance canister's **ability** to call the specific endpoint, and then further proposals can execute that ability and make the governance canister perform the call to the specific endpoint on the top-level canister.
+
+The first proposal action type is `AddGenericNervousSystemFunction`. In the `AddGenericNervousSystemFunction` value you specify an `id` that identifies this proposal-that-calls-the-specific-endpoint ([id must be >= 1000](https://github.com/dfinity/ic/blob/089612a41c853b40f47de0ddb02f9f3fe48c379d/rs/sns/governance/src/proposal.rs#L551-L553)), a `name` (something like: 'Upgrade Child Canisters'), a `description` (something like: 'This proposal type makes the sns governance canister call the endpoint on the top level canister to start upgrading the child canisters.'), and a `function_type` variant select the `GenericNervousSystemFunction` variant type and there you can put the values: `target_canister_id` is the canister_id of your top-level-canister, and `target_method_name` is the method name which you want to call on the top-level-canister. `validator_canister_id` and `validator_method_name` are a canister and method accept the same argument as `target_method_name` but returns a `Result<String, String>`. When making a later proposal (of type `ExecuteGenericNervousSystemFunction` reference below) to call the `target_method_name` with an argument, the governance canister [will first call this validator function](https://github.com/dfinity/ic/blob/089612a41c853b40f47de0ddb02f9f3fe48c379d/rs/sns/governance/src/canister_control.rs#L217) that you specify with the argument and will validate that the argument is valid (return an Ok(String) if the argument is valid or an Err(String) if the argument is invalid) before calling the `target_method_name` with the argument. The validator method is there as a double check sort of thing so that when making proposals to call `target_method_name` with an argument, the governance canister double checks that the argument is valid for the `target_method_name` by calling the validator function with the same argument.
+
+Once that proposal passes and the governance canister's ability to call the top-level-canister's method is set up, then further proposals can execute this function and make the governance canister perform the call to the top-level-canister. This is done by the proposal action type: `ExecuteGenericNervousSystemFunction`. In the `ExecuteGenericNervousSystemFunction` variant value, the `function_id` is the id that you put previously that identifies the proposal-that-calls-the-specific-endpoint (id >= 1000), and the `payload` is the payload that the governance canister will call the top-level-canister with. When making a proposal of this type, the governance canister will call the validator method (reference above) with the payload to double check that payload is valid for the top-level-canister method and if it is invalid the governance canister will not register the proposal.
+
+[quote="saikatdas0790, post:3, topic:20507"]
+I’m quite certain I copied the neuron ID correctly. Here:
+
+![image](upload://xigkPqce7nvZyI3hQdIlvJLj9MX)
+
+Thoughts on what I’m doing wrong?
+[/quote]
+
+In this picture you copied the NNS neuron id. The neuron id for making proposals for an sns must be an SNS-neuron of that specific SNS.
+
+-------------------------
+

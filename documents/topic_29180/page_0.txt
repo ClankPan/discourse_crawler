@@ -1,0 +1,155 @@
+senior.joinu | 2024-04-01 08:24:06 UTC | #1
+
+Hi, @kpeacock!
+
+After upgrading `agent-js` to v1.2 we started to observe the following error during ICP token balance fetching:
+```
+Timestamp failed to pass the watermark after retrying the configured 3 times. We cannot guarantee the integrity of the response since it could be a replay attack.
+```
+
+All the other tokens work fine - we're able to fetch the balance without this error most of the time, but sometimes it appears for other tokens as well. Seems like the probability for this error to appear is something like 95% for ICP and 10% for other tokens. 
+
+Maybe, something is wrong with our latency expectations. How do we fix that?
+
+Thanks in advance!
+
+-------------------------
+
+kpeacock | 2024-04-01 16:10:56 UTC | #2
+
+Interesting! It may have something to do with the volume of transactions coming through the ICP canister. This is great feedback, and there are a few ways we can handle this.
+
+Things you can do right now
+
+1. You could wait a second and retry the query if it fails watermarking
+2. You could set a higher retry time count
+
+Things I can do:
+1. Add additional / exponential delay to the retries
+2. Test against the ICP ledger on mainnet and set a more reliable default
+
+-------------------------
+
+senior.joinu | 2024-04-01 18:18:20 UTC | #3
+
+Thanks! We will try this first thing tomorrow and report back to you.
+ 
+I don’t know if it helps, but maybe you could reproduce this issue setting the browser into throttling mode.
+
+-------------------------
+
+senior.joinu | 2024-04-02 10:41:36 UTC | #4
+
+Yes, retrying more times helps. 
+Set to `10` just to be sure.
+
+Thanks!
+
+-------------------------
+
+kpeacock | 2024-04-02 18:40:44 UTC | #5
+
+Here's a PR - I'd appreciate your feedback on the design and naming!
+
+https://github.com/dfinity/agent-js/pull/871
+
+-------------------------
+
+peterparker | 2024-04-20 08:52:16 UTC | #6
+
+I just faced it took in Oisy Wallet. Any progress on the fix?
+
+![Capture d’écran 2024-04-20 à 10.51.46|690x463](upload://vtRLTuOLX8Xo3VqJZNM7o22zDR1.jpeg)
+
+-------------------------
+
+kpeacock | 2024-05-01 22:14:51 UTC | #7
+
+Sorry for the delay. The new strategy has been merged today - https://github.com/dfinity/agent-js/pull/871
+
+-------------------------
+
+kpeacock | 2024-05-01 23:13:25 UTC | #8
+
+And now the fix is out - https://forum.dfinity.org/t/agent-js-1-3-0-is-released/30228
+
+-------------------------
+
+_Eric | 2024-07-04 05:50:25 UTC | #9
+
+hi, I'm having this problem again with agent-js 1.3.0.
+![image|502x76](upload://iZhLi2msdKwJO6P5r2d9sSl9wbi.png)
+
+-------------------------
+
+kpeacock | 2024-07-09 15:35:56 UTC | #10
+
+Which canister is this targeting? Is it the ICP ledger again?
+
+I believe the delay is working correctly, so this might just mean that the `retryTimes` count should be increased
+
+-------------------------
+
+timo | 2024-07-12 19:55:51 UTC | #11
+
+What is this "watermark protections against replay attacks / stale data"? Is it documented somewhere? I would like to understand what causes and throws the error. Is it the gateway, boundary node, replica? And under what circumstances exactly?
+
+-------------------------
+
+senior.joinu | 2024-07-16 15:04:15 UTC | #12
+
+I see two potential places where this problem could happen.
+
+Here `blsVerify` is passed instead of the actual request. Typescript doesn't catch that, becase the request is of type `any` in the definition of `pollForResponse`. 
+https://github.com/dfinity/agent-js/blob/main/packages/agent/src/actor.ts#L544
+
+The fix is:
+```typescript
+const { certificate, reply } = await pollForResponse(
+  agent,
+  ecid,
+  requestId,
+  pollStrategy,
+  undefined,
+  blsVerify,
+);
+```
+
+And here `blsVerify` isn't propagated through the recursion.
+https://github.com/dfinity/agent-js/blob/main/packages/agent/src/polling/index.ts#L71
+
+The fix is:
+```typescript
+return pollForResponse(agent, canisterId, requestId, strategy, currentRequest, blsVerify);
+```
+
+-------------------------
+
+kpeacock | 2024-07-23 21:44:43 UTC | #13
+
+This is an agent error. It was introduced to prevent allowing stale data through that has a timestamp before the last known block that came in as a call.
+
+This can prevent against ordinary stale data, or a malicious MITM replay attack. Since a node can fall behind, a valid canister signature may still come back, but we know that the state may have changed in a more recent block. 
+
+In theory, another request or two with a slight delay should hit a different node, or allow the behind node to catch up.
+
+Despite the security advantages of this feature, this has been leading to increased client errors and degrading the user experience.
+
+-------------------------
+
+kpeacock | 2024-07-23 22:11:27 UTC | #14
+
+Thank you for identifying this mistake! I've opened a PR here - https://github.com/dfinity/agent-js/pull/909. I don't know of a good way to test this flow to verify the theory that this was causing the error, and the fix will resolve it, though. There isn't any tooling to produce a `Processing` response back from a test replica that I know of
+
+-------------------------
+
+timo | 2024-07-24 04:58:14 UTC | #15
+
+[quote="kpeacock, post:13, topic:29180"]
+In theory, another request or two with a slight delay should hit a different node, or allow the behind node to catch up.
+[/quote]
+
+So the correct way to handle it is simply to retry the call?
+
+-------------------------
+

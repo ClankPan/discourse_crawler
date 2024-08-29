@@ -1,0 +1,181 @@
+peterparker | 2024-02-08 14:27:47 UTC | #1
+
+I bet I've got something incorrectly in my custom Docker container but, did not found the solution so far. Does the following error message resulting of an HTTP Outcalls rings a bell to anyone?
+
+> Failed to add canister http request to queue BrokenConnection
+
+I'm using the sample provided in the [example](https://github.com/dfinity/examples/blob/master/rust/send_http_get/src/send_http_get_backend/src/lib.rs) repo. Basically a copy/paste minus adding enough cycles to `http_request` call.
+
+```
+//2. SETUP ARGUMENTS FOR HTTP GET request
+
+    // 2.1 Setup the URL and its query parameters
+    type Timestamp = u64;
+    let start_timestamp: Timestamp = 1682978460; //May 1, 2023 22:01:00 GMT
+    let seconds_of_time: u64 = 60; //we start with 60 seconds
+    let host = "api.pro.coinbase.com";
+    let url = format!(
+        "https://{}/products/ICP-USD/candles?start={}&end={}&granularity={}",
+        host,
+        start_timestamp.to_string(),
+        start_timestamp.to_string(),
+        seconds_of_time.to_string()
+    );
+
+    // 2.2 prepare headers for the system http_request call
+    //Note that `HttpHeader` is declared in line 4
+    let request_headers = vec![
+        HttpHeader {
+            name: "Host".to_string(),
+            value: format!("{host}:443"),
+        },
+        HttpHeader {
+            name: "User-Agent".to_string(),
+            value: "exchange_rate_canister".to_string(),
+        },
+    ];
+
+
+    // This struct is legacy code and is not really used in the code. Need to be removed in the future
+    // The "TransformContext" function does need a CONTEXT parameter, but this implementation is not necessary
+    // the TransformContext(transform, context) below accepts this "context", but it does nothing with it in this implementation.
+    // bucket_start_time_index and closing_price_index are meaninglesss
+    let context = Context {
+        bucket_start_time_index: 0,
+        closing_price_index: 4,
+    };
+
+    //note "CanisterHttpRequestArgument" and "HttpMethod" are declared in line 4
+    let request = CanisterHttpRequestArgument {
+        url: url.to_string(),
+        method: HttpMethod::GET,
+        body: None,               //optional for request
+        max_response_bytes: None, //optional for request
+        transform: None,          //optional for request
+        headers: request_headers,
+    };
+
+    match http_request_out(request, 2_000_000_000).await {
+        Ok((response,)) => {
+
+            Ok(())
+        },
+        Err((r, m)) => {
+            let message =
+                format!("The http_request resulted into error. RejectionCode: {r:?}, Error: {m}");
+
+            Err(message)
+        }
+    }
+```
+
+I start the replica with the subnet feature enabled.
+
+```
+./target/ic-starter --replica-path ./target/replica \
+                    --http-port "$REPLICA_PORT" \
+                    --state-dir "$STATE_REPLICA_DIR" \
+                    --create-funds-whitelist '*' \
+                    --subnet-type application \
+                    --ecdsa-keyid Secp256k1:juno_test_key \
+                    --log-level info \
+                    --use-specified-ids-allocation-range \
+                    --consensus-pool-backend lmdb \
+                    --subnet-features canister_sandboxing \
+                    --subnet-features http_requests
+```
+
+-------------------------
+
+peterparker | 2024-02-08 14:40:11 UTC | #2
+
+I guess the reason is this other error
+
+> Unable to connect to the canister http adapter. No UDS path provided.
+
+So I should path `--canister-http-uds-path` to the replica but, not sure what value.
+
+-------------------------
+
+peterparker | 2024-02-08 15:04:10 UTC | #3
+
+Ah, I bet I need this adapter that is so well documented that there isn't even a README file in the repo
+
+https://github.com/dfinity/ic/tree/master/rs/https_outcalls/adapter
+
+-------------------------
+
+peterparker | 2024-02-08 15:22:29 UTC | #4
+
+Mmmh `./ic-https-outcalls-adapter` takes a config file path as argument but, no idea which proxy? icx-proxy? in what form?
+
+https://github.com/dfinity/ic/blob/f297ddd6f8e45a345ea466be0c935dc8c996c7eb/rs/https_outcalls/adapter/src/cli.rs#L54
+
+-------------------------
+
+peterparker | 2024-02-08 15:36:59 UTC | #5
+
+Mmmh probably something like that
+
+```
+{
+  "incoming_source": "Systemd",
+  "logger": {
+    "level": "error"
+  }
+}
+```
+or like that
+
+```
+{
+   "incoming_source": {
+                    "Path": "/tmp/path.socket"
+            },
+  "logger": {
+    "level": "error"
+  }
+}
+```
+
+But not sure about Systemd or path. [Comment](https://github.com/dfinity/ic/blob/master/rs/https_outcalls/adapter/src/config.rs#L11) just says "The source of the unix domain socket to be used for inter-process communication".
+
+-------------------------
+
+tim1 | 2024-02-08 16:10:30 UTC | #6
+
+Yes, you are correct that you also need the https outcalls adapter. The adapter is a process that runs alongside the replica and does all the network requests. It communicates through a Unix domain socket with the replica.
+
+The following setup should work. It connects the adapter and the replica through a common socket.
+
+For the replica:
+`./target/ic-starter --canister_http_uds_path /tmp/sock ...` 
+For the adapter 
+```
+{
+  "incoming_source": {
+    "Path": "/tmp/sock"
+  },
+  "socks_proxy": "socks5://notaproxy:1080",
+  "logger": {
+    "level": "error"
+  }
+}
+```
+
+The socks proxy field needs to be set but is not relevant for local development.
+
+-------------------------
+
+peterparker | 2024-02-08 17:40:30 UTC | #7
+
+That's great @tim1, thanks! It works out :white_check_mark:
+
+> juno-satellite-1  | Feb 08 17:37:32.544 INFO s:jeyzo-fzy76-vwlp3-oogqe-3ckkt-bppib-zhdbz-owx7x-exsbl-q5fdn-zae/n:3blso-sjaux-cxtqy-sunhm-wxhov-cbsfx-d4ejl-h3dv7-ksoty-qje57-zae/ic_replicated_state/subnet_call_context_manager Received the response for HttpRequest with callback id 6 from CanisterId(jx5yt-yyaaa-aaaal-abzbq-cai)
+
+Not yet merged but, if anyone is looking to integrate HTTP outcalls in a Docker container, that's my PR to integrate this in [juno-docker](https://juno.build/docs/miscellaneous/local-development).
+
+https://github.com/junobuild/juno-docker/pull/4
+
+-------------------------
+

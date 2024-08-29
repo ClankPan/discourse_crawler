@@ -1,0 +1,160 @@
+skilesare | 2023-01-31 15:46:33 UTC | #1
+
+We have a large project that has been refactored a little bit into a good number of type, interface, etc modules.
+
+Our wasm is getting big.  When you drag it into the wasm editor it seems that there is a bunch of candid that is repeated over and over:
+
+![image|690x412](upload://cSwuajCklMfnR5CQlGjFJntGYuH.png)
+
+This candid text seems to be repeated 32 times in the file.  It would be great to:
+
+1. Know how to keep this from happening
+2. Maybe have the compiler be smart enough to know that it already has this text in the wasm somewhere and not repeat it.
+
+-------------------------
+
+claudio | 2023-01-31 19:12:22 UTC | #2
+
+Does that code use actor classes? Each class will contain its own description of its candid interface. Also, there may be some duplication of types in the stable variable sections too
+
+-------------------------
+
+claudio | 2023-01-31 19:15:06 UTC | #3
+
+If possible, can you share the wasm for me to look at? Or point at the repo?
+
+-------------------------
+
+skilesare | 2023-01-31 19:22:54 UTC | #4
+
+It is the same repo as last week. I'll dm the branch.
+
+You can just build one item in dfx and then inspect the wasm.
+
+@ZhenyaUsenko Tried replacing some of the actor references with interface references that had imports and the file got BIGGER. Then he ran the distilled candid through the did -> motoko to get rid of the imports and it got bigger again.
+
+-------------------------
+
+claudio | 2023-01-31 21:57:10 UTC | #5
+
+Actually, I totally forgot (or did not know) that we have a compiler option to omit metadata sections, e.g. `--omit-metadata candid:args` (or perhaps `--omit-metadata "candid:args"`) should do just that.
+
+Probably worth an experiment to see if it cuts down on binary size significantly, but omitting other meta data might make upgrading a little scary... (since dfx will have nothing to check against).
+
+```
+[nix-shell:~/motoko/doc]$ moc --help
+...
+  --omit-metadata <name>  omit icp custom section <name> (candid:args or candid:service or motoko:stable-types or motoko:compiler)
+...
+```
+
+-------------------------
+
+ZhenyaUsenko | 2023-02-01 11:24:06 UTC | #6
+
+no_args - 11_256 KB
+candid:args - 11_254 KB
+candid:service - 11_150 KB
+motoko:stable-types - 11_086 KB
+motoko:compiler - 11_254 KB
+
+-------------------------
+
+claudio | 2023-02-01 11:11:13 UTC | #7
+
+Thanks, but what are those numbers exactly? The total number of bytes in each kind of section or something else? The last one (motoko:compiler) should be much, much smaller
+
+-------------------------
+
+ZhenyaUsenko | 2023-02-01 11:25:50 UTC | #8
+
+Wasm size in KB (updated the comment)
+
+I rechecked **motoko:compiler**. Got the same size
+
+-------------------------
+
+claudio | 2023-02-01 12:20:13 UTC | #9
+
+Isn't that 11MB way over the 2MB (or is 3MB?) binary size limit, regardless of metadata size?
+
+-------------------------
+
+ZhenyaUsenko | 2023-02-01 13:59:02 UTC | #10
+
+It is 3.1 MB when gzipped
+
+-------------------------
+
+skilesare | 2023-02-01 14:27:05 UTC | #11
+
+We are getting close to the limit of where we'll be able to deploy.  It would be good to find the culprit so we can engineer for it.
+
+I'm thinking we may need to end up having "factory" canistors that only reference one actor and are asked to deploy and transfer control to our management canisters so that it doesn't have to reference the actors directly. This would be unnecessary complexity but may become necessary unless we can identify an optimization.
+
+-------------------------
+
+claudio | 2023-02-01 15:05:12 UTC | #12
+
+I was thinking of suggesting that solution too, but now that I've managed to build your project and look at the wasm, I'm beginning to wonder if we don't actually have a bug in the code generator.
+
+Your code seems to import 6 or so actor classes, non-recursively as far as I can tell, and that doesn't seem to match the number of meta-data sections I'm seeing in the binary. So I'm wondering if we are indeed duplicating string constants, perhaps by forgetting to purge the constant pool when we do a recursive build of an actor class.
+
+I'll investigate some more.
+
+Sorry to be so slow.
+
+-c
+
+-------------------------
+
+claudio | 2023-02-01 16:39:12 UTC | #13
+
+Ok, I think I know what might be going on.
+
+I suspect the compiler is linearizing the dependencies between libraries for the entire project, but when it compiles an imported actor class, it's including all the (preceding) libraries in the global order, not just this class's actual dependencies, leading to duplication of code.
+
+So when you import a sequence of actor classes, each class will import all of the preceeding ones, not just the ones it actually needs.
+
+This is pretty bad, but won't be a super-quick fix.
+
+@nomeata does that seem like a reasonable diagnosis?
+
+-------------------------
+
+claudio | 2023-02-01 19:16:09 UTC | #14
+
+Ok, I think I actually have a fix that works. Might make it into 0.8.1.
+
+It reduces the size of the wasm to 3MB, which gzips (after wasm-shrink) to 600K.
+Not too shabby (assuming it still works correctly).
+
+The binary also now has the expected number of meta-data sections (just one per imported actor class plus the one for the main actor, for each sort of section).
+
+-------------------------
+
+claudio | 2023-02-01 19:17:33 UTC | #15
+
+@ZhenyaUsenko @skilesare thank you very much for taking the time to report this!
+
+-------------------------
+
+claudio | 2023-02-01 19:42:47 UTC | #16
+
+https://github.com/dfinity/motoko/pull/3758 is the work in progress PR fixing this.
+
+-------------------------
+
+skilesare | 2023-02-01 22:50:39 UTC | #17
+
+![](upload://7KWwlcW8UbSddugMRwSYbiwr3Hf.gif)
+Celebrate the victories!!!
+
+-------------------------
+
+claudio | 2023-02-03 20:36:06 UTC | #18
+
+Moc 0.8.1 has been released and should fix this issue.
+
+-------------------------
+

@@ -1,0 +1,199 @@
+infu | 2023-10-25 12:06:08 UTC | #1
+
+Is it possible to have conditional message routing?
+Currently, there is a routing table with canister id to subnet, used by the stream builder.
+Perhaps canister ids can point to a bit more advanced routing config stored in the same place and used by the stream builder.
+
+**Example routing config:**
+**Intermediary destination:** 2sqpr-ciaaa-aaaaq-aaaoq-cai 
+**Key selectors:** 
+* H(icrc1_balance_of.inputs.account.owner)
+* H(icrc1_transfer.caller)
+* ...
+
+Where H(v) -> 0 - 65535 (With the option to have a few different transforming functions)
+
+**Routing table:** 
+
+| Range      | Subnet | Destination canister Id
+| ----------- | ----------- | ----------- |
+| 0-12000      | 2fq7c-slacv-26cgz...       |  iywa7-ayaaa-aaaaf-aemga-cai
+| 12000-32000   | 3hhby-wmtmw-umt4t...        | 4ijyc-kiaaa-aaaaf-aaaja-cai
+| 32000-65535  | 5kdm2-62fc6-fwnja... | 6hsbt-vqaaa-aaaaf-aaafq-cai
+
+(With the option to also have a routing table with text ranges like a-b, b-e, e-z in case you want ordered split)
+
+This way you can start with one canister, perhaps one ledger, or an asset canister, and then move its contents to multiple canisters and replace it with a router, while everything keeps working (dexes, wallets, etc) without additional changes in them. 
+
+Controllers should be able to update the routing config. This will allow them to migrate some of the data from one canister to more. Ex: 0-12000 goes to 3 canisters 0-4000, 4000-9000 and 9000-12000.
+
+This should eliminate the need for a cluster to create client libraries for frontends and each CDK.
+An IC call to the Intermediary destination which was previously occupied by a canister '2sqpr-ciaaa-aaaaq-aaaoq-cai' will get routed to another subnet / canister id 
+
+People who may be interested and have worked on multi-canister ledgers/ databases @timo @icme @senior.joinu . Maybe this feature will be helpful? It will be pretty useful to me. 
+
+
+Source <https://medium.com/dfinity/ic-internals-the-xnet-protocol-for-subnets-c4035dac7d2c>
+@roman-kashitsyn 
+
+> The *registry* canister maintains the assignment of nodes to physical machines, and the [Network Nervous System](https://dfinity.org/howitworks/network-nervous-system-nns) governs all the changes to the registry.
+
+> To do its job, the stream builder needs the mapping from canister identifiers to subnet identifiers, the *routing table* . The routing table comes from the registry and changes over time. To ensure determinism, each block pins the registry version that the state machine is using for message processing.
+
+> Messages start their journey in the output queues of canisters hosted on the source subnet. The subnet sorts these messages based on the destination subnet and interleaves them into flat message streams (one stream per destination subnet)
+
+Source <internetcomputer.org>
+> The API boundary node allows IC native applications to directly call the canister smart contracts. In this case, the boundary node simply routes the API canister calls to the right subnet. Hence, no trust is required between the user and the boundary node.
+
+-------------------------
+
+senior.joinu | 2023-10-25 14:34:34 UTC | #2
+
+Sounds awesome. This could simplify a lot of scalability concepts. Something tells me that the Foundation already keeps this in mind.
+
+-------------------------
+
+infu | 2023-10-25 15:33:32 UTC | #3
+
+Probably a big part of architecting a solution on the IC is trying to predict what will happen with the whole ecosystem so you don't have to re-architecture everything all the time. When developing on your own bare-metal server, this is not that pronounced, since you have access to modify everything, but here the whole thing has to be secure, decentralized, DoS resistant, work for everyone, backward compatible, etc, etc.. 
+I don't necessarily require this feature at the moment, but it would be beneficial to understand the direction when developing things today.
+
+-------------------------
+
+icme | 2023-10-25 18:53:24 UTC | #4
+
+[quote="infu, post:1, topic:24000"]
+This way you can start with one canister, perhaps one ledger, or an asset canister, and then move its contents to multiple canisters and replace it with a router, while everything keeps working (dexes, wallets, etc) without additional changes in them.
+[/quote]
+One of the main benefits I see from this feature would be eliminating multiple calls or XNet calls when sharding/re-partitioning data. However, I'd rather have have full control over how the data is split than leave it up to a hash function. This would then mean developers have a closer input/interface with routing table, and how it looks/fills up, which may not be desirable :man_shrugging:
+
+Maybe an additional level of abstraction is needed?
+
+A few questions:
+
+1. How thinly (how many different ranges) should developers be able to use to slice and dice a routing canister into?
+
+2. Why 0-65535?
+
+3. This feature is primarily centered around splitting the data in canisters when they grow too large, correct? Would more performant & easier to use/manage stable storage (similar to Rust BTreeMap) in Motoko help?
+
+-------------------------
+
+infu | 2023-10-25 19:12:24 UTC | #5
+
+[quote="icme, post:4, topic:24000"]
+This would then mean developers have a closer input/interface with routing table
+[/quote]
+
+Actually controllers - which means developers or canisters
+
+[quote="icme, post:4, topic:24000"]
+Why 0-65535?
+[/quote]
+
+Just an arbitrary number. 16,384 slots work for Redis doing the same thing to find which node has a key. 
+You could have text ranges for text keys which will work better for BTree multi-canister structures.
+
+[quote="icme, post:4, topic:24000"]
+This feature is primarily centered around splitting the data in canisters when they grow too large
+[/quote]
+
+Not only. It will also help clusters achieve higher throughput by utilizing multiple subnets.
+
+-------------------------
+
+free | 2023-10-26 08:03:49 UTC | #6
+
+I don't think this kind of feature should be baked into the protocol.
+
+For one, the functionality could be trivially provided by a library: you tell the library what your set of backends is and provide it with a closure that hashes a request. Then make all relevant calls through this library; it hashes each request and decides where to route it.
+
+Second, IMHO the difficult part of sharding is not routing. At least not routing while the sharding is stable. Rather it's moving data around (re-sharding). And routing while data is being moved. If your accesses are all read-only, then it's relatively straightforward. But imagine having to route reads and writes while some piece of data is being moved from canister A to canister B: how do you know that you're not updating the copy that's about to be discarded? how can you ensure that you are not reading the stale copy?
+
+All of this is very much application dependent and there are myriad ways to solve it. The protocol should not dictate a one-size-fits-all solution. Particularly if there is no advantage in doing so.
+
+-------------------------
+
+infu | 2023-10-26 08:38:45 UTC | #7
+
+[quote="free, post:6, topic:24000"]
+the functionality could be trivially provided by a library
+[/quote]
+
+Well, that library has to be made & maintained in:
+(CDK's) Motoko, Rust, Kybra, Azle, C, ...
+(clients) Javascript, Rust, .NET used by Unity, Python, Java, ...
+
+Re-sharding is something the canister can handle on its own yes. 
+
+[quote="free, post:6, topic:24000"]
+All of this is very much application dependent and there are myriad ways to solve it. The protocol should not dictate a one-size-fits-all solution. Particularly if there is no advantage in doing so.
+[/quote]
+Nobody has really solved it yet that has a significant amount of clients. At most, you have a single dapp using its own backend with such a library or a backend with 1-2 dapps made by different developers.
+
+The main advantage is - that you get more scalability options without asking the whole ecosystem to change its frontends, standards, and canisters. You also don't need to think about scaling until you need to. With a client library, you need to start with a cluster right away and predict what your architecture will need, to make sure once you need it you won't have to ask every client using your services to modify their dapps and canisters.
+
+-------------------------
+
+free | 2023-10-26 08:59:38 UTC | #8
+
+[quote="infu, post:7, topic:24000"]
+Well, that library has to be made & maintained in:
+(CDK’s) Motoko, Rust, Kybra, Azle, C, …
+[/quote]
+
+The library would be less than 100 lines of code. As said, the majority of the work would be in load-balancing the actual shards. And in preventing race conditions.
+
+[quote="infu, post:7, topic:24000"]
+(clients) Javascript, Rust, .NET used by Unity, Python, Java, …
+[/quote]
+
+Are you saying that this mechanism should also work for ingress messages? This would require the boundary nodes to also do the routing. Meaning the information would have to be in the registry. Every time a piece of data on some random application moves from one shard to another, the registry would need to be updated. That would be a huge scalability bottleneck.
+
+[quote="infu, post:7, topic:24000"]
+With a client library, you need to start with a cluster right away and predict what your architecture will need, to make sure once you need it you won’t have to ask every client using your services to modify their dapps and canisters.
+[/quote]
+
+You don't. If you don't use the client library from the very beginning, you can still replace your single backend with a proxy canister. Clients that are too lazy to use the new API would not break. They would just have to deal with the extra latency introduced by the proxy.
+
+-------------------------
+
+infu | 2023-10-26 09:38:39 UTC | #9
+
+[quote="free, post:8, topic:24000"]
+Are you saying that this mechanism should also work for ingress messages? This would require the boundary nodes to also do the routing.
+[/quote]
+Yes.
+There won't be that much re-sharding? Let's see a real example - the ICP ledger. It will split into ten subnets for high throughput and once in a few months, re-sharding will happen. During it let's say 1/4 of the accounts in a canister become unavailable for transferring from. Once the move is complete, routing tables get updated - with this easy locking re-sharding, some accounts won't be accessible for like 30 seconds every few months.
+
+[quote="free, post:8, topic:24000"]
+you can still replace your single backend with a proxy canister
+[/quote]
+Fair point. Yes, that proxy is an interesting tradeoff. Is that what will happen to the ICP ledger if it becomes multi-canister? Whoever didn't add the new library will get +2sec lag on every call to it
+
+My main goal here is to try and predict what will happen so I can develop apps that will age and scale well.
+
+-------------------------
+
+free | 2023-10-26 11:35:27 UTC | #10
+
+[quote="infu, post:9, topic:24000"]
+There won’t be that much re-sharding?
+[/quote]
+
+What stops me as a developer from re-sharding every time one shard is 1 KB larger than the next?
+
+What about tens of thousands of applications, all resharding every few hours just because they can? All of them bottlenecked on updating the registry? What about every boundary node having to know the exact sharding of every single application? What about sharding functions for something other than ICRC1? This is very much the definition of non-scalable.
+
+[quote="infu, post:9, topic:24000"]
+Whoever didn’t add the new library will get +2sec lag on every call to it
+[/quote]
+
+Not necessarily. Most of the time subnets are able to schedule multiple "inner rounds" within one execution round. Meaning that the proxy would very likely execute in inner round 0; the actual lookup/update in inner round 1; and the proxy would respond in inner round 2. Of course, the proxy needs to be on the same subnet as the backend shards. But your application would need to grow something like 100x before lazy old clients (and only them) would have to pay the penalty of an extra XNet hop.
+
+As said, I don't believe something like this belongs in the protocol. You may be OK with a 30 second downtime for your whole backend. I may only be OK with a 10 second downtime for single shards. Someone else may not want any downtime at all. Similarly, my sharding logic may be wildly different from yours. Maybe it's not even by key, and all I want is load-balancing. Neither a one-size-fits-all approach, nor a very complex (and thus correspondingly heavy and slow) solution belong in the low-level protocol.
+
+That's my 2c, anyway.
+
+-------------------------
+

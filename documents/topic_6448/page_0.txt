@@ -1,0 +1,220 @@
+ccyanxyz | 2021-08-13 05:54:55 UTC | #1
+
+Here is the Motoko canister code: 
+```
+import HashMap "mo:base/HashMap";
+import Principal "mo:base/Principal";
+import Iter "mo:base/Iter";
+import Array "mo:base/Array";
+
+actor {
+	private stable var mapEntries : [(Principal, Nat)] = [];
+	private var map = HashMap.HashMap<Principal, Nat>(0, Principal.equal, Principal.hash);
+	public shared(msg) func addItem(n: Nat) {
+		map.put(msg.caller, n);	
+	};
+
+	public query func test(): async Bool {
+		true
+	};
+
+	system func preupgrade() {
+        mapEntries := Iter.toArray(map.entries());
+    };
+
+    system func postupgrade() {
+        map := HashMap.fromIter<Principal, Nat>(mapEntries.vals(), 1, Principal.equal, Principal.hash);
+        mapEntries := [];
+    };
+};
+```
+
+Install the canister and check the status, memory size is 378007:
+```
+Canister status call result for test.
+Status: Running
+Controller: tfuft-aqaaa-aaaaa-aaaoq-cai
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(378007)
+Balance: 4_000_000_000_000 Cycles
+Module hash: 0xd9cac7fa14832eec53dbaf56b166216976a418d94b8795e4ba50bbe15bbd7b02
+```
+
+Insert 100 entries into the map and check the status, memory size is 443543, increased 65536, until now, it all make sense:
+```
+Canister status call result for test.
+Status: Running
+Controller: tfuft-aqaaa-aaaaa-aaaoq-cai
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(443543)
+Balance: 4_000_000_000_000 Cycles
+Module hash: 0xd9cac7fa14832eec53dbaf56b166216976a418d94b8795e4ba50bbe15bbd7b02
+```
+
+Then I removed the useless query function and upgraded the canister: 
+```
+// removed this function
+public query func test(): async Bool {
+	true
+};
+// then upgrade:
+// dfx build test
+// dfx canister install test -m=upgrade
+```
+But the memory size increased to 639424, it does not make sense to me:
+```
+Canister status call result for test.
+Status: Running
+Controller: tfuft-aqaaa-aaaaa-aaaoq-cai
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(639424)
+Balance: 4_000_000_000_000 Cycles
+Module hash: 0xae4d9d217a2e1ffa29e03ff6fa999d66805ac3037dee9222a616d29cec0f252c
+```
+I deleted one function, the wasm module size should be smaller, but instead, the canister memory size increased, why?
+I'm thinking maybe it has something to do with the Motoko upgrade functions? Maybe the `mapEntries` memory is not cleared after the upgrade? Will Rust canisters have the same problem?
+
+I'm using dfx 0.8.0.
+
+-------------------------
+
+nomeata | 2021-08-13 09:20:44 UTC | #2
+
+This is not unexpected: For the upgrade, the Motoko runtime serializes your whole state to stable memory, in a format that is almost like Candid. This is not implemented in the most efficient way yet; in particular it will
+ 
+1. increase the main memory to have space to assemble the candid data.
+2. serialized the data in Candid format into that space
+3. copy it in bulk to stable memory
+4. (now the upgrade happens)
+5. increase the main memory to have space for the encoded candid data
+6. copy it in bulk from the stable memory
+7. decode from Candid into Motoko
+
+The scratch space used in step 5 will now be unused, and reclaimed by the GC, but WebAssembly doesn’t allow code to give back memory to the system, so the memory footprint will appear large.
+
+But Motoko will use that memory for new data before it grows the memory again, so it is altogether not too bad.
+
+(The code change is a red herring, I assume you’d see the same behavior even if you upgrade to the same code.)
+
+-------------------------
+
+ccyanxyz | 2021-08-13 09:22:02 UTC | #3
+
+Thanks for making it clear:)
+
+-------------------------
+
+flyq | 2021-08-16 02:50:45 UTC | #4
+
+[quote="nomeata, post:2, topic:6448"]
+But Motoko will use that memory for new data before it grows the memory again, so it is altogether not too bad.
+[/quote]
+
+Perfect answer!
+
+and Rust canister has anything different? Will the Rust canister increase memory size after upgrade?
+
+-------------------------
+
+nomeata | 2021-08-16 12:33:23 UTC | #5
+
+In rust you manage stable memory manually, so this effect will only be visible if you program it that way.
+
+So in most cases I don't expect a rust cansiter to exhibit unexpected memory consumption after an upgrade.
+
+-------------------------
+
+roman-kashitsyn | 2021-10-26 22:32:28 UTC | #6
+
+[quote="nomeata, post:5, topic:6448"]
+So in most cases I don’t expect a rust cansiter to exhibit unexpected memory consumption after an upgrade.
+[/quote]
+
+A few people reported that they actually observed heap usage in Rust canisters doubling after the first upgrade.
+I think it depends on the serialization format and the way developers use stable memory.
+
+When we decode stable memory after an upgrade, we need to first copy a portion of the data into a fresh memory buffer, and then interleave parsing and buffer filling. We cannot free the buffer until the parsing is done, so the expected memory consumption after the upgrade is `size(buffer) + size(data structures)`.
+
+If the buffer management is naive and the serialized data is copied into the main memory in full before the parsing begins, our simple formula predicts that the heap usage roughly doubles.
+
+A quick look at the current Rust CDK implementation reveals that the buffer management used by `stable_restore` is indeed naive: https://docs.rs/ic-cdk/0.3.2/src/ic_cdk/storage.rs.html#53-65
+
+-------------------------
+
+alexeychirkov | 2022-02-23 13:37:23 UTC | #7
+
+@roman-kashitsyn 
+I've registered an [issue](https://github.com/dfinity/cdk-rs/issues/212)
+
+RUST canister: we have a lot of big strings in stable memory (~40Mb)
+After calling `ic_cdk::storage::stable_restore()` canister memory is ~500Mb (see details with specific code point in the issue)
+
+Can you give a comment?
+Thanks in advance
+
+-------------------------
+
+roman-kashitsyn | 2022-02-23 15:08:06 UTC | #8
+
+Hi @alexeychirkov!
+
+[quote="alexeychirkov, post:7, topic:6448"]
+we have a lot of big strings in stable memory (~40Mb)
+[/quote]
+
+Is this the size of the strings, or the size of the stable memory itself? What does [`stable64_size()`](https://github.com/dfinity/cdk-rs/blob/01ad9029e25ad055ae97c8a0fafb8b402745aeb2/src/ic-cdk/src/api/stable.rs#L13) reports?
+
+[quote="alexeychirkov, post:7, topic:6448"]
+After calling `ic_cdk::storage::stable_restore()` canister memory is ~500Mb (see details with specific code point in the issue)
+[/quote]
+
+Oh, the design of `stable_save`/`stable_restore` is unsound because it doesn't remember the exact size of the data stored in the stable memory. That this design was introduced without enough eyes on it (I wish I was added as a reviewer...). Unfortunately, any fix will require changing the stable memory layout and won't be backward compatible.
+
+I'll prioritize implementing a better way of organizing the stable memory.
+
+-------------------------
+
+alexeychirkov | 2022-02-24 08:40:21 UTC | #9
+
+1. Stable contains only a list of strings (40Mb). Those 40Mb is whole stable memory - it corresponds to number of pages got from stable64_size()
+
+2. Why do we actually need to call this "`done()`" method at all? 
+
+https://github.com/dfinity/cdk-rs/blob/main/src/ic-cdk/src/storage.rs#L28
+
+As we see - result is ignored but internally we get huge heap memory increase and cycles burning. 
+
+As you can see the code - the error **always** returned with huge heap memory dumps (`self.de.dump_state()`)
+
+https://github.com/dfinity/candid/blob/master/rust/candid/src/de.rs#L104
+
+-------------------------
+
+roman-kashitsyn | 2022-02-24 12:45:41 UTC | #10
+
+[quote="alexeychirkov, post:9, topic:6448"]
+As you can see the code - the error **always** returned with huge heap memory dumps ( `self.de.dump_state()` )
+[/quote]
+
+Ah, I see, the memory bloat comes from the error construction, where the whole input is copied all over again, even though the error is later ignored. I don't think there is any point in calling `done()`, we should remove it.
+
+I opened a PR to change that: https://github.com/dfinity/cdk-rs/pull/216
+
+Thanks a lot for reporting this issue!
+
+-------------------------
+
+alexeychirkov | 2022-02-24 16:24:06 UTC | #11
+
+This is so cool!
+It will save a lot of cycles in every project!
+💪
+
+-------------------------
+

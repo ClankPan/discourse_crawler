@@ -1,0 +1,259 @@
+varonroy | 2023-11-22 10:06:33 UTC | #1
+
+I am trying to use the `ic_cdk` library to check a canister's status. For example, consider a simple project, with one canister that has a single `async update` method. This function uses `ic_cdk::api::management_canister::main::canister_status` in order to check the canister's status.
+
+`dfx.json`
+```json
+{
+    "canisters": {
+        "my_canister": {
+            "candid": "src/my_canister/my_canister.did",
+            "package": "my_canister",
+            "type": "rust"
+        }
+    }
+}
+```
+
+`src/my_canister/src/lib.rs`
+```rust
+use ic_cdk::{
+    api::{
+        call::RejectionCode,
+        management_canister::{
+            main::{canister_status, CanisterStatusResponse},
+            provisional::CanisterIdRecord,
+        },
+    },
+    export_candid, update,
+};
+
+#[update]
+async fn check_status() -> Result<CanisterStatusResponse, (RejectionCode, String)> {
+    let val = canister_status(CanisterIdRecord {
+        canister_id: ic_cdk::id(),
+    })
+    .await?;
+
+    Ok(val.0)
+}
+
+export_candid!();
+```
+
+After starting dfx and deploying the canister (`dfx start --clean --background && dfx deploy`), the status can be checked in two ways:
+- calling the management canister
+- calling the canister that was just created
+
+```Makefile
+check_status_management:
+	dfx canister call aaaaa-aa canister_status \
+		'(record { canister_id = principal "$(shell dfx canister id my_canister)" })'
+
+check_status_my_canister:
+	dfx canister call my_canister check_status
+```
+
+Calling `make check_status_management` returns:
+```
+(
+  record {
+    79_599_772 = principal "ifxlm-aqaaa-multi-pleco-ntrol-lersa-h3ae";
+    100_394_802 = variant { 3_949_555_199 };
+    238_856_128 = 2_592_000 : nat;
+    596_483_356 = vec { record { blob "\00"; 3_091_753_184_950 : nat } };
+    1_054_895_615 = 1_995_104 : nat;
+    2_190_693_645 = 3_091_753_184_950 : nat;
+    2_336_062_691 = record {
+      79_599_772 = principal "ifxlm-aqaaa-multi-pleco-ntrol-lersa-h3ae";
+      238_856_128 = 2_592_000 : nat;
+      570_880_087 = vec {
+        principal "bnz7o-iuaaa-aaaaa-qaaaa-cai";
+        principal "oq4q5-pqabo-4pqwj-fdthp-ekg2g-tyh5i-hj54z-pudh7-brk35-koxey-rqe";
+      };
+      1_095_112_320 = 5_000_000_000_000 : nat;
+      3_844_961_758 = 0 : nat;
+      4_174_053_672 = 0 : nat;
+    };
+    2_733_945_392 = 1_568_338 : nat;
+    2_928_387_969 = opt blob "\92\a2p\be\ed:\aa\94\9c\1b\98S\e6\e1W\7fj\bd\82O\c6\cbQ\d6c\f5\c1+\b8\b6\f1\c6";
+    4_090_107_140 = 0 : nat;
+  },
+)
+```
+
+Calling `make check_status_my_canister` returns:
+```
+(
+  variant {
+    Err = record {
+      variant { CanisterError };
+      "failed to decode canister response as (ic_cdk::api::management_canister::main::types::CanisterStatusResponse,): Fail to decode argument 0";
+    }
+  },
+)
+```
+
+As you see, the record returned from `check_status_management` does in fact resemble `CanisterStatusResponse` (the struct returned from `canister_status`). However the field names are numbers and not strings. Could that be the issue?
+
+-------------------------
+
+peterparker | 2023-11-22 10:12:44 UTC | #2
+
+[quote="varonroy, post:1, topic:24891"]
+`Ok(val.0)`
+[/quote]
+
+Maybe `val.0` is incorrect?
+
+Or is `.0` equals to `let (status,) = val;` ?
+
+I use the second: https://github.com/junobuild/juno/blob/c9b8bdd709d8bac93af471a08581396eef61ddba/src/shared/src/ic.rs#L80
+
+-------------------------
+
+varonroy | 2023-11-22 10:19:39 UTC | #3
+
+`(status,) = val` does not resolve the issue. 
+Here is the updated code:
+```rust
+#[update]
+async fn check_status() -> Result<CanisterStatusResponse, (RejectionCode, String)> {
+    let (status,) = canister_status(CanisterIdRecord {
+        canister_id: ic_cdk::id(),
+    })
+    .await?;
+
+    Ok(status)
+}
+```
+
+-------------------------
+
+peterparker | 2023-11-22 10:30:42 UTC | #4
+
+Did you regenerate / update the did file? i.e. the did file matches the function description?
+
+-------------------------
+
+varonroy | 2023-11-22 10:46:49 UTC | #5
+
+Yes, the `.did` file is up to date:
+`src/my_canister/my_canister.did`
+```candid
+type CanisterStatusResponse = record {
+  status : CanisterStatusType;
+  memory_size : nat;
+  cycles : nat;
+  settings : DefiniteCanisterSettings;
+  query_stats : QueryStats;
+  idle_cycles_burned_per_day : nat;
+  module_hash : opt vec nat8;
+};
+type CanisterStatusType = variant { stopped; stopping; running };
+type DefiniteCanisterSettings = record {
+  freezing_threshold : nat;
+  controllers : vec principal;
+  memory_allocation : nat;
+  compute_allocation : nat;
+};
+type QueryStats = record {
+  response_payload_bytes_total : nat;
+  num_instructions_total : nat;
+  num_calls_total : nat;
+  request_payload_bytes_total : nat;
+};
+type RejectionCode = variant {
+  NoError;
+  CanisterError;
+  SysTransient;
+  DestinationInvalid;
+  Unknown;
+  SysFatal;
+  CanisterReject;
+};
+type Result = variant {
+  Ok : CanisterStatusResponse;
+  Err : record { RejectionCode; text };
+};
+service : { check_status : () -> (Result) }
+```
+
+-------------------------
+
+peterparker | 2023-11-22 11:01:32 UTC | #6
+
+Not sure, maybe @Severin has an idea?
+
+-------------------------
+
+Severin | 2023-11-22 12:27:02 UTC | #7
+
+So the code you provided in the first message works just fine for me. But when I go and use your .did file then things break, but not in the same way. Can you replace your .did file with a plain `service : {}` and see if it works that way? Then we'll know if the problem is in the .did or the .rs file
+
+-------------------------
+
+varonroy | 2023-11-22 12:56:40 UTC | #8
+
+No problem.
+After replacing the `.did` file with an empty `service: {}`, the issue still remains:
+```
+(
+  variant {
+    3_456_837 = record {
+      variant { 424_852_481 };
+      "failed to decode canister response as (ic_cdk::api::management_canister::main::types::CanisterStatusResponse,): Fail to decode argument 0";
+    }
+  },
+)
+```
+
+EDIT:
+Here are `my_canister`'s dependencies
+```toml
+[dependencies]
+candid = "0.9.11"
+ic-cdk = "0.11.3"
+```
+And I am using `dfx 0.15.1`.
+
+-------------------------
+
+Severin | 2023-11-22 13:48:18 UTC | #9
+
+With these dependencies I'm getting the same error. Trying to debug it... looks a lot like a problem with the CDK
+
+-------------------------
+
+varonroy | 2023-11-22 13:59:59 UTC | #10
+
+Thats weird because I am using the same dependencies as Juno
+
+https://github.com/junobuild/juno/blob/c9b8bdd709d8bac93af471a08581396eef61ddba/src/shared/Cargo.toml
+
+Which dependencies do you use?
+
+-------------------------
+
+Severin | 2023-11-22 14:03:50 UTC | #11
+
+Found the problem. ic_cdk 0.11.4 adds a field `query_stats` to the status response, but the local replica does not serve it. Candid expects that the field is present but can't find it, therefore it fails to decode.
+
+In our dependencies, we specify a _minimum_ version, and cargo uses 0.11.4 instead of 0.11.3 automatically. If you force 0.11.3 (using `ic-cdk = "=0.11.3"`) you'll get that version and things work out just fine
+
+And it works for Juno because (I'm guessing) they already built their Cargo.lock file before 0.11.4 was available, therefore when building the canister it doesn't automatically pull in 0.11.4
+
+-------------------------
+
+varonroy | 2023-11-22 14:26:59 UTC | #12
+
+This worked! However, as you said, this is clearly a problem with the `ic_cdk`. Would you like me to open a new issue on GitHub?
+
+-------------------------
+
+Severin | 2023-11-22 14:33:37 UTC | #13
+
+No need, I'll bring it up with the team
+
+-------------------------
+

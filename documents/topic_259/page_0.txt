@@ -1,0 +1,228 @@
+dpdp | 2019-12-02 19:57:58 UTC | #1
+
+Hello
+
+I am currently experimenting dfx by building a golang app that would interact with the rest api of dfx.
+
+I have some issue as I am not sure how to encode the `arg` of the dfinity transaction
+
+
+I have a structure
+```
+
+type DFNMsg struct {
+	CanisterID  uint64 `codec:"canister_id"` // big.Int
+	RequestType string `codec:"request_type"`
+	MethodName  string `codec:"method_name"`
+	Arg         []byte `codec:"arg"`
+	Nonce    []byte `codec:"nonce"`
+}
+```
+
+
+And a Motoko actor
+
+```
+// File        : main.mo
+// Description : Storage List.
+// Maintainer  : Alex Manelis <alexm@55foundry.com> & David P <dphan@55foundry.com>
+// Stability   : Experimental
+
+import List "mo:stdlib/list.mo";
+import Option "mo:stdlib/option.mo";
+
+type List<T> = List.List<T>;
+
+//
+// StorageList ...
+// -----------------------------------------------------------------------------
+class StorageList() {
+	private var list : List<Text> = List.nil<Text>();
+
+	public func get(ndx : Nat) : Text {
+		return Option.unwrap<Text>(List.nth<Text>(list, ndx));
+	};
+
+	public func set(val : Text) : Nat {
+		list := List.push<Text>(val, list);
+		return List.len<Text>(list);
+	};
+
+	public func len() : Nat {
+		return List.len<Text>(list);
+	};
+};
+
+// Actor / Public CLI interface
+// -----------------------------------------------------------------------------
+actor TwitActor {
+	var sList : StorageList = StorageList();
+	
+	public func slGet(val : Nat) : async Text {
+		return sList.get(val);
+	};
+
+	public func slAppend(val : Text) : async Nat {
+		return sList.set(val);
+	};
+
+	public func sLen() : async Nat {
+		return sList.len();
+	};
+};
+```
+
+
+I'd like to call `slAppend`
+
+Here is my golang code:
+
+```
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"github.com/ugorji/go/codec"
+	"io/ioutil"
+	"log"
+
+	//"math/big"
+	"math/rand"
+	"net/http"
+)
+
+type DFNMsg struct {
+	CanisterID  uint64 `codec:"canister_id"` // big.Int
+	RequestType string `codec:"request_type"`
+	MethodName  string `codec:"method_name"`
+	Arg         []byte `codec:"arg"`
+	Nonce       []byte `codec:"nonce"`
+}
+
+func randNonce() []byte {
+	tok := make([]byte, 32)
+	rand.Read(tok)
+	return tok
+}
+
+func main() {
+	log.Println("starting main...")
+	canisterID := uint64(14257677763023343915) // TODO: read from _canister.id
+	host := "127.0.0.1"
+	port := 8000
+
+	var ch codec.CborHandle
+	var b []byte
+
+	enc := codec.NewEncoderBytes(&b, &ch)
+
+	submitMessage := DFNMsg{
+		CanisterID:  canisterID,
+		RequestType: "call",
+		MethodName:  "slAppend",
+		Arg:         []byte{0x42, 0x24, 0x42, 0x24, 0x42, 0x24},
+		Nonce:       randNonce(),
+	}
+
+	err := enc.Encode(submitMessage)
+	if err != nil {
+		log.Fatalln("error encoding submitMessage", err)
+	}
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s:%d/api/v1/submit", host, port), bytes.NewBuffer(b))
+	if err != nil {
+		log.Fatalln("error creating request ", err)
+
+	}
+	req.Header.Add("Content-Type", "application/cbor")
+	req.Header.Add("Content-Length", string(len(b)))
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Fatalln("error while sending request ", err)
+	}
+
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	bodyString := string(bodyBytes)
+
+	if resp.StatusCode != 202 {
+		log.Fatalln("resp status code not 202 ", resp.StatusCode, bodyString)
+	}
+
+	log.Println("Resp body:", bodyString)
+
+	//simpleMessage := DFNMsg{
+	//	CanisterID:  canisterID,
+	//	RequestType: "query",
+	//	MethodName:  "sLen",
+	//	Arg:         []byte{},
+	//	Nonce:       randNonce(),
+	//}
+	//
+	//err = enc.Encode(simpleMessage)
+	//if err != nil {
+	//	log.Fatalln("error encoding simpleMessage", err)
+	//}
+	//log.Println("encoded simpleMessage: ", b)
+	//
+	//req, err = http.NewRequest("POST", fmt.Sprintf("http://%s:%d/api/v1/read", host, port), bytes.NewBuffer(b))
+	//if err != nil {
+	//	log.Fatalln("error creating request ", err)
+	//
+	//}
+	//req.Header.Add("Content-Type", "application/cbor")
+	//req.Header.Add("Content-Length", string(len(b)))
+	//
+	//resp, err = client.Do(req)
+	//if err != nil {
+	//	log.Fatalln("error while sending request ", err)
+	//}
+	//
+	//bodyBytes, err = ioutil.ReadAll(resp.Body)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//bodyString = string(bodyBytes)
+	//
+	//if resp.StatusCode != 200 {
+	//	log.Fatalln("resp status code not 200 ", resp.StatusCode, bodyString)
+	//}
+	//
+	//log.Println("Resp body: %s", bodyString)
+}
+```
+
+the dfx terminal logs an error
+>       Dec 02 20:40:42.555 INFO Message execution failed: Err(UserError { code: CanisterCalledTrap, description: "Canister 14257677763023343915 trapped explicitly: IDL error: missing magic bytes" }), resetting the executor, canister_id: 14257677763023343915
+
+Any specs on these magic bytes?
+
+-------------------------
+
+hansl | 2019-12-02 20:36:50 UTC | #2
+
+Hi David,
+
+We don't (yet) officially support other languages or making custom calls to the client, but I can let you in on a secret bit; the IDL (the argument encoding) is normally prefixed by `DIDL` as the magic bits. The encoding is not yet ready to open source, so if you want to pass in data you'd have to reverse engineer it yourself. In the meantime, an empty field should be encoded as `DIDL\0\0`. Your Motoko code will not get any arguments.
+
+Hope this helps!
+
+-------------------------
+
+dpdp | 2019-12-02 20:51:42 UTC | #3
+
+Thank you, it does help :slight_smile:
+
+-------------------------
+
+hansl | 2021-02-04 17:20:59 UTC | #4
+
+More info; The argument encoding is currently open sourced at https://github.com/dfinity/candid and you can find the spec and a Rust implementation there.
+
+-------------------------
+

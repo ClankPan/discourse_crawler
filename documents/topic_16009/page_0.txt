@@ -1,0 +1,246 @@
+peterparker | 2022-10-20 10:15:32 UTC | #1
+
+Is there a way to define and set a parameter of the `init` function as mandatory in the state in Rust?
+
+In Motoko I do the following:
+
+```
+actor class StorageBucket(user : Principal) = this {
+  private stable let owner : Principal = user;
+};
+```
+
+i.e. the `owner` state is mandatory.
+
+To convert above code in Rust I did following but, my `owner` becomes optional which is not as convenient:
+
+```
+thread_local! {
+    static STATE: RefCell<State> = RefCell::default();
+}
+
+#[derive(Default)]
+struct State {
+    owner: Option<Principal>,
+}
+
+#[init]
+fn init(user: Principal) {
+    STATE.with(|state| {
+        *state.borrow_mut() = State {
+            owner: Some(user),
+        };
+    });
+}
+```
+
+so I am curious to know if that would be possible since I am a total Rust noob.
+
+-------------------------
+
+Fulco | 2022-10-20 10:45:30 UTC | #2
+
+Instead of deriving default you could also do this:
+
+static STATE: RefCell<State> = RefCell::new(State { owner : Principal::anonymous() });
+
+And then not derive Default
+
+struct State {
+    owner: Principal,
+}
+
+-------------------------
+
+peterparker | 2022-10-20 10:40:44 UTC | #3
+
+[quote="Fulco, post:2, topic:16009"]
+Did the compiler give an error?
+[/quote]
+
+Exactly.
+
+> error[E0277]: the trait bound `candid::Principal: Default` is not satisfied
+  --> src/rust_demo_backend/src/lib.rs:16:5
+   |
+14 | #[derive(Default)]
+   |          ------- in this derive macro expansion
+15 | struct State {
+16 |     owner: Principal,
+   |     ^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `candid::Principal`
+   |
+   = note: this error originates in the derive macro `Default` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+-------------------------
+
+peterparker | 2022-10-20 11:40:38 UTC | #4
+
+[quote="Fulco, post:2, topic:16009"]
+static STATE: RefCell = RefCell::new(State { owner : Principal::anonymous() });
+[/quote]
+
+Good idea, thanks Fulco.
+
+It might not apply to this particular use case, but I keep it in my mind for futher development, pretty sure I might have to use it in the future.
+
+Here I use the principal to limit the access to the functions. So in motoko I whitelist the functions for  `owner == caller`. With an optional type I will have to check if defined and equals, if I would use anonymous as default I would have to check if not anonymous and equals caller, so kind of same same.
+
+-------------------------
+
+Fulco | 2022-10-20 11:46:26 UTC | #5
+
+The anonymous principal is just used to initialise the State struct. 
+
+If you then immediately change it in the init function it will actually never be used to check for access, because the init function is the first function in your canister that gets executed before any other messages:
+
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-init
+
+-------------------------
+
+peterparker | 2022-10-20 12:24:36 UTC | #6
+
+Yes, agree and definitely but type safety-wise, it is not the case so, call me paroniac (😁), still need to test both you know what I mean?
+
+-------------------------
+
+Fulco | 2022-10-20 13:34:56 UTC | #7
+
+I think type wise it's all safe, but if you are super paranoid about forgetting to set it in the init you could also do an assert at the end of the init with a check that makes sure it is not anonymous anymore.
+
+-------------------------
+
+peterparker | 2022-10-20 14:14:57 UTC | #8
+
+[quote="Fulco, post:7, topic:16009"]
+you could also do an assert at the end
+[/quote]
+
+Exactly what I gonna do, just need to learn how to do an asset in Rust first 😉.
+
+Thanks for the inputs Fulco!
+
+-------------------------
+
+Fulco | 2022-10-20 14:32:33 UTC | #9
+
+Thank you for asking in the forum! I know you have a slack chat available to you with very capable rust engineers but this way the answers can be useful for the broader community as well.
+
+-------------------------
+
+paulyoung | 2022-10-20 18:34:52 UTC | #10
+
+[quote="peterparker, post:1, topic:16009"]
+```
+#[derive(Default)]
+struct State {
+    owner: Option<Principal>,
+}
+```
+[/quote]
+
+Depending on your use case you could do this instead:
+
+```
+#[derive(Default)]
+struct State {
+    owners: Vec<Principal>,
+}
+```
+
+It might be a bit more future-proof as well.
+
+-------------------------
+
+paulyoung | 2022-10-20 18:44:05 UTC | #11
+
+[quote="Fulco, post:2, topic:16009"]
+static STATE: RefCell = RefCell::new(State { owner : Principal::anonymous() });
+[/quote]
+
+I wouldn’t recommend this as it introduces the possibility of an unauthenticated caller being considered as the owner
+
+-------------------------
+
+GLdev | 2022-10-20 19:55:01 UTC | #12
+
+I think the Vec approach is much better for flexibility, and much safer. Your worst case scenario is that you get an empty vec, so the default permissions are equivalent to "drop all" instead of "allow all". You can fix a "drop all" scenario by updating the canister, without potentially compromising data.
+
+There's also another thing you can do. You might decide that for every spawned canister you also want a "dfx" principal as the owner (hardcoded one). Or you might decide that the spawner needs to be a controller. Or any other things. You can setup your init() to accept multiple Principals, and add them all to your canister's controllers.
+
+```
+#[init]
+fn init() {
+    let env = Box::new(CanisterEnv::new());
+    let data = Data::default();
+    let mut runtime_state = RuntimeState { env, data };
+
+    let caller_id = ic_cdk::api::caller();
+
+    // This line adds the spawner to the controllers. You might not need this, depending on your usecase
+    runtime_state
+        .data
+        .canister_settings
+        .controllers
+        .push(caller_id);
+
+    // Sample arguments struct, can be anything really.
+    #[derive(CandidType, Deserialize, Debug, Default)]
+    struct SendArgs {
+        greet: String,
+        controllers: Vec<Principal>,
+    }
+
+    let call_arg = ic_cdk::api::call::arg_data::<(Option<SendArgs>,)>().0;
+
+    // Add the additional controllers received from the Index canister
+    for controller in call_arg.unwrap_or(SendArgs::default()).controllers.iter() {
+        runtime_state
+            .data
+            .canister_settings
+            .controllers
+            .push(controller.clone());
+    }
+
+    RUNTIME_STATE.with(|state| *state.borrow_mut() = runtime_state);
+}
+```
+
+And the guard function:
+
+```
+// Guards:
+fn is_controller() -> Result<(), String> {
+    RUNTIME_STATE.with(|state| {
+        if state
+            .borrow()
+            .data
+            .canister_settings
+            .controllers
+            .contains(&state.borrow().env.caller())
+        {
+            Ok(())
+        } else {
+            Err("You are not a controller".to_string())
+        }
+    })
+}
+```
+
+and you can use the guards like so:
+
+```
+#[update(name = "sendCycles", guard = "is_controller")]
+async fn send_cycles()
+[...]
+```
+
+-------------------------
+
+peterparker | 2022-10-21 04:48:28 UTC | #13
+
+Thanks @paulyoung and @GLdev for the useful inputs, well noted and useful!
+
+Regarding the owner being a vector or not, for my use case, Papyrs, having a unique owner is correct. For the future I might follow the controllers path but it's really distant, not even sure I will ever get there 😄.
+
+-------------------------
+

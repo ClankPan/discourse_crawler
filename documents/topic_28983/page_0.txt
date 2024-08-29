@@ -1,0 +1,258 @@
+timo | 2024-03-27 11:10:14 UTC | #1
+
+The `dfx canister create` command has a `--subnet` option which can be used to deploy on a specific subnet.
+
+If a canister dynamically creates a child canister is there any way to have a similar choice and to get the child on a different subnet than the parent?
+
+-------------------------
+
+Samer | 2024-03-27 13:03:29 UTC | #2
+
+I recently achieved this by calling the CMC `create_canister`
+
+```
+use candid::{CandidType, Nat, Principal};
+use ic_cdk::{api::management_canister::main::CanisterSettings, update};
+use ic_ledger_types::MAINNET_CYCLES_MINTING_CANISTER_ID;
+use serde::Deserialize;
+
+#[derive(CandidType, Deserialize)]
+struct CreateCanisterArg {
+    settings: Option<CanisterSettings>,
+    subnet_type: Option<String>,
+    subnet_selection: Option<SubnetSelection>,
+}
+
+#[derive(CandidType, Deserialize)]
+enum SubnetSelection {
+    Subnet { subnet: Principal },
+    Filter { filter: SubnetFilter },
+}
+
+#[derive(CandidType, Deserialize)]
+struct SubnetFilter {
+    subnet_type: Option<String>,
+}
+
+#[derive(CandidType, Deserialize)]
+enum CreateCanisterResult {
+    Ok(Principal),
+    Err(CreateCanisterError),
+}
+
+#[derive(CandidType, Deserialize)]
+enum CreateCanisterError {
+    Refunded {
+        refund_amount: Nat,
+        create_error: String,
+    },
+    RefundFailed {
+        create_error: String,
+        refund_error: String,
+    },
+}
+
+#[update]
+async fn create_canister(subnet: String) -> Principal {
+    let settings = CanisterSettings {
+        controllers: Some(vec![
+            // dev wallet
+            Principal::from_text("uc5c3-viaaa-aaaal-qaaja-cai").unwrap(),
+            // dev id
+            Principal::from_text("hopg6-qb5bk-fywb2-44xhe-2ovp4-stuku-oitob-vkpim-zrip3-7f375-rae")
+                .unwrap(),
+        ]),
+        compute_allocation: None,
+        memory_allocation: None,
+        freezing_threshold: None,
+        reserved_cycles_limit: None,
+    };
+
+    let create_canister_result: CreateCanisterResult =
+        ic_cdk::api::call::call_with_payment::<(CreateCanisterArg,), (CreateCanisterResult,)>(
+            MAINNET_CYCLES_MINTING_CANISTER_ID,
+            "create_canister",
+            (CreateCanisterArg {
+                settings: Some(settings),
+                subnet_type: None,
+                subnet_selection: Some(SubnetSelection::Subnet {
+                    subnet: Principal::from_text(subnet).unwrap(),
+                }),
+            },),
+            // 5T cycles
+            5_000_000_000_000,
+        )
+        .await
+        .expect("Error calling create_canister")
+        .0;
+
+    match create_canister_result {
+        CreateCanisterResult::Ok(canister_id) => return canister_id,
+        CreateCanisterResult::Err(create_canister_error) => match create_canister_error {
+            CreateCanisterError::Refunded {
+                refund_amount,
+                create_error,
+            } => {
+                ic_cdk::trap(&format!(
+                    "Refunded {} cycles due to error: {}",
+                    refund_amount, create_error
+                ));
+            }
+            CreateCanisterError::RefundFailed {
+                create_error,
+                refund_error,
+            } => {
+                ic_cdk::trap(&format!(
+                    "Error creating canister: {}. Error refunding cycles: {}",
+                    create_error, refund_error
+                ));
+            }
+        },
+    }
+}
+```
+
+-------------------------
+
+Samer | 2024-03-27 13:05:29 UTC | #3
+
+And btw, if I knew we had a dfx command for that, I would not have spent an hour writing that code!
+
+Nice to have though
+
+-------------------------
+
+Samer | 2024-03-27 13:16:45 UTC | #4
+
+I should also add that I tried the application subnets with lowest canister count first. Most failed until I got to subnets with ~4k canisters
+
+Any idea why?
+
+-------------------------
+
+Severin | 2024-03-27 13:59:42 UTC | #5
+
+dfx supports `--subnet`, `--subnet-type`, and `--next-to <canister>` 
+
+[quote="Samer, post:4, topic:28983"]
+I should also add that I tried the application subnets with lowest canister count first. Most failed until I got to subnets with ~4k canisters
+[/quote]
+
+The CMC has a list of 'default subnets' (plus some lists with public access, e.g. the fiduciary subnet type). If you don't pick a subnet on one of these public lists then the CMC will not let you create a canister there.  I would assume that the subnets with low canister counts simply are not on these lists
+
+-------------------------
+
+skilesare | 2024-03-27 14:19:01 UTC | #6
+
+If this is a feature now I'd imagine we'd need a command in motoko similar to ExperimentalCycles.add() to direct the subnet.  
+
+```
+ExperamentalC.subnet(xxxxx);
+let x = await myActor.Actor(initargs);
+```
+
+I know the ideal design of motoko was to try to abstract away this layer, but in reality, we sometimes need it.
+
+-------------------------
+
+timo | 2024-03-27 14:52:15 UTC | #7
+
+[quote="Samer, post:2, topic:28983"]
+I recently achieved this by calling the CMC `create_canister`
+
+```
+
+```
+[/quote]
+
+Doesn't the CMC canister require payment in ICP to create a canister? Or can I get away with cycles only here?
+
+-------------------------
+
+Samer | 2024-03-27 16:56:11 UTC | #8
+
+As you can see in the code, i used a call_with_payment
+
+No ledger transfers, just cycles from the canister within the call
+
+-------------------------
+
+Severin | 2024-03-27 17:06:13 UTC | #9
+
+[quote="timo, post:7, topic:28983"]
+Doesn’t the CMC canister require payment in ICP to create a canister?
+[/quote]
+
+`notify_create_canister` requires ICP. As part of the cycles ledger work I added `create_canister` on the CMC, which uses cycles attached to the call like the management canisters's `create_canister` does it too
+
+-------------------------
+
+timo | 2024-03-27 17:12:48 UTC | #10
+
+[quote="Severin, post:9, topic:28983"]
+As part of the cycles ledger work I added `create_canister` on the CMC
+[/quote]
+
+So it is relatively new that this is possible?
+
+[quote="Severin, post:9, topic:28983"]
+the management canisters’s `create_canister`
+[/quote]
+
+Just double-checking my understanding. If I use the management canister's create_canister then I get a canister on the same subnet as the canister that is making the call?
+
+-------------------------
+
+Severin | 2024-03-27 17:26:16 UTC | #11
+
+Yes, it's been available a month or three.
+
+You are right. If you go through the management canister you always land on the subnet you make the call from
+
+-------------------------
+
+claudio | 2024-03-27 17:43:10 UTC | #12
+
+@timo a possible workaround in Motoko might be to first create the canister `id` on a specific subnet with the CMC, and then use the lower level `(system Lib.Class)(#install ...id..)(args)` syntax to install the code to that canister id. Haven't tried it though.
+
+This might give you some inspiration..
+
+https://github.com/dfinity/motoko/blob/master/test/run-drun/actor-class-mgmt.mo
+
+-------------------------
+
+timo | 2024-04-09 08:01:22 UTC | #13
+
+[quote="Severin, post:11, topic:28983"]
+If you go through the management canister you always land on the subnet you make the call from
+[/quote]
+
+@Severin do you know if there are any plans to unify this? It seems a bit weird that there are two canisters I can call (management and CMC) to create a child canister, and they allow different arguments. Will it be possible in the future to specify a subnet when creating a child through the management canister?
+
+-------------------------
+
+Severin | 2024-04-09 08:15:53 UTC | #14
+
+It's possible, but we don't have any plans for now. While it would be possible, it would be surprisingly complex since it would break a few assumptions both in the management canister and the CMC implementations. Not that it would be super hard, just more work than it sounds like at first
+
+-------------------------
+
+timo | 2024-04-09 13:09:18 UTC | #15
+
+And can I test this entire flow locally? I mean can I deploy a CMC on a local replica and when calling create_canister on it then it will actually create one?
+
+-------------------------
+
+cryptoschindler | 2024-04-10 06:39:39 UTC | #16
+
+I just tried this and it did not work for me locally
+```
+Reject text: IC0503: Canister bkyz2-fmaaa-aaaaa-qaaaq-cai trapped explicitly: Couldn't create canister: #Refunded({create_error = "No subnets in which to create a canister."; refund_amount = 99_994_900_000_000})
+```
+
+You can find the code [here](https://github.com/letmejustputthishere/icrc7_launchpad/tree/feature/cmc-create-canister).
+
+FYI, currently it's not easily possible to get the CMC running locally with full functionality. We're working on fixing this by polishing the `dfx nns` extension.
+
+-------------------------
+

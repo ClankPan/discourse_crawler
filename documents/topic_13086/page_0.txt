@@ -1,0 +1,120 @@
+roman-kashitsyn | 2022-05-18 08:40:16 UTC | #1
+
+I'm happy to announce that [Rust CDK 0.5.1](https://docs.rs/ic-cdk/0.5.1/ic_cdk/) is out.
+There are [a few great additions](https://github.com/dfinity/cdk-rs/blob/main/src/ic-cdk/CHANGELOG.md#051---2022-05-16) hiding behind the minor version bump:
+
+
+1. The [long-standing issue with panicking after .await](https://mmapped.blog/posts/01-effective-rust-canisters.html#panic-await) is finally closed. The Rust CDK will correctly free resources if you trap across async boundaries. Huge thanks to @AdamS for elegantly implementing cleanups.
+2. @christian exposed [`call_raw*`](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/call/fn.call_raw.html) and [`arg_data_raw`](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/call/fn.arg_data_raw.html) functions. This API allows you to call canisters that do not encode their arguments as Candid or forward calls without decoding the payload.
+3. @hpeebles implemented [`BufferedStableReader`](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/stable/struct.BufferedStableReader.html) and [`BufferedStableWriter`](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/stable/struct.BufferedStableWriter.html) API for more efficient serialization (don't forget to measure when you optimize!).
+4. @roman-kashitsyn added [`notify*`](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/call/fn.notify_with_payment128.html) family of functions relying on the trick that @nomeata described in his [blog post](https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters#one-way-calls). If your canister uses _only_ `notify*` calls, it safe to upgrade the canister without stopping it first. The notify is a regular call setting a non-existing function as a callback. One practical implication of that implementation is that you get a refund if you attach cycles to the notification and the destination canister traps.
+
+Enjoy building on the IC with the improved Rust CDK!
+
+-------------------------
+
+jzxchiang | 2022-05-18 22:26:24 UTC | #2
+
+> 4. @roman-kashitsyn added [ `notify*` ](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/call/fn.notify_with_payment128.html) family of functions relying on the trick that @nomeata described in his [blog post ](https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters#one-way-calls). If your canister uses *only* `notify*` calls, it safe to upgrade the canister without stopping it first. The notify is a regular call setting a non-existing function as a callback. One practical implication of that implementation is that you get a refund if you attach cycles to the notification and the destination canister traps.
+
+Very exciting! Do you happen to know if and when Motoko will support the same thing?
+
+-------------------------
+
+nomeata | 2022-05-19 06:16:29 UTC | #3
+
+Since [0.6.17](https://github.com/dfinity/motoko/releases/tag/0.6.17), released last December. Sometimes Motoko isn’t last :-)
+
+-------------------------
+
+GLdev | 2022-05-19 06:18:11 UTC | #4
+
+[quote="roman-kashitsyn, post:1, topic:13086"]
+@roman-kashitsyn added [ `notify*` ](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/call/fn.notify_with_payment128.html) family of functions relying on the trick that @nomeata described in his [blog post ](https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters#one-way-calls). If your canister uses *only* `notify*` calls, it safe to upgrade the canister without stopping it first. The notify is a regular call setting a non-existing function as a callback. One practical implication of that implementation is that you get a refund if you attach cycles to the notification and the destination canister traps.
+[/quote]
+
+Wooot! Nice work, very excited to try this.
+
+-------------------------
+
+levi | 2022-05-27 00:17:39 UTC | #6
+
+[quote="roman-kashitsyn, post:1, topic:13086"]
+The Rust CDK will correctly free resources if you trap across async boundaries. Huge thanks to @AdamS for elegantly implementing cleanups.
+[/quote]
+
+Hi @AdamS, can we hear about the elegance of these cleanups? 
+How does it work and how is it used?
+
+-------------------------
+
+flyq | 2022-05-27 00:48:31 UTC | #7
+
+In motoko, using ignore await canister_a.method(xxx)
+
+-------------------------
+
+rckprtr | 2022-05-27 01:06:09 UTC | #8
+
+> 1. @hpeebles implemented [ `BufferedStableReader` ](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/stable/struct.BufferedStableReader.html) and [ `BufferedStableWriter` ](https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/stable/struct.BufferedStableWriter.html) API for more efficient serialization (don’t forget to measure when you optimize!).
+
+Curious what techniques you use to measure?
+
+-------------------------
+
+roman-kashitsyn | 2022-05-27 09:00:49 UTC | #9
+
+You can find the implementation in these PRs:
+* https://github.com/dfinity/cdk-rs/pull/232
+* https://github.com/dfinity/cdk-rs/pull/250
+
+-------------------------
+
+claudio | 2022-05-27 11:05:34 UTC | #10
+
+[quote="flyq, post:7, topic:13086, full:true"]
+In motoko, using ignore await canister_a.method(xxx)
+[/quote]
+
+Actually, I don't think that's correct. The shared function needs to be declared as a oneway function (returning `()`, not `async ()`) and just called without an await.
+
+So, for this example:
+
+Actor:
+```
+actor canister_a {
+    // `()` return  declares a Candid oneway function  that can't be awaited. 
+   public shared func method() : () { 
+     ...
+   };
+}
+```
+
+Client:
+
+```
+   canister_a.method(); // no `await` possible (given return type of `()`, not `async ()`)
+```
+
+Ain''t that right, @nomeata?
+
+-------------------------
+
+AdamS | 2022-05-27 15:08:56 UTC | #11
+
+I think I would call it the exact opposite of elegant. It takes advantage of the fact that WASM is single-threaded to use global state. Essentially, it sets a global bool, executes the future, and then unsets it; the executor, when asked to execute a future, checks the global bool, and if it is set then it doesn't actually execute the future but simply drops it.
+
+The behavior is that all destructors are run in the case of an inter-canister trap, but execution does not continue. You can attach custom cleanup logic by placing it in a destructor via a crate like [`scope_guard`](https://docs.rs/scope-guard/latest/scope_guard/).
+
+-------------------------
+
+nomeata | 2022-05-27 19:35:19 UTC | #12
+
+[quote="claudio, post:10, topic:13086"]
+Ain’'t that right, @nomeata?
+[/quote]
+
+II tthhiinnkk ssoo, yyeess.
+
+-------------------------
+

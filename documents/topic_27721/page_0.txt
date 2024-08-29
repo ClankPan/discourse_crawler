@@ -1,0 +1,81 @@
+lastmjs | 2024-02-20 18:41:39 UTC | #1
+
+Here's the error I am getting while trying to deploy an Azle canister:
+
+```
+Installing canisters...
+Upgrading code for canister backend, with canister ID bkyz2-fmaaa-aaaaa-qaaaq-cai
+Error: Failed while trying to deploy canisters.
+Caused by: Failed while trying to deploy canisters.
+  Failed while trying to install all canisters.
+    Failed to install wasm module to canister 'backend'.
+      Failed during wasm installation call: The replica returned an HTTP Error: Http Error: status 429 Too Many Requests, content type "text/plain", content: The service is overloaded.
+```
+
+I am trying to deploy with a ~74 MiB video file. Azle allows you to specify assets to be included automatically in the binary during compilation, and it uses the `include_bytes` macro under-the-hood to achieve this.
+
+We should have up to 90 MiB of data section available in our Wasm binaries, so I'm wondering why this is failing. It's also a strange error, it should really tell me what's going on if it is the Wasm binary being too big, I suspect there is some other issue though.
+
+-------------------------
+
+dsarlis | 2024-02-21 13:22:58 UTC | #2
+
+The error can happen when you submit too many ingress messages to the replica. The large Wasm is split into multiple messages under the hood by dfx and submitted as a series of ingress messages. It's still strange though that you hit it as you shouldn't need that many messages for the Wasm size you mention.
+
+Can you please give us some reproduction instructions, basically the Wasm you are trying to install might be enough, and we can look into it. I suspect we might need some retry logic in dfx but I would also like to understand why we even hit this case in the first place.
+
+-------------------------
+
+lastmjs | 2024-02-23 20:34:03 UTC | #3
+
+What is the ingress message rate limit? We're working on large file uploads in Azle and we're now hitting this limit while trying to send a 1 GiB file. We'd like to know the throttling necessary
+
+-------------------------
+
+dsarlis | 2024-02-26 14:44:20 UTC | #4
+
+The rate limit you were hitting in the original message was a 50 ingress rate limit per replica at the time of submitting the ingress. However, if you're trying to send a 1GiB file you might start hitting other issues, e.g. the throughput we can get from consensus is roughly 4MiB per block (which is typically also per second given the current speed on most subnets). I'd recommend pacing at that number because rate limit or not, you can't get much better than that throughput really.
+
+-------------------------
+
+lastmjs | 2024-03-07 18:21:39 UTC | #5
+
+The throttling we have gotten to work locally was working pretty well, and was slow but not too slow. When trying to deploy to mainnet, we are hitting the throttling limits very quickly. I'm afraid this is going to cause extremely slow file uploads.
+
+Hitting limits like this:
+
+```
+Server returned an error:
+  Code: 429 (Too Many Requests)
+  Body: load_shed: Overloaded
+
+  Retrying request.
+```
+
+And this:
+
+```
+Server returned an error:
+  Code: 400 (Bad Request)
+  Body: Specified ingress_expiry not within expected range: Minimum allowed expiry: 2024-03-07 18:09:26.089145237 UTC, Maximum allowed expiry: 2024-03-07 18:14:56.089145237 UTC, Provided expiry:        2024-03-07 18:09:00 UTC
+  Retrying request.
+```
+
+Can we somehow get this throttling to be lifted or the message limit lifted? This is a very bad developer experience, it already wasn't the best locally but on mainnet I'm afraid it's going to be much worse.
+
+-------------------------
+
+lastmjs | 2024-03-07 18:23:04 UTC | #6
+
+For the local replica we had a throttle of 500 milliseconds between 2 MB chunks...that throttle worked well locally, but is causing the errors above in production.
+
+-------------------------
+
+lastmjs | 2024-03-07 18:27:06 UTC | #7
+
+Okay we bumped the throttle up to 2_000 milliseconds...which isn't too bad, we had removed the throttle and did sequential chunk uploading which took a very long time, 2_000 milliseconds isn't so bad.
+
+I still would love to brainstorm solutions to removing the message limit, it's causing us a lot of work (message limit, heap limit, and instruction limit combined make uploading large files quite complicated).
+
+-------------------------
+

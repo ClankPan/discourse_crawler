@@ -1,0 +1,132 @@
+diegop | 2021-09-04 01:20:09 UTC | #1
+
+
+## Summary
+
+[The high user traffic incident of September 2, 2021](https://forum.dfinity.org/t/high-user-traffic-incident-retrospective-thursday-september-2-2021/6928) brought back to the forefront the idea that the community prioritizes work for load-balancing canisters across subnets.
+
+
+### Status
+
+Community consideration. 
+
+## What you can do to help
+
+* Ask questions
+* Propose ideas
+
+## Rationale
+
+- People in the community have been bringing up the idea that subnets be able to load balance canisters in the case of peaks. Some examples:
+
+1. ["In the future, could the IC support load-balancing across subnets?"](https://www.reddit.com/r/dfinity/comments/pg3cda/icp_offline_stats/hbawdjg)
+
+
+
+## Key people involved
+ @free @janeshchhabra @diegop 
+
+## Timelines
+
+1. [ ] Forum-based consensus on the low-hanging fruit or problems we want to address: Sept 10, 2021 
+2. [ ] Community Conversation: TBD  
+3. [ ] Design proposed to the community: TBD
+4. [ ] NNS proposal to vote on a design: TBD
+5. [ ] NNS proposal upgrade the network: TBD
+
+## Relevant Background
+
+- https://forum.dfinity.org/t/high-user-traffic-incident-retrospective-thursday-september-2-2021/6928
+
+A lot of the the basic building blocks are already there (specifically copying one canister state from one subnet to another), "all" that's needed is to implement the orchestration:
+
+* stop the canister, wait until all call contexts are closed; optionally let it keep serving queries.
+* remove it from the registry routing table;
+* copy its state to the new subnet; optionally let it serve queries there;
+* update the routing table with a new location;
+* wait until all subnets have caught up to the registry version with the change; (this may be difficult if a single subnet is stalled for a long time; message timeouts may or may not help here)
+* start the canister.
+
+-------------------------
+
+lastmjs | 2021-09-15 14:37:51 UTC | #2
+
+I would like to suggest load balancing within subnets using read replicas, as a priority over load balancing across subnets.
+
+See my more detailed thoughts here with some team acknowledgement of similar thinking: https://forum.dfinity.org/t/high-user-traffic-incident-retrospective-thursday-september-2-2021/6928/34
+
+Considering that the high traffic incident was mostly because of query calls, read replicas within a single subnet should have really helped (besides the boundary node issues), and it seems to me a much simpler engineering problem to ad-hoc add read replicas to an existing subnet, rather than split up existing subnets.
+
+Subnet load balancing might make sense for when a subnet is storing too much data in memory, or perhaps for update calls. But query calls I think can be handled in this simpler way.
+
+-------------------------
+
+free | 2021-09-15 22:28:00 UTC | #3
+
+[quote="lastmjs, post:2, topic:6980"]
+Considering that the high traffic incident was mostly because of query calls, read replicas within a single subnet should have really helped
+[/quote]
+
+Most of the load was indeed from query calls. But much of this was due to a less-than-efficient orthogonal persistence implementation (that does 3 syscalls for every 4 KB heap page that is written to), which also affected query calls (on the one hand because the heap image has to be reconstructed from a checkpoint plus overlaid deltas; on the other hand because the inter-canister query prototype we're working on requires orthogonal persistence support for queries too, as they get suspended while awaiting responses and then need to be resumed). Because of that (and because of earlier issues with the `pjkjw` subnet) both updates and queries were limited to a single core each, so query throughput was (very) significantly limited.
+
+We have been working on optimizing the orthogonal persistence implementation, particularly for the multi-threaded execution case, which is now over 10x faster in our testing. This should allow us to revert the single-core limitation on `pjljw` and, more generally, to support significantly higher query throughput across all subnets.
+
+[quote="lastmjs, post:2, topic:6980"]
+it seems to me a much simpler engineering problem to ad-hoc add read replicas to an existing subnet, rather than split up existing subnets.
+[/quote]
+
+It would likely be a somewhat simpler problem to solve but it would still require significant effort, unless we're talking the simplest possible implementation, which is adding replicas to a subnet that execute all updates while handling some query load, but don't participate in consensus. In which case, doing a full state sync (synchronizing the full state of the subnet) is likely to take on the order of 1 hour (if another replica is not already present in the same data center) and executing updates is also likely to take up significant resources, that the replica may otherwise use entirely for executing queries.
+
+At that point, you may as well add another regular replica that takes part in consensus and scale query capacity that way at the cost of a very tiny increase in consensus latency. Which is something that can be done today (again, after a 1 hour state sync; which would not have been particularly useful in the ICPunks case).
+
+A much more elegant solution would be to be able to state sync single canisters (as opposed to the whole subnet state) and either continue applying deltas every round or else using a single core to execute the same updates as the subnet while using all other cores to process queries. Neither of which is trivial: we can't currently state sync a single canister (and it may be expensive to apply deltas every round; they could be hundreds of MB that already overloaded replicas will have to send out); as for executing updates, some of those updates might come from canisters on the same subnet, even produced within the same round.
+
+I guess all I'm trying to say is that it's far from a simple problem to implement efficiently and it would only solve query load problems. Whereas canister migration might be more generally useful (loadbalancing, grouping related canisters on the same subnet or spreading them across subnets to better deal with load, etc.).
+
+-------------------------
+
+jzxchiang | 2021-09-16 06:26:10 UTC | #4
+
+How does the IC currently decide what subnet a newly created canister gets deployed to? Was it pure coincidence that Entrepot, ICPunks, and Dfinance canisters were all sharing the same subnet?
+
+Also, I'm curious how accurate this [technical overview](https://medium.com/dfinity/a-technical-overview-of-the-internet-computer-f57c62abc20f) from Sept 2020 is in describing the current state of the IC mainnet:
+
+Here are a couple of interesting features that Medium post describes:
+
+* The NNS can split subnets to distribute load without interrupting canisters. Wouldn't this have solved this issue?
+* Canisters running in "fiduciary" subnets can hold ICP and have a replication factor of 28. AFAIU the recent NNS [proposal](https://forum.dfinity.org/t/enable-canisters-to-hold-icp/6153/70) makes a "data" subnet fiduciary-like but doesn't actually add a new type of fiduciary subnet.
+* Unlike updates, query calls run concurrently in different threads. This seems at odds with @free's comment about updates and queries currently being limited to a single core (unless there are multiple threads running in a single-core environment?).
+
+Any clarifications would be super helpful.
+
+-------------------------
+
+free | 2021-09-16 11:48:47 UTC | #5
+
+[quote="jzxchiang, post:4, topic:6980"]
+How does the IC currently decide what subnet a newly created canister gets deployed to?
+[/quote]
+
+A canister gets deployed onto the same subnet as the (wallet or other) canister that created it. Wallet canisters get created on random subnets, AFAIK.
+
+[quote="jzxchiang, post:4, topic:6980"]
+* The NNS can split subnets to distribute load without interrupting canisters. Wouldn’t this have solved this issue?
+* Canisters running in “fiduciary” subnets can hold ICP and have a replication factor of 28. AFAIU the recent NNS [proposal](https://forum.dfinity.org/t/enable-canisters-to-hold-icp/6153/70) makes a “data” subnet fiduciary-like but doesn’t actually add a new type of fiduciary subnet.
+[/quote]
+
+Neither of these features is actually implemented yet (although the technical overview makes it sound like they are). The latter is being voted on (the thread you posted) and is already in the works; the former is still under discussion on this thread and internally (we're still at the stage where we're trying to come up with the most efficient and safe way to implement it and the roll-out stages, if necessary).
+
+[quote="jzxchiang, post:4, topic:6980"]
+Unlike updates, query calls run concurrently in different threads. This seems at odds with @free’s comment about updates and queries currently being limited to a single core (unless there are multiple threads running in a single-core environment?).
+[/quote]
+
+Queries are independent and can run in parallel on mulitple threads. But if you re-read my comment above, somewhere in the middle of that wall of text I mention that the `pjljw` subnet was limited to running a single execution and a single query thread because of performance issues we encountered with our orthogonal persistence implementation in the presence of multithreading. We (and that doesn't include me) have worked on improving this over the past couple of weeks and will deploy those changes over the coming week (including reverting the single-thread limit on `pjljw`).
+
+-------------------------
+
+lastmjs | 2021-09-16 12:28:49 UTC | #6
+
+Thanks for the detailed response. I'll just let my comments stand and assume my ideas here have been understood and taken into consideration during this design process. It's definitely not simple, and there seem to be some nuanced tradeoffs.
+
+-------------------------
+

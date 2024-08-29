@@ -1,0 +1,338 @@
+jamesbeadle | 2024-05-26 08:03:56 UTC | #1
+
+I'm trying to transfer using ledger/icrc but get the following error:
+
+![image|564x62](upload://gDc8Dtuz3tWmSwb2GwWA8lZsO25.png)
+
+
+I'm trying to transfer from my users caller account on the FPL ledger to my apps backend account with the caller as a sub account.
+
+Here is the transfer code:
+
+async function saveEuro2024Predictions(
+    dto: Euro2024PredictionDTO,
+  ): Promise<any> {
+    try {
+      const identityActor = await ActorFactory.createIdentityActor(
+        authStore,
+        process.env.FOOTBALL_GOD_BACKEND_CANISTER_ID ?? "",
+      );
+
+      if (dto.alreadyEntered) {
+        const result = await identityActor.submitEuro2024Prediction(dto);
+        console.log(result);
+        if (isError(result)) {
+          console.error("Error saving Euro2024 prediction.");
+          return;
+        }
+        return result;
+      }
+
+
+      authStore.subscribe(async (auth) => {
+                
+        const agent = await createAgent({
+          identity: auth.identity!,
+          host:  process.env.DFX_NETWORK === "ic"
+          ? `https://${ActorFactory.getAgent()}.icp-api.io`
+          : `http://localhost:8080/?canisterId=qhbym-qaaaa-aaaaa-aaafq-cai`,
+          fetchRootKey: true
+        });
+
+        const { transfer } = IcrcLedgerCanister.create({
+          agent,
+          canisterId: Principal.fromText("avqkn-guaaa-aaaaa-qaaea-cai")
+        });
+        
+        let principal = auth.identity?.getPrincipal();
+        if(principal){
+          let subaccount: Uint8Array = principalToSubAccount(principal);
+          console.log(subaccount)
+          let transfer_result = await transfer({
+            to: {
+              owner: Principal.fromText(
+                process.env.FOOTBALL_GOD_BACKEND_CANISTER_ID ?? "",
+              ),
+              subaccount: [subaccount],
+            },
+            fee: 100_000n,
+            memo: new Uint8Array(Text.encodeValue("0")),
+            from_subaccount: undefined,
+            created_at_time: BigInt(Date.now()),
+            amount: 100_000_000_000n,
+          });
+          console.log(transfer_result);
+
+
+          
+        }
+
+
+
+Thinking the problem might be the undefined from_subaccount but I transferred from my local nns to that sub account using just my apps principal id. So maybe the from_subaccount needs to be a combination of (FPL_SNS_LEDGER_CANISTER, CALLER). If so, how do I create this blob from these 2 principals..
+
+-------------------------
+
+kolexstrings | 2024-05-26 09:20:05 UTC | #2
+
+If i get you correctly you want the caller to make the transfer right?
+
+to do that you should be passing the prinicpalId as the owner not the canisterId 
+something like this
+
+```
+let principal = auth.identity?.getPrincipal();
+    if(principal){
+      let subaccount: Uint8Array = principalToSubAccount(principal);
+      console.log(subaccount)
+      let transfer_result = await transfer({
+        to: {
+          owner: Principal.fromText(principal), //take note of this line
+          subaccount: [subaccount],
+        },
+        fee: 100_000n,
+        memo: new Uint8Array(Text.encodeValue("0")),
+        from_subaccount: undefined,
+        created_at_time: BigInt(Date.now()),
+        amount: 100_000_000_000n,
+      });
+      console.log(transfer_result);
+```
+
+with this, the caller is recognized as the one doing the transfer
+
+-------------------------
+
+jamesbeadle | 2024-05-26 09:32:02 UTC | #4
+
+Well that's the 'to' field. I want to transfer 'to' my app, whose principal is the football_god_backend and I want to mark it as the users by using the caller as the sub account.
+
+-------------------------
+
+kolexstrings | 2024-05-26 09:44:45 UTC | #5
+
+Oh sorry about that 
+
+maybe you should try using square bracket for the from_subaccount 
+
+```
+from_subaccount: []
+```
+instead of undefined
+since it's supposed to be an (opt vec nat8), i.e an optional field
+
+-------------------------
+
+jamesbeadle | 2024-05-26 09:57:21 UTC | #6
+
+[quote="kolexstrings, post:5, topic:31169"]
+`[]`
+[/quote]
+
+Hey, so thanks for this. 
+
+I get a new error (progress):
+
+![image|327x331](upload://kSZH5ca1JMZbAcL8uUKJbvsOiEY.png)
+
+-------------------------
+
+peterparker | 2024-05-26 10:54:49 UTC | #7
+
+> ![image|564x62](upload://gDc8Dtuz3tWmSwb2GwWA8lZsO25.png)
+
+Before rushing to change the code, did you actually had a look to the all error?
+
+"Failed to transfer" is just the message, the error returned by `transfer()` provides more information, namely an `errorType`. Having a further look to it should provide more information about the effective issue.
+
+It should provide you one of those error:
+
+```
+export type TransferError =
+  | {
+      GenericError: { message: string; error_code: bigint };
+    }
+  | { TemporarilyUnavailable: null }
+  | { BadBurn: { min_burn_amount: Tokens } }
+  | { Duplicate: { duplicate_of: BlockIndex } }
+  | { BadFee: { expected_fee: Tokens } }
+  | { CreatedInFuture: { ledger_time: Timestamp } }
+  | { TooOld: null }
+  | { InsufficientFunds: { balance: Tokens } };
+```
+
+-------------------------
+
+jamesbeadle | 2024-05-26 11:06:46 UTC | #8
+
+Ok so here is the full console error:
+
+![image|314x500](upload://orV8qWs4EBVk3r6YD8Kcjex6Aiv.png)
+
+I do look to log the result and I do catch the error but I don't know how to extract the TransferError detail :pensive:
+
+-------------------------
+
+peterparker | 2024-05-26 11:10:45 UTC | #9
+
+That's the error of your updated code no? Not the original error when you opened this thread no?
+
+-------------------------
+
+jamesbeadle | 2024-05-26 11:29:26 UTC | #10
+
+[quote="jamesbeadle, post:1, topic:31169"]
+`undefined`
+[/quote]
+
+I believe the only change I've made since opening the thread is updating the from_subaccount: undefined to from_subaccount: []
+
+But again, that error is not very descriptive
+
+![image|652x262](upload://7nVfFzMFspC0o7x1tCVORwrE6l3.png)
+
+-------------------------
+
+peterparker | 2024-05-26 11:32:05 UTC | #11
+
+[quote="jamesbeadle, post:10, topic:31169"]
+But again, that error is not very descriptive
+[/quote]
+
+Again, this error contains an `errorType`. Can you debug it and provide the related error type?
+
+-------------------------
+
+peterparker | 2024-05-26 11:33:19 UTC | #12
+
+```
+try {
+  transfer
+} catch err {
+  if ("errorType" in err) {
+    console.error(err.errorType)
+```
+
+-------------------------
+
+jamesbeadle | 2024-05-26 11:37:39 UTC | #13
+
+I've probably set something up wrong as I can't do that
+
+![image|607x403](upload://xfI6Wlottr7gKhC1MV97rkRxKoT.png)
+
+-------------------------
+
+peterparker | 2024-05-26 11:40:54 UTC | #14
+
+Well, that was just a snippet to explain, I excepted you to finalize the proper code. You can cast it as `any` for quick debug or the actual type is `IcrcTransferError`.
+
+-------------------------
+
+peterparker | 2024-05-26 11:41:56 UTC | #15
+
+You can also maybe just `console.log(err)` probably that might do too.
+
+```
+try 
+   transfer
+catch err
+  console.log(err)
+```
+
+-------------------------
+
+jamesbeadle | 2024-05-26 11:46:28 UTC | #16
+
+Yeah the whole time it's been wrapped in a try catch with a log for the error but it doesn't ever get there. Just doing this returns me to my original error:
+
+![image|612x333](upload://nFjDCFk5tQmWn4jLYo95o7y1pXM.png)
+
+![image|628x240](upload://iOR3VwBd0G9fNTjRCrCS0HAM9lx.png)
+
+-------------------------
+
+jamesbeadle | 2024-05-26 11:50:47 UTC | #17
+
+[quote="peterparker, post:7, topic:31169"]
+`InsufficientFunds`
+[/quote]
+
+As for the casting I can't seem to find the library with the error types you mention although I have IcrcTransferError but requires <T>
+
+![image|603x243](upload://rPEq673nAZTcrRto7eO8X7Blkwf.png)
+
+-------------------------
+
+peterparker | 2024-05-26 11:57:16 UTC | #18
+
+Please try either:
+
+```
+catch (err: unknown) {
+  console.log(err); // <----- LOG not error
+```
+
+or
+
+```
+catch (err: unknown) {
+   if ("errorType" in (err as IcrcTransferError<unknown>) {
+      console.log((err as IcrcTransferError<unknown>).errorType);
+```
+
+or just
+
+```
+catch (err: any) {
+  console.log(err.errorType);
+```
+
+-------------------------
+
+jamesbeadle | 2024-05-26 11:58:11 UTC | #19
+
+[quote="peterparker, post:7, topic:31169"]
+`TransferError`
+[/quote]
+
+![image|259x82](upload://tLvpHZXIpW6uSqz342VbJW3LX8w.png)
+
+Thank you, so it's TooOld, will take a look at the dates etc.
+
+-------------------------
+
+peterparker | 2024-05-26 12:00:21 UTC | #20
+
+From Rosetta:
+
+> // The request is too old.
+    // The ledger only accepts requests created within 24 hours window.
+    // This is a non-recoverable error.
+
+-------------------------
+
+peterparker | 2024-05-26 12:01:26 UTC | #21
+
+[quote="kolexstrings, post:2, topic:31169"]
+`created_at_time: BigInt(Date.now()),`
+[/quote]
+
+This looks wrong. `Date.now` gives milliseconds. The IC works with nanoseconds.
+
+```
+const nowInBigIntNanoSeconds = (): bigint => BigInt(Date.now()) * BigInt(1e6);
+```
+
+-------------------------
+
+jamesbeadle | 2024-05-26 12:02:51 UTC | #22
+
+![image|640x123](upload://pxsiU4AWlXM1d6wqPuLGjm38u6w.png)
+
+Thanks yeah so I converted the date properly and it looks like I'm good from here. 
+
+Thanks everyone!
+
+-------------------------
+

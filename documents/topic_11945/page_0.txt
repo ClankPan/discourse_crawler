@@ -1,0 +1,272 @@
+lastmjs | 2022-04-05 22:17:41 UTC | #1
+
+I'm running into some strange issues locally while testing out some heartbeat functionality, and I just want to check my reasoning. Is it possible that the heartbeat gets called before the init update call is completed and its state is committed?
+
+-------------------------
+
+berestovskyy | 2022-04-06 06:56:02 UTC | #2
+
+Hi lastmjs,
+`init` an integral part of `install_code`, so if it fails, the whole `install_code` fails. So it's definitely happening before any heartbeat or update call being processed, but might run in parallel with queries.
+
+Could you please provide more detail on what exactly you're observing?
+
+-------------------------
+
+berestovskyy | 2022-04-06 07:52:41 UTC | #3
+
+oh, btw if the "init update call" is your own handler, not the `canister_init` method the IC calls on install/reinstall code, then it's exactly the opposite: the heartbeat will be called before any ingress or inter-canister messages will be processed.
+
+sorry for the confusion...
+
+-------------------------
+
+ildefons | 2022-04-06 10:10:28 UTC | #4
+
+@berestovskyy Excuse me for the simple questions:
+1) is the hearbeat call also an update call? has it the same cost in cycles than an update call?
+2) what is an ingress message? is this different than query and update calls?
+
+-------------------------
+
+lastmjs | 2022-04-06 12:32:56 UTC | #5
+
+Thanks for the replies...actually the issues were probably not stemming from what I thought. I had an obvious bug in my code. But these thoughts are useful as I analyze behavior, thanks!
+
+-------------------------
+
+berestovskyy | 2022-04-06 15:54:21 UTC | #6
+
+hey @ildefons 
+No problem at all!
+
+Regarding the the heartbeat:
+
+1. The heartbeat method gets called once per round at most, at the beginning of the round.
+2. It can mutate the Canister state (i.e. update the state).
+3. The Canister gets charged for executing the heartbeats as normal.
+4. The instructions limit is shared across the heartbeat and the update messages.
+
+Regarding the ingress messages:
+
+1. There are messages which can mutate (update) the Canister state and which have no effect on the state (queries).
+2. The state could be mutated with a message from another Canister (inter-canister call) or from a user (ingress message).
+3. The query methods can technically mutate the state (i.e. they can change variables as normal), but all those changes are discarded at the end of the query execution.
+
+Hope that helps 😉
+
+-------------------------
+
+nomeata | 2022-04-08 16:14:20 UTC | #7
+
+[quote="lastmjs, post:5, topic:11945"]
+I had an obvious bug in my code.
+[/quote]
+
+So this is resolved?
+
+-------------------------
+
+lastmjs | 2022-04-08 16:41:38 UTC | #8
+
+For now yes, it is resolved to my satisfaction
+
+-------------------------
+
+nomeata | 2022-04-08 17:10:18 UTC | #9
+
+Then, if convenient, you can check the “resolved” checkbox next to one of the responses, and the post will appear as resolved in the main overview. Makes it easier to spot posts that still need attention.
+
+-------------------------
+
+jzxchiang | 2022-04-09 05:50:02 UTC | #10
+
+It would be nice if there was a way for a canister to subscribe to every X heartbeats instead of every heartbeat. Right now, it's pretty cycle intensive. (You can implement some approximation of that in the heartbeat function, but it still gets called every round.)
+
+-------------------------
+
+lastmjs | 2022-04-09 12:19:59 UTC | #11
+
+I would really like to see this functionality as well. There is at least one very major use case that @bob11 and I have discussed that realistically be done without a much cheaper heartbeat.
+
+We would like register a heartbeat to be called only once per day or per week or per month for example. Also, it would be nice to have the ability to register multiple heartbeats. I think this is essential to our use case as well.
+
+-------------------------
+
+nomeata | 2022-04-09 12:26:05 UTC | #12
+
+The idea was that people write fully featured cron _canisters_ that you then subscribe to, and that the heartbeat is the low-level feature used by such cron canisters. Would that not work for you? Why don’t you write such a canister?
+
+-------------------------
+
+lastmjs | 2022-04-09 12:29:24 UTC | #13
+
+That canister will be very expensive to run. And then someone has to maintain that service for other canisters to use. The best DX is to allow individual canisters to register directly with the system with whatever cron parameters it needs.
+
+-------------------------
+
+lastmjs | 2022-04-09 12:30:04 UTC | #14
+
+But I agree it could work in the mean time. I still think the system should provide a more granular heartbeat.
+
+-------------------------
+
+GLdev | 2022-04-09 12:31:18 UTC | #15
+
+I'm just finishing up the starter app for the scalability bounty, and I'm beginning to think that the way forward will be with a per-project dedicated cron canister, where you'll call your canisters from a central heartbeat-enabled canister. It would bring the best from both worlds, you'd have granular control, you'd be able to know what services you call into, and you'd get to enjoy the benefits of a cron system.
+
+If I have time before the hackathon I'll give it a go, see what I can come up with in a weekend.
+
+-------------------------
+
+nomeata | 2022-04-09 13:54:26 UTC | #16
+
+Sure, it’s alway seems easier for the system provide anything. But I doubt that sentiment will scale – even something as simple sounding as a cron service has so many different possible features, just starting with configuring of how to specify the intervals.
+
+And why stop at a cron canister? How about a cycle balance watching service? A shareded database? A log viewer? A Single Sign On service?  …
+
+I think it’ll be better in the long run if the Internet Computer _system_ focuses on bare primitives, embrace the vision of composable service, and allow anyone to build such services, instead of just impatiently waiting for the core devs at DFINITY to build them.
+
+Obligatory reference to unix: While `cron` is part of every (well, most) distributions, it is _not_ part of the kernel. I often find that the kernel/userspace separation in Linux and unix gives good guidance for the system/platform separation in the Internet Computer.
+
+And conversely, if it is impractical to use a canister to provide cron services to many canisters, then _that_ smells like a failure of the Internet Computer to achieve the vision behind it. So if “cron canisters” don’t work now, we should maybe use this to improve the system to make them work, rather than giving up and stuffing more features into the core components.
+
+-------------------------
+
+lastmjs | 2022-04-22 15:39:26 UTC | #17
+
+I agree that we need to be pragmatic about what features to leave in or out of the system. In this case I lean towards the system providing this functionality leading to the simplest and most efficient implementation compared to an implementation in application-space.
+
+> And conversely, if it is impractical to use a canister to provide cron services to many canisters, then *that* smells like a failure of the Internet Computer to achieve the vision behind it. So if “cron canisters” don’t work now, we should maybe use this to improve the system to make them work, rather than giving up and stuffing more features into the core components.
+
+That's exactly what I am suggesting we do, improve the system to make cron canisters work. Any cron canister is going to rely on the heartbeat functionality if it is to run entirely on the IC. How I suggest we do this is change the system to allow canisters to register when the heartbeat function should be called, instead of calling it nearly every second on every canister that has a registered heartbeat function.
+
+It doesn't seem to me that a lot of information would need to be stored by the system per canister to achieve this, and hopefully it could just be stored in the canister's memory space somehow.
+
+In my experience with heartbeat it is simply too course and expensive to use nicely. Any canisters spun up to provide cron services to other canisters will become incredibly expensive to run and will reach the scalability limits of a single canister performing many cross-canister calls per heartbeat function.
+
+The design of the heartbeat is too course right now, and I think a relatively simple improvement at the system level could make the feature much more usable.
+
+There is definitely something wrong with heartbeat, various people are smelling it:
+* https://forum.dfinity.org/t/cycle-burn-rate-heartbeat/12090
+* https://forum.dfinity.org/t/why-does-a-canister-keep-consuming-cycles/10821/7
+* @bob11's experience at Toniq
+
+-------------------------
+
+lastmjs | 2022-04-22 15:39:47 UTC | #18
+
+This is an interesting idea: https://forum.dfinity.org/t/cycle-burn-rate-heartbeat/12090/27, an `inspect_message` for heartbeat.
+
+-------------------------
+
+PaulLiu | 2022-04-22 19:27:14 UTC | #19
+
+It is very clear that no one-size-fits-all solution exists for cron.
+
+But on the other hand, I can write a public cron service with the following interface:
+
+```
+type Seconds = Nat64;
+type Tag = Nat64;
+type Job = Nat64;
+
+service {
+  schedule: ({ interval: Seconds; tag: Tag; callback: (Tag) -> () }) -> (Job);
+  cancel: (Job) -> ();
+}
+```
+
+Another canister will have to send some cycles along when scheduling a job. These cycles will be deducted by a fixed fee each time when callback is invoked. A job will no longer run if cancelled or it runs out of cycles.
+
+I don't see why it is so hard to offer such a service for people to use. It might even be profitable with appropriate fee setting and enough users. 
+
+But it does not exist today. Maybe it is because people don't want it enough?
+
+-------------------------
+
+nomeata | 2022-04-22 19:28:58 UTC | #20
+
+[quote="lastmjs, post:17, topic:11945"]
+Any canisters spun up to provide cron services to other canisters will become incredibly expensive to run
+[/quote]
+
+That seems to be the crux. I’d expect for a (popular) cron server, decently implemeted to keep the heartbeat short when nothing to do, the extra cost due to the “stupid” heartbeat interface is acceptable. But it’s just an expectation without doing the reseach and math.
+
+Maybe the system charges too much for the heartbeat? Maybe some per-message constant cost is charged that isn’t really needed for such a “non-message” that doesn't take space in the blocks.
+
+-------------------------
+
+jzxchiang | 2022-04-23 04:53:29 UTC | #21
+
+> But it does not exist today. Maybe it is because people don’t want it enough?
+
+Speaking for myself, I want cheap cron badly but I'm not sure I'm ready to trust a "public" canister that I send cycles to and that invokes my canister on a periodic basis. That canister would need to be autonomous, which very few people have done so far (and for good reason, since the source code needs to be open, airtight, and preferably audited).
+
+I can see it happening in the future, but I need cheap heartbeat right now. I could build such a public canister, but there's no guarantee that enough people will choose to use it for the time spent to be worth it. I might as well spend an hour setting up a cronjob on AWS that calls my canister.
+
+(I know this sounds like I'm making excuses, but I want to be brutally honest on the thought process that's going through my head.)
+
+What I'm curious about is how much work it would take for the replica to support configurable heartbeat intervals or even an `inspect_message` for heartbeats. Is it a lot of work? Even something simple like a canister exposing some simple integer `heartbeat_interval` configuration variable that tells the replica how often to call its heartbeat (with the unit being # of blocks) would go a very long way, I think.
+
+EDIT: Here is a [reason](https://forum.dfinity.org/t/the-biggest-problem-with-the-ic-intercanister-calls/11598/8?u=jzxchiang) why inter-canister calls may not be the safest choice right now. Another reason why we may not be ready for a public cron canister just yet.
+
+-------------------------
+
+nomeata | 2022-04-23 09:59:50 UTC | #22
+
+[quote="jzxchiang, post:21, topic:11945"]
+even an `inspect_message` for heartbeats.
+[/quote]
+
+I don't expect that to be much cheaper (in terms of actual work done by the system) than to run the heartbeat and trap quickly if there is nothing to do. And no easier to use either.
+
+Maybe the problems go away if canister developers (or CDK) make sure they really don't do much in the heartbeat if nothing is there to do, and the system doesn't overcharge that pattern.
+
+Could someone run an experiment with a canister that has a heartbeat that always immediately traps? I.e. the cheapest possible implementation of a heartbeat? Let's see how expensive that actually is.
+
+-------------------------
+
+icme | 2022-04-26 08:01:12 UTC | #23
+
+Lets say I spin up this crowdsourced heartbeat canister.
+
+Is there a way for this heartbeat canister to make one-way calls to the 3rd party canisters that sign up such that my heartbeat canister doesn't have to wait for the response? (i.e. if a 3rd party canister update method hung it wouldn't stall the heartbeat canister)
+
+-------------------------
+
+GLdev | 2022-04-26 09:16:34 UTC | #24
+
+I have prototyped a rust canister, with the following interfaces:
+
+```
+service : {
+  start_cron : (nat64, opt nat64) -> (bool);
+  stop_cron : (opt nat64) -> (bool);
+}
+```
+
+Start cron takes an interval_secods and an opt task_id. The canister will be called with that task_id every "interval".
+
+Under the hood it uses a binaryheap to hold the tasks, and every heartbeat it pops the tasks where timestamp <= now() and calls a predefined fn on that canister. 
+
+I still have to write a bunch of tests, but my intention is to publish it in the first days of the hackathon, with the idea of this being used as a "per-project" or "per-org" heartbeat canister. If you need heartbeat in more than one canister, you'd be better off spinning-up one central canister, and have it call all your other canisters with whatever intervals you decide.
+
+I'm now looking into @nomeata's hints on how to send -1 -1 to make a call that doesn't need to be awaited. If I figure this out, it should be feasible to run this as a public service, after some more testing. Anyone up to sponsor this, if it works with non-async calls?
+
+-------------------------
+
+nomeata | 2022-04-26 16:44:27 UTC | #25
+
+[quote="icme, post:23, topic:11945"]
+Is there a way for this heartbeat canister to make one-way calls to the 3rd party canisters that sign up such that my heartbeat canister doesn’t have to wait for the response?
+[/quote]
+
+Yes, I’d say so: On the system level, pass `-1` (a.k.a. MAXINT) as the table index for the callback handler. In Motoko, you invoke the method with a return type of `()` (_not_ `async ()`). And in the Rust CDK probably someone has to add support for that.
+
+If you do this, you can safely upgrade your canister, as discussed in <https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters>.
+
+Or is your question how to invoke a all without `await` in the Rust CDK? Probably someone else knows that better :-)
+
+-------------------------
+

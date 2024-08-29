@@ -1,0 +1,132 @@
+cken | 2024-05-26 18:43:57 UTC | #1
+
+I'm trying to generate a properly encoded response for the http-request system API from scratch. However, I'm running into the `Body does not pass verification` error.
+
+I can query the endpoint using the Candid UI which returns:
+
+```
+(record 
+  {
+    body=vec {31; 139; 8; 0; 33; 117; 83; 102; 2; 255; 179; 201; 40; 201; 205; 177; 227; 82; 0; 2; 155; 164; 252; 148; 74; 8; 19; 4; 60; 82; 115; 114; 242; 117; 20; 194; 243; 139; 114; 82; 20; 33; 10; 244; 33; 42; 108; 244; 33; 154; 0; 164; 199; 192; 64; 60; 0; 0; 0};
+    headers=vec {
+      record {"Content-Type"; "text/html; charset=utf-8"};
+      record {"Content-Encoding"; "gzip"}; record {"Content-Length"; "59"};
+      record {"IC-Certificate";
+        "certificate=:2dn3omR0cmVlgwGDAYMBggRYICZ9EIuCUUnIiSJ/IgyiAROM5iHDHHw88XQRfnAVEQu3gwJIY2FuaXN0ZXKDAYMBggRYIHIcQPRl0NXl9DqdgXakKGSri8/asl+A6ju2fHB5bkEGgwJKgAAAAAAQAAEBAYMBgwGDAk5jZXJ0aWZpZWRfZGF0YYIDWCA9Gi23gwjYQTYNJ/sSTLj5tFh+se6ZWX2vuz0Qm/QRO4IEWCC9sZJnLAN1uq9V0Apa9RPw26aliigoYp4IgEBw5SbHvYIEWCDx0ExzGXLJMFhEQrw5f9bOvhpvqjhBnwmtwiQpj5r4hYIEWCBw5Ein3AOf0rJYMpDqM7bU1uZVylp412HlFZg1DiB804IEWCC1mnRylI+ZnmLvXtI5yKLhOArpOzrae99uuBVYtmQhiYMBggRYIPawll8UFvmzjaxG4lTkwZUn3+o5qRTmb8lNuR3+fAlLgwJEdGltZYIDSa600PPW5MbpF2lzaWduYXR1cmVYMK1e/XVNGP5aOZ8Qqhgwdxdh6lvu4ZC/QeOTELTQIoOTUXHTs8hrPZ5Tsf3fCdvl3w==:,
+         tree=:ggGDAktodHRwX2Fzc2V0c4IBgwJLL2luZGV4Lmh0bWyCA1ggwngs/wYRCS72n7b+wWbqchIVyOvXvEosQ2eHZ/38q1A=:"}};
+      status_code=200
+    }
+)
+```
+
+I'm testing this locally using dfx, but if I calculate the root hash for the `tree` in `IC-Certificate` it matches the `certified_data` hash in `certificate['tree']`. The sha256 hash of the body also matches the `tree['/index.html']` hash. The public key, signature, and message when passed to the bls implementation used by `agent-js` also passes, and the body properly gzip decompresses to the expected HTML.
+
+Is the "Body does not pass verification" error produced by some portion of the HTTP gateway that's not open sourced? I'm having trouble figuring what else might be wrong with this response. If I remove the `IC-Certificate` header, it works as expected since it's not being certified in that case.
+
+-------------------------
+
+Severin | 2024-05-27 09:30:04 UTC | #2
+
+[Here](https://github.com/dfinity/sdk/blob/f3c5b68d82fe12230fc5210f3ee5a1a8b88dc2cc/src/canisters/frontend/ic-certified-assets/src/tests.rs#L85) is how we do certification tests in the asset canister. Maybe you can use it for inspiration?
+
+From the [v1 spec](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#legacy-response-verification):
+> * The path `["http_assets", <url>]` exists in the `tree` and is a leaf with a value, where `<url>` is the utf8-encoded URL from the `HttpRequest`.
+
+But you say 
+
+[quote="cken, post:1, topic:31189"]
+The sha256 hash of the body also matches the `tree['/index.html']` hash.
+[/quote]
+
+Should it be `tree['http_assets', '/index.html']` instead?
+
+[quote="cken, post:1, topic:31189"]
+Is the “Body does not pass verification” error produced by some portion of the HTTP gateway that’s not open sourced?
+[/quote]
+
+@NathanosDev, please correct me if I'm wrong, but the boundary nodes use the `ic-response-verification` crate that you can also see in use in the tests I linked above and nothing else (at least for the `Body does not pass verification` part).
+
+-------------------------
+
+NathanosDev | 2024-05-27 10:00:58 UTC | #3
+
+[quote="Severin, post:2, topic:31189"]
+[Here ](https://github.com/dfinity/sdk/blob/f3c5b68d82fe12230fc5210f3ee5a1a8b88dc2cc/src/canisters/frontend/ic-certified-assets/src/tests.rs#L85) is how we do certification tests in the asset canister. Maybe you can use it for inspiration?
+[/quote]
+
+I second this. Making some automation tests will make your life much, much easier when debugging this stuff. Using the `ic-response-verification` crate directly allows you to extract the exact error that is being emitted and that can help track down the source of any issues.
+
+[quote="Severin, post:2, topic:31189"]
+Should it be `tree['http_assets', '/index.html']` instead?
+[/quote]
+
+This seems to be the case in the tree provided by the `IC-Certificate` header in his example.
+
+[quote="Severin, post:2, topic:31189"]
+@NathanosDev, please correct me if I’m wrong, but the boundary nodes use the `ic-response-verification` crate that you can also see in use in the tests I linked above and nothing else (at least for the `Body does not pass verification` part).
+[/quote]
+
+Yep, I'd really recommend this approach.
+
+[quote="cken, post:1, topic:31189"]
+Is the “Body does not pass verification” error produced by some portion of the HTTP gateway that’s not open sourced? I’m having trouble figuring what else might be wrong with this response. If I remove the `IC-Certificate` header, it works as expected since it’s not being certified in that case.
+[/quote]
+
+There's no part of the HTTP Gateway that's not open sourced. Everything related to the verification of responses can be found [here](https://github.com/dfinity/response-verification/tree/main/packages/ic-response-verification).
+
+[quote="cken, post:1, topic:31189"]
+I’m testing this locally using dfx, but if I calculate the root hash for the `tree` in `IC-Certificate` it matches the `certified_data` hash in `certificate['tree']`. The sha256 hash of the body also matches the `tree['/index.html']` hash. The public key, signature, and message when passed to the bls implementation used by `agent-js` also passes, and the body properly gzip decompresses to the expected HTML.
+[/quote]
+
+Does the leaf at `['http_asset', '/index.html']` match sha256 of the _encoded_ or _decoded_ body? For v1, it should be the hash of the _decoded_ body.
+
+-------------------------
+
+cken | 2024-05-27 18:05:55 UTC | #4
+
+Thanks for the links. That’s the test I have been referencing.
+
+[quote="Severin, post:2, topic:31189"]
+Should it be `tree['http_assets', '/index.html']` instead?
+[/quote]
+
+You’re right about this. I was kind of writing pseudocode there.
+
+-------------------------
+
+cken | 2024-05-27 18:13:53 UTC | #5
+
+[quote="NathanosDev, post:3, topic:31189"]
+Does the leaf at `['http_asset', '/index.html']` match sha256 of the *encoded* or *decoded* body? For v1, it should be the hash of the *decoded* body.
+[/quote]
+
+It matches based on the decoded body. Good point though, I did run into that issue previously.
+
+Any idea where that exact error message originates from? I was trying to trace if it might be caused by something other than the actual body certification/verification.
+
+Good to know I’m looking at the right code at least though. I’ll keep digging.
+
+-------------------------
+
+NathanosDev | 2024-05-28 08:02:01 UTC | #6
+
+[quote="cken, post:5, topic:31189"]
+Any idea where that exact error message originates from?
+[/quote]
+
+The error originates here: https://github.com/dfinity/ic/blob/master/rs/boundary_node/icx_proxy/src/validate.rs#L54-L63
+
+[quote="cken, post:5, topic:31189"]
+I was trying to trace if it might be caused by something other than the actual body certification/verification.
+[/quote]
+
+It's definitely a certification issue, please write a test and use `ic-response-verification` (Rust) or `@dfinity/response-verification` (JavaScript) directly so you can observe the original error.
+
+-------------------------
+
+cken | 2024-05-28 14:58:18 UTC | #7
+
+Aha! I could’ve sworn I searched the organization for it on Github and it wasn’t finding it… Thanks for the links though, that will be helpful!
+
+-------------------------
+

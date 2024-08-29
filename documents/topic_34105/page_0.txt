@@ -1,0 +1,241 @@
+Mysticx | 2024-08-12 12:03:39 UTC | #1
+
+Hello, I am trying to connect users to my web app completely hosted on the IC with II which is working fine on chrome but safari is blocking the pop-up, I guess because client.login is an async call so I'm calling it inside an async function which safari doesn't allows (?). but I've checked some other apps such as http://nns.ic0.app and open chat which seems to work fine (even though they are also opening in a different tab) any clue on how I could go about fixing this?. 
+Any help is appreciated. 
+P.S I also have NFID integrated and it seems to be working just fine
+
+-------------------------
+
+peterparker | 2024-08-12 12:20:35 UTC | #2
+
+If I'm not wrong, Safari doesn't have any issues with opening popups using async code. However, it does require user interaction to do so. Is your login triggered by a button with a `click` event?
+
+-------------------------
+
+Mysticx | 2024-08-12 13:05:58 UTC | #3
+
+yes, though the button is inside of a modal.
+
+-------------------------
+
+Mysticx | 2024-08-12 13:14:04 UTC | #4
+
+I would like to mention that auth.login isn't called directly inside the ``click`` event (it is nested inside).
+this is the code snippet: 
+```js
+  const methods = authMethods({
+    useAuthStore,
+    setIsLoading,
+    handleClose,
+  });
+  async function handleLogin(type: LoginEnum) {
+    setSelected(type);
+    methods.login(type, navigation, callBackfn);
+  }
+```
+The login function: 
+```js 
+const login = async (
+    type: LoginEnum,
+    navigation: any,
+    callBackfn: () => void,
+  ) => {
+    let ran = false;
+    if (
+      auth &&
+      auth.state === 'anonymous' &&
+      handleClose &&
+      setIsLoading
+    ) {
+      setIsLoading(true);
+      if (type == LoginEnum.InternetIdentity) {
+        const client = await AuthClient.create({
+          idleOptions: {
+            idleTimeout: (1000 * 60 * 60) / 2,
+          },
+        });
+        await client?.login({
+          maxTimeToLive: BigInt(1800) * BigInt(1_000_000_000),
+          // windowOpenerFeatures:
+          //   'toolbar=0,location=0,menubar=0,width=500,height=500,left=100,top=100',
+          identityProvider:
+            process.env.NEXT_PUBLIC_DFX_NETWORK === 'ic'
+              ? 'https://identity.ic0.app/#authorize'
+              : `http://${process.env.CANISTER_ID_INTERNET_IDENTITY}.localhost:4943/#authorize`,
+          onSuccess: () => {
+            authenticate(client as AuthClient).then(() => {
+              const path = window?.location;
+              if (path?.pathname == '/') navigation.push(DASHBOARD_ROUTE);
+
+              if (callBackfn) {
+                callBackfn();
+              }
+            });
+          },
+          onError: () => {
+            handleClose();
+          },
+        });
+      } else if (type == LoginEnum.NFID) {
+        setIsLoading(true);
+
+        try {
+          const nfid = await NFID.init({
+            application: {
+              name: appData.name,
+              logo: appData.logo,
+            },
+            idleOptions: {
+              idleTimeout: 45 * 60 * 1000, 
+              captureScroll: true, 
+            },
+          });
+          const delegationIdentity: Identity = await nfid.getDelegation({
+    
+            maxTimeToLive: BigInt(2) * BigInt(3_600_000_000_000),
+          });
+          authenticate(undefined, delegationIdentity).then(() => {
+            const path = window?.location;
+            if (path?.pathname == '/') path.assign(DASHBOARD_ROUTE);
+          });
+        } catch (error) {
+          setIsLoading(false);
+        }
+      } else if (auth && !ran && auth.state === 'anonymous') {
+        initAuth();
+        ran = true;
+      } 
+    }
+  };
+```
+
+-------------------------
+
+peterparker | 2024-08-12 14:12:23 UTC | #5
+
+[quote="Mysticx, post:4, topic:34105"]
+I would like to mention that auth.login isn’t called directly inside the `click` event
+[/quote]
+
+Does your button calls `handleLogin`?
+
+[quote="Mysticx, post:4, topic:34105"]
+`methods.login(type, navigation, callBackfn);`
+[/quote]
+
+If for testing purpose you replace this code by a call to the login `(await AuthClient.create(...)).login()`, does the popup open?
+
+A bit hard to tell based on the snippet. Can you share a link to the repo?
+
+-------------------------
+
+Mysticx | 2024-08-12 14:16:43 UTC | #6
+
+[quote="peterparker, post:5, topic:34105, full:false"]
+Does your button calls `handleLogin`?
+[/quote]
+yes it calls ``handleLogin``.  
+[quote="peterparker, post:5, topic:34105, full:false"]
+If for testing purpose you replace this code by a call to the login `(await AuthClient.create(...)).login()`, does the popup open?
+[/quote]
+I'll try 
+
+
+[quote="peterparker, post:5, topic:34105, full:false"]
+A bit hard to tell based on the snippet. Can you share a link to the repo?
+[/quote]
+I'm sorry but this code isn't public (yet) so I can't really share the repo right now but if you want I can explain it in more details
+
+-------------------------
+
+peterparker | 2024-08-12 14:40:25 UTC | #7
+
+Let me know if the test work. If it doesn't, maybe you can try to share a minimal sample repo to reproduce the issue?
+
+-------------------------
+
+Mysticx | 2024-08-12 16:40:42 UTC | #9
+
+I’ve created the repo for the II authentication [here](https://github.com/AbdullahUmar-fantasy/II-authentication/tree/master).
+And I did verify the issue it still persists (on Mac safari). I tested it by deploying to the playground
+
+-------------------------
+
+peterparker | 2024-08-12 16:55:41 UTC | #10
+
+Thanks for the sample repo :+1:. I can reproduce the issue with it. After some debugging, I believe the problem is related to creating the `AuthClient` within the same function or click event that handles the login. If I instantiate the `AuthClient` on mount and perform only the login within the function, then the popup opens correctly in Safari.
+
+```
+
+function HomePage() {
+
+  const [authClient, setAuthClient] = useState(undefined);
+
+  useEffect(() => {
+    (async () => {
+      const client = await AuthClient.create({
+        idleOptions: {
+          idleTimeout: (1000 * 60 * 60) / 2 // set to half an hour
+        }
+      })
+      setAuthClient(client);
+    })();
+  }, [])
+
+  async function handleLogin() {
+    // await AuthClient.create(...) <---- Doing this here too blocks the popup
+
+    await authClient?.login();
+  }
+  return (
+    <div className={styles.container}>
+      <Head>
+        <title>Internet Computer</title>
+      </Head>
+      <main className={styles.main}>
+        <h3 className={styles.title}>
+          Welcome to Next.js Internet Computer Starter Template!
+        </h3>
+        <button onClick={handleLogin}>Login</button>
+        
+      </main>
+    </div>
+  )
+}
+
+export default HomePage
+```
+
+-------------------------
+
+kpeacock | 2024-08-12 17:22:30 UTC | #11
+
+Thank you for helping debug, @peterparker!
+
+@Mysticx his recommendation matches what I also recommend, as the maintainer of the library.
+
+Safari can be very particular about how it allows new windows to be opened, so as a rule you should avoid any async behavior in between the `click` handler and the function that opens the window.
+
+`AuthClient.create` is async because it needs to make an asynchronous query against indexeddb to see if you have a previously created delegation or key it can use to restore your session. That check is getting in between the click and opening the window.
+
+The correct way to handle this is to construct the auth client during the `mount`, `init`, or equivalent phase of your app, and then to invoke the `login` method directly from your click handler. Passing both `onSuccess` and `onError` handlers is also a best practice!
+
+-------------------------
+
+Mysticx | 2024-08-13 03:12:27 UTC | #12
+
+Thanks for the help! @peterparker,
+I had the thought that I should try to move the client.create (so ashamed of myself rn).
+
+[quote="kpeacock, post:11, topic:34105, full:false"]
+Safari can be very particular about how it allows new windows to be opened, so as a rule you should avoid any async behavior in between the `click` handler and the function that opens the window.
+[/quote]
+ it is still weird to me how safari doesn't allow async calls in between the event and the pop-up opening function. 
+
+[quote="kpeacock, post:11, topic:34105, full:false"]
+The correct way to handle this is to construct the auth client during the `mount` , `init` , or equivalent phase of your app, and then to invoke the `login` method directly from your click handler. Passing both `onSuccess` and `onError` handlers is also a best practice!
+[/quote]
+Yea this is what I'm doing in my actual implementation. (just couldn't be bothered to add all that in the repo)
+
+-------------------------
+

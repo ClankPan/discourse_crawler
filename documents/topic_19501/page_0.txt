@@ -1,0 +1,307 @@
+kpeacock | 2023-04-18 19:43:03 UTC | #1
+
+Hey all, I wanted to share a new tool I've been working on!
+
+Available at [https://mops.one/server](https://mops.one/server) - Server is a library for dynamically handling HTTP requests, using syntax that is inspired by the popular Express.js framework for Node.
+
+This is all made possible through an additional base library - [https://mops.one/certified-cache](https://mops.one/certified-cache), which handles storing the responses and certifying them so that they can be queried later.
+
+![Code Sample of Server](upload://37vXRnA4TatRgMhf0Tm5fkKewDD.png)
+
+The library makes it easy to register dynamic `GET`, `POST`, `PUT`, and `DELETE` requests in your motoko canister. The first time any uncached request is hit, it will get upgraded to an `update` request, but any cached request can be used as a query.
+
+Finally, `server` is in its early stages. I plan to add more features, particularly around making static assets more convenient to work with. Try it out and request some features!
+
+To get a sense of what is possible now with server - try visiting https://qg33c-4aaaa-aaaab-qaica-cai.ic0.app/
+
+It's a rebuild of the `dfx new` starter project, refactored to run on a single Motoko canister, and with no JavaScript agent - just a `http` `POST request. Code for the demo lives at https://github.com/krpeacock/server/tree/main/examples/http_greet
+
+Have fun!
+
+-------------------------
+
+infu | 2023-04-18 20:29:35 UTC | #2
+
+Nice interface. 
+Can we have https requests to custom domains?
+I was also wondering, can't somehow canisters be on the other end of SSL, so we don't have to check if responses are certified. I suppose If that can be done, then nodes and boundary nodes will then be considered man in the middle.
+
+-------------------------
+
+skilesare | 2023-04-18 21:03:14 UTC | #3
+
+The request gets upgrade on the proxy...but how does the service worker know that what was returned was actually an update?  Do you flag the response and requery?
+
+Awesome work!
+
+-------------------------
+
+kpeacock | 2023-04-19 16:44:07 UTC | #4
+
+It's managed by the boundary node - if a query returns `upgrade = ?true;`, the  b̶o̶u̶n̶d̶a̶r̶y̶ ̶n̶o̶d̶e̶ http gateway will re-try as an update call and then return the result. That is handled by the `agent`, and the ServiceWorker is configured to accept the returned data
+
+-------------------------
+
+domwoe | 2023-04-19 07:13:00 UTC | #5
+
+Does the service worker actually verify the response in this case?
+
+-------------------------
+
+Severin | 2023-04-19 07:52:26 UTC | #6
+
+If it is an update call, then the service worker doesn't have to do anything. The agent takes care of validating the result/signature of an update call.
+
+-------------------------
+
+domwoe | 2023-04-19 08:03:50 UTC | #7
+
+What agent? The client side doesn't know anything about the update call that has been made by the boundary node. Not sure if I'm somehow on the wrong track.
+
+-------------------------
+
+skilesare | 2023-04-19 12:29:12 UTC | #8
+
+Yeah...this is where I was a bit confused my understanding of the flows are
+
+![mermaid-diagram-2023-04-19-072735|690x401](upload://38wwBHGsXnMnK900RjiglcrtXvM.png)
+
+https://mermaid.live/edit
+
+```
+sequenceDiagram
+  participant ServiceWorker  
+  participant Browser
+  participant BoundaryNode
+  participant Canister
+
+  Browser->>+BoundaryNode: Send query
+  BoundaryNode->>+Canister: Send query using http_request
+  Canister->>+BoundaryNode: Request upgrade using headers
+  BoundaryNode->>+Canister: Resubmit as upgrade request using http_request_upgrade
+  Canister->>+BoundaryNode: Perform update and return http response
+  Canister->>+Canister: Can't provide updated cert because updates can't provide updated certification
+  BoundaryNode->>-Browser: Relay result (without certification header)
+  Browser->>+ServiceWorker: ?
+```
+
+-------------------------
+
+Severin | 2023-04-19 12:37:12 UTC | #9
+
+I don't think that's entirely correct. I just recently created this diagram for a presentation that shows the flow of a query call (so not quite the same thing that you're talking about):
+![image|690x320](upload://ohXL887OW2bayTF3RvdPEgURCoz.jpeg)
+
+I'll try to get someone to explain how it works for the `http_request_upgrade` flow, but in general an update call doesn't need an updated cert because the response is already certified by consensus
+
+-------------------------
+
+skilesare | 2023-04-19 12:39:10 UTC | #10
+
+[quote="Severin, post:9, topic:19501"]
+I’ll try to get someone to explain how it works for the `http_request_upgrade` flow, but in general an update call doesn’t need an updated cert because the response is already certified by consensus
+[/quote]
+
+I think the issue here is how does the service worker "know" that it was upgraded?  I'm guessing maybe the boundary node is adding a header or something. Likely there is a lone of code that we can point at to better understand.
+
+-------------------------
+
+NathanosDev | 2023-04-19 12:51:49 UTC | #11
+
+Short answer: There's a property in the candid interface for canisters that serve HTTP requests that the service worker checks: https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-gateway-interface
+
+A side note on terminology: The boundary node does not perform this logic, the HTTP Gateway Protocol does this. The HTTP Gateway Protocol can be the Service Worker _or_ ICX Proxy. If you navigate to https://nns.ic0.app/ then you're using the Service Worker, if you navigate to https://nns.raw.ic0.app/ then you're using ICX Proxy.
+
+Longer answer: The particular feature that we're discussing here is called an "upgrade to update call" and it's detailed in the spec here: https://internetcomputer.org/docs/current/references/ic-interface-spec/#upgrade-to-update-calls.
+
+You guys are on the right track anyway, but here's my summary of the flow:
+- Browser makes a standard HTTP request
+- HTTP Gateway converts this request into an Internet Computer query call
+- HTTP Gateway sends the query call request using `agent-js` to a canister's `http_request` method via the boundary node (the boundary node handles the routing to the replica)
+- Canister responds with the `upgrade` property set to `true`
+- HTTP Gateway repeats the original request as an update call using `agent-js`, and again this is routed by the boundary node
+- `agent-js` polls the IC with a `read_state` request and once it receives a response it is then returned to the HTTP Gateway
+- Since this response is present in the state tree (this is what the `read_state` request checks), it has been signed by consensus and we can trust the entire response
+
+-------------------------
+
+domwoe | 2023-04-19 12:56:01 UTC | #12
+
+[quote="NathanosDev, post:11, topic:19501"]
+HTTP Gateway repeats the original request as an update call using `agent-js`, and again this is routed by the boundary node
+[/quote]
+
+Ah, in case on a non-raw request, the upgrade to an update call is done in the service worker not the boundary node. Thanks!
+
+-------------------------
+
+NathanosDev | 2023-04-19 12:58:22 UTC | #13
+
+[quote="infu, post:2, topic:19501"]
+can’t somehow canisters be on the other end of SSL, so we don’t have to check if responses are certified
+[/quote]
+
+This is something that has been explored before, but unfortunately it's extremely expensive and slow. This is an oversimplification, but you would essentially need to create a threshold SSL handshake that would involve every replica on the subnet.
+
+-------------------------
+
+skilesare | 2023-04-19 15:54:00 UTC | #14
+
+Would the vetkey tech be good for this?  We have this bounty in the freezer once we are able to have reliably secure decryption on the canister and I think that there is a direct plug-in for @kpeacock server system that would keep data private from boundary nodes.
+
+https://github.com/icdevs/Icdevs_fleeksite/blob/main/_posts/2022-08-08-Private%20Candid%20-%20Motoko.md
+
+As an aside....this server infrastructure makes this other "freezer" bounty much more doable:
+
+https://github.com/icdevs/Icdevs_fleeksite/blob/main/_posts/2024-10-03-ICSwagger%20-%20Motoko.md
+
+It would be super cool for new devs if they could point to a swagger file and have the 'server' file be rendered with hooks that made it super easy to implement the details of each service.
+
+-------------------------
+
+miadey | 2023-08-19 16:00:47 UTC | #15
+
+Hi! Is it possible to call an actor function (async/await) from server.get("/greet", func(req : Request, res : ResponseClass) : Response{  
+    await actor.function()
+
+Seem impossible to return a : async Response from the server
+Thank you
+
+-------------------------
+
+kpeacock | 2023-08-21 16:05:12 UTC | #16
+
+It should be possible since we do run it in an update, but it would take some redesigning around the API to make it happen. I'd need to think about how to pull it off
+
+-------------------------
+
+patnorris | 2023-09-20 01:47:28 UTC | #17
+
+Hi @kpeacock , thank you for this library, I think it's really useful! I wanted to combine this with the Motoko proxy you wrote (https://github.com/krpeacock/motoko-outcalls-proxy) but realized it would also need async requests for this. If you have a design in mind and some pointers for me, I could see if I can help and contribute work on the async requests :) cheers
+
+-------------------------
+
+kpeacock | 2023-09-20 17:12:37 UTC | #18
+
+When there is a cache miss, the library will run as an async update call and it should be valid. You could see if just modifying the `server.get` interface to be async works, or maybe we could add a new `getAsync` handler that gets around the Motoko constraints
+
+-------------------------
+
+patnorris | 2023-09-21 14:22:50 UTC | #19
+
+cool, thanks! I'll work on this and update you.
+
+-------------------------
+
+patnorris | 2023-09-28 20:38:31 UTC | #20
+
+Hi @kpeacock , I implemented a first very simplistic approach, you can see the wip here: https://github.com/patnorris/server/pull/1 I couldn't really come up with a good way to add the async functionality into the existing functions without breaking compatibility (so without making http_request and http_request_update and the functions they call async). 
+
+Some ideas I had were changing the HttpFunction type such that both regular and async functions would be included (so something along the lines of: type HttpFunction = (Request) -> Response or (Request) -> async Response ; ) or "hiding" the async behavior in registerRequestWithHandler by just awaiting each call (regular or async) but I don't think Motoko supports this. 
+
+Not sure how helpful this simplistic approach I implemented really is but happy to incorporate any feedback you have. What would need to change to become useful to the server library?
+
+-------------------------
+
+kpeacock | 2023-09-28 20:57:09 UTC | #21
+
+Probably the most convenient approach would be to make the `getRequests` map able to store a new type like
+```
+{
+    #sync: HttpFunction;
+    #async: HttpAsyncFunction
+}
+```
+and then make the handler able to process the response accordingly
+
+-------------------------
+
+patnorris | 2023-09-29 11:26:33 UTC | #22
+
+cool, cheers, I'll give this a shot :slight_smile:
+
+-------------------------
+
+patnorris | 2023-10-01 15:20:46 UTC | #23
+
+[quote="kpeacock, post:21, topic:19501"]
+`HttpAsyncFunction`
+[/quote]
+
+Hi @kpeacock , I aimed to implement this approach here: https://github.com/patnorris/server/pull/2/files does this look similar to what you had in mind?
+
+-------------------------
+
+kpeacock | 2023-10-02 16:54:11 UTC | #24
+
+That looks good! I do wish we had words that were more clearly dissimilar than `asynchronous` and `synchronous` for the variants.
+
+Come to think of it, apart from it being a breaking change, is there any compelling reason to avoid just making the functions async across the board? That would probably lead to a little less boilerplate
+
+-------------------------
+
+kpeacock | 2023-10-02 18:05:53 UTC | #25
+
+Here's a PR that I've tested with it!
+https://github.com/krpeacock/server/pull/6
+
+-------------------------
+
+patnorris | 2023-10-03 09:30:28 UTC | #26
+
+Thank you, I think this looks good :) I agree it makes sense to have it all async, simplifies the code a lot. Maybe even the http_request? For consistency but I think then it could also be made a query call (if that's desired)
+
+-------------------------
+
+kpeacock | 2023-10-03 15:32:21 UTC | #27
+
+Letting http_request serve queries is definitely a feature worth preserving, when the cache has a value. I've got some build complications with some dependencies, but I'll ship this once I get it working
+
+-------------------------
+
+Mercury | 2023-10-05 05:04:27 UTC | #28
+
+I have a rookie question: This Motoko Server can be utilized for a use case involving [RFC 7636: Proof Key for Code Exchange](https://oauth.net/2/pkce/), right?
+
+-------------------------
+
+kpeacock | 2023-11-17 21:47:56 UTC | #29
+
+I've released server 0.3.0 with the new async compatible pattern!
+
+Requests with this version will be formatted like this: 
+```
+server.get(
+  "/",
+  func(req : Request, res : ResponseClass) : async Response {
+    res.send({
+      status_code = 200;
+      headers = [("Content-Type", "text/html")];
+      body = Text.encodeUtf8(
+        "<html><body><h1>hello world</h1></body></html>"
+      );
+      streaming_strategy = null;
+      cache_strategy = #default;
+    });
+  },
+);
+```
+
+Also, `cache_strategy` is a required field officially.
+
+> Important note - certified responses are currently broken on local deployment as of `dfx 0.15.1`. They are working on mainnet, however, and are working in the latest beta for `0.15.2-beta.2`
+
+-------------------------
+
+miadey | 2023-11-18 02:04:27 UTC | #30
+
+Really working great, I have my MVC up and running :smiley:
+
+-------------------------
+
+patnorris | 2023-11-18 14:52:32 UTC | #31
+
+Awesome, thank you and congrats :) I think the code looks clear and should be easy to work with!
+
+-------------------------
+

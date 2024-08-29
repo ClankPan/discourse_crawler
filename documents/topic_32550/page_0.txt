@@ -1,0 +1,88 @@
+borovan | 2024-07-01 08:15:28 UTC | #1
+
+Hi, we've got a lot of different types that use Storable, so I ended up making my own derive macro.  It only uses unbounded, and that's not a huge problem because it's easy to modify the macro to take parameters.  We've got about 400 types of struct that need it.
+
+```
+///
+/// Storable
+/// just so the code's in one place, we can redo this in the future
+/// always uses UNBOUNDED
+///
+
+#[proc_macro_derive(Storable)]
+pub fn storable(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let expanded = quote! {
+        impl ::lib_ic::storage::storable::Storable for #name {
+            fn to_bytes(&self) -> ::std::borrow::Cow<[u8]> {
+                ::std::borrow::Cow::Owned(::lib_cbor::serialize(self).unwrap())
+            }
+
+            fn from_bytes(bytes: ::std::borrow::Cow<[u8]>) -> Self {
+                ::lib_cbor::deserialize(&bytes).unwrap()
+            }
+
+            const BOUND: ::lib_ic::storage::storable::Bound = ::lib_ic::storage::storable::Bound::Unbounded;
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+```
+and the candid version:
+
+```
+
+///
+/// DataValue
+///
+
+#[derive(CandidType, Clone, Debug, Serialize, Deserialize)]
+pub struct DataValue {
+    pub data: Vec<u8>,
+    pub metadata: Metadata,
+}
+
+impl Storable for DataValue {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        Cow::Owned(Encode!(self).unwrap())
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        Decode!(bytes.as_ref(), Self).unwrap()
+    }
+
+    const BOUND: Bound = Bound::Unbounded;
+}
+```
+
+Is using the candid macros the most optimal way to do this, or Serialize?
+
+Is there a reason that something like this doesn't exist, at least for basic structures?
+
+-------------------------
+
+Kepler | 2024-07-01 08:31:18 UTC | #2
+
+Hi @borovan, similar to your suggestion, for Orbit we did a proc macro that accepts as arguments the size (if bounded), and the serializer (defaults to cbor), check [here](https://github.com/dfinity/orbit/blob/bb3151235a30f5e3a3ef6698c03814dbbf9d176b/libs/orbit-essentials-macros/src/macros/storable.rs#L54) and it's usage [here](https://github.com/dfinity/orbit/blob/bb3151235a30f5e3a3ef6698c03814dbbf9d176b/core/station/impl/src/models/request.rs#L42).
+
+This simplified quite a bit things for us, specially when we were experimenting the serialization format, because like that it's quite easy to change the default and perform benchmarks. 
+
+I agree that having something like this would be useful for devs using stable-structures and it could ideally come with a serializer that is performant in terms of instructions and friendly for schema evolution.
+
+> Is using the candid macros the most optimal way to do this, or Serialize?
+
+As per benchmarks in Rust, i would not recommend to use Candid on the storage layer, on a simple struct it consumes 11x more instructions then `serde_cbor` on serialization and 8x more on deserialization.
+
+-------------------------
+
+borovan | 2024-07-01 08:50:06 UTC | #3
+
+Oh wow 11x ...
+
+Thanks, that's a really good way of doing it.  Switched everything to cbor (ciborium)!
+
+-------------------------
+

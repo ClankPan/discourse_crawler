@@ -1,0 +1,164 @@
+saikatdas0790 | 2022-10-07 16:43:11 UTC | #1
+
+If I have a loop that makes an inter-canister call inside the loop, on every iteration, does every iteration execute as part of subsequent blocks?
+
+The concern behind the above question is around exhausting the instruction limit when running the entire loop. But if they execute as part of separate blocks, then the entire loop will run to completion since the loop won't go over the cycle limit.
+
+My primary use case is upgrading my dynamic canisters with a newer WASM without having to worry about running into instruction/cycle limits
+
+I remember reading that await calls are atomic which implies they go through consensus, hence my assumptions above :slight_smile:
+
+-------------------------
+
+skilesare | 2022-10-07 18:17:38 UTC | #2
+
+Each await will likely see a different block. As far as how the accounting of the cycles goes, I'm not sure.  I was under the impression that each ingress call got a certain amount of cycles to spend and that when they were gone they were gone....if awaits had occurred before the exhaustion then that state would be committed, but the execution would stop.
+
+There was some discussion that you actually did get a fresh set of cycles after every await, but I haven't confirmed it.
+
+There is a third scenario where you do some awaits and end up with a bunch of committed state, but the something at the end exhausts the fresh set of cycles and you ultimately get an error with some committed state.
+
+@claudio may have some insight.
+
+-------------------------
+
+rossberg | 2022-10-08 08:48:44 UTC | #3
+
+Inter-canister calls themselves do not commit or suspend the current execution, but await does(*). If you await inside a loop, then yes, every iteration will run as a separate method execution. Technically, that doesn't necessarily mean that it runs in a different block, since the system may decide to still pull it into the current one if there is time. In fact, block boundaries are completely transparent to canisters, the only thing they can observe is the order of commits and method executions.
+
+(*) You can initiate inter-canister calls without awaiting immediately, or at all. But the messages are only actually sent out once execution reaches a commit point, i.e., the next await or the end of the entry method. If there is a rollback due to failure, the messages since the last commit point are not sent.
+
+-------------------------
+
+saikatdas0790 | 2022-10-08 09:07:20 UTC | #4
+
+So, my use case here is:
+
+I have an index canister of sorts that has spun up a large number of canisters dynamically by sending requests to the management canister to create and install canisters based on an end user login. It also sets itself as the controller of these dynamically created canisters.
+This index canister maintains the list of canister IDs in a stable data structure.
+It also has the wasm for the dynamically generated canister embedded inside it as a byte string that gets updated with newer versions when it gets updated.
+
+What I'm trying to do is, on a function call, loop through all canister IDs and upgrade them one by one. In case there is a failure, it notes those canister IDs  to a separate list so that they can be retried/tried manually later. My concern in this case was since this loop could grow to be arbitrarily large, at some point this function call would exceed the allowed instruction limit in a single block.
+
+So, essentially my question is, would awaiting those upgrade calls inside the loop mandatorily put them in separate blocks and hence I wouldn't run into the instruction limit as mentioned above? Or is my concern invalid and I am free to not await those calls at all?
+
+-------------------------
+
+rossberg | 2022-10-08 09:23:06 UTC | #5
+
+Yes, every commit point essentially resets the cycle limit.
+
+FWIW, cycle limits apply to message executions. To what blocks those are scheduled is up to the system and completely irrelevant to the application. In general, you should forget about blocks entirely, they are an implementation detail of the IC and not relevant for anything as far as canisters are concerned.
+
+-------------------------
+
+saikatdas0790 | 2022-10-08 09:55:55 UTC | #6
+
+Got it, thank you.
+
+I was referring to commit points synonymously with blocks, but as you pointed out, blocks are an implementation detail that canister devs needn't be concerned about.
+
+-------------------------
+
+saikatdas0790 | 2023-03-29 04:44:14 UTC | #7
+
+Hi @rossberg 
+
+Quick follow up question. Does the commit point resetting cycle limit behaviour also apply to [notify calls](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.notify.html) or only [async calls](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.call.html)?
+
+-------------------------
+
+Severin | 2023-03-29 08:32:41 UTC | #8
+
+AFAIU every `await` is a commit point, nothing else (besides the call being completed). The functions you linked both don't await by themselves, you have to use `await` yourself
+
+-------------------------
+
+saikatdas0790 | 2023-03-29 09:00:12 UTC | #9
+
+The call method **has** to be awaited because it returns a future.
+
+The notify method is synchronous.
+
+Trying to clarify what the default behaviour is :slight_smile:
+
+-------------------------
+
+Severin | 2023-03-29 09:07:20 UTC | #10
+
+I don't think it _has_ to be awaited if you don't care about the result. The call would still be dispatched at the next commit point
+
+-------------------------
+
+saikatdas0790 | 2023-03-29 09:34:39 UTC | #11
+
+From my understanding, I believe Rust doesn't invoke an async function unless it is awaited. Please correct me if I am missing something
+
+-------------------------
+
+rossberg | 2023-03-29 16:22:40 UTC | #12
+
+Sorry, what I said wrt await was mainly about Motoko. I don't know exactly how the Rust CDK integrates with Rust's async mechanism (though I heard it's a bit hacky :) ).
+
+On the platform level there is no such thing as async, so it depends on the language how these concepts are mapped to the platform.
+
+With Motoko, the commit story also became much more muddy since the introduction of `await*`, which hence should only be used very carefully.
+
+-------------------------
+
+skilesare | 2023-03-29 17:21:27 UTC | #13
+
+I think you are ok using await* liberally as long as you make the conservative assumption that an await has always occurred and proceed with your programming as if it has.
+
+Don't fear the star! Respect it. :)
+
+-------------------------
+
+rossberg | 2023-03-29 20:54:18 UTC | #14
+
+See, that's the wrong assumption to make. It's _not_ conservative. Because if an await has not occurred, but an error occurs, your state may rollback farther than you have anticipated. Basically, the scope of rollbacks is almost entirely unpredictable in the presence of await* -- and rollbacks are already difficult enough to handle correctly with regular await, where you know your commit points precisely.
+
+-------------------------
+
+skilesare | 2023-03-29 21:00:42 UTC | #15
+
+I'm glad I stuck my neck out because this may just save me. Thanks for the lesson....I'll have to think about this.
+
+Can you await an async* to force it?
+
+-------------------------
+
+skilesare | 2023-03-31 19:46:19 UTC | #16
+
+@rossberg 
+
+Can you take a look at Star.mo at [Star Example](https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/?tag=2809641052)
+
+I'm thinking as a best practice we might want to put in a compiler warning whenever someone uses async * without returning this class(Or whatever similar thing the base team comes up with...I'm not tied to these names and variants...it was just an experiment I threw together this morning).
+
+The idea would be that you should always return back the awaited state from an async* so that it can be properly handled.  There are likely some helper methods that can be added here...I'm thinking one that takes a bool at the end that can be passed in at the end of your async* to turn a Result int a Star....something like:
+
+public func fromResult<R, E>(x : Result.Result<R,E>, didAwait : Bool) : Star<R, E>
+
+(looks like chain may have an issue due to shared types.... definitely need a better motoko dev to look at this).
+
+-------------------------
+
+saikatdas0790 | 2023-04-04 15:55:25 UTC | #17
+
+Here's another follow up question. What is the behaviour if I use [`ic_cdk::spawn`](https://docs.rs/ic-cdk/latest/ic_cdk/fn.spawn.html)
+
+If I have 10 async calls being awaited inside the `spawn`, do they get executed as part of separate commit points? And if so, is the instruction/cycle limit reset between each one?
+
+Thoughts?
+
+@Severin @rossberg
+
+-------------------------
+
+AdamS | 2023-04-04 16:14:55 UTC | #18
+
+An await point is an abstraction over a callback being invoked; the callback counts as the same type of entry point as canister methods. So yes to all. `spawn` doesn't relate to the behavior, it just executes it; an async canister method is implicitly wrapped in `spawn`.
+
+-------------------------
+

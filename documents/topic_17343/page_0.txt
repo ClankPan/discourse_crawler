@@ -1,0 +1,127 @@
+allengr220 | 2022-12-12 05:18:29 UTC | #1
+
+I have the basic-bitcoin tutorial deployed at cfza3-5aaaa-aaaag-qa7lq-cai. 
+Everything works except the send function. When I try to send my btc back to the test net faucet 
+dfx canister --network=ic call basic_bitcoin send '(record { destination_address = "tb1qndnfnxvjupgyfut6skz8mdj6zcmgu9r65rv7lr"; amount_in_satoshi = 321; }) '
+I get the following error:
+WARN: The default identity is not stored securely. Do not use it to control a lot of cycles/ICP. Create a new identity with `dfx identity create` and use it in mainnet-facing commands with the `--identity` flag
+Error: Failed update call.
+Caused by: Failed update call.
+  The Replica returned an error: code 4, message: "IC0503: Canister cfza3-5aaaa-aaaag-qa7lq-cai trapped explicitly: assertion failed at Base58.mo:89.11-89.32"
+
+It seems like the code is not able to send to a Bech32 address (tb1...).
+
+-------------------------
+
+neeboo | 2022-12-12 05:42:33 UTC | #2
+
+Have to support address converting before sending txn
+
+-------------------------
+
+allengr220 | 2022-12-12 17:14:55 UTC | #3
+
+Thanks, but how is that done?
+
+-------------------------
+
+allengr220 | 2022-12-14 02:51:57 UTC | #4
+
+So yeah, that appears to be a bug and not a feature:
+
+I was able to send sats to a testnet faucet address starting with an m. No change of code.
+
+-------------------------
+
+neeboo | 2022-12-14 09:00:59 UTC | #5
+
+https://wiki.internetcomputer.org/wiki/Bitcoin_integration#:~:text=the%20following%20address%20formats%20are%20supported%3A
+
+According to this document, Bech32 is not supported in current implementation
+
+-------------------------
+
+timo | 2022-12-14 11:38:13 UTC | #6
+
+According to that document P2WPKH, P2WSH, P2TR are all supported and they are bech32.
+
+The limitation is not in the Bitcoin integration, it is only in the `basic_bitcoin` example code. See here:
+https://github.com/dfinity/examples/blob/bda794f1dc26993342da48bcdbb2c204c3b67dc4/motoko/basic_bitcoin/src/basic_bitcoin/src/BitcoinWallet.mo#L125
+An outer function is taking `dst_address` and is assuming it is p2pkh when passing it to an inner function. Unfortunately, the inner function only accepts the p2pkh type:
+https://github.com/tgalal/motoko-bitcoin/blob/10cf7f2efbba9bb4d077013db1b990143f193844/src/bitcoin/Types.mo#L39-L41
+Not sure how necessary that restriction is. There is a whole file for bech32 in that repo:
+https://github.com/tgalal/motoko-bitcoin/blob/10cf7f2efbba9bb4d077013db1b990143f193844/src/Bech32.mo
+
+-------------------------
+
+neeboo | 2022-12-14 11:59:49 UTC | #7
+
+Looking at the bitcoin_canister, it seems supported, let me do a local and mainnet test shortly
+
+-------------------------
+
+allengr220 | 2022-12-14 16:05:51 UTC | #8
+
+Thanks for looking into it!
+
+-------------------------
+
+blabagastered | 2023-01-12 13:02:21 UTC | #9
+
+[quote="timo, post:6, topic:17343"]
+```
+        Utils.get_ok_except(Bitcoin.buildTransaction(2, own_utxos, [(#p2pkh dst_address, amount)], #p2pkh own_address, Nat64.fromNat(total_fee)), "Error building transaction.");
+          
+```
+[/quote]
+
+I'm using an address derived this way
+
+
+ 
+```
+  // Get BTC address for a given user:
+  public func get_btc_address_for_a_given_user(user_principal : Principal) : async Text {
+    let derivation_path_with_double_array : [[Nat8]] = await get_btc_derivation_path_for_a_given_user(user_principal);
+    let bitcoin_address : Text = await get_p2pkh_address_for_a_given_derivation_path(derivation_path_with_double_array);
+    return bitcoin_address;
+  };
+
+  // Get BTC derivation path for a given user:
+  public func get_btc_derivation_path_for_a_given_user(user_principal : Principal) : async [[Nat8]] {
+    let user_principal_blob : Blob = Principal.toBlob(user_principal);
+    let user_principal_array : [Nat8] = Blob.toArray(user_principal_blob);
+    let derivation_path_with_double_array : [[Nat8]] = [user_principal_array];
+    return derivation_path_with_double_array;
+  };
+
+  // Adapted from BasicBitcoin example:
+  /// Returns the P2PKH address of this canister for a given (as an argument) derivation path.
+  public func get_p2pkh_address_for_a_given_derivation_path(derivation_path : [[Nat8]]) : async BitcoinAddress {
+    await BitcoinWallet.get_p2pkh_address(NETWORK, KEY_NAME, derivation_path);
+  };
+```
+
+And on send I'm seeing 
+
+
+```
+Uncaught (in promise) Error: Call was rejected:
+  Request ID: bdd267afdeb9a1abda78fd1627bbdae5ea7654a2ef1e03e7ab43f64f7fa63ab6
+  Reject code: 4
+  Reject text: IC0503: Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped explicitly: Error building transaction.
+```
+
+and 
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Fetching UTXOs...
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Building transaction...
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] pattern failed
+```
+ How might I fix this?
+
+The problem arises only on send. Address generation throws no errors.
+
+-------------------------
+

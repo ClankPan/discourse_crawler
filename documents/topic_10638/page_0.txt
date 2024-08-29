@@ -1,0 +1,304 @@
+palinda | 2022-02-02 12:19:47 UTC | #1
+
+Support
+
+I'm trying to call install_code function from Nodejs. For that i'm reading wasm file as below,
+
+const wasm = fs.readFileSync("<file_name>.wasm")
+Then invoke the method by passing [...new Uint8Array(wasm)]. 
+
+But my request rejects with 
+Reject code: 4
+Reject text: Canister trapped explicitly: IDL error: word read out of buffer
+
+Any help!
+
+-------------------------
+
+senior.joinu | 2022-02-02 13:27:35 UTC | #2
+
+Could you please provide more details on how you actually invoke the method. The more code you can provide the better.
+
+-------------------------
+
+palinda | 2022-02-02 14:08:26 UTC | #3
+
+Thank you for the quick response!
+
+Nodejs code for motoko canister call
+```
+const idlFactory = ({ IDL }) => {
+    const Key = IDL.Text;
+    const Value = IDL.Record({ 'age' : IDL.Int, 'name' : IDL.Text });
+    return IDL.Service({
+      'upgradesub' : IDL.Func([IDL.Vec(IDL.Nat8), IDL.Vec(IDL.Nat8)], [], []),
+    });
+  };
+
+const testaudit = createActor(canisterId, {
+    agentOptions: { host: "http://localhost:8000",}
+});
+
+let updateSubCanisters = async () => {
+    const wasm = fs.readFileSync("./../../.dfx/local/canisters/testaudit/testaudit.wasm")
+    const res = await testaudit.upgradesub([...new Uint8Array(wasm)], [...new 
+    Uint8Array(Buffer.from("Xep"))]).catch(e => { return "Error" + e });
+    return res;
+}
+```
+Motoko canister function
+```
+ public func upgradesub(wasm: Blob, args: Blob) : async () {
+    Debug.print("upgrade_sub: ");
+      for ((key, bucket) in buckets.entries()) {
+        let principal = Principal.fromActor(bucket);
+        let status = await IC.canister_status({canister_id=principal});
+        Debug.print("cycles: " # Nat.toText(status.cycles));
+        await IC.stop_canister({canister_id=principal});
+        await IC.install_code({canister_id=principal; mode=#upgrade; wasm_module=wasm; arg=args});
+        await IC.start_canister({canister_id=principal});
+      };
+  };
+
+```
+
+This is the response I'm getting
+```
+The given bytes are a valid wasm module
+ErrorError: Call was rejected:
+  Request ID: 2ae15b8f3ec0d64659e4d44968f329341985866e6448e6c8a1660b2b6f1580da
+  Reject code: 4
+  Reject text: Canister <canister-id> trapped explicitly: IDL error: word read out of buffer
+```
+I read my buffer needs to encode in Candid data format, But I don't know how to do it.
+
+-------------------------
+
+senior.joinu | 2022-02-02 14:24:33 UTC | #4
+
+Yes, there is an error.
+
+```javascript
+const res = await testaudit.upgradesub([...new Uint8Array(wasm)], [...new 
+    Uint8Array(Buffer.from("Xep"))]).catch(e => { return "Error" + e });
+```
+Args should be candid-encoded, not plain text.
+
+I don't know your interfaces, but basically you have to use `IDL.encode()` function. For example, if your `init` canister function takes a `Text` as an argument, on js side you should encode it like:
+```
+const args = Array.from(IDL.encode([IDL.Text], ["Xep"]));
+```
+and then use it like this:
+```
+const res = await testaudit.upgradesub([...new Uint8Array(wasm)], args);
+```
+
+I might make a mistake, but it seems like a right direction to look for an error.
+
+-------------------------
+
+palinda | 2022-02-02 15:07:50 UTC | #5
+
+It changed the previous error. I updated my Nodejs function as below,
+```
+let updateSubCanisters = async () => {
+    const wasm = fs.readFileSync("./../../.dfx/local/canisters/testaudit/testaudit.wasm")
+    const args = Array.from(IDL.encode([IDL.Text], ["Xep"]));
+    console.log(args)
+    const res = await testaudit.upgradesub([...new Uint8Array(wasm)], args).catch(e => { return "Error" + e });
+    return res;
+}
+```
+
+args print output
+```
+[
+  68,  73, 68, 76, 0,
+   3, 113,  1, 88
+]
+```
+
+And now I'm receiving following error
+```
+[ERR_INVALID_ARG_TYPE]: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined
+```
+
+I'm trying to update my org.mo dynamic canisters initiated by main.mo canister via main canister.
+
+main.mo
+```
+actor {
+    type Org = orgs.Org;
+    type Key = Text;
+    type Value = person.Person;
+    let IC : ICType.Self = actor "aaaaa-aa";
+
+    stable var entries : [(Text, Org)] = [];
+
+    let buckets = Map.fromIter<Text,Org>(entries.vals(), 10, Text.equal, Text.hash);
+
+    public func put(o: Text, k : Key, v : Value) : async () {
+        let bucket = switch (buckets.get(o)) {
+        case null {
+            // provision next send, 
+            let b = await orgs.Org(o); // dynamically install a new Bucket
+            buckets.put(o, b);
+            b;
+        };
+        case (?bucket) bucket;
+        };
+        await bucket.put(k, v);
+  };
+
+  public func upgradesub(wasm: Blob, args: Blob) : async () {
+    Debug.print("upgrade_sub: ");
+      for ((key, bucket) in buckets.entries()) {
+        let principal = Principal.fromActor(bucket);
+        let status = await IC.canister_status({canister_id=principal});
+        Debug.print("cycles: " # Nat.toText(status.cycles));
+        await IC.stop_canister({canister_id=principal});
+        await IC.install_code({canister_id=principal; mode=#upgrade; wasm_module=wasm; arg=args});
+        await IC.start_canister({canister_id=principal});
+      };
+  };
+```
+
+Org.mo canister
+```
+actor class Org(n : Text) {
+};
+```
+
+Any idea what I'm missing here. Appreciate your help.
+
+-------------------------
+
+senior.joinu | 2022-02-02 15:20:48 UTC | #6
+
+Does 
+```
+console.log(wasm);
+```
+print something?
+
+Looks like one of your variables is undefined.
+
+-------------------------
+
+palinda | 2022-02-02 15:31:16 UTC | #7
+
+Updated as below
+
+```
+let updateSubCanisters = async () => {
+    const wasm = fs.readFileSync("./../../.dfx/local/canisters/testaudit/testaudit.wasm")
+    var valid = WebAssembly.validate(new Uint8Array(wasm));
+    console.log("The given bytes are " + (valid ? "" : "not ") + "a valid wasm module");
+    console.log(wasm);
+    const args = Array.from(IDL.encode([IDL.Text], ["Xep"]));
+    console.log(args)
+    const res = await testaudit.upgradesub([...new Uint8Array(wasm)], args).catch(e => { return "Error" + e });
+    return res;
+}
+```
+
+Output
+```
+The given bytes are a valid wasm module
+<Buffer 00 61 73 6d 01 00 00 00 01 ee 81 80 80 00 26 60 02 7f 7f 00 60 01 7e 00 60 08 7f 7f 7f 7f 7f 7f 7f 7f 00 60 00 01 7f 60 00 01 7e 60 03 7f 7f 7f 00 60 ... 435195 more bytes>
+[
+   68,  73, 68, 76,   0,
+    1, 113,  3, 88, 101,
+  112
+]
+
+```
+
+Thanks!
+
+-------------------------
+
+peterparker | 2022-02-02 17:52:23 UTC | #8
+
+It is still under development, that's why my code is still in a branch, but i've got a working example: https://github.com/deckgo/deckdeckgo/blob/build/install-code/canisters/scripts/ic.installcode.mjs
+
+For me the tricks was
+
+1. be sure that the local candid description is up-to-date
+2. encode the canister parameters as candid parameters ([thread](https://forum.dfinity.org/t/encode-principal-to-candid-arguments/10465))
+
+Not sure it is your error but maybe by comparing you will notice something. Hope it helps.
+
+-------------------------
+
+palinda | 2022-02-03 02:20:36 UTC | #9
+
+It has what I want to do. I'll follow the repo. Thanks for the help!
+
+-------------------------
+
+palinda | 2022-02-07 08:35:14 UTC | #10
+
+I went through the code, I was able to do my requirement. But I like to do an improvement, In the below code owner is parsed as a parameter from the outside. Can I use some Text data inside the canister as an argument?. 
+file: canister.utils.mo
+```
+public func installCode(canisterId: Principal, owner: Blob, wasmModule: Blob): async() {
+            await ic.install_code({
+                arg = owner;
+                wasm_module = wasmModule;
+                mode = #upgrade;
+                canister_id = canisterId;
+            });
+        };
+```
+
+Expected:
+```
+private stable var owner : Text= "me";
+public func installCode(canisterId: Principal, wasmModule: Blob): async() {
+            await ic.install_code({
+                arg = text_to_candid_encode_blob(owner); <---- requirement
+                wasm_module = wasmModule;
+                mode = #upgrade;
+                canister_id = canisterId;
+            });
+        };
+```
+Thanks!
+
+-------------------------
+
+peterparker | 2022-02-07 15:11:46 UTC | #11
+
+It's an on-going PR. The  parameter `owner: Blob` should actually be renamed to something like "any args".
+
+```
+public func installCode(canisterId: Principal, anyArgs: Blob, wasmModule: Blob): async() {
+```
+
+These args are encoded in the [JS code](https://github.com/deckgo/deckdeckgo/blob/5ec5c9076344de36fdbcd583af45016aae1665c3/canisters/scripts/ic.installcode.mjs#L62).
+
+There I guess yes in the JS code you can extend the code or modify the code to pass the parameters you want, those needed by your canister.
+
+-------------------------
+
+shashika | 2022-03-31 11:29:07 UTC | #12
+
+Hi all, I faced the same issue as above when passing the parameters for install_code method to upgrade canisters using NodeJs.
+```
+let updateSubCanisters = async () => {
+    const wasm = fs.readFileSync("./../../.dfx/local/canisters/testaudit/testaudit.wasm")
+   // const args = Array.from(IDL.encode([IDL.Text], ["Xep"])); <---- instead of Array use Uint8Array as below
+    const args = [... new Uint8Array(IDL.encode([IDL.Text], ["Xep"]))];
+    console.log(args)
+    const res = await testaudit.upgradesub(
+  [...new Uint8Array(wasm)], 
+  args
+).catch(e => { return "Error" + e });
+    return res;
+}
+```
+The problem here is that a simple array is treated as Candid [Nat8] and Uint8Array is treated as a Candid Blob data type respectively.
+
+-------------------------
+

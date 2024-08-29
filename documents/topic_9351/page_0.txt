@@ -1,0 +1,81 @@
+nomeata | 2021-12-05 17:34:30 UTC | #1
+
+When writing canisters (services, smart contracts) on the Internet Computer, and these services are meant to call other canisters, or if you create external services or agents that interact with the Internet Computer, it is probably important to test the behaviour of your code when some of these calls are still pending, or if they come back in particular order.
+
+The Internet Computer of course does not give you control over its scheduling. But there is an interesting aspect of the IC's behavior that allows us to send an inter-canister or ingress call, and externally control when it returns (without resorting to even more horrible hacks like looping self-calls): If a canister tries to stop itself, then the call to `stop_canister` will prevent this stopping from happening, and the canister will be stuck in state `stopping`.  This situation can then be externally resolved using `canister_start`.
+
+I wrote code for two canisters that can be used to demonstrate this, and can be used in tests:
+
+https://github.com/nomeata/ic-barrier
+
+The "barrier" canister provides this interface:
+
+    service : {
+      enter: () -> ();
+      lock: () -> ();
+      release: () -> ();
+      transaction_notification: () -> ();
+      wallet_receive: () -> ();
+    }
+
+First you invoke `lock` to close the barrier. Then you can call `enter` as often as you want, all these calls with not respond. Once you call `release`, all of these calls will return.
+
+The barrier canister is installed at [cuptx-eaaaa-aaaai-aa67q-cai](https://ic.rocks/principal/cuptx-eaaaa-aaaai-aa67q-cai), you can play around with it there, or you can get the source code and install it yourself.
+
+The endpoints `transaction_notification` and `wallet_receive` will behave like `enter` and can be used to test the behaviour of the ICP-ledger (or compatible ledger) respectively the cycle wallet.
+
+**CAUTION**: Most canisters with outstanding calls cannot be upgraded safely. This means this canister _could_ be used to stage attacks against any service that you can trick to call you (e.g. by asking someone to transfer some cycles to your canister). But of course we woudn't do that. Still, if this worries you, read
+[how to protect your canisters from such attacks](https://www.joachim-breitner.de/blog/789-Zero-downtime_upgrades_of_Internet_Computer_canisters).
+
+-------------------------
+
+nomeata | 2021-12-05 17:37:09 UTC | #2
+
+I am using the same pattern (but implemented using the "universal canister") to improve the coverage of our IC Specification Compliance Test Suite (`ic-ref-test`), and found bugs in the reference implementation (to be blamed on me as well). So testing for how your code deals with long-running calls and stopping canisters is surely worth it!
+
+https://github.com/dfinity/ic-hs/pull/63
+
+-------------------------
+
+GLdev | 2021-12-05 20:34:18 UTC | #3
+
+So, besides not calling untrusted canisters (something that might be easy now, but will become harder as we move to more open-services available) is there anything you can do to "drop" messages after some time or prepare for a clean update?
+
+-------------------------
+
+nomeata | 2021-12-05 21:19:39 UTC | #4
+
+With the [improved System API](https://forum.dfinity.org/t/prioritize-safe-instantaneous-canister-upgrades/9039?u=nomeata) and an adjusted Rust CDK you can take full control of the set of outstanding calls, even across upgrades, and implement such logic in the canister. So hopefully we will have this ability before the lack of it bites us. And canisters using `await` won't benefit easily even then.
+
+-------------------------
+
+levi | 2021-12-06 00:00:04 UTC | #5
+
+Sounds like this is happening, that is awesome. I am 100% for this change. With the new system api how will it work, will each call be considered a one way call including the callbacks? is it something like for each call that a canister makes it also makes a entry point for that specific callback? Does this mean that now all calls will be atomic? Will a call be able to do other work after sending out an inter-canister-call? And it still be atomic? If so what happens when a canister traps in the work after it sends out a call, the state will get rolled back, if it’s atomic, but the inter-canister-callback will still come to the callback entry point? That is ok with me the callback can check the state again. I want to get a better picture of how the model will look. Also what are the specific commit points in the new model?
+
+-------------------------
+
+timo | 2023-11-27 13:14:36 UTC | #6
+
+[quote="nomeata, post:1, topic:9351"]
+Then you can call `enter` as often as you want, all these calls with not respond
+[/quote]
+
+The Ic-barrier is probably something from the beginning of the IC that doesn't work anymore, or does it?
+
+The current spec says that calls in state `stopping` (as well as stopped) are rejected with `canister_reject`. So I believe there was a change between 2021 and now or am I missing something?
+
+-------------------------
+
+nomeata | 2023-11-27 15:50:56 UTC | #7
+
+But the call to `enter` isn't a call to a stopping canister; it is a call to a canister that is the controller of another canister, and that second canister is stopping. By calling the management method `stop_canister`, the call waits until the other canister is fully stopped. (If I remember correctly.)
+
+-------------------------
+
+timo | 2023-11-27 16:24:16 UTC | #8
+
+I see, two calls to `stop_canister` in parallel. Cool, I'll try to use that for some tests I am writing.
+
+-------------------------
+

@@ -1,0 +1,84 @@
+senior.joinu | 2021-06-30 12:27:01 UTC | #1
+
+So, I have a method in one of my canisters, which:
+* does some calculations and state modifications
+* sends user-defined (possibly large) amount of external messages
+* returns a result
+
+The result does not depend on whether external messages made it to another end. In fact, I don't care at all, if my external messages arrived at their destination (nor that they were processed without errors).
+
+Can I somehow achieve this behavior in order to save some time which is now wasted awaiting for responses?
+
+The only optimization I found working right now is to send all the messages at once and simultaneously await for all of them to complete with rust's `Future::join()`.
+
+-------------------------
+
+claudio | 2021-06-30 12:31:03 UTC | #2
+
+In Motoko you would just send the message but not await the result. Not sure if Rust allows that, or if you have to explicitly discard the result somehow (without awaiting it).
+
+-------------------------
+
+senior.joinu | 2021-06-30 12:35:35 UTC | #3
+
+That's the point. Rust's futures work on polling and do nothing until they're awaited.  I thought Motoko should have similar behavior.
+
+Does that mean that Rust and Motoko have different task scheduling mechanisms?
+
+-------------------------
+
+claudio | 2021-06-30 12:55:28 UTC | #4
+
+I'm not o fey with the Rust cdk implementation of async/await, but if that's the case, then scheduling behaviour is indeed different.
+
+In Motoko, sending a message queues it up for transmission at the next return, exiting throw or await (the next commit point). If you don't await the result, the message will still be sent. If you trap before a commit point is reached, the message (and all other side-effects since the last commit point) are discarded.
+
+-------------------------
+
+senior.joinu | 2021-06-30 13:02:49 UTC | #5
+
+Thanks again @claudio. That's very helpful. Can you, please, mention someone who can help me understand if it is the case for rust's `ic_cdk`?
+
+-------------------------
+
+claudio | 2021-06-30 13:09:13 UTC | #6
+
+@roman-kashitsyn might know better...
+
+-------------------------
+
+roman-kashitsyn | 2021-06-30 15:03:22 UTC | #7
+
+Hi @senior.joinu!
+
+Thanks for a great question! `ic-cdk` docs are indeed somewhat laking at the moment. I'm not the author of `ic-cdk`, but I know the inner workings quite well.
+
+In the current implementation of `ic-cdk`, when you invoke `call()`, the function actually talks to the system API to dispatch the call right away. The returned `Future` is only used as a handle to obtain the result (see the definition of [`call_raw`](https://github.com/dfinity/cdk-rs/blob/8bd512852d34e9b129b81f9f7c7e228adbf2bed3/src/ic-cdk/src/api/call.rs#L217-L257)). In other words, the returned future is _inert_, but the `call` function is not. If you drop the future returned by `call()`, the destination will be called anyway, and the results will be discarded.
+
+However, while dropping futures returned by `call` will do what you want, dropping more complicated futures (e.g., a future that does 2 calls in a row) won't.
+
+In order to achieve that, we'll have to use a very inappropriately named function [`block_on`](https://docs.rs/ic-cdk/0.3.0/ic_cdk/fn.block_on.html) (it should really have been called `spawn`!) that takes a future and drives it to completion in the background. With the current API, the correct way to spawn an async action and reply immediately is:
+
+```
+async fn background_task() { /* ... */ }
+
+#[update]
+async fn my_call(input: Input) -> Output {
+  let output = do_work(input);
+  // sic! there is really no way to *block* on a future
+  // inside of a canister!
+  ic_cdk::block_on(background_task());
+  output
+}
+```
+
+I'll send a PR to deprecate `block_on` and provide `spawn` instead.
+
+-------------------------
+
+senior.joinu | 2021-06-30 15:03:55 UTC | #8
+
+Yes! That's exactly what I wanted to know. Thanks a lot!
+
+-------------------------
+

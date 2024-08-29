@@ -1,0 +1,1108 @@
+ericswanson | 2022-08-04 18:03:23 UTC | #421
+
+I was able to reproduce this.  The problem is that the current version of the ic-starter doesn't overwrite the subnet configuration if it already exists.  My understanding is that this is in the process of being fixed.
+
+What this means is if you run `dfx start` or `dfx replica`, without enabling bitcoin integration, and then try to run `dfx start --enable-bitcoin` or `dfx replica --enable-bitcoin`, the subnet won't have the bitcoin feature enabled.
+
+The workaround is either `dfx start --enable-bitcoin --clean`, or to remove the `.dfx/state` and `.dfx/local` directories first.
+
+-------------------------
+
+jmac | 2022-08-04 22:21:12 UTC | #422
+
+So in basic terms, ICP is successfully moving forward?
+
+-------------------------
+
+diegop | 2022-08-04 22:30:47 UTC | #423
+
+Id like to think it never stopped, but this is certainly undeniably a large jump.
+
+-------------------------
+
+flyq | 2022-08-07 04:11:22 UTC | #424
+
+I may have lost 0.01277662 BTC, worth about 300 u.
+
+**This is entirely my own fault and has nothing to do with the security of the ECDSA and Bitcoin interface.**
+
+Here is the details:
+
+A few days ago, I deployed canister to the mainnet and tested the BTC on the testnet, everything works fine!
+
+So why not test the mainnet BTC? Although I saw the announcement saying not to use valuable BTC, I thought this is mainly used to explain that the key of ecdsa may be changed when it is officially released in the future, but it does not matter, because I will transfer the BTC out immediately.
+
+So I ran:
+````sh
+dfx canister --network ic install basic_bitcoin --argument='(variant {Mainnet})' -m=reinstall
+
+dfx canister --network ic call basic_bitcoin get_p2pkh_address
+("1T6xcKM23GjYNNeZXrQrctSEFAKcfmGq2")
+````
+Everything looked good, and I could get the address of the BTC mainnet correctly. It seemed everything is normal, so I withdrew a small amount of BTC from the exchange to this address. I knew the risks, so I limited the possible losses to what I can afford. In the boring waiting, (compared to IC, BTC is really slow), I tried to randomly obtain an address with a balance from the BTC explorer, to test whether the balance can be obtained correctly:
+````sh
+dfx canister --network ic call basic_bitcoin get_balance '("<btc address>")'
+Error: Failed update call.
+Caused by: Failed update call.
+  The Replica returned an error: code 5, message: "Canister zso2k-nqaaa-aaaak-aao3q-cai trapped explicitly: Panicked at 'called `Result::unwrap()` on an `Err` value: (CanisterReject, "Received request for mainnet but the subnet supports testnet")', src/bitcoin_api.rs:31:17"
+````
+I realized that something was wrong, so I quickly went to check the withdrawal interface, the 2min cancellation period has passed, the transaction has been sent to the node's memory pool, and I want to consume the utxo by sending another transaction with a higher fee price again to cancel the previous transaction, but the withdrawal is through the exchange, and it may time out waiting for customer service. 
+
+![image|484x500](upload://Am20QrQxpxuKCl1B5l1KWYvH5OH.png)
+[src](https://www.blockchain.com/btc/address/1T6xcKM23GjYNNeZXrQrctSEFAKcfmGq2)
+
+Since the interface of ecdsa is not banned (getting address requires getting public key from ecdsa), then theoretically I should be able to withdraw from this address.
+
+The interface `get_current_fee_percentiles` to get fee_price (fee per byte) is not available, I deleted it, and then checked some recent transactions from the btc explorer, most of them are below 100, so setting it to 110.
+
+Then, deleting the `get_utxos`, input the UTXOs as a parameter. The `height` and `value` in `Utxo` are easy to find from the BTC explorer, and the `txid` in `OutPoint` generated from tx_hash:
+```rs
+    // the hash is from: https://www.blockchain.com/btc/tx/e1d3f2afe6ef975a1c2675cac813d4fe1c981e6beeb3edec1ad0d872996edb21
+    let hash = bitcoin_hashes::sha256d::Hash::from_str(
+        "e1d3f2afe6ef975a1c2675cac813d4fe1c981e6beeb3edec1ad0d872996edb21",
+    )
+    .unwrap();
+
+    let txid = bitcoin::hash_types::Txid::from_hash(hash);
+    let txid_vec = txid.to_vec();
+````
+vout may be the index of utxo under this address, because there is only one transaction, so I set it to 0;
+
+`send_transaction` doesn't work either, so I return the signed transaction bytes.
+
+Finally achieved this effect:
+```sh
+dfx canister --network ic call basic_bitcoin tx '(record {destination_address= "3QnYGgtC1hNrSRBHdUnDn7EBZ3R8fwezVh"; amount_in_satoshi=1247662; }, record {height=747887;value=1277662; outpoint=record {txid=vec{33;219;110;153;114;216;208;26;236;237;179;238;107;30;152;28;254;212;19;200;202;117;38;28;90;151;239;230;175;242;211;225;};vout=0;}})'
+(
+  "020000000121db6e9972d8d01aecedb3ee6b1e981cfed413c8ca75261c5a97efe6aff2d3e1000000006b483045022100e2644f76115c826a73488967e11390a444f0d673686b1f4e00b1b16a9ebb1e670220131e74ffb8cbf116446c84c99c805b0c1b3824d453a6a85d3ffcd60a78161d6c012103dcdb13eda6c212e807626e6e72ef8aca901a4c0f31f1bf7036803e3756240b96ffffffff02ae0913000000000017a914fd564e358f1f3f7f88990244ed1b5293946964558718750000000000001976a91404efca051ff7d7d8ba81f7dcc5c783c7381566b188ac00000000",
+  blob "\02\00\00\00\01!\dbn\99r\d8\d0\1a\ec\ed\b3\eek\1e\98\1c\fe\d4\13\c8\cau&\1cZ\97\ef\e6\af\f2\d3\e1\00\00\00\00kH0E\02!\00\e2dOv\11\5c\82jsH\89g\e1\13\90\a4D\f0\d6shk\1fN\00\b1\b1j\9e\bb\1eg\02 \13\1et\ff\b8\cb\f1\16Dl\84\c9\9c\80[\0c\1b8$\d4S\a6\a8]?\fc\d6\0ax\16\1dl\01!\03\dc\db\13\ed\a6\c2\12\e8\07bnnr\ef\8a\ca\90\1aL\0f1\f1\bfp6\80>7V$\0b\96\ff\ff\ff\ff\02\ae\09\13\00\00\00\00\00\17\a9\14\fdVN5\8f\1f?\7f\88\99\02D\ed\1bR\93\94idU\87\18u\00\00\00\00\00\00\19v\a9\14\04\ef\ca\05\1f\f7\d7\d8\ba\81\f7\dc\c5\c7\83\c78\15f\b1\88\ac\00\00\00\00",
+)
+
+curl -H "Authorization: Bearer <API TOKEN>"  -d '{"tx": "020000000121db6e9972d8d01aecedb3ee6b1e981cfed413c8ca75261c5a97efe6aff2d3e1000000006b483045022100f79de358f564aed17cb8fd7cf95d79aee65218698bcd1cf037e136605029f93702203dba9fed10b25da52d6db6bd643631af832442e87051eea8f19a0f6e8d72b2f9012103dcdb13eda6c212e807626e6e72ef8aca901a4c0f31f1bf7036803e3756240b96ffffffff02ae0913000000000017a914fd564e358f1f3f7f88990244ed1b5293946964558718750000000000001976a91404efca051ff7d7d8ba81f7dcc5c783c7381566b188ac00000000"}' -X POST https://ubiquity.api.blockdaemon.com/v2/bitcoin/mainnet/tx/send
+{"type":"bad-request","code":16397,"title":"Bad Request","status":400,"detail":"failed to send transaction. Error: bad-txns-inputs-missingorspent. Code: -25"}%  
+
+# If I changed to vout to 1, and got another error, it seems vout = 0 is correct:
+{"type":"bad-request","code":16397,"title":"Bad Request","status":400,"detail":"failed to send transaction. Error: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element). Code: -26"}%  
+```
+I have added permission control to interfaces that needs to be signed with an ECDSA key.
+
+ <details><summary>the code of tx interface</summary>
+
+```rs
+pub async fn tx(
+    network: Network,
+    derivation_path: Vec<Vec<u8>>,
+    key_name: String,
+    dst_address: String,
+    amount: Satoshi,
+    utxos: Vec<Utxo>,
+) -> Vec<u8> {
+    // Get fee percentiles from previous transactions to estimate our own fee.
+
+    let fee_per_byte = 110;
+
+    // Fetch our public key, P2PKH address, and UTXOs.
+    let own_public_key =
+        ecdsa_api::ecdsa_public_key(key_name.clone(), derivation_path.clone()).await;
+    let own_address = public_key_to_p2pkh_address(network, &own_public_key);
+
+    print("Fetching UTXOs...");
+    let own_utxos = utxos;
+
+    let own_address = Address::from_str(&own_address).unwrap();
+    let dst_address = Address::from_str(&dst_address).unwrap();
+
+    // Build the transaction that sends `amount` to the destination address.
+    let transaction = build_transaction(
+        &own_public_key,
+        &own_address,
+        &own_utxos,
+        &dst_address,
+        amount,
+        fee_per_byte,
+    )
+    .await;
+
+    // Sign the transaction.
+    let signed_transaction = sign_transaction(
+        &own_public_key,
+        &own_address,
+        transaction,
+        key_name,
+        derivation_path,
+        ecdsa_api::sign_with_ecdsa,
+    )
+    .await;
+
+    let signed_transaction_bytes = signed_transaction.serialize();
+
+    signed_transaction_bytes
+}
+```
+</details>
+
+Finally, still failed.
+
+1. Is there any problem with the above steps?
+2. It has been determined that the ECDSA key will be modified before the application subnet supports the BTC **mainnet** interface, so waiting for the development of the BTC interface will not solve the problem, is there any other solution?
+[quote="diegop, post:1, topic:14675"]
+* Threshold ECDSA deployment with a test key, which will be deleted once available on IC mainnet for public consumption
+[/quote]
+
+-------------------------
+
+PaulLiu | 2022-08-07 07:16:28 UTC | #425
+
+The ICP BTC integration only supports BTC testnet at the moment. So you cannot use the bitcoin API to send transaction or receive utxos or check balances of anything on the BTC mainnet.
+
+Since you have already sent some bitcoin to the address, you will have to manually craft a raw transaction, and send it via other means (e.g. bitcoin-cli command line) to the BTC mainnet to get the fund out. You will have to use your canister to sign on the raw transaction, which uses threshold ECDSA API, which is not related to and thus not affected by the bitcoin API.
+
+So your fund is not lost, and retrieve it definitely can be done, just that you can't use existing bitcoin API to send the transaction. Hope it helps!
+
+-------------------------
+
+Benjamin_Loison | 2022-08-07 10:26:45 UTC | #426
+
+This doesn't seem to be the reason why your transaction got rejected but please note that as far as I know your `fee_per_byte` in your tx interface is below the [relay fee](https://github.com/bitcoin/bitcoin/blob/26ec2f2d6bb12525044b6d09422b42715fc09319/src/policy/policy.h#L58-L59) as `fee_per_byte` is in millisatoshis per byte. Maybe you wanted to type `1100` instead of `110` ?
+
+-------------------------
+
+flyq | 2022-08-07 22:52:46 UTC | #427
+
+[quote="Benjamin_Loison, post:426, topic:6147"]
+Maybe you wanted to type `1100` instead of `110` ?
+[/quote]
+Thanks for the reminder, I ended up setting this value to 3000. 
+
+More importantly, you guys gave me confidence, and let me know it's going to work right away. So I searched for error: `bad-txns-inputs-missingorspent` and found the specific meaning of `vout` from [here](https://bitcoin.stackexchange.com/questions/86156/18-bad-txns-inputs-spent): In a certain tx, there may be multiple utxos output, and these utxos have an index, which is `vout`. The `vout` of the utxo used above should be 2, after changing that, The transaction is sucessfully!
+![image|474x500](upload://y9Q5AMky4kwCeglny2p7Yed1DMI.png)
+
+Amazing experience, like magic!
+
+-------------------------
+
+flyq | 2022-08-09 10:12:29 UTC | #428
+
+Will the bitcoin api consider adding support for other apis in the future, such as obtaining the details of a transaction according to tx_hash?
+
+-------------------------
+
+Benjamin_Loison | 2022-08-09 14:58:43 UTC | #429
+
+[Like @spnrapp](https://forum.dfinity.org/t/direct-integration-with-bitcoin/6147/371), are you looking for transaction information only about `tx_hash` that you created and broadcasted using your canister or you are looking for any arbitrary transaction information for a given `tx_hash` not necessarily created and broadcasted by your canister ?
+
+If you are looking for transaction information for an arbitrary `tx_hash`, a DFINITY staff may give current DFINITY point of view. Anyway using the HTTP request feature you can use a website like [blockchain.com](https://www.blockchain.com) to retrieve the transaction information associated to a given `tx_hash`.
+I am not very keen on the HTTP request feature but using [the documentation](https://internetcomputer.org/docs/current/samples/http-requests-exchange-rates) and [some details I shared on StackOverflow](https://stackoverflow.com/a/73165909/7123660), you should be able to code something doing the trick.
+
+-------------------------
+
+Maxfinity | 2022-08-09 16:20:57 UTC | #430
+
+[quote="Benjamin_Loison, post:429, topic:6147"]
+If you are looking for transaction information for an arbitrary `tx_hash`, a DFINITY staff may give current DFINITY point of view. Anyway using the HTTP request feature you can use a website like [blockchain.com](https://www.blockchain.com) to retrieve the transaction information associated to a given `tx_hash`.
+[/quote]
+
+This won't be possible long-term when certain websites ban IC nodes because too many requests are coming from the IC.
+
+-------------------------
+
+Fatalerror | 2022-08-15 18:43:35 UTC | #431
+
+Any progress update? Can you give a release date finally? There is a lot of speculation. The progress time has been delayed for months.
+
+-------------------------
+
+diegop | 2022-08-12 12:54:52 UTC | #432
+
+[quote="Fatalerror, post:431, topic:6147"]
+Any progress update?
+[/quote]
+
+Not sure you saw but last week we released the testnet, sample code and documentation so devs are building are now building smart contracts with BTC on ICP.
+
+https://forum.dfinity.org/t/btc-testnet-icp-integration-the-testnet-is-live/14675?u=diegop
+
+-------------------------
+
+Fatalerror | 2022-08-12 15:57:26 UTC | #433
+
+I think you don’t understand me. The btc integration release date was in June (you did not mean the test-net release at this date)
+It is been about 3 months then you released the btc integration test-net. 
+The manipulation is, the mainnet release date was at June. Now in August you did not give any (detailed) information about the process including mainnet release date. 
+
+When we ask the update, you were delayed the release date. 
+
+If something went wrong at the backside for processing the btc-integration we should know. 
+
+On the other hand dfinity team has given a public information the btc and ethereum integrations should have processed at the end of 2022.
+With this information how is it possible to release the integrations at the end of this year?
+The btc integration still in process since approximately 1 year. 
+I am not arguing with you but you hidden my previous post. It was a rude behaviour. 
+Kind regards
+
+-------------------------
+
+anonymous | 2022-08-12 19:26:36 UTC | #435
+
+I don’t mean to be defensive, especially on their behalf, but why are you being so impatient with such an incredibly complex and significant feature? They’re working incredibly hard to make sure this feature is built the right way and secure. The dates they have given in the past were never concrete.
+
+It’s one thing to ask for progress updates every once in a while, but many people who frequently ask (seeming impatient) the same question over and over again don’t seem to have the best intentions for the network as a whole. I’d assume you’re just speculating that the release will boost the price of ICP.
+
+Let the team do their work without constantly feeling as though they need to feed updates to those who are impatient and unappreciative of their amazing contribution to the network.
+
+-------------------------
+
+Fatalerror | 2022-08-12 20:17:14 UTC | #436
+
+To be honest I am not impatient person. I believe the team are working too much to develop this feature. I am supporting the project since the genesis.
+I did not mention anything about the price but I bought ICP when it was about 200-300 Euros at coinbase. 
+Then I still believe the price will be restored next days but my faith is dwindling day by day because of the community. 
+
+However, I am following other projects as well. They are doing community calls they giving an informations about the project and updates.
+For instance ethereum community are giving a lot of informations about the process of merge. They sharing what are they doing at the background.
+
+I mean I just wanted to ask why it is delayed too much? Which kind of thinks went wrong? Am I wrong?
+
+Also this is the forum page where can people discuss each other. I am here to discuss not arguing but my previous comment was hidden without any comment. 
+I didn’t expect to write these things but that was a rude behaviour. 
+Kind regards
+
+-------------------------
+
+mparikh | 2022-08-12 21:19:15 UTC | #437
+
+I see that your post was innocuous and should not have been flagged. Your question is legitimate. 
+
+However for all of us who are following the btc integration, updates are practically everywhere. It is true that in this post the last update was 27d ago. 
+
+On the "complete" ETH integration, we are not going to  make it this year, i believe. That said , you might want to look up @lastmjs 's tweet (or a post here, i cant remember) on what can be done with ETH after a couple of features being released on mainnet.
+
+-------------------------
+
+diegop | 2022-08-12 23:33:09 UTC | #438
+
+[quote="Fatalerror, post:433, topic:6147"]
+I think you don’t understand me.
+[/quote]
+
+Tbh, I think there is a misunderstanding, but maybe not the original one I thought. 
+
+The BTC integration team gives regular updates on the progress. The testnet going live is such an update. So when you ask, “*any updates in the progress?*” its reasonable to say “*lots of progress and lots of updates.*” If BTC project were a train from Paris to Madrid, there are constant updates like “*reached pamplona station*”, “*reached Zaragoza station*,” etc… updates like this imply the listener knows how close Zaragoza is to Madrid (which may not be the case).
+
+I suspect (based on your follow up post) your intent is not “*progress on the project*”, but rather: “*what is the latest projected mainnet release? How close are we to mainnet release?*” that’s a reasonable question!
+
+I also suspect that you are asking on the dev forum because although updates are common on dev forum and Reddit (I have an [update few days ago](https://www.reddit.com/r/dfinity/comments/wfr2br/btc_testnet_icp_integration_the_testnet_is_live/iiyptbm/) for example), you are referring to more vocal updates (from Dfinity Twitter for example).
+
+The best answer for this is divided into two components.
+
+1.	On the Threshold ECDSA side (necessary feature for BTC integration): time + tests. Just want to make sure we test and test to make sure there are no issues or bugs (if there are, we will of course fix them). But no major functional pieces left.
+
+2.	⁠On the BTC side: in addition to testing, there are a number of improvements that needed security-wise and performance-wise for to be ready for GA. **This also highly depends on what bugs or security issues people find in testing (this needs to be bulletproof)**. There may be bugs we are unaware of. “Weeks” would be optimistic (given the pace the last few months), so somewhere between weeks and months for GA.
+
+Does that help?
+
+PS not sure why your original comments was hidden (it was certainly not me).
+
+-------------------------
+
+diegop | 2022-08-12 23:48:42 UTC | #439
+
+[quote="Fatalerror, post:436, topic:6147"]
+Which kind of thinks went wrong? Am I wrong?
+[/quote]
+
+There are many updates on the projects in this thread (possible they are not helpful), but I think the **helpful** answer is that things took longer to build and test right than expected since no one has ever built such an integration. As they designed a whole new crypto protocol (tecdsa), built and tested they found things along the way which they did not expect when they started.
+
+it may be helpful for future folks to have a list showing all the surprises or unexpected things between planning and implementation, but i don’t have one available.
+
+More importantly.. my current intent is to satisfy YOU (and folks like you). What kind of update or level of information would be helpful? I am aware in some areas my answers are too high level and too low level in others, so not the right level to be **helpful**.
+
+-------------------------
+
+Fatalerror | 2022-08-13 00:20:17 UTC | #440
+
+thank you for quick response.
+I prefer to use developer forum to follow updates on the IC platform.I do not use reddit usually. 
+
+Your response is very helpful. Thank you so much. 
+
+However I wonder something. What did you mean exactly about the bugs and security issues on the btc integration? I mean the bridge platforms are hacked to steal funds from the platforms. That’s why the btc integration is important. 
+What if I find the exploit or bug in this feature what can I do with that? What are the possibilities?
+
+Kind regards
+
+-------------------------
+
+dfisher | 2022-08-14 23:02:26 UTC | #441
+
+Is iBTC similar to ckBTC? Polkadot doesn’t have a native BTC integration but ckBTC might have some competition 
+
+https://www.coindesk.com/tech/2022/08/11/polkadot-now-has-a-decentralized-version-of-wrapped-bitcoin/
+
+-------------------------
+
+JaMarco | 2022-08-14 23:30:20 UTC | #442
+
+[quote="dfisher, post:441, topic:6147, full:true"]
+Is iBTC similar to ckBTC? Polkadot doesn’t have a native BTC integration but ckBTC might have some competition 
+
+https://www.coindesk.com/tech/2022/08/11/polkadot-now-has-a-decentralized-version-of-wrapped-bitcoin/
+[/quote]
+
+Looks like the token relies on random users providing BTC liquidity/collateralization and locking them in "vaults". [The vaults don't sound too trivial to setup.](https://docs.interlay.io/#/vault/overview?id=what-do-i-need-to-become-a-vault)
+
+-------------------------
+
+dieter.sommer | 2022-08-15 19:41:08 UTC | #443
+
+[quote="Fatalerror, post:440, topic:6147"]
+I prefer to use developer forum to follow updates on the IC platform.I do not use reddit usually.
+[/quote]
+
+It's at least partially my fault that there have been few updates in the recent weeks as I have been usually doing them, but have been off for summer vacation for over 2 weeks. I should have still maintained the usual pace of updates to not leave this gap in information I guess.
+
+@diegop  already provided you with lots of valuable information regarding the status and reasoning behind it. Let me give you some more insights, with a bit more technical detail.
+
+**Threshold ECDSA**
+As Diego has already mentioned, one of the big items here is to increase our assurance of correctness of the implementation. We have already done one external round of code reviews with a world-leading code audit company. We are planning to do another round when the changes that we still want to implement are complete. This will be again with a top-notch external review firm. And of course we will be doing lots of testing on our own.
+In addition to these assurance-related efforts, we still need to work on improving the performance of the implementation. We are currently running the system with the test key on a 13-node subnet. For the production key, we decided to start with a 34-node subnet for the security / decentralization we want to have. This has a major implication on performance, i.e., it will be quite a bit slower there. In order to reach, what we think is an acceptable level of performance, we need to put some more thinking and engineering effort into getting good-enough performance on such larger subnet.
+
+**Bitcoin**
+You were asking about the tasks that remain to be done for the Bitcoin integration part. What Diego means with *security improvements* are some very specific protections mostly agains very powerful adversaries. One could consider most of the possible attacks to be theoretical, but we are paranoid and want those to not be possible at all.
+One of the larger items in our backlog is one huge performance improvement. I need to give some details to explain this: The system tracks UTXOs in a UTXO set, but it provides the capability to resolve forks. Thus, it needs to keep a number of blocks that are not yet absorbed into the UTXO set as they might be on the wrong branch of a fork. Only once we are sufficiently sure that a block is not in a wrong branch of a fork, e.g., after hours worth of blocks, a block gets "absorbed" into the UTXO set by adding the UTXOs its transactions create and removing the ones they consume from our UTXO set. Queries thus need to query the UTXO set and all "pending" blocks towards the chain tip of the Bitcoin blockchain which may be dozens depending on how conservative we are. This is currently not implemented very efficiently for the Testnet release and needs to be sped up to have acceptable performance for the Bitcoin Mainnet release.
+
+Also, as has been mentioned multiple times in this and other forum topics, projects like the Bitcoin integration are really hard to plan precisely because it's all new and has never been done before. Clearly, it might be possible to plan more thoroughly and spend more energy on this, but this would partially contradict the idea of an agile software process which we follow at DFINITY quite rigorously. And in an agile process, you cannot give planning figures like in a waterfall process, particularly when the work is as exploratory as for Bitcoin and threshold ECDSA.
+
+Also, we expect some minor bug reports from the community related to our Bitcoin Testnet operation which we will fix as they come in.
+
+Hope this explains a bit better what is happening on the technical front.
+
+-------------------------
+
+diegop | 2022-08-15 20:00:15 UTC | #444
+
+[quote="Fatalerror, post:440, topic:6147"]
+What if I find the exploit or bug in this feature what can I do with that? What are the possibilities?
+[/quote]
+
+Hi there, if you find a bug you can:
+
+1. Post here or
+2. DM @dieter.sommer or @Manu if you think it is sensitive.
+
+Did that answer your question or did I misunderstand?
+
+-------------------------
+
+mparikh | 2022-08-15 23:20:40 UTC | #445
+
+[quote="dieter.sommer, post:443, topic:6147"]
+One could consider most of the possible attacks to be theoretical, but we are paranoid and want those to not be possible at all.
+[/quote]
+
+You can be assured that any potential attack vector WILL BE exploited by powerful adversaries to the extent that it is exploitable. In this game, "only the paranoid survive".
+
+So please, please take the time to make it correct.
+
+-------------------------
+
+dieter.sommer | 2022-08-16 19:37:41 UTC | #446
+
+[quote="mparikh, post:445, topic:6147"]
+In this game, “only the paranoid survive”.
+[/quote]
+
+I think we have a healthy level of paranoia here at DFINITY! :-)
+
+-------------------------
+
+Ideaseed | 2022-08-17 01:49:53 UTC | #447
+
+Keep up the good work ladies & gentlemen/Dfinity team members...what you're doing is very complex, and though you are racing to be first, you also understand that it has to be tight before its released and ready to be put into real life action, there is alot on the line.
+
+-------------------------
+
+lastmjs | 2022-08-17 12:06:03 UTC | #448
+
+Based on a [new update in the tECDSA thread](https://forum.dfinity.org/t/threshold-ecdsa-signatures/6152/177), is it correct to not expect the full release before November 2022?
+
+-------------------------
+
+slym-23 | 2022-08-21 11:41:15 UTC | #449
+
+我According to the productivity of developers in the past, I think it will be longer today next year?
+
+-------------------------
+
+dieter.sommer | 2022-08-23 11:35:59 UTC | #450
+
+Roughly, as of a current estimation, but we run an agile process, so don't take this as firm timeline. We do actually not provide a concrete timeline for GA, having learned from previous experiences.
+See here for the scope of the GA release, it will include also the ckBTC canister.
+As mentioned above and in the t-ECDSA topic you are referencing, there are a couple of things we need to get done *before* we can make a GA release. If we see a way to release earlier we will of course do so. It's also in our interest to get this out as quickly as possible, but we *must* do certain things before.
+
+I realize that we have never communicated clearly that it will take more than a few weeks' time after the beta release to have GA ready.
+
+[quote="slym-23, post:449, topic:6147, full:true"]
+According to the productivity of developers in the past, I think it will be longer today next year?
+[/quote]
+
+Developer productivity of the teams is pretty high actually, there's just a huge amount of work to be done including making sure that the code is secure. Achieving correctness of the implementation adds substantial effort but is crucial for functionality like the one we are building here.
+
+-------------------------
+
+tonynguyen | 2022-08-25 03:54:58 UTC | #452
+
+Hi,
+When release this feature on BTC mainnet?
+
+-------------------------
+
+Jonathan | 2022-08-25 05:36:03 UTC | #453
+
+It's probably a good sign that people are posting on this thread without reading it.
+
+There's clearly some level of non-developer interest in BTC integration.
+
+-------------------------
+
+jzxchiang | 2022-08-25 16:04:24 UTC | #454
+
+> This has a major implication on performance, i.e., it will be quite a bit slower there. In order to reach, what we think is an acceptable level of performance, we need to put some more thinking and engineering effort into getting good-enough performance on such larger subnet.
+
+After watching the demo at the global R&D subnet, I think that upping performance is the right call. Balance queries took 10 seconds and transfers took 30 seconds [during the demo](https://forum.dfinity.org/t/monthly-global-r-d-meeting/14463/7?u=jzxchiang). That was with a 13-node subnet. I don't think that type of latency will be good enough for end users expecting a step change in performance with the IC-BTC integration.
+
+-------------------------
+
+timo | 2022-08-26 07:13:58 UTC | #455
+
+What difference do 30 seconds make for sending if you have to wait 1h afterwards to get the Bitcoin transaction sufficiently confirmed?
+
+Balance queries should be faster though if the balance is already confirmed.
+
+-------------------------
+
+dieter.sommer | 2022-08-27 09:49:42 UTC | #456
+
+[quote="timo, post:455, topic:6147"]
+Balance queries should be faster though if the balance is already confirmed.
+[/quote]
+
+Optimizing retrieval of UTXO sets is one of the important pieces of work we have on our plan for the GA release.
+
+-------------------------
+
+Ideaseed | 2022-08-29 04:36:36 UTC | #457
+
+The more I read this thread, the more I realize just how uncertain this team is, regarding the final button up and security process. My gut is telling me that some other company is going to solve the puzzle before ICP or the longer this drags out, the less confident the small cumulative investors will become, dumping their investment in the future of ICP.  I'm hoping I'm wrong on all fronts, because I've been a big picture investor in ICP.
+
+-------------------------
+
+mparikh | 2022-08-29 05:04:42 UTC | #458
+
+Lol! That is paranoia at work. 
+
+Why does NASA want to go to the MOON AGAIN after 50+ years before going to Mars? So that they can completely work out the kinks before landing on Mars. This is a similar thing with IC Integration with BTC.
+
+"Only the paranoid survive". I believe that no amount of pressure is going to affect the IC team in releasing the BTC Integration prior to its time. And that is the way it should be, imo.
+
+-------------------------
+
+dymayday | 2022-08-29 05:49:09 UTC | #459
+
+My gut is telling me that there will hardly be another chance for the ICP if this feature fail and money are hacked. I fear that with all the FUD there is around the ICP after the genesis attack, the project will not survive another scandal.
+
+So the team has to make it right the first time.
+
+We are in a bear market, so there is no rush actually.
+So take your time, I know you will make it right, I trust you 🤙
+
+-------------------------
+
+tsetse | 2022-08-29 06:41:41 UTC | #460
+
+Have you heard of any other team even attempting the same thing? It is unlikely that an elite team of cryptographers has been hired to accomplish the task in secret. The only way this can go wrong is if there is some kind of security breach. Getting everything perfectly secure and working is paramount, and I think Dfinity have the right perspective on it. They know a mistake here could be fatal to the entire network.
+As for small investors, sadly, they tend to get out of projects at all time lows because they don't have the capacity or patience or foresight to hold through to the next bull phase. As @dymayday wrote, this bear market is not going to ease up any time soon. As long as the IC gets substantial upgrades in the next twelve months, it will be ready to take full advantage of the next bull run, at which time a few tokens will go from being undervalued to fair value and then dramatically overshoot even that price for a time.
+
+-------------------------
+
+dieter.sommer | 2022-08-29 07:09:51 UTC | #461
+
+Thanks to the various posts made already to respond to the comment on the timeline of the feature. @mparikh , @dymayday , and @tsetse have already mentioned why security of this is so important for the IC, and its community, including investors in the IC ecosystem. We must get this right the first time and must not have a security flaw that leads to the loss of funds.
+
+And, indeed, not many projects are even attempting doing something like we do, especially in the area of threshold ECDSA. This is just a complex protocol and implementation and thus takes time to implement, speed up, and to ascertain its security, e.g., through internal and external audits.
+
+Two key things we are working on currently is ensuring security of the features and increasing the performance, both not being easy tasks.
+
+For those who repeatedly voice their criticism w.r.t. timeline, please note that a fully working beta has been released and is being used by developers, and you can be assured that the GA release is following in due time, that is, once it is finished and we are ready to launch. Your patience will be rewarded with functionality that is second to none on the market. Good things take time! Thanks for your patience and trust in the team working on this!
+
+-------------------------
+
+DHemingway | 2022-08-29 10:53:59 UTC | #462
+
+Any “investor” no matter the size of their investment is probably not “dumping” their ICP and will not…. A more likely scenario is their ICP is staked and therefore locked and cannot be sold. 54.5% of total supply is staked. A proper investor does not buy/sell on speculation, those are traders, investors have their ICP staked for 8-years and have read the 20-year roadmap from Dom in its entirety and surmise that they will never half to sell their investment ever, because of the proceeds that their original investment will produce in the future by spawning new neurons if that is what they choose to do.
+
+-------------------------
+
+jzxchiang | 2022-08-30 06:07:16 UTC | #463
+
+Somewhat unrelated, but is there a beginner's guide to threshold ECDSA that you recommend? Like a blog post, a textbook, or even a paper? I'm curious how it works under the cover, and why it's a challenging endeavor.
+
+-------------------------
+
+JaMarco | 2022-08-30 08:10:26 UTC | #464
+
+I think this is the paper https://eprint.iacr.org/2022/506.pdf
+
+-------------------------
+
+Benjamin_Loison | 2022-08-30 10:09:12 UTC | #465
+
+The webpage https://internetcomputer.org/docs/current/developer-docs/functionality/t-ecdsa/ with its links is a good introduction to tECDSA.
+
+-------------------------
+
+dieter.sommer | 2022-08-31 07:27:28 UTC | #466
+
+There is another paper, however, this is far from beginner level. ;-)
+https://eprint.iacr.org/2021/1330
+
+@Benjamin_Loison has pointed out further, more beginner-friendly resources.
+
+Hope that helps!
+
+-------------------------
+
+lastmjs | 2022-09-01 15:28:17 UTC | #467
+
+I'm becoming increasingly concerned with the security of the Bitcoin Integration because of the node operator collusion attack vector of the tECDSA subnets, please see here: https://forum.dfinity.org/t/threshold-ecdsa-signatures/6152/202
+
+I'm not entirely decided, but personally I don't think I'd trust much of my BTC on the IC at this point, and having $millions of people's funds on the IC will make me feel very uneasy.
+
+-------------------------
+
+tsetse | 2022-09-01 16:07:20 UTC | #468
+
+Can we hope that the narrow jurisdictions in which node operators currently operate expose them to competent judicial systems, making collusion of the kind you mention untenable? Because the collusion will be verifiably exposed, right?
+
+-------------------------
+
+Sormarler | 2022-09-01 18:29:55 UTC | #469
+
+We need to solve the node ownership problem. If it takes the NNS to strategically place specific nodes for the Bitcoin subnet  to ensure as many unique providers as possible are part of the BTC subnet then so be it. If there are 34 nodes, the goal should be to get 34 different node owners ( probably not possible). 
+
+In my opinion for the internet computer to reach its goal The decentralization of node providers has to be implemented in a different way and mean different things than on other networks. To me decentralization of node providership is about not having one entity owning the majority of nodes or having the ability to censor applications or transactions. It's not about whether they are KYCed or not or having to comply with local regulations. For enterprise use cases, the internet computer has to be able to provide the same level of security and privacy. That starts with providers being known and under contracts. We need to stop pretending that we are ETH but scalable.
+
+-------------------------
+
+JaMarco | 2022-09-01 22:08:47 UTC | #470
+
+Hasn't Chainlink already solved this? Their oracle providers are KYCed and everyone in the industry trusts their off-chain data feeds for their dapps. How do they do it?
+
+-------------------------
+
+mparikh | 2022-09-01 23:40:45 UTC | #471
+
+You (we) can hope. "But if wishes were horses, beggars would ride "
+
+Hope is most disastrous in these situations. Everything that can go wrong, will go wrong. 
+
+What law prohibits the existence & execution of complex mathematical functions? Wouldn't an advanced adversary take the position that this ability to collude is the "raison d'exister" for him/her as a node provider to exist? What would a contract for a provider look like? That the node provider must never merge with another node provider?
+
+Consider this for a change: if ETH Merge goes wrong (or a parallel POW fork takes over), who would you sue if you were an active staker ? 
+
+I like @lastmjs 's term: progressively decentralizing. Currently you can sign through test tECSDA. Of course you want to move in-n-out relatively quickly. Similarly the amount of risk that you take will be a factor of (a) potential loss and (b) the amount of time you are in the integration net.
+
+Therefore the dapps that will thrive in this eco-system are quick get-in and quick get-out.
+
+As we begin to harden, the amount of potential loss and amount of time can increase. In the meantime, we should have clear warnings about what the limitations of the current platform are.
+
+-------------------------
+
+dfisher | 2022-09-05 05:35:49 UTC | #472
+
+Is LayerZero a real competitive threat to ICP’s native integrations? How should we think of one vs the other?
+
+-------------------------
+
+JaMarco | 2022-09-14 15:10:34 UTC | #473
+
+I dont think so, LayerZero relies on oracles/Chainlink to function. And it cant do Bitcoin transactions.
+
+-------------------------
+
+spnrapp | 2022-09-09 06:51:25 UTC | #474
+
+For people who build canisters that try to create bitcoin transactions, here is an alternative library that you can use
+
+https://github.com/spinner-cash/bitcoins-rs
+
+We have made some simple patches to https://docs.rs/bitcoins, and have been using this library in building the BTC functionality in Spinner.
+
+The main advantage over https://docs.rs/bitcoin is that "bitcoins-rs" does not depend on secp256k1, which is a C library that is challenging to compile/link in Wasm.
+
+Just to throw it out there in case somebody may find it useful!
+
+-------------------------
+
+THLO | 2022-09-09 13:55:59 UTC | #475
+
+Just to let everyone know, there is a small but noteworthy change to the [Bitcoin interface spec](https://github.com/dfinity/interface-spec/blob/master/spec/index.adoc#ic-method-bitcoin_get_current_fee_percentiles):
+The function `bitcoin_get_current_fee_percentiles` returns fee percentiles expressed in millisatoshi/vbyte (and not millisatoshi/byte as it said before).
+
+For readers who are not so familiar with Bitcoin, relative fees in Bitcoin transactions are properly measured in sat/WU (satoshi per weight unit) or, equivalently, sat/vbyte (satoshi per virtual byte) ever since the segregated witness protocol upgrade in 2017.
+This small change in the interface spec makes it explicit that the Bitcoin integration also adheres to this standard by expressing fees in the correct unit.
+
+If there are any questions about the interface or this change, please let me know!
+
+-------------------------
+
+slym-23 | 2022-09-12 12:47:19 UTC | #476
+
+* We believe my team this speed integration next year
+
+-------------------------
+
+Roman | 2022-09-12 13:17:12 UTC | #477
+
+If you can make it faster than Dfinity's team, be our guest...
+
+-------------------------
+
+passio | 2022-09-21 19:42:48 UTC | #478
+
+Hi, is Dfinity Team making progress about Bitcoin Integration difficulties ?
+
+-------------------------
+
+Chowski | 2022-09-21 19:46:17 UTC | #479
+
+As many of you know there is a good amount of bitcoin that is lost because it is sent to an address that doesn't exist or an address that doesn't except bitcoin. Is it possible to write a smart contract that will identify a bitcoin transaction that is going to the wrong address and mold an address to receive it instead of it being burned. I thought of this when I read this snippet of  the bitcoin integration page, "Internet Computer smart contracts to create bitcoin addresses and directly send and receive bitcoin"
+
+-------------------------
+
+dieter.sommer | 2022-09-21 19:51:47 UTC | #480
+
+Dear community!
+
+**TL;DR**
+
+We invested some time now on an aspect of the implementation that will help accelerate development in the future: We evaluated and progressed moving the Bitcoin canister implementation from the replica to a Wasm canister. The move looks promising and helps us get rid of technical debt.
+
+**Details**
+
+After some time of silence in terms of progress updates from our side, let me give you details on what has been happening in the recent weeks.
+
+We have been evaluating and progressing a change of the implementation architecture of the BTC functionality: We have been looking at implementing the BTC canister completely in canister space as Wasm canister instead of in the replica, the architecture used up until now. So far, the approach is looking extremely promising and it is highly likely that we will switch the implementation to this architecture, unless something unexpected hits us.
+
+There have been a couple of reasons for proceeding with the evaluation of this architectural change:
+
+* In the replica implementation, we could not utilize the features a Wasm canister has to offer. The most relevant ones here include canister scheduling, deterministic time slicing, the upcoming HTTP outcalls etc. This list will likely be growing in the future as we add additional features to the Internet Computer.
+
+* The replica implementation is tightly coupled with the replica and thus slowing us down. This means, changes to the Bitcoin functionality require touching more components, thus requiring code reviews from other teams, increasing time to release changes etc. Every change requires more overhead from the Bitcoin team as well as other teams involved.
+
+* The replica implementation requires addition functionalities to be implemented, such as specific handling of the new stable memory regions the Bitcoin feature requires and that need to be part of replicated state. Bitcoin Mainnet implementation would create (some) additional effort in this domain, even after the Bitcoin Testnet implementation has been finished as it would require further memory regions to store the Bitcoin Mainnet state on the IC.
+
+* As the replica implementation cannot trap, the implementation results in a higher code complexity as in the canister implementation because of the need to handle all kinds of errors rigorously, which can be handled by a trap in canister space. Also, there is the risk of bugs in the replica which can crash a subnet, which is not the case in the canister implementation.
+
+The canonical question you may ask now is: *Why* have we not done the implementation as a Wasm canister right from the beginning? This is a very good question and a main reason for this is that we did not have enough stable memory per canister to hold the Bitcoin Mainnet UTXO set. Thus, a pure Wasm canister implementation was just not a viable option at the time. In addition, we did not have features such as deterministic time slicing available at the time and it was not clear when this feature would land in the IC canister execution environment. Overall, the assessment at the time clearly hinted at a replica-based architecture. Thus, the choice at the time was the replica-based implementation that we implemented for the Beta release.
+
+This is not an as big change is it sounds like, it is essentially switching from a Rust implementation compiled into the replica and running in machine code to a Rust implementation running in our Wasm virtual machine and benefitting from the various canister features. As both architectures are based on a Rust implementation, the vast majority of the source code, particularly, all the crucial algorithms, remain unchanged, and only the "plumbing" to move the implementation into a canister needed to be done and has progressed far.
+
+We spent some engineering time now to assess and progress the feasibility of the Wasm canister implementation and it looks very promising, as mentioned earlier. Unless unexpected problems appear, we will be switching to this architecture. Following the above argumentation, this will considerably accelerate the future development related to the feature towards mainnet release, and particularly in the longer term for the feature maintenance.
+
+*This architectural change is an investment now that will be amortized soon as it will help accelerate work on this feature from now on due to the reasons mentioned further above.*
+
+Many thanks to @ielashi, the main engineer currently working on this feature, for his ongoing efforts in facilitating this transition! This step has only been possible with Islam's sustained effort that he has put into the engineering of this feature! :-)
+
+-------------------------
+
+skilesare | 2022-09-21 20:42:31 UTC | #481
+
+[quote="dieter.sommer, post:480, topic:6147"]
+BTC canister completely in canister space as Wasm canister instead of in the replica
+[/quote]
+
+This is great news!!!  I get the explanation now, but at the time I was befuddled as to why we'd want to have that complexity in the replica.
+
+-------------------------
+
+Benjamin_Loison | 2022-09-22 13:53:57 UTC | #482
+
+First of all, @Chowski, welcome to the Developer Forum! 
+
+Let's put the odds on your side by assuming that you meant that your canister is responsible for people to broadcast their *possibly lost transaction* (being defined as you did, that is the address doesn't exist or doesn't accept bitcoins). Even in this case if you consider the general case that is Bitcoin, the private key associated to a Bitcoin address is generated off-chain. This means that if someone tells you to pay to address *X* and you declare to your smart contract that you want to pay *X*, then if it's the first time this address *X* appears in the Bitcoin blockchain, then you can't know if your interlocutor has the private key associated to *X* or sent you an incorrect address (and so he doesn't have the private key associated to *X*).
+
+We could think that for being an address *Y* that sending to doesn't result in a *possibly lost transaction* it requires *Y* to appear in the Bitcoin blockchain and to already have spent at least one UTXO. So in addition to require an initialization phase to prove that at a given time someone was holding the associated private key to this Bitcoin address *Y*, it doesn't guarantee that after this moment in time the person who was holding the private key associated to *Y* still holds it (as he may have lost it).
+
+So as far as I know it's not a perfect solution anyway.
+
+-------------------------
+
+passio | 2022-09-22 14:29:32 UTC | #483
+
+Thank you for your so quick answer, I am impressed and it’s very exciting.
+
+-------------------------
+
+lastmjs | 2022-09-22 17:19:28 UTC | #484
+
+Will the API change? Will we still access the functionality through the management canister?
+
+-------------------------
+
+jzxchiang | 2022-09-23 06:24:45 UTC | #485
+
+Just to be clear, this affects the (once virtual, now real) Bitcoin canister and not the wrapped Bitcoin canister (which was always intended to be a real wasm canister), right?
+
+-------------------------
+
+dieter.sommer | 2022-09-23 06:33:10 UTC | #486
+
+[quote="skilesare, post:481, topic:6147"]
+This is great news!!! I get the explanation now, but at the time I was befuddled as to why we’d want to have that complexity in the replica.
+[/quote]
+
+Indeed! Everyone is happy that we can go down this road now.
+
+[quote="passio, post:483, topic:6147, full:true"]
+Thank you for your so quick answer, I am impressed and it’s very exciting.
+[/quote]
+
+You are welcome!
+
+[quote="lastmjs, post:484, topic:6147, full:true"]
+Will the API change? Will we still access the functionality through the management canister?
+[/quote]
+
+This is under discussion and inputs from the community side are welcome. One strong reason to keep the management canister ist that it would allow deterministic load balancing between multiple BTC canisters, all with the same canister id. Of course, a reason to go with a regular canister identifier is simplicity and less replica code, but it does not allow for transparent load balancing. In the latest discussions, we were leaning towards keeping the management canister API to have the additional flexibility.
+
+[quote="jzxchiang, post:485, topic:6147, full:true"]
+Just to be clear, this affects the (once virtual, now real) Bitcoin canister and not the wrapped Bitcoin canister (which was always intended to be a real wasm canister), right?
+[/quote]
+
+Exactly!
+
+-------------------------
+
+jzxchiang | 2022-09-23 06:53:05 UTC | #487
+
+This load balancing feature (behind a single logical canister ID) seems like a really useful feature for canister developers as well. I wonder if it will ever be exposed as a public API; basically, let users create their own virtual canisters a la the management canister.
+
+-------------------------
+
+slym-23 | 2022-09-24 12:07:21 UTC | #488
+
+How soon will the official version be released？
+
+-------------------------
+
+JaMarco | 2022-09-24 14:49:20 UTC | #489
+
+As soon as it's finished.
+
+-------------------------
+
+smaug | 2022-09-26 19:18:14 UTC | #490
+
+I’d rather hear this than hear another deadline and watch it pass.
+
+-------------------------
+
+dieter.sommer | 2022-10-04 14:49:46 UTC | #491
+
+Dear community!
+
+Let me give you another update from what is happening in the Bitcoin feature.
+
+In the most recent update further above, we have been announcing the new architecture of most logic of the implementation being moved into a Wasm canister. Now we are already starting to harvest the fruits of this move, namely being able to iterate much faster on the performance improvements we have been working on.
+
+The following performance optimizations have been implemented recently:
+* Fee percentiles for the fee query are being cached now.
+* We have a profiling framework that helps with identifying performance bottlenecks and help our engineering speed.
+* Transaction ids are cached once computed to avoid to repeatedly perform the same resource-intensive computations.
+* Replaying unstable blocks has been optimized dramatically: This operation is required to keep the most recent blocks, e.g., 144 blocks for a day worth of blocks, as unstable blocks not merged with the UTXO set yet. Replaying of all unstable blocks needs to be done whenever someone makes a UTXO query, i.e., it is an essential operation and crucial for performance of a core aspect of the feature, namely, retrieving the UTXO set of a Bitcoin address.
+
+In addition to the above optimizations, we have been starting a Bitcoin Testnet sync on an IC testnet, which has been running successfully so far (unfortunately the testnet was accidentally claimed by someone else and cleared at around block 2.2M of 2.35M blocks, i.e., close to the syncing being finished). Key metrics such as the checkpointing time (2-3s) and finalization rate have been looking very good as well, so far confirming the architectural change we made. The speed at which we can iterate, e.g., for performance improvements, has improved visibly, so the investment in the architectural change will have amortized rather quickly.
+
+And: No new deadline communicated now, it's done when it's done. :slight_smile:
+
+-------------------------
+
+flyq | 2022-10-05 01:54:08 UTC | #492
+
+Very good progress, and I'm especially excited that it shows the potential of Canister and how to fully exploit this potential. Looking forward to more information on this in the future, including the profiling framework
+
+-------------------------
+
+JaMarco | 2022-10-06 00:43:31 UTC | #493
+
+After the full BTC integration is released, what would it take to enable Lightning support on the IC?
+
+-------------------------
+
+dfisher | 2022-10-10 22:36:49 UTC | #494
+
+Thanks @dieter.sommer. Understood that no new deadline will be issued, but the old deadline was 2/3 months which put it at October/November. To the extent you believe that timeline will slip I do think its better to let the community know sooner rather than later.
+
+-------------------------
+
+dieter.sommer | 2022-10-14 07:27:30 UTC | #495
+
+We have been making excellent progress with the Bitcoin canister implementation -- the velocity of development has improved quite a bit with the new architecture. We are now working on a mechanism to launch the Bitcoin canister with a UTXO set that can be precomputed off chain to avoid the long bootstrapping times of the canister syncing the complete Bitcoin blockchain on chain. This helps greatly reduce the time it takes to get the canister up and running (ready to serve requests) once the source code has been finalized.
+November is still looking to be feasible for the GA release of the Bitcoin feature. As a first step, the current Bitcoin Testnet implementation will be switched over from the replica-based implementation to the new Wasm canister architecture, still remaining on a 13-node subnet. Then, the Bitcoin canister code can finally be removed from the replica. The canister for Bitcoin Mainnet will be launched on a high-replication subnet for better security.
+
+-------------------------
+
+tsetse | 2022-10-14 13:03:15 UTC | #496
+
+These updates are very helpful, @dieter.sommer . I think of early 2023 as a kind of rebirth of the IC, with a series of major upgrades all coming onstream.
+
+-------------------------
+
+dfisher | 2022-10-14 18:48:46 UTC | #497
+
+Amazing thanks so much Dieter. The steady communication is really appreciated.
+
+-------------------------
+
+MotoshiNakasato | 2022-10-14 22:27:39 UTC | #498
+
+What does this mean for scalability? Is the expected throughput still 1 tps per subnet?
+
+-------------------------
+
+tonynguyen | 2022-10-15 11:51:57 UTC | #499
+
+sounds good. I can't wait to see the release on that time.
+
+-------------------------
+
+emiss | 2022-10-15 16:28:42 UTC | #500
+
+Doesn't change anything if marketing is as it is right now. People sentiment towards Icp is still as bad. I think 1 thing could really change it is to have a famous Twitter/YouTube influencer that really learn about Icp and promote it (of course after all the goodie updates gets rolled out).
+
+-------------------------
+
+tsetse | 2022-10-15 17:57:07 UTC | #501
+
+I have given up on the marketing side of matters. I mean, these are people who thought Internet Computer was a good name for a blockchain and who thought weird URLs could be a selling point rather than a roadblock :grinning: . The IC is built by techies who don't know what they don't know outside of their domain. Still, within their domain they are brilliant, and we must hope that will be enough. The first quarter of 2023 should give us an indication if that is the case.
+
+-------------------------
+
+Aow | 2022-10-15 19:22:55 UTC | #503
+
+[quote="tsetse, post:501, topic:6147"]
+The IC is built by techies who don’t know what they don’t know outside of their domain.
+[/quote]
+
+This only magnifies the importance of small developer + retail participation in NNS governance as well as forums like this. Its nice to see such an active ICP community.
+
+-------------------------
+
+diegop | 2022-10-17 21:47:46 UTC | #505
+
+Hey folks,
+
+Here is a relevant security audits for those interested: 
+
+1. https://forum.dfinity.org/t/threshold-ecdsa-integration-and-bitcoin-canisters-security-review-by-trail-of-bits-third-party-security-audit-5/15952
+
+2. https://forum.dfinity.org/t/canister-sandbox-review-by-trail-of-bits-third-party-security-audit-4/15951
+
+-------------------------
+
+dieter.sommer | 2022-10-27 07:17:02 UTC | #506
+
+**Update**
+
+*Bitcoin Testnet*
+
+The work on the Bitcoin canister has been progressing very well and we want to launch it for Bitcoin Testnet, probably next week. The replica changes for this will be merged this week likely. The rollout will be done as follows:
+* Deploying the replica change that routes the Bitcoin management canister API to the new Wasm canister instead of the replica implementation;
+* Testing on a first subnet whether the transition from the replica implementation to the canister works without problems;
+* Doing a wider rollout following the standard rollout schedule.
+
+The nice thing about this approach is that there is no interruption of service. Until the replica gets upgraded on a specific subnet, Bitcoin requests continue to be routed to the replica implementation, once a subnet has been upgraded, the requests will be routed to the new Wasm canister. The API does not change, so canister smart contracts should not experience any interruption of service.
+
+
+*Bitcoin Mainnet*
+
+Meanwhile, work on the Bitcoin canister for the Bitcoin Mainnet launch continues, as there are still some open things to be addressed:
+* Wait for quiet mechanism to only start serving requests once the blockchain is synched to the tip;
+* Unstable blocks should be stored in stable memory, not on the heap;
+* Increasing the stability threshold to 144; most of the hard part enabling this – the performance optimizations to make this fast – have been implemented already;
+* Monitoring / alerting that checks that the Bitcoin canister's view is in line with the real blockchain; raise an alert to the on-duty team if the tip of the canister does not agree with the main blockchain. This will help us all to sleep better;
+
+Without giving a firm commitment, late November still seems doable for the Bitcoin Mainnet canister.
+
+-------------------------
+
+dfisher | 2022-10-27 17:09:24 UTC | #507
+
+This made my day. The community appreciates you 🙏
+
+-------------------------
+
+nlh | 2022-10-30 12:48:23 UTC | #508
+
+Thanks @dieter.sommer for the update. I think every single person in this forum is looking forward to seeing how this works out in practice.
+I have one question though: is it too optimistic to expect that the first wave of dapps on IC leveraging bitcoin integration should be in main net in Q1-2023?
+Thank you.
+
+-------------------------
+
+nlh | 2022-11-04 02:45:05 UTC | #509
+
+Hi @dieter.sommer A bit quiet lately so I guess everyone is busy with this. Do we still plan to launch the Bitcoin test net "this week"? Thanks.
+
+-------------------------
+
+Ideaseed | 2022-11-04 05:20:37 UTC | #510
+
+What is the probability of Musk/ Twitter adopting ICP tech into Twitter once the Bitcoin integration is implemented? Would DESO and ICP  be a good fit to unite and help lure more user and devs integration?
+
+-------------------------
+
+dieter.sommer | 2022-11-04 07:33:56 UTC | #511
+
+Indeed, we have all been extremely busy and there was silence here.
+
+[quote="nlh, post:509, topic:6147"]
+Do we still plan to launch the Bitcoin test net “this week”?
+[/quote]
+
+**tl;dr**
+
+Yes!
+
+**Testnet**
+
+*The good news:* The Bitcoin Testnet canister has been rolled out onto one subnet already for smoke testing it before the larger rollout.
+
+*The better news:* The feature is currently being rolled out on the IC. The update that is getting rolled out this week to the subnets contains the code that switches routing over from the replica implementation to the new Wasm Bitcoin canister. People using the feature already should not see any interruption of service. After the update of the respective subnet, the requests will not be routed to the replica of the Bitcoin subnet, but to the Wasm Bitcoin Testnet canister.
+
+**Mainnet**
+
+For Mainnet, we need to do some remaining implementation tasks. We still think that November is realistic for the Bitcoin Mainnet canister to be ready and be deployed.
+
+-------------------------
+
+dieter.sommer | 2022-11-04 07:43:54 UTC | #512
+
+[quote="nlh, post:508, topic:6147"]
+I have one question though: is it too optimistic to expect that the first wave of dapps on IC leveraging bitcoin integration should be in main net in Q1-2023?
+[/quote]
+
+Launching the feature within the next couple of weeks means that projects would have a couple of months to adopt the feature and launch their product in production some time in Q1 2023. So I would see this as realistic, knowing that there are projects already building on the beta version of the Bitcoin feature and have something working.
+
+Different topic, but just to mention it: There are also projects who use the beta threshold ECDSA feature and HTTPS outcalls to integrate with Ethereum.
+
+-------------------------
+
+nlh | 2022-11-05 03:36:45 UTC | #513
+
+Thanks @dieter.sommer for both answers. What an exciting time ahead for the IC network. 
+Have a good weekend to you and everyone else in the forum.
+
+-------------------------
+
+ielashi | 2022-11-09 15:05:45 UTC | #514
+
+Hey everyone, I just wanted to share a quick update that we have open-sourced the [bitcoin canister repo](https://github.com/dfinity/bitcoin-canister) in preparation for the upcoming mainnet launch. As @dieter.sommer already mentioned, we've been migrating from a replica implementation to a canister implementation, and in the past few days we've already started routing all of the bitcoin testnet requests to the canister implementation.
+
+As stated in the README of the repo, it's still not feature complete. We're missing some small additions like block validation and the wait-for-quiet mechanism, which will be implemented over the coming days.
+
+-------------------------
+
+daijianlin | 2022-11-10 11:21:59 UTC | #515
+
+It is amazing to see this, thanks for sharing this.  I believe ICP will be the king finally :grin: :grin: :grin:
+
+-------------------------
+
+memetics | 2022-11-12 12:18:57 UTC | #516
+
+Is there any plan to incorporate the BTC integration into the NNS ( native wallets ) now or in the future, or is this up to third party dapps to provide us with wallets etc ?
+
+-------------------------
+
+romulusp | 2022-11-12 15:38:48 UTC | #517
+
+That will be awesome!
+
+-------------------------
+
+Manu | 2022-11-12 16:03:32 UTC | #518
+
+The current plan is that the NNS dapp would support SNS tokens and [ckBTC](https://forum.dfinity.org/t/feedback-wanted-wrapped-bitcoin-ledger-on-the-internet-computer/10681?u=manu), but not real BTC directly.
+
+-------------------------
+
+gatsby_esp | 2022-11-12 17:23:28 UTC | #519
+
+We want $ghost token as well!! Key part of the ecosystem
+
+-------------------------
+
+dfisher | 2022-11-12 23:35:10 UTC | #520
+
+You guys should consider implementing BTC into the NNS dapp directly. One of the reasons I personally use the NNS dapp (apart from staking) is that I trust the Dfinity Foundation. 
+
+There’s going to be a lot of buzz around this BTC integration and I believe there should be at least one “trusted” foundation approved wallet to hold the BTC in. If someone creates a wallet that has a vulnerability so bitcoin gets stolen but the integration is solid, the integration nonetheless may get blamed. 
+
+Furthermore, alot of IC enthusiasts are also BTC enthusiasts. Enabling them to keep all their funds in one wallet (NNS dapp) would be a major convenience. 
+
+Food for thought. Lmk your thoughts.
+
+-------------------------
+
+Roman | 2022-11-13 13:57:30 UTC | #522
+
+I totally agree. Any problem with a third party wallet will be used against Dfinity and the whole innovation by haters. But even without considering the haters : since ICP intends to become an interoperable chain, people must have the possibility to have their ICP and BTC in the « same » wallet, or they won’t use the nns if they must subscribe at least another wallet to hold at least their BTC on ICP Blockchain. Practically and « marketingly » it is problematic, but also systematically because if people can’t use the nns to centralize at least the 2/3 main assets, they won’t use it and won’t participate to the governance.  
+
+So we can’t say « yes you can hold your BTC on ICP, but only trusting third parties », per se but also for the consequences.
+
+I know Dfinity want to promote the innovation and the decentralization by letting third parties create their own solutions. It is honorable, but at least to begin and at least to hold the 2/3 main assets which people don’t want to take a chance to lose so easily, a wallet designed by Dfinity is strongly needed, at least for the preadoption.
+
+NNS has always been presented by Dfinity itself as the nucleus of ICP and as hyper secured (it has often been a marketing point), so we can’t ask now people to store their BTC outside of it : a lot have adopted the nns basing themselves on the safety narrative, they can’t be asked to abandon their BTC to a logically less safe place.
+
+None newcomers will inject their BTC if they must jump at board as suddenly and as far by having to withdraw their BTC from Bitcoin to a third party. We are an important number having proceeded by first – in may 2021 – putting our ICP on the nns before exploring very carefully  third parties wallet. Maybe we would not have done it if we had to directly go from an exchange to a third party wallet. We proceeded with degrees, gradually. People will need to have the same possibility with their BTC, or none real BTC flooding will happen on ICP. 
+
+Let us not forget that lot of third parties wallets hacks happened this year, like the big one on Solana. People from these « countries » joining our blockchain will have experienced such hacks in a way or another, so they won’t start their ic journey with third parties wallets.  
+
+Plus, it sends an odd message : « Dfinity implements the BTC within ICP, but not allow to hold it within its own wallet ? Why ? They don’t believe in BTC ? They don’t believe in BTC within ICP ? They don’t believe in their implementation ? They can’t do it ? Bizarre ». We can’t afford this kind of questions.  
+
+**To recap : we can’t have been promoting and still promote as much the NNS for its security and ask people to forget it when they will want to store their BTC. Same situation for ETH. We are ICP OG, we know the probity of the providers of the third parties wallet and admire their work and yet we want the ability to hold BTC in the nns for safety reasons, so imagine how the newcomers, not knowing the third parties like we do, will feel : they won’t take the chance**
+
+-------------------------
+
+memetics | 2022-11-13 10:17:42 UTC | #523
+
+Totally agree. Really thought this integration would be baked into the NNS.
+
+Hoping some senior members can perhaps get this looked into / proposals formed as being able to utilise BTC within the NNS would be epic.
+
+-------------------------
+
+gatsby_esp | 2022-11-13 12:29:32 UTC | #524
+
+This commentary pisses me off A LOT.... BTC integration is ALL about trust and there is nothing MORE trustworthy inside ICP ecosystem than NNS.
+
+So the way I see it.. BTC integration is NOT finished until:
+- I can hold bitcoin in NNS
+- I can swap seamlessly between bitcoin and ckBTC INSIDE NNS
+
+And among all.. this is the way to make the feature visible outside the ecosystem because is the SIMPLEST way to make people interact with it... as NNS is the entry point.
+Come on guys wake up... I don't understand how haven't you come up with this.
+
+-------------------------
+
+gatsby_esp | 2022-11-13 12:38:10 UTC | #525
+
+And once again I realise how badly Dfinity is doing when it comes to marketing and communicating the product. There is no doubt that ICP has the most advanced technology. But 90% of the crypto world that will interact with ICP is not a software developer.
+People want to understand in a very simple way how this new functionality will impact the exchange or custody of their crypto and the simplest use cases: NFT, DEfi, etc.
+And that's why it bothers me so much that the dfinity team has not taken into account such obvious (and necessary) use cases such as being able to hold bitcoin and bridge it with ckbtc within NNS.
+Because from the outside, you can't understand the progress of technology if you don't make people visualize simple use cases with real impact!
+
+-------------------------
+

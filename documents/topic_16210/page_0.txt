@@ -1,0 +1,260 @@
+johan | 2022-10-28 11:08:55 UTC | #1
+
+# Background
+
+Motion [18337](https://dashboard.internetcomputer.org/proposal/18337), which was adopted by the NNS over a year ago (September 3, 2021), proposes to increase the stable memory available to canisters from 4GiB to the full capacity of each subnetwork - currently around 350GiB. The first step towards implementing this proposal was to provide a [64-bit API](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-imports) for stable memory and increase the available stable memory to 8GiB. These changes were made generally available already on September 30, 2021. More recently, in October 2022, the size of stable memory available to a canister was quadrupled, from 8GiB to 32GiB.
+
+In [November 2021](https://forum.dfinity.org/t/two-questions-about-canister-storage/7776/18), DFINITY's engineers discovered some performance issues that made it difficult to continue to increase the stable memory available to canisters. DFINITY's new thinking was further clarified in a March 31, 2022 [forum post](https://forum.dfinity.org/t/increased-canister-smart-contract-memory/6148/114). This forum post gives two reasons for the pause.
+
+* Performance. Accessing stable memory has large overhead, as each call to the system API involves a context switch between the Wasm runtime (Wasmtime) and the replica code. Thus, stable memory better be backed by Wasm's multiple memory and 64-bit features before increasing it further.
+* Tooling. Developers need libraries and tools to make efficient use of stable memory. Different options are explored in this post.
+
+![Before|690x476](upload://3mvKr8TZtDUxu8RVzF7rqX5F0fQ.png)
+
+# Performance
+
+DFINITY's engineering teams are working on modifying stable memory to make use of Wasm's proposed [multiple memory](https://github.com/WebAssembly/multi-memory/blob/main/proposals/multi-memory/Overview.md) functionality as explained in a recent [Forum post](https://forum.dfinity.org/t/proposal-wasm-native-stable-memory/15966). Multiple memories are already supported by [Wasmtime](https://wasmtime.dev/), the Wasm runtime used by the IC. This change will be completely transparent to developers on the Internet Computer, i.e., the current interface to stable memory, namely [`ic0.stable[64]_{read|write|grow|size}`](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-imports), will remain unchanged.
+
+Stable memory will be mapped to Wasm memory number one, and this memory will typically be a 64-bit memory accessed using System API methods `ic0.stable64_*`. Calls to these methods are translated into their Wasm bytecode equivalents (memory.copy), directly accessing memory number one. This translation happens when an IC-compatible Wasm module is installed in a canister. That is, the format of the Wasm module installed by developers will not change and will not make direct use of Wasm's multiple memory facility. This is a good thing, as most programming languages that are used to generate Webassembly (e.g., Rust) are not able to generate code to access multiple memories.
+
+![After|546x500](upload://bFTOkLJVmE1HY5rasz5Sq2LRxpf.png)
+
+In addition, if the change to multiple memories is adopted, the stable memory interface may be extended with methods to load and store individual bytes from stable memory locations. For example, a method `ic0.stable64_loadi64 : (offset : i64) -> i64` could be added to load data from an offset to stable memory directly onto the Wasm stack.
+
+# Tooling
+
+We now have two Wasm memories: the main Wasm heap (memory zero), which is cleared on upgrade, and stable memory (soon Wasm memory one), whose lifetime is the same as the canister's. When the changes described above are implemented, the performance of using these memories will be similar, except for the performance difference between 32- and 64-bit memories. Developers are now faced with several choices regarding where to keep data and how and when to move data between memories. Some of the choices are described in this picture (describing the situation after stable memory is backed by Wasm's multiple memory feature).
+
+![Screenshot 2022-10-28 at 13.06.21|690x461](upload://hqnnVegjitfPQ7AwJCsYaQj6apn.png)
+
+
+* The simplest approach (red) is simply keep data in Wasm memory zero using the native datatypes of the programming language compiler. The downside is that the canister cannot be upgraded. This method is (only) suitable for canisters that must never be upgraded, such as example code and very simple services.
+* Another approach (blue), which is used by most canisters today, is to operate on data in Wasm memory zero using the native datatypes of the programming language compiler, serialize the values of all global variables to stable memory before upgrading the canister, and deserialize after the upgrade. Motoko uses this approach for its "stable" variables. The NNS canisters, written in Rust, also use this approach, with Protobuf as the stable format.
+
+The naive (red) approach is typically ruled out as developers need to be able to upgrade their canisters. There are also several downsides to the save/restore approach.
+
+* A canister cannot use more than 4GiB of memory unless 64-bit Wasm is enabled for main memory. However, enabling 64-bit Wasm for memory zero would be a big change to Motoko. Moreover, for all languages, the [overhead of bounds checking](https://github.com/bytecodealliance/wasmtime/blob/32a7593c949a17f20c2a718e1cbf0d8c449b0c47/cranelift/wasm/src/code_translator.rs#L2190) would be incurred for every operation when using a 64-bit heap.
+* The time spent serializing and deserializing during an upgrade is proportional to the size of the canister's memory footprint. Thus, the serialization/deserialization steps, which happen in the pre- and post-upgrade hooks, can run out of cycles or main memory.
+* Data structures with sharing or cycles are cumbersome to preserve across serialization and deserialization, and, thus, difficult to deal with during the upgrade.
+* Developers that don't use Motoko need to manually code the serialization and deserialization logic and make sure that the schema of the serialized data is compatible across upgrades. Bugs is this logic will likely lead to data loss.
+
+Already today, developers can use the low-level API to access stable memory directly, and use this memory for any purpose. Some canisters have decided to keep all their persistent data in stable memory, e.g., the [Internet Identity canister](https://mmapped.blog/posts/11-ii-stable-memory.html). Thereby, they do not require any pre- or post-upgrade hooks. This option is represented by green and yellow in the above picture. Improving the performance of stable memory access and increasing its size makes these approaches even more appealing. Thus, it is natural to ask the following question:
+
+**What is the best way to structure the raw bytes of stable memory?**
+
+The problem is not surprisingly similar to the problem faced by a traditional database when storing data to a file. The Internet Computer uses [orthogonal persistence](https://medium.com/dfinity/ic-internals-orthogonal-persistence-9e0c094aac1a), so the lower level issues of mapping the file to memory, recovery and redundancy, synchronization and locking, etc., are taken care of by the protocol layer and the runtime, but the problem of how to organize structured data into linear memory remains the same.
+
+One key decision is what data model to use for data stored in stable memory. This is a difficult choice, as it is not clear that there is a single data model that is optimal, or even suitable, for all applications. Moreover, it is a controversial topic and debates tend to degenerate into flame wars. Thus, I like to tread this ground carefully... For example, do we want to use
+
+* a plain key-value store (e.g., Google Bigtable, Amazon DynamoDB), or
+* the relational model (and SQL), or
+* a graph model (like for the semantic web), or
+* document model (e.g., used by MongoDB, often using JSON or XML),
+* etc.
+
+At the lowest implementation level, most data models are implemented on top of B-trees. A good example is the file format of [SQLite](https://www.sqlite.org/fileformat.html). Thus, regardless of the data model preferred by canister developers, one good answer to the question is likely to be a collection of B-trees. Higher level abstractions can be built on top of this foundation. For this reason, DFINITY has developed a first version of a library ([`ic_stable_structures`](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/)) that helps developers organize a canister's stable memory as a B-tree.
+
+**What will the canister programming model look like?**
+
+First, a canister's global variables would be mapped to either Wasm globals or to stable memory through some indirection (e.g., pointers) that are stored in Wasm globals or main memory. Wasm globals are limited to Wasm's native data types (`i32` and `i64`), and of limited utility on their own. Global variables are often containers (e.g., a plain key value store), and these map nicely to B-trees stored in stable memory. A similar approach can be used for more abstract data models. For example, if the relational model is adopted, a global variable would represent a [relvar](https://en.wikipedia.org/wiki/Relvar) which, in turn, is backed by a B-tree, or several B-trees if the relvar is indexed. Similarly, in the graph model, global variables would probably correspond to verbs, each backed by a B-tree, or by two B-trees if the underlying binary relation is navigable in both directions.
+
+What happens to global variables (containers stored in stable memory) when a canister is upgraded? I propose the following lifecycle of global variables and their backing B-trees.
+
+* The canister is upgraded and the new version starts using a new global variable, which starts as an empty container (or relvar, verb, etc.).
+* Developers decide that the variable is no longer needed in its current form. It is deprecated and made read only. Perhaps the canister has a field for user address that started as a free form string and must be migrated to structured form with street address, number, and postal code. The old address field can be deprecated and only read by the upgraded canister, but never written.
+* When a variable has been deprecated for a while, the canister may stop using it entirely. For example, once the addresses of all users have been to the new format, the address field is no longer used.
+* Finally, once it has been confirmed that the new address solution is satisfactory, the old address field can be permanently removed from the canister's stable memory. This would be a manual step; that is, the state of the variable is not automatically removed just by upgrading the canister code to a version that no longer uses it.
+
+![Screenshot 2022-10-28 at 13.07.14|690x460](upload://16sh2RwX2jhZY4Sw4DoHc2SeO7F.png)
+
+This lifecycle works when all (container) global variables of a canister are stored in stable memory, but it also extends to the case when each global variable is stored in its own Wasm memory. That is, as a future extension of stable memory, the Internet Computer may provide a canister with any number of memories, each containing a single global variable. This would simplify some operations, but it is also more difficult to implement in the replica software.
+
+In summary, global variables are backed by B-trees (perhaps with a layer of abstraction in between) stored in stable memory, ought to be key components of the programming model. The set of global variables used by a canister can evolve according to the lifecycle described above.
+
+**What to store in B-tree cells?**
+
+The key of a global (container) variable is usually a simple data type, like an integer or a string, but the value can often be a more complex data structure, like a record representing a user or some other entity.
+
+**Option #1** (yellow above). Copy data between the main Wasm heap (0) and stable memory (1) when reading or writing cell values. The format of values can be [Candid](https://github.com/dfinity/candid/blob/master/spec/Candid.md), [Protobuf](https://developers.google.com/protocol-buffers/), or even JSON. That is, any format that supports schema evolution.
+
+**Option #2**. Avoid copying data between the main Wasm memory and stable memory. If the stable memory interface is extended with methods to load and store individual bytes, data can be moved directly from stable memory to the Wasm stack, without going through the main Wasm heap.
+
+* **Option #2A**. Use a format, such as [flatbuffers](https://google.github.io/flatbuffers/), that supports both schema evolution and access paths with minimal indirection.
+* **Option #2B** (green above). Store data directly in the cell values without support for schema evolution. For example, this method is used when the cell value is a single fixed size integer (like Rust's u64) or a struct of such values.
+
+||Ease of implementation|Performance|Supports schema evolution of the value|
+| --- | --- | --- | --- |
+|**Option #1**|Better|Good|Yes|
+|**Option #2A**|Good|Better|Yes|
+|**Option #2B**|Best|Best|No|
+
+The comparison table shows that there is no obvious best choice. The problem with **Option #2B** is that it does not support schema evolution of the value type. This can be alleviated by replacing a single global variable which is a collection of structs with several global variables each being collections of simple data types. For example, instead of one global variable which is a map from user ID to a struct consisting of a name and an age, use two global variables, one map from user ID to name and one from user ID to age. That is, store data by column instead of by row. This way, schema evolution of the value is no longer necessary. On the other hand, performance may suffer, depending on the access pattern.
+
+**How to avoid problems when upgrading canisters?**
+
+To safely upgrade a canister, the developers must ensure that the data schema (A) pre-upgrade and the data schema (B) post-upgrade are compatible. In most cases, developers would want the compatibility to be in both directions so that a rollback is possible if issues are detected post-upgrade.
+
+Developing the necessary tooling is not a small task, even for the simple key-value store. And it becomes increasingly more complex for more complex data models. For example, the tooling could check schema compatibility in the post-upgrade hook to ensure that an upgrade doesn't go through if schema (B) is not compatible with schema (A).
+
+Here we also face the dilemma of standardization vs. adaptation: with a standard schema language, developers can have greater confidence that their canisters can be upgraded in the future; with many competing standards, novel features are likely to reach developers faster.
+
+One approach is to directly use SQLite to access stable memory, as was [proposed on this Forum](https://forum.dfinity.org/t/sqlite-backed-by-stable-memory-the-perfect-match/9998) in December 2021. This would imply specific answers to all questions raised in this post: bytes in stable memory would verbatim follow [SQLite's file format](https://www.sqlite.org/fileformat.html); the programming model would most likely use `sqlite3_{prepare|bind*|step|reset}` to interact with stable memory; and the format of cells/columns is also specified by SQLite. Data would be moved between stable and main memory by the page cache of SQLite and, thus, employ a variant of **Option #1** (yellow).
+
+**Questions to the community**:
+
+* Are there additional concerns that I have overlooked?
+* What data model or data models do developers want to see supported for canister development?
+* Is SQLite backed by stable memory something that the community is interested in exploring further?
+* Would the community like to see NNS Motions on topics relating to stable memory and data models on the Internet Computer?
+
+-------------------------
+
+nomeata | 2022-10-28 11:32:19 UTC | #2
+
+Very interesting solution of backing the existing system API by wasm-land instructions to avoid the context switch. Exciting! Is it done by liking wasm functions with these calls, or by actually instrumenting the code to replace the calls with the appropriate memory instruction?
+
+What’s not clear to me from the description: Will canisters in that future _have_ to use the System API method to access stable memory, or will those whose tooling is already up to multiple memory wasm also get to use Wasm memory instructions (which may be more efficient, support bulk instructions etc.). Or is the plan to keep the Wasm multi-memory instructions out of the hand of canister developers?
+
+-------------------------
+
+johan | 2022-10-28 12:44:45 UTC | #3
+
+Hi Joachim :wave:! I think we're going to inline the calls, i.e., replace them with the appropriate `memory.copy` instruction. See also the comment thread on @abk's https://forum.dfinity.org/t/proposal-wasm-native-stable-memory/15966.
+
+-------------------------
+
+jzxchiang | 2022-10-29 05:33:51 UTC | #4
+
+Excellent write-up! The idea of storing a global variable in its own Wasm memory is really interesting... is it that easy to dynamically create new Wasm memories at runtime?
+
+A few other questions:
+* Are B-trees performant / compatible with how the IC replica implements orthogonal persistence? E.g. checkpoint files, memory mapping, etc.
+* What if one day Motoko needs to garbage collect variables stored in stable memory? E.g. if they implement stable variables using the green or yellow approaches in your diagram. Does that change the calculus for which approach is best?
+
+-------------------------
+
+stefan.schneider | 2022-10-29 12:11:26 UTC | #5
+
+To your first question: Internally we operate on pages of 4KB, so it certainly makes sense to try to use full pages and avoid flipping individual bits as much as possible.
+
+-------------------------
+
+johan | 2022-10-29 15:53:43 UTC | #6
+
+@jzxchiang - thank you! I don't think it is feasible to dynamically create new Wasm memories at runtime, as they must be declared in the Wasm module. However, the natural time to create new memories is during canister upgrade (or installation), so it can certainly be dynamic in this sense. I think B-trees are a good match with how the IC certifies the state, based on pages (4kiB pages, as @stefan.schneider points out) - because B-tree data structures also tend to optimise for modifying as few pages as possible. Perhaps @luc-blaeser can comment on the garbage collection question?
+
+-------------------------
+
+Fulco | 2022-10-31 09:40:19 UTC | #7
+
+I would very much be in favour of the SQLite approach because that is a technology that developers already know. I also think the concepts of memory/disk maps nicely to memory/stable memory. 
+It would actually take away from the number of things you have to learn to get started while using some custom schema language would add to it.
+
+Given that developers have access to the low level api's there is still plenty of space to innovate if the SQLite approach doesn't cut it.
+
+"Is SQLite backed by stable memory something that the community is interested in exploring further?" 
+
+Could you expand on what you mean by this? Are you thinking of a working group, a grant RFP, an initial technical exploration by the foundation?
+
+-------------------------
+
+abk | 2022-10-31 16:31:42 UTC | #8
+
+[quote="nomeata, post:2, topic:16210"]
+What’s not clear to me from the description: Will canisters in that future *have* to use the System API method to access stable memory, or will those whose tooling is already up to multiple memory wasm also get to use Wasm memory instructions (which may be more efficient, support bulk instructions etc.). Or is the plan to keep the Wasm multi-memory instructions out of the hand of canister developers?
+[/quote]
+
+For the short term they will definitely only be able to use the System API, but hopefully we could eventually move to allowing use through the memory instructions.
+
+-------------------------
+
+paulyoung | 2022-10-31 16:53:12 UTC | #9
+
+Regarding SQLite, I tried to get that going a while ago here:
+
+https://github.com/codebase-labs/ic-sqlite
+
+Progress stalled when I couldn’t get it to build using Nix.
+
+More recently, @FroghubMan got something working here:
+
+https://github.com/froghub-io/ic-sqlite.git
+
+It’s a very similar approach to the one I took with a more complete example.
+
+However, I just learned from the following issues (and other sources) that linking C code and targeting `wasm32-unknown-unknown` might appear to work but can’t really be relied upon.
+
+> Currently the wasm32-unknown-emscripten and asmjs-unknown-emscripten targets are the only targets that can be linked with C code because all the other wasm targets use a different ABI
+
+> only the wasm32-unknown-emscripten target uses the real C ABI for FFI. All the other targets, including WASI, use the different wasm32_bindgen_compat ABI. You've been lucky that your C interop has happened to work, but in general this will not be the case.
+
+https://github.com/rust-lang/rust/issues/83788
+
+***
+
+> Another nice effect of stabilizing this ABI is that the `wasm32-unknown-unknown` target's default C ABI can be switched back to matching clang. This longstanding mismatch is due to my own personal mistake with the original definition and the reliance on the mistake in `wasm-bindgen` . Once the "wasm" ABI is stable, however, I can switch `wasm-bindgen` to using the "wasm" ABI everywhere and then the compiler can switch the default ABI of the `wasm32-unknown-unknown` target to match the C ABI of clang.
+
+https://github.com/rustwasm/team/issues/291
+
+-------------------------
+
+paulyoung | 2022-10-31 17:08:36 UTC | #10
+
+One potential way to address the above is with c2rust: https://c2rust.com
+
+-------------------------
+
+luc-blaeser | 2022-11-01 08:53:39 UTC | #11
+
+Thank you for the question on garbage collection of stable memory. If Motoko would use the stable memory as standard heap (green or yellow approach), the GC would certainly need to scale with much larger memory space. For this purpose, we are working on implementing an incremental GC that would never block the program for a noticeable time and would also be able to deal with a 64-bit heap space. Another aspect to consider is that the GC on stable memory would have to retain heap structures of old program versions that still need to be (lazily) upgraded to a new version.
+
+-------------------------
+
+GLdev | 2022-11-01 14:16:23 UTC | #12
+
+Just wanted to add my 2c regarding the SQLite efforts that were mentioned in this topic. On the one hand, I think it's a terrific effort, and kudos to everyone working on this. It's not an easy feat, and having it run on the IC is a great thing.
+
+On the other hand, I'm not sure this will work, even if all the kinks get ironed out. The way I've come to understand the actor model, it seems to me that the traditional DB isn't well suited for the task, and we'd need to search for alternative patterns to build a truly IC-native solution. Sure, the familiarity of the API brings a lot of advantages, but will the solution truly work without heavy thought put into the underlying data structures? Will this effort work with even moderately large datasets? Do we have any control over how many pages SQLite will touch for a simple join? What about more complicated queries?
+
+I've thought a lot about this while researching various implementations for ECS solutions, aimed at running game server instances on the IC. ECS's are often called a poor man's SQL, and they aim to solve the same problems - separation of concerns and speed (often times, ECS tools need to provide a solution every frame). The mere fact that you'd need to hit lots of mempages on every tick, made me reconsider this whole thing. I went with other access patterns altogether, since I thought it would be best to stay as close to the Actor Model as possible (i.e. modify small amounts of data - and preferably only your data - on each call).
+
+I think that in order to have *the* solution for a relational DB running natively on the IC we'll need to search for something closer to the actor-model paradigm. Something where sharding can be done with compute in mind, where each canister can work on its own limited set of data, and somehow aggregate the results, something that can perhaps take advantage of the new features being proposed (i.e. inter canister queries & such). I don't see dumping everything on a single canister and wrapping it in a flavor of SQL ever truly working on the IC. Not even with time slicing (sure, it might work, but what good is a query that gets executed in 8 seconds because it was hitting a lot of memory pages?)...
+
+-----
+
+I don't want to distract or take away anything from the great effort in this area, I just want to point out some things that I've hit while considering similar approaches, and maybe start the conversation towards finding something that can truly scale and work as a native IC RDB.
+
+-------------------------
+
+johan | 2022-11-02 11:06:27 UTC | #13
+
+Thanks @GLdev! I appreciate you sharing your thoughts and agree with your concerns about the relational model, or, rather, the SQL version of the relational model. I'm not that familiar with ECS, but, from a semantic point of view, it seems to be in the direction of graph databases RDF(S)/OWL, etc. I think this is an interesting avenue to explore for data on the IC. For example, every entity can be given a URI (urn, or http, or other schema), by specifying a canister ID and an entity ID local to the canister (or an entity type and an entity ID for the type).
+
+On the topic of access patterns, the actor model, and not touching too many memory pages: I don't think B-trees themselves are too limiting in this regard even for queries. The problem, as you point out, is rather that SQL query optimisers are fickle and it may not be a good idea to rely on them for performance critical work.
+
+-------------------------
+
+Berg | 2022-11-03 04:45:24 UTC | #14
+
+Hi @johan, really enjoyed your presentation yesterday and just came to bump this thread for visibility and additional feedback.
+
+-------------------------
+
+abk | 2022-11-03 10:16:55 UTC | #15
+
+[quote="paulyoung, post:9, topic:16210"]
+However, I just learned from the following issues (and other sources) that linking C code and targeting `wasm32-unknown-unknown` might appear to work but can’t really be relied upon.
+[/quote]
+
+I wonder if it would be possible to compile to the `wasm32-unknown-emscripten` target and then strip out the unused empscripten API stuff so that you could run on the IC.
+
+-------------------------
+
+paulyoung | 2022-12-10 03:31:14 UTC | #16
+
+I’ve had some success with using `wasm-snip` on Wasm that targeted WASI.
+
+I don’t know anything about emscripten but maybe that would work there too.
+
+-------------------------
+

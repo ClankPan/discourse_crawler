@@ -1,0 +1,873 @@
+berestovskyy | 2022-06-25 07:50:31 UTC | #1
+
+Availability
+========
+
+* WebAssembly: `(import "ic0" "performance_counter" (func $ic0_performance_counter (param i32) (result i64)))`
+-- available on all the subnets of the Internet Computer
+* Motoko: `ExperimentalInternetComputer.countInstructions(comp)`
+-- available in the latest Motoko and Motoko Playground. Note: as the Performance Counter doesn’t support measuring computations with inter-canister calls, the Motoko is designed the library to reject async functions to prevent misuse at the moment.
+* Rust: `ic_cdk::api::call::performance_counter(counter_type: u32) -> u64`
+-- available in the latest Rust CDK
+* The Internet Computer SDK (i.e. `dfx`):
+-- available in the latest beta.
+
+What Is It?
+========
+
+The Canisters are encoded in WebAssembly. By executing a Canister method, in fact we execute WebAssembly instructions:
+
+![Screenshot 2022-06-24 at 20.06.31|560x500](upload://e8FFv6LuyD5PZ0JE8pk9JV1cTPh.png)
+
+The Performance Counter is a new System API call, so Canisters can ask the Internet Computer how many instructions the Canister executed so far in the current message.
+
+The counter is reset between messages. Note, if you use async calls, each async point corresponds to a new message.
+
+Why Do We Need It?
+================
+
+The Performance Counter is a way to know runtime the complexity, and hence the cost of a piece of code.
+
+We can use this information to profile our Canisters, benchmark our libraries, or even to dynamically charge other Canisters based on exact work done.
+
+Are There Any Alternatives?
+====================
+
+There are many profilers, flame graphs etc. The key differences are:
+
+1. The Performance Counter is an exact number of WebAssembly Instructions, not an estimation.
+2. The information is available runtime, during the execution, so the Canister can take decisions based on that.
+
+Demo
+=====
+
+Here is a small demo on Motoko Playground:
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1375554920
+
+Fun fact, as I'm a backend engineer, it's probably, my first Motoko program 😎
+
+High-level, it's a bit modified `Counter` Motoko tutorial, but with two stable counters.
+
+Click `Deploy`, and then mark `Enable Profiling` to enable the Flame Graphs.
+
+`incCounter()`
+------------------
+
+```
+  stable var counter : Nat = 0;
+  public func incCounter() : async Nat64 {
+    EIC.countInstructions(func() { counter += 1 });
+  };
+```
+
+The first public function `incCounter()` just increases a stable counter. Note, the actual work is wrapped inside the `countInstructions()`, and it returns the number of instructions consumed by the lambda inside.
+
+In the `Candid UI` on the left, call `incCounter`.
+
+![Screenshot 2022-06-24 at 20.31.48|446x500](upload://8ZHqfNdDnsjsLs5PwRTpeUvOzzc.png)
+
+It returns `638` WebAssembly instructions. Why so many?
+
+First of all, the `ic0.performance_counter()` System API call takes 200 instructions for a start. That's an overhead of exiting the WASM Execution and providing the information to the Canister.
+
+Next, profiling to build the Flame Graph. If we deploy the Demo with no profiling enabled, it will take just `234` Instructions, out which `200` instructions is a fixed overhead of the Performance Counter itself. Profiling is expensive, but invaluable!
+
+Let's compare the results with the Flame Graph. Hover the mouse over `incCounter` and it shows `929` WebAssembly instructions estimated by the profiler. Flame Graph includes many other things, like Candid arguments deserialization and function result serialization, so it's expected to be more than the pure `countInstructions()` call.
+
+Those are still comparable results. So far so good!
+
+`incBigCounter()`
+----------------------
+
+```
+  stable var bigCounter : Nat = 12345678901234567890;
+  public func incBigCounter() : async Nat64 {
+    EIC.countInstructions(func() { bigCounter += 1 });
+  };
+```
+
+Let's try the second counter. As you can see, everything is exactly the same, but the initial value of the counter is huge.
+
+Click `Call` in the `Candid UI` to call the `incBigCounter()`
+
+![Screenshot 2022-06-24 at 20.32.15|459x500](upload://o8L64k6bg7apVpxFrPU8m5P3jCi.png)
+
+Previously it took `638` WebAssembly Instructions, and now it's `5330` 😱
+
+Flame graphs to the rescue! We see that Motoko has started to use `BigInt` library underneath, as the initial value was too big to represent in normal form.
+
+That's a super simple, yet a great example why we need to profile our Canisters with real data structure sizes. The more data flows in, the more instructions it might take to process the requests. Even on such a basic level of a single counter.
+
+Comparing with the Flame Graph estimations, now we start to see a difference. The Flame Graph estimates the call to `~2K` Instructions, while in fact it took `~5K`. But it will be super clear in the last example.
+
+`readStableMemory()`
+-----------------------------
+
+```
+  public func readStableMemory() : async Nat64 {
+    EIC.countInstructions(func() {
+      var o = StableMemory.grow(1);
+      var b = StableMemory.loadBlob(0, 65536);
+    });
+  };
+```
+
+In the `readStableMemory()` we just grow the stable memory, and read a binary blob from it.
+
+Let's call it...
+
+![Screenshot 2022-06-24 at 20.33.04|484x500](upload://omNByIOYhbqQFTz1q2u59jY0JI0.png)
+
+Ok, so it took ~`66K` WebAssembly Instructions, but since the most of the work was done on the backend, on the System API level, the flame graph estimation shows just ~`1K`.
+
+And that is why we need the Performance Counter! It's precisely what the Canister will be charged for, it includes all the work done in WebAssembly and on the System API level.
+
+Links
+====
+1. The Internet Computer Interface Specisication:
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-performance-counter
+2. Canister Cycles vs Performance Counter Wiki (or why async functions are tricky):
+https://wiki.internetcomputer.org/wiki/Comparing_Canister_Cycles_vs_Performance_Counter
+3. This Demo on Motoko Playground:
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1375554920
+
+Next Iterations
+===========
+The Performance Counter interface is extensible, so a few new Counters might be added. At the moment we're considering to add:
+
+1. A counter which returns Cycles, not WebAssembly instruction.
+2. A stable counter which will be growing across async calls/responses.
+
+-----
+
+It was a small feature, but many changes across components and teams.
+Thanks @roman-kashitsyn @ulan @claudio @chenyan @lwshang and everyone in Execution, Languages, Runtime, SDK teams!
+
+-------------------------
+
+icme | 2022-06-24 22:54:40 UTC | #2
+
+
+Thanks for this great tool! Looking forward to using it.
+
+[quote="berestovskyy, post:1, topic:14027"]
+And the last point, Motoko is not Rust, it allocates stable variables on heap, so a bit of overhead will always be there.
+[/quote]
+
+Can you elaborate on how much overhead we can expect when writing to the heap in Motoko vs. writing to/incrementing variables Rust? Has this same performance test been done for the equivalent Rust code?
+
+-------------------------
+
+rckprtr | 2022-06-25 01:06:25 UTC | #3
+
+Extremely excited for this.  What versions of the CDK-RS and the DFINITY Client do we need to use this?
+
+ic-cdk = "0.5.2"
+
+Im thinking it will be DFX "0.10.2" ?  Just tried 0.10.1 and got `asm module has an invalid import section. Module imports function 'performance_counter' from 'ic0' that is not exported by the runtime."`
+
+Thank you,
+Rick
+
+-------------------------
+
+chenyan | 2022-06-25 05:13:41 UTC | #4
+
+Some clarifications:
+
+[quote="berestovskyy, post:1, topic:14027"]
+Motoko: `ExperimentalInternetComputer.countInstructions(comp)`
+– available in the latest Motoko and Motoko Playground. Note: Motoko does not support the Performance Counter for async lambdas at the moment.
+[/quote]
+
+`performance_counter` doesn't support measuring computations with inter-canister calls. This is a limitation of the system API itself, not a limitation of Motoko. We design the library to reject async functions to prevent misuse.
+
+[quote="berestovskyy, post:1, topic:14027"]
+Next, let’s have a look on the flame graphs. There is some deserialization and serialization going on. That’s profiling, to build the Flame Graph.
+[/quote]
+
+The deserialization and serialization is used to decode input arguments and encode return values. It happens for all Candid methods, not specific for profiling. One limitation of the Motoko library function `countInstructions` is that it cannot measure the cost of Motoko runtime behaviors, such as encoding/decoding arguments and GC. But we can capture this in the flamegraph. So the comparison of these two numbers is a bit misleading, they measure different things: `countInstructions` measures the cost only for the function body, while flamegraph measures the whole canister call.
+
+[quote="berestovskyy, post:1, topic:14027"]
+And the last point, Motoko is not Rust, it allocates stable variables on heap, so a bit of overhead will always be there.
+[/quote]
+
+Quite the contrary, if the Rust canister is writing data directly to stable memory, it has more overhead, because the stable memory API is expensive, as we can see from the last example. Also Motoko base library has support for accessing stable memory directly, we choose not to do this for stable variables precisely because of the overhead.
+
+A bit more background on why the flamegraph is not using `performance_counter` yet:
+1) `performance_counter` resets for each message, so we cannot use it to measure functions with inter-canister calls
+2) The flamegraph is generated by instrumenting Wasm binary. If we use `performance_counter`, the instrumented instruction itself will be counted towards the cost in the flamegraph, skewing the measurement result. But this can be mitigated by subtracting the instrument cost.
+3) It seems the only thing we didn't measure correctly in the flamegraph is the bulk memory instructions, which is easy to fix in the instrumentation code.
+
+-------------------------
+
+berestovskyy | 2022-06-25 07:58:42 UTC | #5
+
+hey @chenyan,
+You're right, I just rephrased all your points but one:
+
+[quote="chenyan, post:4, topic:14027"]
+The deserialization and serialization is used to decode input arguments and encode return values. It happens for all Candid methods, not specific for profiling.
+[/quote]
+
+As you said below, the performance counter does not capture public function prologue/epilogue, so those `638` instructions definitely can't be attributed to Candid. That's the Flame Graph profiling, and if you try to deploy the Demo without profiling enabled, it takes just `234` instructions, out of which `200` is the Performance Counter itself.
+
+UPD: I get your point, and both statements seems to be true: 1) the serialization captured on the graph is related to the Candid and 2) the Performance Counter captures the flame graph profiling.
+
+So, I rephrased this again. Thanks a lot for clarifications, @chenyan
+
+-------------------------
+
+berestovskyy | 2022-06-25 06:37:36 UTC | #6
+
+[quote="rckprtr, post:3, topic:14027"]
+What versions of the CDK-RS and the DFINITY Client do we need to use this?
+[/quote]
+
+Hm, probably, the manifest is still not updated... It's available in the latest SDK beta: https://github.com/dfinity/sdk/releases/tag/0.10.2-btcbeta.0
+
+The following worked for me:
+```
+DFX_VERSION="0.10.2-btcbeta.0" sh -ci "$(curl -fsSL https://smartcontracts.org/install.sh)"
+```
+
+-------------------------
+
+berestovskyy | 2022-06-25 06:50:15 UTC | #7
+
+[quote="icme, post:2, topic:14027"]
+Can you elaborate on how much overhead we can expect when writing to the heap in Motoko
+[/quote]
+
+Sorry, it was not quite correct comparison. Some might expect that `counter += 1` takes like `5` instructions (load-inc-store), not `638`. So my goal was to explain why it's so many, not comparing it to Rust.
+
+So, I clarified in the original post two points:
+
+> And the last point, Motoko allocates stable variables on the heap, so a bit of overhead in comparison with local variables will always be there.
+
+and:
+
+>Note, if we deploy the Demo with no profiling enabled, it will take just `234` Instructions, out which `200` instructions is a fixed overhead of the Performance Counter itself. So, no worries about Motoko performance or overhead.
+
+Hope that addresses your concerns, @icme
+
+-------------------------
+
+rckprtr | 2022-06-25 16:06:58 UTC | #8
+
+Awesome works
+
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Performance Data 1 467,420
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Performance Data 2 420,468,819
+
+```
+ic_cdk::println!(
+        "Performance Data 1 {:?}",
+        ic_cdk::api::call::performance_counter(0)
+    );
+```
+
+I put Data 2 at the bottom of a function that causes quite a bit of issues, very cool.
+
+-------------------------
+
+chenyan | 2022-06-30 23:30:03 UTC | #9
+
+Thanks for the update. I also update the flamegraph to reflect the real system API cost.
+
+As an example, here is flamegraph for `readStableMemory`:
+
+![Screen Shot 2022-06-30 at 4.25.48 PM|512x171](upload://xylichtnEUeGpICmc9s4cmVStEe.png)
+
+The cost of `anon-func-17.27`, which is one stack above `countInstructions`, is the real cost of the function body we want to measure. You will notice that the number measured by the performance counter is slight higher, because it includes the cost of the profiling instructions itself. If you deploy the same code without profiling, you will see the outputted number will be very close to what flamegraph measured.
+
+-------------------------
+
+lastmjs | 2022-07-06 21:30:49 UTC | #10
+
+I'm having a really hard time using the performance counter in Motoko, considering it only allows a synchronous lambda. In Rust and Azle (which uses Rust under-the-hood) the performance counter API is working fantastically. I am able to capture all of the Wasm instructions up to the point of calling `performance_counter(0)`, and it will capture all work (I assume) including Candid deserialization of the parameters (apparently the Rust CDK performance counter does not capture the instructions for Candid deserialization).
+
+But in Motoko it seems like a whole lot of instructions are being cut out, and the lambda makes it very difficult to use the performance counter nimbly in many different situations.
+
+The current API makes it difficult for me to do in-depth benchmarks across Azle, Rust, and Motoko since the Motoko `EIC.countInstructions` leaves so much out compared to the Rust CDK. I also really want the garbage collector to be in the performance counter for Motoko, as Azle is also garbage collected and I would assume its gc is included in the performance counter (it uses Rust CDK under-the-hood).
+
+I would like to request the API be changed to match the Rust CDK API, just exposing a simple `performance_counter` function that returns the number of instructions up to that point.
+
+-------------------------
+
+chenyan | 2022-07-06 21:21:46 UTC | #11
+
+[quote="lastmjs, post:10, topic:14027"]
+In Rust and Azle (which uses Rust under-the-hood) the performance counter API is working fantastically. I am able to capture all of the Wasm instructions up to the point of calling `performance_counter(0)`, and it will capture all work (I assume) including Candid deserialization of the parameters.
+[/quote]
+
+Nope. It allows you to call `performance_counter` anywhere, but it doesn't mean you always get the correct result. After each await, the counter resets to zero. So the only meaningful way to measure the instructions is within a synchronous lambda. Unless you change the Rust CDK, it doesn't capture the work for Candid either.
+
+-------------------------
+
+lastmjs | 2022-07-06 21:29:52 UTC | #12
+
+You can store the result of a previous `performance_counter` call just before an await boundary correct? If this is true then it seems relatively simple to add up all instructions across await boundaries with the Rust CDK, but not with the Motoko sync lambda.
+
+I think it would be much more flexible to expose the same API in Motoko and let the developer decide when to call it. Storing a value before the await boundary doesn't seem that difficult to do, but the sync lambda seems to prevent a lot of use.
+
+-------------------------
+
+chenyan | 2022-07-06 22:07:22 UTC | #13
+
+Theoretically yes, but unless you do this at the Wasm level, you still cannot cover all costs.
+
+```
+let start = call performance_counter();
+...
+global_counter += call performance_counter() - start;
+let res = canister.method(...).await?;
+...
+global_counter += call performance_counter();
+```
+In the above code, the costs we didn't cover are: 1) the system API cost for making inter-canister calls; 2) Candid serialization cost for `canister.method`; 3) the Candid cost for the main method where this code resides; 4) The Candid deserialization cost for `res` is counted though.
+
+In Motoko, you can use `Prim.performanceCounter(0)` to get the equivalent of Rust. Just be careful to know what exactly you are counting.
+
+-------------------------
+
+lastmjs | 2022-07-07 16:08:42 UTC | #14
+
+[quote="chenyan, post:13, topic:14027"]
+In Motoko, you can use `Prim.performanceCounter(0)` to get the equivalent of Rust. Just be careful to know what exactly you are counting.
+[/quote]
+
+This could be exactly what I was looking for. How do I access this though (what is `Prim`)? I don't see this in the Motoko Reference: https://internetcomputer.org/docs/current/references/motoko-ref/stdlib-intro or the base library: https://github.com/dfinity/motoko-base/tree/master/src
+
+-------------------------
+
+lastmjs | 2022-07-07 17:15:58 UTC | #15
+
+Is Prim from an emoji? https://github.com/dfinity/motoko-base/blob/master/src/ExperimentalInternetComputer.mo#L5
+
+-------------------------
+
+domwoe | 2022-07-07 17:35:00 UTC | #16
+
+:joy:
+
+```
+import Prim "mo:prim";
+
+Prim.performanceCounter(0);
+```
+
+-------------------------
+
+lastmjs | 2022-07-07 17:40:14 UTC | #17
+
+[quote="domwoe, post:16, topic:14027"]
+`import Prim "mo:prim";`
+[/quote]
+
+Oh that's better, thanks!
+
+-------------------------
+
+lastmjs | 2022-07-07 17:43:42 UTC | #18
+
+[quote="domwoe, post:16, topic:14027"]
+`Prim.performanceCounter(0);`
+[/quote]
+
+I'm getting this:
+
+```
+main.mo:8.1-8.22: import error [M0010], package "Prim" not defined
+```
+
+-------------------------
+
+lastmjs | 2022-07-07 17:46:16 UTC | #19
+
+I had to do `import Prim "mo:⛔";`
+
+-------------------------
+
+domwoe | 2022-07-07 17:51:48 UTC | #20
+
+:thinking: I'm sure I used that in the past. Funny...
+
+-------------------------
+
+Ori | 2022-07-12 17:34:54 UTC | #21
+
+It used to be mo:prim, it was changed to discourage people from using it directly (it’s an internal module and its content is subject to change).
+
+-------------------------
+
+lastmjs | 2022-07-27 22:11:34 UTC | #22
+
+I'd like to add some feedback on the performance counter API. We've been using it extensively to benchmark Azle, Motoko, and Rust canisters. Here's some feedback:
+
+1. Motoko seems to outperform beyond reasonable expectations, I'm not exactly sure why (gc/prelude/postlude differences?)
+2. It's hard to use the performance counter on code that already exists. We either have to change the canister method signatures to return the results of the performance counter, or we have to create some kind of global variable and set the performance results during update call execution (which doesn't work for query calls). It would be much nicer to just call a query/update function and have ALL of the performance information returned as part of the response data.
+
+-------------------------
+
+berestovskyy | 2022-07-28 08:26:28 UTC | #23
+
+> Motoko seems to outperform beyond reasonable expectations
+
+Unexpected, but very cool! 😎
+
+> It would be much nicer to just call a query/update function and have ALL of the performance information returned as part of the response data.
+
+Sounds like Prometheus library, no? We can collect performance counters in different parts of the program and map them to Prometheus counters. Then a query might scrape the results in one go.
+
+Not sure if there are any Prometheus libraries for Motoko, but even basic approach described in [Effective Rust Canisters > Observability](https://mmapped.blog/posts/01-effective-rust-canisters.html#observability) might do the job.
+
+-------------------------
+
+lastmjs | 2022-07-28 13:39:34 UTC | #24
+
+[quote="berestovskyy, post:23, topic:14027"]
+Motoko seems to outperform beyond reasonable expectations
+[/quote]
+
+Haha, I meant that I think there's a problem with the performance counter, I suspect the Motoko function prelude instructions aren't being accounted for in the same way that Rust's are.
+
+-------------------------
+
+lastmjs | 2022-07-28 13:41:05 UTC | #25
+
+I think it would be best if the developer didn't have to change anything in their source code, so that any query or update call can be profiled by a simple call. It really is a lot of work to add all of this performance counting code, especially retrofitting it into existing applications.
+
+-------------------------
+
+berestovskyy | 2022-07-28 14:03:13 UTC | #26
+
+you mean like `call("my_query")` would also return some meta information how many instructions (or Cycles) the whole query took?
+
+-------------------------
+
+lastmjs | 2022-07-28 18:06:39 UTC | #27
+
+Exactly, I believe this is how Ethereum works, it will return the exact amount of gas used.
+
+-------------------------
+
+berestovskyy | 2022-08-02 09:37:31 UTC | #28
+
+It's not on our roadmap, but we'll discuss it internally this week and I'll let you know @lastmjs
+
+-------------------------
+
+lastmjs | 2022-08-02 13:19:11 UTC | #29
+
+I appreciate that, thank you
+
+-------------------------
+
+berestovskyy | 2022-08-04 15:18:44 UTC | #30
+
+We've just discussed it internally, @lastmjs 
+
+The team has acknowledged the current performance counter implementation might be not the easiest one to use for quick performance assessments of the existing Canisters, some effort must be put into instrumenting the code, making this information available, etc.
+
+If we implement this on the IC level, there are a few open questions like should this information be public, how to pass the information to the users and caller Canisters, how to represent the results etc. Seems like we're looking at the Distributed Tracing here, and we're not quite sure how much of that we want to be implemented on the IC. So, it might take some time to clarify those questions...
+
+From the other side, we should definitely improve the profiling on the SDK/CDK level. It might be as easy as:
+
+```
+#[query]
+#[enable_profiler]
+fn my_query() {
+
+}
+```
+
+This `#[enable_profiler]` macro could generate `my_query` and `my_query_profiler`. Calling `my_query_profiler` could internally execute `my_query`, gather and return the profiler info...
+
+Another point we discussed is a process of getting a structured feedback from the community. While this forum is a great tool for casual conversations or announcements, it's still not that easy for you guys to file a formal feature request, show that it's a valuable feature for the community, and so for this request to be prioritized accordingly.
+
+I hope we will soon improve here as well...
+
+-------------------------
+
+lastmjs | 2022-08-04 16:06:56 UTC | #31
+
+That all sounds great, I look forward to the discussions and improvements.
+
+-------------------------
+
+dymayday | 2022-08-05 09:43:58 UTC | #32
+
+Love the ideas and the attitude @berestovskyy ! Thank you !
+
+-------------------------
+
+iamenochchirima | 2023-10-16 12:19:41 UTC | #33
+
+[quote="lastmjs, post:19, topic:14027, full:true"]
+I had to do `import Prim "mo:⛔";`
+[/quote]
+
+I'm just going through this thread trying to understand how this Performance Counter really work and then I just thought I should ask this thing I have been wondering all along. 
+
+Why does this Prim module have to be imported from this emoji ⛔ ?. What's happening there?
+
+-------------------------
+
+berestovskyy | 2023-10-19 15:36:56 UTC | #34
+
+IMO it's just a name, and I guess it means that you should know what you're doing using those functions, but probably @claudio or @ggreif could explain better.
+
+-------------------------
+
+ggreif | 2023-11-02 22:45:59 UTC | #35
+
+It is an internal module, specific to the compiler version. The emoji tries to convey the message that it is off-limits, so don't expect stuff in there to be in any way stable. The `base` library is the stable user-facing interface.
+
+That said, accessing the primitives can be justified with various arguments, but you should know what you are doing :slight_smile: (and be prepared for breakage). Test well!
+
+-------------------------
+
+berestovskyy | 2023-11-30 21:33:05 UTC | #36
+
+Hey folks,
+There is a new async-friendly performance counter available (type 1):
+
+```
+Rust:       ic_cdk::api::performance_counter(1);
+Motoko:     import IC "mo:base/ExperimentalInternetComputer";
+            IC.performanceCounter(1);
+TypeScript: import ic from 'azle';
+            ic.performanceCounter(1);
+Python:     from kybra import ic
+            ic.performance_counter(1)
+```
+
+The new counter lives in call context and monotonically increases across await points, until the original call is either replied or rejected:
+![image|690x288](upload://1mld9HsMQXBF5a3guQzY5uzc3Oj.jpeg)
+
+For more details please see [the spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-performance-counter) and [the examples](https://github.com/dfinity/examples/tree/master/rust/performance_counters).
+
+-------------------------
+
+ZenVoich | 2023-12-08 12:07:22 UTC | #37
+
+[quote="berestovskyy, post:36, topic:14027"]
+There is a new async-friendly performance counter available
+[/quote]
+
+Will it count Motoko GC if I make an async call to the canister itself?
+
+Motoko compiled with `--force-gc` flag
+
+-------------------------
+
+berestovskyy | 2023-12-08 14:15:38 UTC | #38
+
+The perf counter does not include any nested executions, even if it's a call to self. So IMO it won't, but we can double check with Motoko experts cc @claudio @chenyan @luc-blaeser @ggreif
+
+-------------------------
+
+claudio | 2023-12-08 17:13:15 UTC | #39
+
+The way the Motoko GC works is that it runs after the user code in any IC message, including those user-code calls to performanceCounter(). So I think performance counter(1) will include the cost of all GC calls executed in the call context prior sofar, but not the last GC itself before returning or doing the next await().
+
+There is a low-level primitive "rts_mutator_instructions" and "rts_collector_instructions" (IIRC) that give you the costs of the last message executed, but it uses performanceCounter(0) to do that, so you won't get a running tally of all messages that make up the current call context, just the last one.
+
+Also, the incremental GC spreads a full GC across several messages, so rts_collector_instructions just counts the amount of GC work actually done in the message, not the cost of a full GC of the entire heap.
+
+-------------------------
+
+ZenVoich | 2023-12-11 07:39:59 UTC | #40
+
+[quote="claudio, post:39, topic:14027"]
+There is a low-level primitive “rts_mutator_instructions” and “rts_collector_instructions” (IIRC) that give you the costs of the last message executed, but it uses performanceCounter(0) to do that, so you won’t get a running tally of all messages that make up the current call context, just the last one.
+[/quote]
+
+Is this the right way to count instructions used by GC?
+```motoko
+public func gcIns() : async Nat {
+  doSomeWork(); // add/remove heap data
+  await noop(); // trigger gc
+  Prim.rts_mutator_instructions() + Prim.rts_collector_instructions(); // gc cost for doSomeWork()
+};
+```
+
+-------------------------
+
+claudio | 2023-12-11 08:36:40 UTC | #41
+
+Yes, I think that should work as long as there are no other concurrent messages that could run during the await.
+
+Perhaps we could improve this behaviour. Would need to think about it.
+
+-------------------------
+
+claudio | 2023-12-11 08:38:42 UTC | #42
+
+@luc-blaeser do these counters still behave the same for the incremental gc? I think so, but want to check
+
+-------------------------
+
+claudio | 2023-12-11 08:40:51 UTC | #43
+
+To be clear, you probably only want to count the collector instructions, the mutator instructions are user code
+
+-------------------------
+
+luc-blaeser | 2023-12-11 09:48:15 UTC | #44
+
+Yes, `Prim.rts_mutator_instructions()` and `Prim.rts_collector_instructions()` have the same semantics for the incremental GC. `rts_collector_instructions()` returns the number of instructions of the last GC increment. A detail aspect is that the costs of write barriers and load barriers are added to the mutator instructions. This is the case for the incremental GC and for the generational GC (the latter only entails write barriers).
+
+Referring to the example above, it would make sense to also count the `Prim.rts_collector_instructions()` inside the `noop()` function, since most probably the GC is also running when the `await` expression is reached and before `noop()` is executed (as a result, the function `noop()` sees the costs of this previous GC run). With the incremental GC, there could be multiple consecutive GC increments for a larger heap, one at the `await` (the most probable for all GCs), one at the end of the `noop()`, one at the end of the public function etc..
+
+-------------------------
+
+timo | 2023-12-11 10:42:20 UTC | #45
+
+[quote="luc-blaeser, post:44, topic:14027"]
+as a result, the function `noop()` sees the costs of this previous GC run
+[/quote]
+
+So he should do this then?
+```
+public func gcIns() : async Nat {
+  doSomeWork(); // add/remove heap data
+  await async {  Prim.rts_collector_instructions() }; // gc cost for doSomeWork()
+};
+```
+
+-------------------------
+
+abc | 2023-12-11 11:47:14 UTC | #46
+
+https://x.com/dstar_peter/status/1734168796535890127?s=20
+**How to Define or Count unlimted better?**
+**Thank you very much!**
+
+-------------------------
+
+berestovskyy | 2023-12-11 12:45:21 UTC | #47
+
+I'm not sure I follow, @abc
+
+-------------------------
+
+ZenVoich | 2023-12-11 13:00:57 UTC | #48
+
+[quote="luc-blaeser, post:44, topic:14027"]
+Referring to the example above, it would make sense to also count the `Prim.rts_collector_instructions()` inside the `noop()` function, since most probably the GC is also running when the `await` expression is reached and before `noop()` is executed (as a result, the function `noop()` sees the costs of this previous GC run)
+[/quote]
+
+Does `rts_collector_instructions` reset after each `await` or does it just increase?
+
+Is this example correct?
+```motoko
+var ins = Nat64.toNat(ExperimentalInternetComputer.countInstructions(func() {
+	doSomeWork();
+}));
+ins += await async {
+	Prim.rts_collector_instructions();
+};
+ins += Prim.rts_collector_instructions();
+```
+
+-------------------------
+
+luc-blaeser | 2023-12-11 16:18:50 UTC | #49
+
+Yes, `rts_collector_instructions()` resets after each message end.
+Therefore, it is good to sum the collector instructions in each continuation of the async function as it is done in your example. 
+There are two aspects to be considered:
+* An additional GC increment may run at the function end. Those costs are currently not yet captured in this example.
+* This assumes that no other message/async function runs in between at the await point. Otherwise, this other function would see the previous GC costs.
+
+-------------------------
+
+skilesare | 2023-12-12 15:51:27 UTC | #50
+
+[quote="ZenVoich, post:48, topic:14027"]
+```
+ins += await async {
+	Prim.rts_collector_instructions();
+};
+```
+[/quote]
+
+Would await* async* help keep other messages from jumping in front?
+
+-------------------------
+
+claudio | 2023-12-12 16:40:45 UTC | #51
+
+
+> Would await* async* help keep other messages from jumping in front?
+
+No, unfortunately, the code would just run synchronously and you would not count the last GC.
+
+I think if we really wanted to collect these stats properly we would need to do a bit more book-keeping in the generated code, and (perhaps) selectively return the stats as additional fields of every response (or using a log message, once supported).
+
+-------------------------
+
+ZenVoich | 2023-12-15 08:27:22 UTC | #52
+
+[quote="luc-blaeser, post:49, topic:14027"]
+Yes, `rts_collector_instructions()` resets after each message end.
+[/quote]
+
+I found that it doesn't reset after every async call:
+
+```motoko
+		doSomeWork();
+		Debug.print("-----------------------------------");
+		await async {};
+
+		Debug.print("1");
+		Debug.print(debug_show(Prim.rts_collector_instructions()));
+		await (func() : async() {
+			Debug.print(debug_show(Prim.rts_collector_instructions()));
+		})();
+
+		Debug.print("2");
+		Debug.print(debug_show(Prim.rts_collector_instructions()));
+		await (func() : async() {
+			await async {};
+			Debug.print(debug_show(Prim.rts_collector_instructions()));
+		})();
+
+		Debug.print("3");
+		Debug.print(debug_show(Prim.rts_collector_instructions()));
+		await noop();
+		Debug.print(debug_show(Prim.rts_collector_instructions()));
+
+		Debug.print("4");
+		Debug.print(debug_show(Prim.rts_collector_instructions()));
+		await noop2();
+		Debug.print(debug_show(Prim.rts_collector_instructions()));
+```
+
+output
+```raw
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] -----------------------------------
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 1
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_903
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_903
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 2
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_903
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 41_869
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 3
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_903
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_903
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 4
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_903
+2023-12-15 08:20:13.606126639 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 37_876
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] -----------------------------------
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 1
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_318
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_318
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 2
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_318
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 485_284
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 3
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_318
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_318
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 4
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_318
+2023-12-15 08:20:15.555419004 UTC: [Canister bkyz2-fmaaa-aaaaa-qaaaq-cai] 481_291
+```
+
+moc 0.10.2 with --force-gc --copying-gc
+dfx 0.15.2
+
+-------------------------
+
+luc-blaeser | 2023-12-15 09:43:56 UTC | #53
+
+Thank you very much @ZenVoich for analyzing this. The results look indeed strange, but I believe there is the following phenomenon:
+
+The GC is running with exactly the same number of instructions (due to the very deterministic setup here). To be sure (it is always good to test/verify the implementation, therefore thanks again for reporting this), I double checked it by instrumenting the compiler/runtime system to log the update of the variable behind `rts_collector_instructions()` and got this trace:
+```
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] -----------------------------------
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 3048
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17626
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17626
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 1
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665       <-- GC ran with exactly the same number of instructions
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 2
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 22932
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 22932
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 22932
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 22_932
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 22932
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 3
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 4
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17665
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17620
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17620
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 17620
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 17_620
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 17620
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 12356
+```
+This log shows that the GC is indeed repeatedly running with exactly the same number of instructions, which is possible because no intermediate live objects have been allocated and `--force-gc` option schedules the GC in a continuous interval.
+
+I tried to create some live (non-garbage) objects to obtain more variations in the GC instructions counters in this example:
+
+```
+Debug.print("1");
+var x = Array.init<Nat>(1_000_000, 0);
+Debug.print(debug_show(Prim.rts_collector_instructions()));
+await (func() : async() {
+    x := Array.init<Nat>(1_000, 0);
+    Debug.print(debug_show(Prim.rts_collector_instructions()));
+})();
+Debug.print("length " # debug_show(x.size())); // necessary to retain array during previous GC runs.
+``` 
+
+With this change, I get the following different GC instruction results:
+```
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 1
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 18_087
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 18087
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 34519036
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] 34_519_036
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] COPYING GC
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] OLD GC INSTRUCTIONS 34519036
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] RESET TO NEW GC INSTRUCTIONS 53505
+[Canister rwlgt-iiaaa-aaaaa-aaaaa-cai] length 1_000
+```
+
+-------------------------
+

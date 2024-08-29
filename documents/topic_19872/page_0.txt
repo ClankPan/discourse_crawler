@@ -1,0 +1,102 @@
+timo | 2023-05-10 14:11:50 UTC | #1
+
+We are pleased to announce a new Motoko package that provides an efficient vector data structure with O(sqrt(n)) memory waste and O(sqrt(n)) worst-case append cost. It is published on [mops](https://mops.one/vector) and [github](https://github.com/research-ag/vector/).
+
+The go-to data structure for a variable length array in Motoko is `Buffer`, but memory waste and worst-case append cost are both linear. `Buffer` internally uses a 1-dimensional `Array` and when that is full then the whole array gets copied over into a newly allocated one. Vector instead uses a 2-dimensional `Array` and never copies data blocks. The trade-off is an increased random access cost because two random `Array` accesses happen under the hood. However, the improved worst-case cycle cost makes it more predictable to use when cycle limits are critical.
+
+The implementation is highly cycle-optimized. We have extensively benchmarked `Vector` against `Buffer` and `Array`. The result can be seen in the [README](https://github.com/research-ag/vector#benchmarks).
+
+-------------------------
+
+rossberg | 2023-05-10 11:37:46 UTC | #2
+
+Hi Timo, interesting. I haven't seen a 2D array used for this before, only ropes (trees of arrays), where most operations are O(log N), I believe. Is there some pointer comparing these representations?
+
+-------------------------
+
+timo | 2023-05-10 12:10:35 UTC | #3
+
+I haven't seen any external comparison between a 2D array and a tree-based approach. The paper on which our 2D array is based (https://sedgewick.io/wp-content/themes/sedgewick/papers/1999Optimal.pdf) does not go into that. Our primary goal was to reduce the worst-case append cost. Naturally we considered a tree as well because that could bring it down even further. But our secondary goal was to maintain O(1) access cost. We considered O(sqrt(n)) worst-case append good enough for our application, hence this trade-off was made.
+
+-------------------------
+
+chenyan | 2023-05-10 20:35:10 UTC | #4
+
+Interesting. I think the main benefits of this sqrt(n)-sized array is that the space complexity is optimal. A rope would need `O(n)` extra space. For time complexity, rope's access and append are both `O(logn)`, whereas the array's access and append are `O(1)` and `O(sqrt(n))`. Given our memory is only 4G, not sure how much it matters for `O(1)` and `O(log n)`.
+
+I think the sqrt(n) trick was first introduced in Knuth's book. Because the size of the array is `O(sqrt(n))`, it automatically makes any quadratic algorithm linear time. Knuth also mentioned that we can use this data structure to simulate Josephus problem. I rarely see this data structure being implemented in practice, probably because memory is cheap?
+
+-------------------------
+
+skilesare | 2024-07-30 13:29:44 UTC | #5
+
+Given the benchmarks at: https://mops.one/vector/benchmarks
+
+I'm trying to decide which structure to use when accumulating results to output for returning from an actor endpoint.
+
+It looks like Array may still be the best to use with `tabulate` if you know the number of items in your result.
+
+If you don't know the number of results, would you recommend using Vector or Buffer?
+
+I'm also curious if there is a difference in cost for the `.toArray` cost which will be needed at the end of the calculation to output the data.
+
+-------------------------
+
+timo | 2024-07-30 22:55:04 UTC | #6
+
+[quote="skilesare, post:5, topic:19872"]
+If you don’t know the number of results, would you recommend using Vector or Buffer?
+[/quote]
+
+I don't think it matters for the sizes we are talking about. Since responses from actor endpoints are limited to 2 MB the array can't be very large. Both are fine.
+
+If you know the number of results or can approximate it then Buffer accepts an initial capacity argument. Sometimes, even when you know the size in advance, Array.tabulate is inconvenient or impossible to use. Then Buffer with the correct initial capacity is a better alternative.
+
+[quote="skilesare, post:5, topic:19872"]
+I’m also curious if there is a difference in cost for the `.toArray` cost which will be needed at the end of the calculation to output the data.
+[/quote]
+
+That function `toArray` is benchmarked. See the README on [vector](https://mops.one/vector).
+
+-------------------------
+
+skilesare | 2024-07-31 11:29:14 UTC | #7
+
+Ah....that is great and very detailed! I was looking in the wrong place. It is interesting that the memory hit is 4x on add for buffer.  I guess if it is transient it doesn't make much difference except that I assume that memory allocation has some cycle cost? Or maybe not? I'm guessing that buffer is higher in part do to the 'lumpy' allocation that may occur during the growth of the buffer.  Pre-allocation would likely reduce this I think.
+
+-------------------------
+
+timo | 2024-07-31 17:20:35 UTC | #8
+
+[quote="skilesare, post:7, topic:19872"]
+I assume that memory allocation has some cycle cost? Or maybe not?
+[/quote]
+
+It has an instructions cost. As you can see in the row for `add` in the instructions table, adding N elements to Buffer uses about 1.5x as many instructions as Vector. The difference comes from a) allocation and b) copying. I don't know what the relative share of a) and b) is, though.
+
+[quote="skilesare, post:7, topic:19872"]
+I guess if it is transient it doesn’t make much difference 
+[/quote]
+
+At the size where the benchmark was done, which is N = 100,000 entries, the transient allocation indeed does not matter besides instructions. But at 100 million it may matter. The transient allocation (and copying) can for example:
+- increase your canister's high watermark memory usage and then you'll pay for that because wasm memory cannot shrink at least until an upgrade 
+- cause problems with reaching the instruction limit
+
+It's really only at those large sizes that you may feel safer when using Vector.
+
+-------------------------
+
+rossberg | 2024-07-31 20:08:25 UTC | #9
+
+@timo, cool stuff, do you know what the O-complexities of the various operations are? At scale, that may be more interesting than raw benchmark numbers.
+
+-------------------------
+
+timo | 2024-07-31 20:36:05 UTC | #10
+
+You mean for the whole table, for all functions? Yes, that would be interesting to write down. Though there won't be any surprises.
+
+For the addition operation, which was discussed above, the average complexity is O(1) and the worst-case complexity is O(sqrt(n)) compared to Buffer which has average complexity O(1) and worst-case O(n).
+
+-------------------------
+

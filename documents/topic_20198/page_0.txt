@@ -1,0 +1,177 @@
+qwertytrewq | 2023-05-23 21:36:19 UTC | #1
+
+As far as I know, there is development in switching to 64 bit heap memory. Correct me, if it is not true.
+
+I have like
+```
+stable var tree: BTree.BTree<Nat32, SubDB>;
+```
+
+Is it wise to use `Nat64` instead in order to streamline switch to 64 bit? Will using `Nat64` help in this in any way? If yes, how exactly may it help?
+
+-------------------------
+
+Severin | 2023-05-24 07:34:13 UTC | #2
+
+This is unrelated. 64 bit WASM is about how much non-stable memory you can use in your canister. What you are asking about is using a 4 or 8 byte Nat. The only difference between the two is how large the numbers they can represent can go up to.
+
+-------------------------
+
+rossberg | 2023-05-24 09:15:24 UTC | #3
+
+Also, you really want to use plain `Nat`. There rarely is a reason to use anything else.
+
+-------------------------
+
+lastmjs | 2023-05-24 13:09:27 UTC | #4
+
+You think so? Can you explain? I usually try to use the smallest nat/int for the job (in Azle/Kybra/Rust), do you think your reasoning applies to the Rust Nat as well?
+
+-------------------------
+
+skilesare | 2023-05-24 13:14:07 UTC | #5
+
+I know in motoko Nat can be smaller in memory than Nat64. Of course it can be bigger as well.
+
+-------------------------
+
+qwertytrewq | 2023-05-24 13:51:23 UTC | #6
+
+So, do I understand correctly that as 64 bit WASM is about increasing heap memory, I may specify `Nat64` to allow more entries, in the hope that I could put more entries into the tree in the future?
+
+-------------------------
+
+Severin | 2023-05-24 14:35:33 UTC | #7
+
+Yes, that works. Alternatively you can use a data structure that uses stable memory to get a larger max limit already now
+
+-------------------------
+
+timo | 2023-05-24 16:45:00 UTC | #8
+
+Why not make it Nat?
+
+-------------------------
+
+qwertytrewq | 2023-05-24 16:46:14 UTC | #9
+
+`Nat` is a variable size type. Thus it will require memory allocation that diminishes both memory and time efficiency because it will need to be allocated.
+
+-------------------------
+
+timo | 2023-05-24 16:58:22 UTC | #10
+
+I don’t think that’s true. It depends on the values in them. For a value of the same size Nat and Nat32/Nat64 behave essentially the same. I have benchmarked and cycle-optimized a few libraries and couldn’t measure a noticeable difference. If I remember correctly then the comparison operation can even be faster for Nat. Modular addition is faster than normal addition, that can be an advantage of NatX.
+
+-------------------------
+
+rossberg | 2023-05-24 17:38:56 UTC | #11
+
+@qwertytrewq, that's a common misconception. In fact, it's almost the opposite. The memory word size in Wasm is 32 bit (and we need 1 bit in Motoko to distinguish pointers for the GC). So any value that requires more than 32/31 bits has to be boxed. Thus, Nat32 and Nat64 are boxed, i.e., require allocations in most circumstances, because they lack a variable-size representation. Small Nat values (< 2^31) o.t.o.h. are unboxed.
+
+The only use cases for fixed-size NatX/IntX types in Motoko are for interaction with external data formats that use them, and for the implementation of algorithms that inherently use 32/64-bit integer arithmetics, e.g., many crypto algorithms.
+
+-------------------------
+
+qwertytrewq | 2023-05-24 19:06:33 UTC | #12
+
+I don't understand:
+
+1. Nat32 is 32 bit, why does it need to be boxed?
+
+2. Nat64 is 64 bit, why it is not two (unboxed) 32-bit words?
+
+-------------------------
+
+rossberg | 2023-05-24 22:00:21 UTC | #13
+
+Because Motoko is a GC-ed, polymorphic language. And as such it needs to use a uniform representation, where every type is representable in a single word, minus 1 bit to distinguish pointers. Representations can be flattened in some circumstances (e.g., in locals), but not in general (e.g., as individual values in memory).
+
+-------------------------
+
+skilesare | 2023-05-24 23:07:23 UTC | #14
+
+What about working with [Nat8] and Blob.  Is there a more efficient way to use Nats?  Should we have conversions from [Nat] to blob?  Or since these are less than 32 bits are they efficient enough?
+
+-------------------------
+
+timo | 2023-05-25 04:50:28 UTC | #15
+
+Yes, Nat8/16 aren’t boxed.
+
+-------------------------
+
+rossberg | 2023-05-25 06:28:30 UTC | #16
+
+It would be nice to have specialised representations for arrays with small element types. The trade-off is that it would make accesses to arrays of _generic_ element type significantly more expensive, because they'd need to inspect and dispatch on the type. Hence Motoko currently does not do that, though it has been discussed repeatedly in the team, and may happen eventually.
+
+But right now that means that a [Nat8] takes up 4x the space of a Blob in memory (though not on wire). That's the reason why Blob was introduced in the first place.
+
+FWIW, specialising arrays with larger element type, such as unboxing the elements in [Nat32] or [Nat64], would be even more costly, because then reads would involve a boxing allocation in many situations.
+
+-------------------------
+
+timo | 2023-06-02 04:56:56 UTC | #17
+
+[quote="timo, post:10, topic:20198"]
+I don’t think that’s true. It depends on the values in them. For a value of the same size Nat and Nat32/Nat64 behave essentially the same.
+[/quote]
+
+I think I have to correct myself here. I should have said "For a value of the same _small_ size Nat and Nat32/Nat64 behave essentially the same." As soon as the values cross into 31 bits, i.e. when boxing happens, the differences start to show. I measured storing Nat/Nat32/Nat64 in an array. When the values are <= 30 bits it is 4 bytes per entry for all of the three types. When the value is 31 bits then it is 12 bytes per entry for Nat32, 16 bytes for Nat64 and 152 bytes for Nat.
+
+So I think the answer to OP's question could be yes. If he uses Nat64 now then it is as memory efficient as it can be while there are < 2^31 keys (which will certainly be the case with 32 bit memory). When a switch to 64 bit memory happens and there are >= 2^31 then Nat64 is more memory-efficient than Nat.
+
+It is unclear from OP's if the keys are purely internal or if they are user supplied. It should be noted that in candid Nat32 serializes to 4 bytes and Nat64 to 8 bytes fixed length regardless of the value inside it. While Nat serializes to variable length, so can be more efficient on the wire. It could be important if it's a high volume application.
+
+-------------------------
+
+rossberg | 2023-06-02 08:52:46 UTC | #18
+
+[quote="timo, post:17, topic:20198"]
+I measured storing Nat/Nat32/Nat64 in an array. When the values are <= 30 bits it is 4 bytes per entry for all of the three types.
+[/quote]
+
+I don't believe that's correct. When the values are ≤ 30 bits, it's indeed 4 bytes for Nat, but should still be 12 resp 16 bytes for Nat32/64, because they are always boxed in memory.
+
+-------------------------
+
+timo | 2023-06-02 08:58:34 UTC | #19
+
+No, Nat32/Nat64 aren't always boxed to my knowledge and according to my measurements. I measured an array. Does that make a difference for what we are saying? An array of n elements of type Nat32 takes 4*n + c bytes if all values are <= 30 bits.
+
+-------------------------
+
+ZhenyaUsenko | 2023-06-02 11:01:42 UTC | #20
+
+I also see the same behavior in my measurements. Nat/Nat32 take the same amount of space when they are <= 30bit. Above that Nat will start going crazy (Bigint path). It will hugely increase cycle consumption for arithmetic operation (especially for division and remainder which become crazily expensive - like 10x lower overall performance) and start producing garbage for arithmetic operations. Even if they are <= 30bits arithmetic operations are a lot faster for Nat32 (especially wrapping ones) because Nat will need to perform overflow checks on every arithmetic operation.
+
+-------------------------
+
+qwertytrewq | 2023-06-02 11:13:39 UTC | #21
+
+But when Nat is a part of a struct, doesn't need it to be boxed independently on the size of the number (to have a fixed offset for following fields of the struct)?
+
+-------------------------
+
+rossberg | 2023-06-02 13:53:13 UTC | #22
+
+@timo, ah yes, Motoko does indeed unbox small Nat/Int32/64 as well, my mistake.
+
+@ZhenyaUsenko, I doubt that _checked_ Nat32 ops are notably faster than Nat ops within the 31 bit value range. Did you measure that?
+
+Of course, _unchecked_ (i.e., wrapping) ones are somewhat faster, but since undetected integer overflow is one of the most dominant source of serious bugs in systems (and has enabled costly exploits of smart contracts), I would not recommend using them, except in very specific situations or if somebody actually proved the code correct.
+
+@qwertytrewq, fields in a struct or slots in an array are always 4 bytes wide, regardless of type or value (so that generics can be type-agnostic). Like elsewhere, Nat/Int values are only boxed when they don't fit that, i.e., they exceed the 31 bit range (with the remaining bit used to distinguish the two cases).
+
+-------------------------
+
+ZhenyaUsenko | 2023-06-02 14:01:06 UTC | #23
+
+[quote="rossberg, post:22, topic:20198"]
+@ZhenyaUsenko, I doubt that *checked* Nat32 ops are notably faster than Nat ops within the 31 bit value range. Did you measure that?
+[/quote]
+
+Not much. But looping through array with a Nat32 counter and converting the counter to Nat only to access array index is faster than having a Nat counter and doing no conversions even for checked Nat32 ops - the difference increases for wrapping operators.
+
+-------------------------
+

@@ -1,0 +1,186 @@
+shashika | 2022-02-11 04:26:48 UTC | #1
+
+Hi, I followed actor class creation tutorial using Motoko. It works fine 
+in local environment but when I'm deploying it to the IC network and try to create new bucket I get following error `The Replica returned an error: code 4, message: "Creating a canister requires a fee of 100000000000 that is deducted from the canister's initial balance but only 0 cycles were received with the create_canister request."`  https://smartcontracts.org/docs/language-guide/actor-classes.html 
+
+Can someone help me to resolve this?
+
+-------------------------
+
+chenyan | 2022-02-11 04:34:44 UTC | #2
+
+Guess you are using Motoko playground. We don't allow cycle transfer in the playground, and creating canister requires cycle transfer. It's best to use dfx and deploy to the IC for this example.
+
+-------------------------
+
+shashika | 2022-02-11 04:40:09 UTC | #3
+
+Thanks for the quick response @chenyan . I didn't use the playground. I deployed it through my laptop with command
+ `dfx deploy --network ic --wallet <wallet-id> --with-cycles 4000000000000`
+
+-------------------------
+
+Jesse | 2022-02-11 04:48:35 UTC | #4
+
+Before the line where you instantiate a new canister, you have to call the `Cycles.send()` method to send the cycles to the canister that you’re creating
+
+-------------------------
+
+shashika | 2022-02-11 04:54:19 UTC | #5
+
+hey @Jesse. In the documentation, they didn't mention something like that. Why do we need to handle cycle manipulation in our code? it should inherit by default right?
+
+-------------------------
+
+Jesse | 2022-02-11 05:06:45 UTC | #6
+
+Not sure why it’s not included in the documentation. I think they still have some updates to make. But it’s not handled inherently. You’ll have to explicitly send the cycles. It’s not too hard. I’ll post an example for you here when i get near my laptop. If i haven’t posted it here within 24 hrs, feel free to send me a reminder.
+
+-------------------------
+
+shashika | 2022-02-11 05:37:46 UTC | #7
+
+Sure @Jesse . Thanks for the help
+
+-------------------------
+
+Jesse | 2022-02-11 15:58:40 UTC | #8
+
+in the canister that you're sending the cycles from, you'll have to do the following:
+
+```
+import Cycles "mo:base/ExperimentalCycles";
+
+
+Cycles.add(100_000_000_000);
+let canisterInstance = await CanisterFileName.ActorClassName(argument);
+let amountAccepted = await canisterInstance.wallet_receive();
+```
+
+in the canister that you're instantiating (the canister that will be receiving the cycles) you'll have to define the `wallet_receive()` method like so:
+
+```
+import Cycles "mo:base/ExperimentalCycles";
+
+private var capacity = 1000000000000000000;
+private var balance = Cycles.balance();
+
+
+// Returns the cycles received up to the capacity allowed
+public func wallet_receive() : async { accepted: Nat64 } {
+    let amount = Cycles.available();
+    let limit : Nat = capacity - balance;
+    let accepted = 
+        if (amount <= limit) amount
+        else limit;
+    let deposit = Cycles.accept(accepted);
+    assert (deposit == accepted);
+    balance += accepted;
+    { accepted = Nat64.fromNat(accepted) };
+};
+```
+
+heres some more code you might need to include later if you want to query the balance of the canisters:
+
+```
+
+public shared(msg) func wallet_balance() : async Nat {
+    return balance
+};
+```
+
+-------------------------
+
+saurav-iiitg | 2022-10-04 22:56:11 UTC | #9
+
+I used the dfx deposit command to deposit cycles in my respective wallets . I am receiving the same error in that case as well , is there a fix ? 
+Or I need to re-deploy with ( --with-cycles arguments passed ) ? 
+I mean if I have initially not specied any amount of cycles during deployment , i should be able to deposit cycles later and not face this error , right ?
+
+-------------------------
+
+Severin | 2022-10-05 06:47:23 UTC | #10
+
+Can you explain a bit more what you're doing? This thread so far is about Motoko but now you say you're using `dfx canister deposit-cycles`. What exactly are you running and what's the exact error output you are getting?
+
+[quote="saurav-iiitg, post:9, topic:10820"]
+Or I need to re-deploy with ( --with-cycles arguments passed ) ?
+[/quote]
+this shouldn't be necessary
+
+[quote="saurav-iiitg, post:9, topic:10820"]
+I mean if I have initially not specied any amount of cycles during deployment , i should be able to deposit cycles later and not face this error , right ?
+[/quote]
+Topping up a canister with more cycles is always possible. `--with-cycles` is only relevant for initial creation of a canister.
+
+-------------------------
+
+saurav-iiitg | 2022-10-05 11:48:37 UTC | #11
+
+I am creating a nft minting tool , I am taking the principal id from plug wallet and passing it in the mint function . 
+The mint function implementation : 
+
+```
+ public shared({ caller }) func mintDip721(to: Principal, metadata: Types.MetadataPart) : async Types.MintReceiptPart {
+    if (not List.some(custodians, func (custodian : Principal) : Bool { custodian == to })) {
+       throw Error.reject("Unauthorised")
+    };
+      
+    let newIndex = Nat64.fromNat(List.size(nfts));
+  
+    let newNFT = await NFTActorClass.NFT(metadata.nftName , metadata.data, to,newIndex);
+    let newId = await newNFT.getCanisterId();
+
+    let nft : Types.Nft = {
+      owner = to;
+      id = newId;
+      index = newIndex; 
+      metadata = metadata;
+    };
+    
+    // Debug.print(Principal.toText(nft.owner)); 
+    // Debug.print(Principal.toText(nft.id));
+
+    nfts := List.push(nft, nfts);
+
+    transactionId += 1;
+
+    return {
+      token_id = newId;
+      id = transactionId;
+      owner = to; 
+    };
+  };
+```
+I am taking the principal id and image data from frontend . 
+The error I am getting is : 
+
+```
+ Reject code: 4
+  Reject text: Creating a canister requires a fee of 100000000000 that is deducted from the canister's initial balance but only 0 cycles were received with the create_canister request.
+```
+I am deploying the canister using this command : 
+
+```
+dfx deploy --argument "(  principal\"$(dfx identity get-principal)\",  record {                          
+    logo = record {
+      logo_type = \"image/png\";
+      data = \"\";
+    };
+    name = \"My DIP721\";
+    symbol = \"DFXB\";
+    maxLimit = 10;
+  }
+)"  --network=ic
+```
+
+-------------------------
+
+icme | 2022-10-06 16:42:29 UTC | #12
+
+Before dynamically creating a new canister from an actor, you need to use the add method from the ExperimentalCycles API with the number of cycles to give the canister in the line directly before your canister creation call https://github.com/dfinity/motoko-base/blob/master/src/ExperimentalCycles.mo#L42.
+
+Since canister creation takes 100 billion cycles, I’d recommend allocating at least 200-300 billion cycles for canister creation so that you’ll have 100-200 billion cycles left over for the newly created canister.
+
+-------------------------
+

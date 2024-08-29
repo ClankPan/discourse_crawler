@@ -1,0 +1,265 @@
+icpp | 2023-08-01 12:18:14 UTC | #1
+
+Hello C++ developers,
+
+I've been experimenting with orthogonal persistence of various C++ data structures in canisters on the Internet Computer (IC) and would like to share my findings with the community.
+
+TL;DR
+It works great!
+
+## Here are the key points:
+
+1. Data structures fully living in the global/static section of the stack are correctly persisted. This includes regular data types like `int`, `float`, `uint64_t`, etc. and the special STL container `std::array`, which keeps all its data on the stack.
+2. Self-managed dynamic data structures are correctly persisted too. This is when the data lives on the Heap, but the pointer to the data is in the global/static section of the stack. This was tested for both `new/delete` and `calloc/free` style memory management.
+3. Self-managed pointers to STL containers  that use dynamic heap memory, like `std::vector`, `std:string` & `std::unordered_map` also work. As long as you self manage a pointer in the global/static memory, and then use new/delete on them inside your functions.
+4. Defining STL containers that use dynamic heap memory directly in global/static section is not working. Not only are they not persisted,  just adding these to the global/static section corrupts the canister memory, even if you're not using them at all.... The tests show that the metadata for the `std::vector` (like its size and the Heap address pointed to by the vector) is persisted, but the actual values aren't. *I would love to get the perspective from the DFINITY team if they have any idea why adding STL containers like `std::vector` directly to the global/static section is not possible. Is this a bug in the Orthogonal Persistence code for canisters, or if not, can I enter a feature request to get it supported? It is not a blocker by any means, because options 1,2,3 all work perfect, but it would be good to support it.*
+
+## To see the code & replicate this experiment, see GitHub: [memory demo canister](https://github.com/icppWorld/icpp-demos/tree/main/canisters/memory)
+
+-------------------------
+
+icpp | 2023-08-01 12:18:33 UTC | #3
+
+Based on the outcome of this study, I updated/created these demos:
+
+- [counter](https://github.com/icppWorld/icpp-demos/tree/main/canisters/counter): An Orthogonal Persistence demo for uint64_t
+
+---
+- [counter4me](https://github.com/icppWorld/icpp-demos/tree/main/canisters/counter4me): An Orthogonal Persistence demo for std::unordered_map<std::string, uint64_t>
+  - With your principal as the key!!
+  - dynamically create & grow the umap
+
+---
+- [counters](https://github.com/icppWorld/icpp-demos/tree/main/canisters/counters): An Orthogonal Persistence demo for std::vector
+  - dynamically create and grow the number of counters
+
+-------------------------
+
+icpp | 2024-07-17 10:54:56 UTC | #4
+
+@abk , @ulan ,
+
+Because you're the wasm experts :fire:, I'd like to re-ask a question. 
+
+I recently spent a lot of time re-discovering this issue as I am porting llama.cpp to the IC, and an std::map was not working when compiling to wasm, while it worked just fine natively.
+
+This issue seems to be a side effect of Orthogonal Persistence and not WebAssembly itself.
+
+Would you be able to comment on this?
+
+------------
+
+This is what is happening when compiling to WebAssembly and running it on the IC:
+
+Defining C++ STL containers directly in global/static section is not working. 
+
+Examples are  `std::vector` or  `std::map`, or `static const std::vector` or `static const std::map`. 
+
+Not only are they not properly persisted, just adding them to the global/static section corrupts the canister memory, even if you’re not using them at all. 
+
+The tests seem to show that the metadata for an std::vector or std::map (like its size and the Heap address pointed to by the vector) which lives on the stack, is persisted, but the heap address is pointing to the wrong location. 
+
+Then, when you try to access the values, you're pointing into wrong memory locations, which will then lead to heap out of bounds errors, and the canister will return this error:
+
+```
+Error: Failed query call. Caused by: The replica returned a rejection error: reject code 
+CanisterError,  reject message IC0502: 
+
+Error from Canister bkyz2-fmaaa-aaaaa-qaaaq-cai:
+
+Canister trapped: heap out of bounds, error code Some("IC0502")
+```
+------------
+
+Now, I have found a work-around, by wrapping these STL containers in a static class, and then use new/delete to manage the heap memory myself, but it is really unfortunate that we cannot take code that is valid and works for non-wasm and need to refactor it like this. 
+
+Would you agree this is a side effect of Orthogonal Persistence, or is it something else?
+
+I updated the [C++ memory demo](https://github.com/icppWorld/icpp-demos/tree/main/canisters/memory) canister with an std::map example, and I also updated the README how to run the tests.
+
+-------------------------
+
+ulan | 2024-07-17 09:11:03 UTC | #5
+
+Thanks for the report @icpp! That is indeed strange. I'll try to reproduce and debug the example.
+
+-------------------------
+
+ulan | 2024-07-18 07:47:17 UTC | #6
+
+@icpp: thanks for the good example with detailed steps! I reproduced the issue and here are my findings:
+
+- The root cause of the issue is that the constructors of static classes (e.g. `vec1`) are not invoked at startup (canister install / upgrade).
+- Since the constructors are not invoked, the containers are empty (e.g. `vec1.size() == 0`). I verified this by printing the size immediately after installation.
+- The "heap out of bounds" error happens because of an attempt to access elements of an empty container.
+- The `memory_wasi.wasm` has a `_start` function that invokes the constructors.
+- The `memory.wasm` doesn't have that function anymore (optimized away?).
+- The fix would be to keep the `_start` function and
+   - either export it as a `(start)` function. IC guarantees to invoke  an exported function with name `(start)` at canister startup: https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-module
+   - or call the `_start` function as the first thing in `canister_init` / `canister_post_upgrade`. 
+
+I hope that helps.
+
+-------------------------
+
+icpp | 2024-07-18 14:45:00 UTC | #7
+
+Thank you @ulan for that investigation and summary. 
+
+I will investigate it further and test out your proposed fix  to make sure we keep the `_start` function and export it as a `(start)` function.
+
+-------------------------
+
+icpp | 2024-07-18 19:40:07 UTC | #8
+
+Hi @sgaflv,
+
+I need some help with figuring out how to implement the proposed solution from @ulan . 
+
+I created a [PR](https://github.com/wasm-forge/demo2/pull/3) for your demo2. The PR contains a version of demo2 that currently fails for the reason described above:
+- I added an std::vector in the static section
+- When accessing it, we get heap out of bounds error
+
+I experimented a bit to try to get it to work, but was not successful. 
+
+Hope you can have a look and provide some guidance.
+
+-------------------------
+
+ulan | 2024-07-19 13:50:34 UTC | #9
+
+I looked deeper into the PR for demo2. I see that the `_start` function is actually handled correctly by `wasi2ic`: https://github.com/wasm-forge/wasi2ic/blob/ba3c03bdf6b99314e23154bbc54db28afaca2975/src/main.rs#L245
+
+It converts the function into a module `(start)` function and that function gets invoked properly.
+
+Something goes wrong in the replica after that, so you original theory about an orthogonal persistence bug could still be true. I am debugging the replica now.
+
+-------------------------
+
+ulan | 2024-07-19 15:19:32 UTC | #10
+
+@icpp, @sgaflv 
+
+I know what's going on and it is obvious in the hindsight :D 
+
+The program is defined as a standalone binary with the `main()` function. The C++ compiler adds the `_start` function that does three things:
+1. Construct all static objects.
+2. Call `main()`.
+3. Destruct all static objects.
+
+Note that all these steps run during canister startup.
+
+It is the third step that causes the "corruption" that we are observing. From the language point of view that is working as intended because `main()` has finished.
+
+You can verify this with the following code:
+```
+class My {
+    public:
+    int64_t x;
+    My() {
+        ic0_debug_print("my constructor", 10);
+        this->x = 0xfafafafafafafafaull;
+        this->print();
+    }
+    void print() {
+        char r[123];
+        sprintf(r, "=> %p %llx", &this->x, this->x);
+        ic0_debug_print(r, strlen(r));
+    }
+    ~My() {
+        ic0_debug_print("my destructor", 10);
+        this->x = 0xdeadbeef;
+        this->print();
+    }
+};
+
+std::vector<My> vec(2, My());
+```
+
+You will see 3 destructors during canister installation.
+
+The fix would be to tell the compiler that this is not a usual program with `main()`, but rather a so-called reactor: 
+https://clang.llvm.org/docs/ClangCommandLineReference.html#webassembly-driver
+
+> Select between “command” and “reactor” executable models. Commands have a main-function which scopes the lifetime of the program. Reactors are activated and remain active until explicitly terminated. <arg> must be ‘command’ or ‘reactor’.
+
+Additionally both `demo2` and `wasi2ic` need to be adjusted to not use `main()`.
+
+-------------------------
+
+ulan | 2024-07-19 16:18:22 UTC | #11
+
+In case someone wants to learn more about command vs reactor:
+https://gitlab.haskell.org/ghc/ghc-wasm-meta#why-the-distinction-and-why-should-you-care
+
+-------------------------
+
+icpp | 2024-07-19 18:08:45 UTC | #12
+
+[quote="ulan, post:10, topic:21828"]
+The fix would be to tell the compiler that this is not a usual program with `main()`
+[/quote]
+
+That is interesting. 
+
+Note that before integrating wasi2ic, we actually did not use a main() program, and compiled with the `-nostartfiles -Wl,--no-entry` flags, but also had this issue.
+
+Something to investigate further in light of your comments about a `reactor`.
+
+-------------------------
+
+sgaflv | 2024-07-19 18:23:09 UTC | #13
+
+Hi @icpp, @ulan,
+
+@ulan thank you for the great insight! I will try to provide the bugfix later on today.
+
+-------------------------
+
+icpp | 2024-07-19 18:25:03 UTC | #14
+
+I found that clang has a `-mexec-model=reactor` compiler flag.
+
+-------------------------
+
+ulan | 2024-07-20 07:07:01 UTC | #15
+
+If you didn't have any entry point, then the problem was probably due to constructors not running.
+
+-------------------------
+
+sgaflv | 2024-07-20 10:30:32 UTC | #16
+
+Hi @icpp,
+
+I've updated the wasi2ic and the demo2 example. You can try using the latest version (Note: you can install it via `cargo install wasi2ic`)
+
+-------------------------
+
+icpp | 2024-07-20 12:31:02 UTC | #17
+
+Hi @sgaflv ,
+I checked out demo2 and it works great now. Thank you so much for getting this fixed, and thank you @ulan for your detective work.
+
+@sgaflv ,
+- I noticed the clang++ command in the README of demo2 was not yet updated. It does not yet include the `-mexec-model=reactor` flag. 
+- I closed my PR, since I saw you now added a sample of std::vec.
+
+-------------------------
+
+sgaflv | 2024-07-20 12:48:43 UTC | #18
+
+[quote="icpp, post:17, topic:21828"]
+I noticed the clang++ command in the README of demo2 was not yet updated. It does not yet include the `-mexec-model=reactor` flag.
+[/quote]
+
+Thanks, yes, I've updated the README as well.
+
+-------------------------
+
+icpp | 2024-07-20 16:07:25 UTC | #19
+
+I released `icpp-pro 4.1.0`, containing this update. :tada: :tada: :tada:
+
+-------------------------
+

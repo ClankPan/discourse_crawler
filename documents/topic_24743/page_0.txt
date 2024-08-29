@@ -1,0 +1,192 @@
+kpeacock | 2023-11-16 18:48:36 UTC | #1
+
+Significant new features in this release!
+
+Most notably, @dfinity/agent version 0.20.0 now handles query signature verification. All queries will automatically check for signatures in the state tree signed by the node that replies. This enables the client to verify that there have been no man-in-the-middle attacks without a developer needing to implement certified variables or use update calls.
+
+> important note: if you are using a lower version of dfx than 0.15.2, you will need to set `{verifyQuerySignatures: false}` in your `HttpAgent` options, as the signatures were not present in earlier replica versions.
+
+Additionally, this change replaces the package `tweetnacl` with `@noble/curves` for Ed25519 curve signatures and validation.
+
+## What's Changed
+
+Full notes available at: https://github.com/dfinity/agent-js/releases/tag/v0.20.0
+
+-------------------------
+
+peterparker | 2023-11-17 06:09:01 UTC | #2
+
+While this is undoubtedly a nice feature, I assume it might impact performance. Do you have any benchmarks to share?
+
+Additionally, how can a developer verify that the signature verification was successful?
+
+-------------------------
+
+kpeacock | 2023-11-17 19:20:34 UTC | #3
+
+As a quick follow-up, 0.20.1 is now released. It has new retry and cache pruning logic for the case where you have a cached set of subnet keys, but the actual node you have queried has recently been updated or replaced.
+
+https://github.com/dfinity/agent-js/releases/tag/v0.20.1
+
+-------------------------
+
+kpeacock | 2023-11-17 19:27:56 UTC | #4
+
+I don't currently have performance benchmarks for the agent's performance. The query certificates will be present regardless of whether we check them or not (they have already been on mainnet), so the main new overhead is in checking the subnet status to gather the valid public keys of nodes that are allowed generate query responses. That is also cached for subsequent requests, and the `request_status` call is made in parallel to the query to reduce blocking time.
+
+The validation is done automatically unless you disable the feature, and failed checks will throw errors, but the process for checking lives here: 
+https://github.com/dfinity/agent-js/blob/v0.20.1/packages/agent/src/agent/http/index.ts#L545
+
+You can also use the `CanisterStatus.request` utility and request the `subnet` path in order to get access to the subnet / node info for a given canister ID and run the check yourself. I admit that inserting a mid-flight hook into the `query` method (and updates for that matter) to inspect the call and run custom code is a worthwhile improvement item we should look into as well
+
+-------------------------
+
+peterparker | 2023-11-18 05:53:05 UTC | #5
+
+Thanks for the feedback!
+
+[quote="kpeacock, post:4, topic:24743"]
+so the main new overhead is in checking the subnet status to gather the valid public keys of nodes that are allowed generate query responses. That is also cached for subsequent requests, and the `request_status` call is made in parallel to the query to reduce blocking time.
+[/quote]
+
+While I do really appreciate the addition of this feature, I must admit that I would have been quite curious to see some benchmarks to better understand its impact. I of course do trust and assumes performance will still be great but still, would have appreciated some numbers rather than "try and see".
+
+Regarding caching, what strategy is applied to cache the information? In all the apps I create for the foundation or myself, I do not preserve any state on the app side regarding the agent or the actor. In other words, every request recreates a new actor. Is this pattern supported by the caching strategy?
+
+[quote="kpeacock, post:4, topic:24743"]
+and failed checks will throw errors,
+[/quote]
+
+Sounds good. In the code you linked, this particular [line](https://github.com/dfinity/agent-js/blob/d03fd4f7ae7080ece1067e454b938fef782ea37d/packages/agent/src/agent/http/index.ts#L586) throws an `Error`. Is this expected?
+
+Btw, regarding the same snippet, shouldn't this particular [line](https://github.com/dfinity/agent-js/blob/d03fd4f7ae7080ece1067e454b938fef782ea37d/packages/agent/src/agent/http/index.ts#L610), throw an error as well? I assume it can never be reached, or do we assume that a response without a signature is a valid response?
+
+-------------------------
+
+kpeacock | 2023-11-27 17:44:59 UTC | #6
+
+@Shuo would you be able to run some benchmarks with an old agent and replica and see what the real world impact is?
+
+> Is this pattern supported by the caching strategy
+
+No, you don't have any benefit from caching using this strategy. I intend to externalize the cache as an enhancement, but the cache is local to the `HttpAgent` instance currently
+
+As for the errors, I just got back from PTO, and I'll add them to my list of things to review!
+
+-------------------------
+
+peterparker | 2023-11-27 18:16:55 UTC | #7
+
+[quote="kpeacock, post:6, topic:24743"]
+but the cache is local to the `HttpAgent` instance currently
+[/quote]
+
+So, if I re-create an `HttpAgent` everytime I create an actor, I get zero caching at the moment and the certificate is fetched for every query?
+
+Just asking to be sure I get it right.
+
+-------------------------
+
+kpeacock | 2023-11-27 19:15:53 UTC | #8
+
+I mean, if every single query or update you make creates a new `Actor` and `HttpAgent` instance, than yes, you will have no caching benefits.
+
+I don't know exactly why someone would build their app that way - one `Actor` instance per canister seems pretty reasonable to me, but yeah, that'd be really inefficient
+
+edit: I think I misread. Subsequent queries from an `Actor` will use a cache of the subnet status as long as the keys for that canister ID have been fetched
+
+-------------------------
+
+peterparker | 2023-11-27 19:20:07 UTC | #9
+
+[quote="kpeacock, post:8, topic:24743"]
+I don’t know exactly why someone would build their app that way
+[/quote]
+
+Why not? It's not documented anywhere that agent-js is not stateless and must require a persistent state.
+
+[quote="kpeacock, post:8, topic:24743"]
+that’d be really inefficient
+[/quote]
+
+Thanks for the confirmation. It means it's going to be quite some work to migrate any of the projects I've been involved in. We also have to think if and how we should enforce developers using ic-js level to use a single instance of the HttpClient.
+
+-------------------------
+
+kpeacock | 2023-11-27 19:26:32 UTC | #10
+
+> It’s not documented anywhere that agent-js is not stateless
+
+Fair point! My intuition as a dev is that classes generally hold some degree of state, but not everyone necessarily thinks that way!
+
+Would you be interested in a set of purely functional exports to use instead of the Actor and Agent model?
+
+> that’d be really inefficient
+
+I probably shouldn't speak too glibly about this. My intuition is that it would be somewhat inefficient, moreso now that we've introduced the cache. I do not have profiling that indicates that creating a new Actor for every request takes up a problematic amount of processing or memory in practice
+
+-------------------------
+
+peterparker | 2023-11-27 19:32:22 UTC | #11
+
+[quote="kpeacock, post:10, topic:24743"]
+Would you be interested in a set of purely functional exports to use instead of the Actor and Agent model?
+[/quote]
+
+I personally would definitely prefer pure functions. The most important thing, I believe, is to have one single approach that is well-documented and that the entire community can refer to.
+
+-------------------------
+
+peterparker | 2023-11-27 19:34:08 UTC | #12
+
+[quote="kpeacock, post:10, topic:24743"]
+My intuition is that it would be somewhat inefficient, moreso now that we’ve introduced the cache. I do not have profiling that indicates that creating a new Actor for every request takes up a problematic amount of processing or memory in practice
+[/quote]
+
+Well noted. Nevertheless, seems that treating HttpAgent as a singleton tends to be the expected pattern. I need to think a bit about it.
+
+Thanks for the explanations and feedback!
+
+-------------------------
+
+JJ_2100 | 2024-01-23 09:27:16 UTC | #13
+
+Sorry to interrupt, but in which file should we change the setting of http agent and replaces the package `tweetnacl` with `@noble/curves` ? I come across the same problem. Thanks!
+
+-------------------------
+
+peterparker | 2024-01-23 10:29:28 UTC | #14
+
+Linking the duplicate question of @JJ_2100 -> https://forum.dfinity.org/t/invalid-signature-from-replica/26676/7?u=peterparker
+
+-------------------------
+
+kpeacock | 2024-01-23 19:50:30 UTC | #15
+
+If you use the latest release, tweetnacl is no longer a dependency
+
+-------------------------
+
+lastmjs | 2024-02-17 20:03:07 UTC | #16
+
+I just upgraded Azle to `"@dfinity/agent": "^1.0.0" and now we're getting various `Invalid certificate: Signature verification failed` intermittently in our tests.
+
+Here are the tests, without digging in too deeply they just seem to happen randomly/intermittently. We are using `dfx 0.16.1`, and these are from our property tests that essentially execute very basic query/update calls over and over again with random inputs. Is there some kind of issue with the icx-proxy or replica where the keys are thrown out after a while or somehing?: 
+
+- https://github.com/demergent-labs/azle/actions/runs/7943820108/job/21688642237
+- https://github.com/demergent-labs/azle/actions/runs/7943820108/job/21688642462
+- https://github.com/demergent-labs/azle/actions/runs/7943820108/job/21688642842
+- https://github.com/demergent-labs/azle/actions/runs/7943820108/job/21688643092
+
+I've been rerunning those tests to try and see if it's just a fluke, so some of those might now be passing. Here's the main run which still has some of these tests failing: https://github.com/demergent-labs/azle/actions/runs/7943820108
+
+-------------------------
+
+kpeacock | 2024-02-20 18:42:06 UTC | #17
+
+Interesting - I have mainnet tests that fire off 20 queries in my e2e suite and I haven't encountered this yet. I'll have to scale those up, and I'll also see what I can do to identify where this might be going wrong. 
+
+https://sourcegraph.com/github.com/dfinity/agent-js/-/blob/e2e/node/basic/mainnet.test.ts?L33
+
+-------------------------
+

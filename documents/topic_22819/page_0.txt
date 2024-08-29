@@ -1,0 +1,1146 @@
+Manu | 2023-09-08 14:30:44 UTC | #1
+
+Hello everybody!
+
+I would like to start a forum thread on ckETH, where we can discuss the design and post updates wrt progress.
+
+# What is ckETH?
+
+* Chain-key Ether, or ckETH, is an IC-native token that represents Ether (ETH), the native token of Ethereum. Anybody that has $ETH can use a canister smart contract on the IC to convert that into ckETH. Vice-versa, any holder of ckETH can choose to receive the underlying ETH instead. All ETH backing ckETH is held by a canister smart contract using the [threshold ECDSA functionality](https://internetcomputer.org/docs/current/developer-docs/integrations/t-ecdsa/t-ecdsa-how-it-works).
+* Since ckETH is an IC-native token, it can be transacted very fast and with low fees, and is easy to use from other IC dapps. ckETH would follow the [ICRC1](https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-1) and [ICRC2](https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-2) standards.
+* If you're familiar with [ckBTC](https://internetcomputer.org/ckbtc), then you can understand ckETH as the equivalent of ckBTC but for Ether instead of Bitcoin.
+
+# How do we propose to build it?
+
+DFINITY is working on an implementation for ckETH, with the following components.
+
+* A ledger canister, an archive canister, and an index canister. These three canisters are used for many ledgers on the IC, including all SNS tokens. One change here is that they need to support 256 bit amounts.
+* an Ethereum smart contract to help make converting ETH into ckETH easy.
+* a "ckETH minter" canister. This canister is responsible for converting between ETH and ckETH. It has minting capabilities on the ckETH ledger, and holds all the ETH using tECDSA.
+
+![image|690x439](upload://oAv3cHoUmaYYPromFyCjkecKl7d.png)
+
+**How would converting ETH into ckETH work?**
+
+We plan a smart contract that exposes a function "deposit", which takes as argument a byte string. To convert x ETH into ckETH, a user would call this deposit function and encode its IC principal as bytes in the argument. It attaches x ETH to the call. This smart contract emits an event for every deposit call.
+
+The ckETH minter canister, using the [Ethereum integration](https://forum.dfinity.org/t/long-term-r-d-integration-with-the-ethereum-network/9382), periodically looks up the finalized height of the Ethereum blockchain, and looks if there are new deposit events registered. If so, then for each deposit event, it mints the corresponding amount of ckETH to the principal that was encoded in the deposit call.
+
+**How would converting ckETH into ETH work?**
+
+A user holding ckETH that wants to convert x ckETH into native ETH would first have to approve the ckETH minter canister to take at least x of its ckETH, by doing an ICRC2 approve. The user then calls the ckETH minter canister, saying it wants to convert x ckETH into ETH, and specifies an Ethereum address where it wants to receive the ETH. The ckETH minter canister then tries to burn x ckETH from the user (using an `icrc2_transfer_from` which uses the previous approval from the user), and then construct a native Ethereum transaction sending the user ETH. We are planning that the user is responsible for the gas fees on Ethereum, so in this example, the user would receive x minus gas fees ETH.
+
+**How does the ckETH minter communicate with Ethereum?**
+
+In the long run, the plan is to use the native Ethereum integration, where IC replicas run Ethereum nodes. While we are in "phase 1" of Ethereum Integration, the ckETH minter will communicate with Ethereum by contacting providers that support the Ethereum JSON-RPC API using [HTTPS outcalls](https://internetcomputer.org/https-outcalls). To ensure no single point of failure, the minter will contact multiple providers for any security relevant state-changing operation (e.g., minting or withdrawal) and only proceed if all received responses are consistent. How many and which providers will be contacted is still to be defined.
+
+# Discussion & people involved
+
+We hope this forum topic can serve as a good place to discuss all things around ckETH, and keep everybody up to date on our progress. From DFINITY’s side, we have @0rions, @gregory-demay, @roman-kashitsyn, @dieter.sommer, @bogwar, @benji, and myself (@manu) involved.
+
+So please feel free to ask questions here, challenge the design / propose alternatives, we look forward to discussing ckETH!
+
+-------------------------
+
+good | 2023-09-08 14:47:34 UTC | #2
+
+This is beneficial to icp ecology.
+
+-------------------------
+
+timo | 2023-09-08 15:27:23 UTC | #3
+
+Why 256 bits for amounts? 128 are enough, or?
+
+-------------------------
+
+timo | 2023-09-08 15:45:15 UTC | #4
+
+For the ETH -> ckETH the user needs a wallet with call abilities (not just ETH transfer ability). So sending from some wallets and exchanges won’t work, right?
+
+-------------------------
+
+neeboo | 2023-09-08 19:37:10 UTC | #5
+
+If we can send coins with call data. Would that be easier? Just like a memo and clearly declaring the deposit event. Then we can get tx response and see if the events matching the payload.
+
+Similar to: https://docs.ethscriptions.com/overview/introducing-ethscriptions#what-is-calldata
+
+-------------------------
+
+roman-kashitsyn | 2023-09-08 21:13:09 UTC | #6
+
+> If we can send coins with call data. Would that be easier?
+
+We considered this design as our first option. Unfortunately, it has a severe drawback: the raw Ethereum [JSON RPC](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block) interface does not provide a way to efficiently query transfers by the receiver address. Scanning the entire Ethereum chain from a canister is too expensive to be practical, and using third-party proprietary APIs (Etherscan, Alchemy) would undermine the decentralized nature of ckETH. So, the deposits would have to function in a very non-user-friendly way:
+1. The user submits a transaction with their principal encoded in the TX data.
+2. The user waits for the transaction to finalize.
+3. The user obtains the transaction hash and notifies the ckETH Minter canister about the incoming transaction.
+4. The minter gets the transaction receipt and mints ckETH tokens to the principal encoded in the TX data.
+
+That's a lot of complexity compared to executing a single deposit on a smart contract and letting the minter take care of the rest.
+
+-------------------------
+
+gregory-demay | 2023-09-11 08:00:01 UTC | #7
+
+> Why 256 bits for amounts?
+
+Ethereum transactions use 256 bits for amounts.
+
+-------------------------
+
+timo | 2023-09-11 08:33:16 UTC | #8
+
+I don't understand. You mean in the interface? 
+
+There are 120m ETH * 10^18 = 1.2 * 10^26 wei in circulation which is 87 bits. It's safe to assume that this number will always be <128 bits. To represent a wei balance in the ledger 128 bits are therefore sufficient. It shouldn't matter what Ethereum uses internally.
+
+-------------------------
+
+gregory-demay | 2023-09-11 09:00:46 UTC | #9
+
+> I don’t understand. You mean in the interface?
+
+Yes, [Ethereum yellow paper](https://ethereum.github.io/yellowpaper/paper.pdf) specifies the transaction amount as being a value in N_256 ("the set of all non-negative integers smaller than 2^{256}")
+
+> There are 120m ETH * 10^18 = 1.2 * 10^26 wei in circulation which is 87 bits. It’s safe to assume that this number will always be <128 bits. To represent a wei balance in the ledger 128 bits are therefore sufficient.
+
+Even if the total amount of Wei in circulation is always smaller that 128 bits, it makes sense in my opinion to follow the specification. This does make it more future-proof (no assumption on the state of Ethereum) and also ease inter-operability with other crates that also represent transaction amount with 256 bits, like for example [ethers-rs](https://github.com/gakonst/ethers-rs/blob/a28c5ae9b76d04a8b4ab39e5afcd772bfd43bd1f/ethers-core/src/types/transaction/eip1559.rs#L41)
+
+-------------------------
+
+timo | 2023-09-11 09:39:30 UTC | #10
+
+U256 is a custom implementation from the ethereum_types crate. Do you know how it is laid out in memory? The balances are probably going to be responsible for the biggest part of memory use of the ledger. Just afraid you are going to store 16 bytes of zeros for each balance.
+
+The yellow paper describes the EVM which stores all integers (whether they represent balances or something else) in 256 bit. I don't think it means much for how wallet code should store ETH balances.
+
+Since in the OP it is mentioned as a change away from the existing ledger implementations, I was thinking it would be more beneficial to not alter the existing ledger implementation (compared to being compatible with the ethereum crate you mentioned).
+
+-------------------------
+
+gregory-demay | 2023-09-11 10:58:33 UTC | #11
+
+> U256 is a custom implementation from the ethereum_types crate. Do you know how it is laid out in memory?
+
+`U256` from `ethereum_types` is defined as an array of 4 `u64` (it uses the [`construct_unint!`](https://github.com/paritytech/parity-common/blob/master/uint/src/uint.rs#L557) macro). Another implementation I know of `U256` is from [ethnum-rs](https://github.com/paritytech/parity-common/blob/master/uint/src/uint.rs#L557) and uses 2 `u128`. 
+
+> Since in the OP it is mentioned as a change away from the existing ledger implementations, I was thinking it would be more beneficial to not alter the existing ledger implementation.
+
+To my knowledge all the other icrc1 ledgers use 64 bits amounts (which as you pointed out is not sufficient for Ethereum) and only the ckETH ledger uses 256 bits. Their representation in canister memory is constant size (i.e., 8-byte array for `u64` and 32-byte array for `u256`, see for example the [implementation of `Storable` on `U256`](https://github.com/dfinity/ic/blob/af2edc2c5722713118345080a4b09fefeb1a0d22/rs/rosetta-api/icrc1/tokens_u256/src/lib.rs#L102)). @roman-kashitsyn knows for sure here more than I do.
+
+> The balances are probably going to be responsible for the biggest part of memory use of the ledger. Just afraid you are going to store 16 bytes of zeros for each balance.
+
+I think you definitively have a point here and the amounts could be stored as `u128` on the ledger. I do have the impression that this will only ever be a problem if we start having that many transactions/accounts on the ledger, which would actually be nice :grinning:. Maybe @roman-kashitsyn has some further inputs regarding `u128` vs. `u256` to store amounts on the ckETH ledger?
+
+-------------------------
+
+sea-snake | 2023-09-11 16:22:21 UTC | #12
+
+[quote="Manu, post:1, topic:22819"]
+One change here is that they need to support 256 bit amounts.
+[/quote]
+
+Seems like the ICRC-1 standard uses `nat` for amount which should support values without any limit, so the spec seems to support it without any issue. 
+
+On the Rust side of the canister, changes will indeed be needed since it only seems to support up to 128 bit at the moment. Rust doesn't natively support u256, hopefully this can be abstracted within the `Candid::Nat` implementation so users don't need to implement arrays of u128 or u64.
+
+Edit: I see that U256 support in the ICRC-1 ledger is already implemented.
+
+Regarding transaction history storage canister, the ICRC-3 spec defines `nat` storage as `leb128` so there shouldn't be any limit there and even with 256 bits it should be less than 32 bytes due to `leb128` encoding.
+
+I assume the ledger canister itself also stores amounts as `leb128` bytes instead of u64/u128/u256?
+
+-------------------------
+
+dfisher | 2023-09-11 22:13:46 UTC | #13
+
+Thanks @Manu . When do you expect ckETH and ckERC20 tokens will be rolled out?
+
+-------------------------
+
+famouscat8 | 2023-09-12 06:00:11 UTC | #14
+
+Is it possible to support l2 in the same time?
+
+-------------------------
+
+Manu | 2023-09-12 07:33:32 UTC | #15
+
+Hey Timo! 
+>So sending from some wallets and exchanges won’t work, right?
+
+That is correct. This is clearly a downside, and we did think a lot about this. We propose to do it this way because it makes things much easier:
+- we want that all funds backing ckETH end up in a single ETH wallet
+- we must know which principal to credit for a deposit
+
+So if we want to do deposit purely with an ETH transaction, it will be user's eth wallet -> intermediate address -> ckETH pot, so two ETH transactions. This is much more annoying wrt UX and fees etc. For that reason, we thought it's better to start with the flow based on a smart contract call, such that we can launch ckETH asap. We can then always add another layer onto it which allows for user deposits by just doing an ETH transfer. Happy to hear your thoughts on this.
+
+-------------------------
+
+Manu | 2023-09-12 07:45:26 UTC | #16
+
+[quote="dfisher, post:13, topic:22819, full:true"]
+Thanks @Manu . When do you expect ckETH and ckERC20 tokens will be rolled out?
+[/quote]
+
+@dfisher Our rough timeline is ckETH end of 2023, and ckERC20 Q1 2024, but of course plans may change and we may run into setbacks.
+
+[quote="famouscat8, post:14, topic:22819, full:true"]
+Is it possible to support l2 in the same time?
+[/quote]
+
+@famouscat8 we currently don't have plans for ck-tokens for Ethereum L2s, we want to focus on the Ethereum assets now. But I think the code required for that would be very similar, so it's something we could consider in the future, or the community could pick up.
+
+-------------------------
+
+dfisher | 2023-09-13 02:14:00 UTC | #17
+
+Thanks @manu. I would strongly suggest rolling out ckUSDC with ckETH in Q4 if that’s possible. I would argue ckUSDC will be just as if not more valuable than ckETH given we don’t have any stable coins on the IC and defi needs to ramp up … the other ckERC20 coins are less pressing
+
+-------------------------
+
+JxBrian | 2023-09-13 02:51:01 UTC | #18
+
+[quote="Manu, post:1, topic:22819"]
+The ckETH minter canister then tries to burn x ckETH from the user (using an `icrc2_transfer_from` which uses the previous approval from the user), and then construct a native Ethereum transaction sending the user ETH.
+[/quote]
+
+First of all really enjoyed reading the simplistic nature of this complex project and the answers of the questions that were raised thus far.
+
+Hypothetically speaking from the future, would the transfer mechanism always use **"icrc2_transfer_from"** method or function? Or does that depend on how the project would be maintained; Say in a few years developers start using ICRC3, for the project to work efficiently, would the transfer method/function need to change as well?
+
+-------------------------
+
+timo | 2023-09-13 07:12:33 UTC | #19
+
+[quote="Manu, post:15, topic:22819"]
+We can then always add another layer onto it which allows for user deposits by just doing an ETH transfer. Happy to hear your thoughts on this.
+[/quote]
+
+Providing both (and one of them first) seems like a good idea to me.
+
+-------------------------
+
+timo | 2023-09-13 07:21:15 UTC | #20
+
+[quote="dfisher, post:17, topic:22819"]
+I would strongly suggest rolling out ckUSDC
+[/quote]
+
+You can’t wrap centrally issued tokens in this way like you can with BTC, ETH, etc. The problem is the issuer can freeze the whole pool and they will if there is one transaction going on that they don’t like, making all ckUSDC worthless even if they aren’t related to that transaction. Central issuers must issue natively on ICP.
+
+-------------------------
+
+dfisher | 2023-09-13 17:26:13 UTC | #21
+
+That makes sense. Could the foundation choose one decentralized stablecoin - perhaps ckDAI - to roll out in Q4 alongside ckETH? I do believe it would be incredibly important to prioritize some type of stablecoin on the IC @Manu
+
+-------------------------
+
+roman-kashitsyn | 2023-09-13 21:02:39 UTC | #22
+
+[quote="timo, post:10, topic:22819"]
+The balances are probably going to be responsible for the biggest part of memory use of the ledger.
+[/quote]
+
+The balance table stores `(account, amount)` pairs; each account occupies at least 62 bytes (up to 29 bytes for the principal + 1 byte for the principal size + 32 bytes of the subaccount). Hence, using 128bit vs. 256bits saves 1 - (62 + 16) / (62 + 32) ~ 17% of storage, a minor difference given other inefficiencies in the current ledger storage technology.
+
+Even if all the Ethereum in existence fits in 128bits, some other ERC20 tokens we might want to support in the future might not. Using EVM's native integer width simplifies the code understanding and helps us avoid future surprises.
+
+-------------------------
+
+timo | 2023-09-14 06:56:44 UTC | #23
+
+Do we store the principal repeatedly for each subaccount of the same owner?
+
+-------------------------
+
+roman-kashitsyn | 2023-09-14 09:01:58 UTC | #24
+
+Yes, currently, the key in the map is the entire Account (principal + subaccount).
+We also plan to migrate the stable structures library to stable storage, where we must keep the same approach because stable structures don't support nesting by design.
+One optimization we could do is to store accounts with default subaccounts separately:
+```
+DEFAULT_ACCOUNTS: StableMap<Principal, Amount>;
+ACCOUNTS: StableMap<(Principal, Subaccount), Amount>;
+```
+We could also use variable-size encoding (leb128) for amounts to support up to u256 without wasting too much space.
+
+-------------------------
+
+Manu | 2023-09-14 11:58:40 UTC | #25
+
+We absolutely agree on how useful ckERC20 would be, and in particular a ckStablecoin, and are working hard to get it as quickly as we can. We think it makes sense to start with ckETH, and then do ckERC20 as quickly as we can after that.
+
+*Why not build both at the same time?* If we would launch them together, it would mainly mean that one simply launches later because its waiting for the other one, which does not make sense to me.
+
+*Why start with ckETH?* we think starting with ckETH makes sense, because ETH is the native token, and gas has to be paid in ETH also for ckERC20. We think that we may be able to use ckETH for gas fees in ckERC20. Additionally, the approach of passing in a principal via a call argument is possible for ETH but cannot be done for ERC20. We may be able to build on ckETH to link ETH accounts and IC principals, which we can then use in ckERC20.
+
+-------------------------
+
+JoakimEQ | 2023-09-14 14:05:43 UTC | #26
+
+ckDAI is one option. ckFRAX would be cool too.
+
+Even better imho is ckCHAI, this is the yield bearing version of DAI!
+
+-------------------------
+
+dfisher | 2023-09-14 17:17:21 UTC | #27
+
+Thanks so much for the detailed response. I understand your rationale and agree. We all appreciate your hard work and know that it is a trying time in the depths of the bear market. 
+
+It is sometimes difficult for non-technical folks to understand how long it takes for complex features to be rolled out. I want to stress just how grateful the community is for all your hard work!
+
+-------------------------
+
+dfisher | 2023-09-19 23:24:17 UTC | #28
+
+@Manu do you think Q4’24 is a good timeline for phase 2 integration?
+
+-------------------------
+
+Manu | 2023-09-20 15:15:06 UTC | #29
+
+It's hard to say something confidently as it's so far out, but that timeline seems realistic to me.
+
+-------------------------
+
+icper | 2023-09-20 21:39:58 UTC | #30
+
+Hello, are you sure it's December 2024? Is the integration we're looking forward to in Q4 2023 going to be delayed by another year?
+
+-------------------------
+
+Manu | 2023-09-21 07:24:51 UTC | #31
+
+[quote="icper, post:30, topic:22819"]
+are you sure it’s December 2024?
+[/quote]
+dfisher asked about the "phase 2" integration, where ICP nodes also act as Ethereum mainnet nodes, and canisters can request ethereum state directly from ICP nodes. This feature will not be done in 2023, but come later. 
+
+For ckETH, so the topic of discussion in this thread, we hope that this will launch in 2023. This will build on HTTPS outcalls first (and may later be upgraded to build on the "phase 2" native ethereum integration when that's available).
+
+-------------------------
+
+0xkookoo | 2023-09-25 14:29:37 UTC | #32
+
+[quote="Manu, post:1, topic:22819"]
+To ensure no single point of failure, the minter will contact multiple providers for any security relevant state-changing operation (e.g., minting or withdrawal) and only proceed if all received responses are consistent.
+[/quote]
+
+Not sure if I make it wrong or not, 
+- Querying multiple ETH RPC-providers to make sure the result of state-changing operation are all the same. This is good to me as query is idempotent. 
+- But how about send out write transactions, e.g. converting ckETH into ETH? What if the ckETH canister failed to construct a native Ethereum transaction sending the user ETH, will we try to construct the same transaction to another ETH RPC-provider? If so, how to make sure the transfer only success once per the transfer result.
+
+Forgive me if the questions are so straightforward, I am expecting we are using Nonce to control this but would love to learn more about your solution.
+
+-------------------------
+
+Manu | 2023-09-25 16:08:36 UTC | #33
+
+We made quite some progress with our proof-of-concept ckETH, and @gregory-demay demonstrates the current status in [this video](https://youtu.be/y_2im2V66k0?si=vJB3qPe55sQWZZbT). We plan to publish some guide on how to use the current test version soon, so everybody can play around with it. 
+
+Happy to hear everybody's feedback!
+
+-------------------------
+
+gregory-demay | 2023-09-26 07:15:54 UTC | #34
+
+Hi @0xkookoo !
+
+> * Querying multiple ETH RPC-providers to make sure the result of state-changing operation are all the same. This is good to me as query is idempotent.
+
+You're correct that all JSON-RPC methods that we query, excepted of course with `eth_sendRawTransaction` for sending Ethereum transactions issued by the minter, simply read the state of the Ethereum blockchain, e.g. `eth_getLogs` to retrieve the events originated from the helper smart contract when a deposit occurred. Note that requiring equality between the various responses from the various contacted JSON-RPC providers only make sense when one is querying `finalized` data since all JSON-RPC nodes should have the same view on the `finalized` state. This is not the case when one is querying more recent data, like at `latest` block height since some nodes might be in advance by a few blocks in comparison to others. There, another another strategy is needed depending on the concrete use-case.
+
+> * But how about send out write transactions, e.g. converting ckETH into ETH? What if the ckETH canister failed to construct a native Ethereum transaction sending the user ETH, will we try to construct the same transaction to another ETH RPC-provider? If so, how to make sure the transfer only success once per the transfer result.
+
+The minter will construct an [EIP-1559](https://eips.ethereum.org/EIPS/eip-1559) transaction, sign it via [threshold ECDSA](https://internetcomputer.org/docs/current/developer-docs/integrations/t-ecdsa/) and send it to Ethereum by using the JSON-RPC method `eth_sendRawTransaction`. The current implementation sends a transaction via HTTP outcall to **only one** JSON-RPC provider (if it's offline the next ones will be tried out one-at-a-time in a round-robin fashion).  The reasoning being that the sent payload is a signed statement and cannot be altered by any man-in-the-middle. The worst a malicious node provider could do would be some type of DoS by postponing the submission of the transaction to the mempool.
+
+Even though a single JSON-RPC provider is contacted, the call is still replicated by the number of nodes in the subnet (28 in case of [pzp6e](https://dashboard.internetcomputer.org/subnet/pzp6e-ekpqk-3c5x7-2h6so-njoeq-mt45d-h3h6c-q3mxf-vpeq5-fk5o7-yae)). This is not a problem because Ethereum guarantees that for a given nonce there is at most one transaction for a given sender. What typically happens is that one of the contacted JSON-RPC node will accept the transaction, while the other contacted nodes will reply with an error along the lines that this transaction is already known (which is expected in our case).
+
+-------------------------
+
+0xkookoo | 2023-09-27 03:47:54 UTC | #35
+
+Thanks @gregory-demay , that's very clear to me.
+
+[quote="gregory-demay, post:34, topic:22819"]
+This is not the case when one is querying more recent data, like at `latest` block height since some nodes might be in advance by a few blocks in comparison to others. There, another another strategy is needed depending on the concrete use-case.
+[/quote]
+BTW, could you elaborate more on the special strategy for querying the most recent data?
+
+-------------------------
+
+gregory-demay | 2023-09-27 06:52:58 UTC | #36
+
+Hi @0xkookoo
+
+> BTW, could you elaborate more on the special strategy for querying the most recent data?
+
+A concrete example is `eth_getTransactionCount` which for a given Ethereum address and [block height](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block) returns the number of transactions that was sent by this address for that height. Calling this method with the minter's address (controlled via threshold ECDSA) at height `latest` is interesting because it tells us how many transactions from the minter were already mined. Based on that information, sent transactions with higher or equal nonces were not yet mined, which might be a sign that there are stuck and should be resubmitted.
+
+
+We are going to call this method with several providers say A and B and they may have a different view on which block is the `latest` one: say for provider A `latest` is block `0x42ba9a` while for provider B `latest` is block `0x42ba9b`. In that example provider A is one block behind provider B. That means that when calling `eth_getTransactionCount` with Provider A we might get a smaller returned value that when doing the same query with Provider B, because the transactions in block `0x42ba9b` are not yet accounted for. How we reconcile those 2 results is highly use-case dependent. In that particular example we actually are going to take the minimum of those 2 values. The reasoning being that resubmitting a transaction is cheap (if we were to resubmit a transaction that was previously mined in  `0x42ba9b` the the resubmitted transaction will be ignored and we would have only wasted a few cycles) while having a stuck transaction (say because `0x42ba9b` was reorganized) is critical because it blocks all future transactions.
+
+-------------------------
+
+Sormarler | 2023-10-02 01:36:08 UTC | #37
+
+How hard would it be to do an integration or some form of cross chain bridge with an L2 like base, enabling the IC to obtain USDC and other assets from and to base and Coinbase seamlessly? A direct integration with Ethereum will still involve expensive gas fees to interact with L1. I feel integration a leading L2 would be more beneficial in the short to mid term, especially Base. 
+
+
+What do you think? Perhaps I am missing something.
+
+-------------------------
+
+devabcd | 2023-10-02 02:23:06 UTC | #38
+
+At what point is this the responsibility of the ecosystem vs the responsibility of the platform developers.
+
+
+Circle's CCIP exists.
+
+-------------------------
+
+Sormarler | 2023-10-02 03:57:43 UTC | #39
+
+Valid point. This doesn't have to be Dfinity. Maybe that's something rocklab or orally can implement since it seems to be along their alley. Perhaps platform devs can use CCIP to connect to L2s to bring stables to IC.
+
+-------------------------
+
+devabcd | 2023-10-02 04:09:06 UTC | #40
+
+CCIP is permissioned. Circle owns it. Just use BTC until the stables are officially supported
+
+-------------------------
+
+Manu | 2023-10-02 13:46:53 UTC | #41
+
+[quote="Sormarler, post:37, topic:22819"]
+How hard would it be to do an integration or some form of cross chain bridge with an L2 like base, enabling the IC to obtain USDC and other assets from and to base and Coinbase seamlessly? A direct integration with Ethereum will still involve expensive gas fees to interact with L1. I feel integration a leading L2 would be more beneficial in the short to mid term, especially Base.
+[/quote]
+
+I think this should be quite manageable, because I believe most of these L2s (including Optimism / Base) use the Ethereum JSON RPC interface. So I would hope that most of the ckERC20 work would directly carry over to ck-ERC20-on-base tokens, you would just make the HTTP outcalls to the ETH RPC interface use a different chain id. But none of this is tested, and I'm sure there will be some surprises. So I think dfinity will first focus on getting ckETH fully done, then ckERC20 for Eth mainnet, and then we (dfinity or other ICP community members, it's all open source) can see how much effort it would take to take the code of ckETH / ckERC20 and make it work with L2s.
+
+[quote="devabcd, post:38, topic:22819"]
+Circle’s CCIP exists.
+[/quote]
+You mean [circle's CCTP](https://www.circle.com/en/cross-chain-transfer-protocol) right? [CCIP](https://docs.chain.link/ccip) is chainlink.
+
+-------------------------
+
+Manu | 2023-10-09 13:44:30 UTC | #42
+
+Hi everybody,
+
+You can now play around with ckETH yourself! We have a testing version of ckETH installed on ICP mainnet that we call ckSepoliaETH, as it works with Sepolia testnet Ether.
+
+You can obtain Sepolia ETH (from some faucet, like [this](https://sepoliafaucet.com/) or [this](https://www.infura.io/faucet/sepolia) or [this](https://faucet.quicknode.com/ethereum/sepolia)), convert it to ckSepoliaETH, send ckSepoliaETH around between wallets, and convert back to SepoliaETH. You can find the instructions [here](https://github.com/dfinity/ic/blob/master/rs/ethereum/cketh/minter/README.adoc). 
+
+The canister IDs of ckSepoliaETH can be found [here](https://github.com/dfinity/ic/blob/master/rs/ethereum/cketh/testnet/canister_ids.json), and the ckSepoliaETH minter also exposes a [dashboard](https://jzenf-aiaaa-aaaar-qaa7q-cai.raw.icp0.io/dashboard) showing conversions and the corresponding ethereum transactions.
+
+Note that there is no nice front-end yet, so you'll have to be comfortable with some `dfx` calls especially for the last step. If you're a developer and aim to support converting between ETH and ckETH in your dapp, then you can also start experimenting with ckSepoliaETH. 
+
+**Please keep the following in mind**
+1. This is still under development, so things may break, and the state of the canister will be reset upon upgrades.
+2. It is expected that there are still bugs. Please help us make ckETH rock solid by reporting those here.
+3. In case the instructions don't work for you, please report back, and we'll be happy to help and improve the instructions.
+
+-------------------------
+
+Maxfinity | 2023-10-09 13:46:28 UTC | #43
+
+[quote="Manu, post:41, topic:22819"]
+I think this should be quite manageable, because I believe most of these L2s (including Optimism / Base) use the Ethereum JSON RPC interface. So I would hope that most of the ckERC20 work would directly carry over to ck-ERC20-on-base tokens, you would just make the HTTP outcalls to the ETH RPC interface use a different chain id. But none of this is tested, and I’m sure there will be some surprises. So I think dfinity will first focus on getting ckETH fully done, then ckERC20 for Eth mainnet, and then we (dfinity or other ICP community members, it’s all open source) can see how much effort it would take to take the code of ckETH / ckERC20 and make it work with L2s.
+[/quote]
+
+Hi Manu, can we have a working group so that the community can provide valuable feedback on the design of the bridging? This will be a major feature and I know that we'd like to provide some commentary on the design to make it as interoperable with our products as solutions as possible.
+
+-------------------------
+
+curry | 2023-10-10 09:01:13 UTC | #45
+
+Call the [minter helper contract](https://sepolia.etherscan.io/address/0xb44B5e756A894775FC32EDdf3314Bb1B1944dC34#writeContract) `deposit` function with my principal(k5utp-4vwqp-mzmv5-alvjl-b45ck-d7hgo-kd4pj-tfny7-i3umi-wglek-oqe) encoded and the amount as parameters.
+When will my ckSepliaEth mint?
+This is my transaction record: https://sepolia.etherscan.io/tx/0xfc268bc402436879416ded46821b77774184ac2a1a32af4e846ab719bdcf78df
+@Manu
+
+-------------------------
+
+b3hr4d | 2023-10-10 11:03:25 UTC | #46
+
+Seems like the Last synced block number [`4458589`](https://sepolia.etherscan.io/block/4458589) from ~15 hours ago!
+
+-------------------------
+
+Manu | 2023-10-10 11:20:31 UTC | #47
+
+It indeed looks like the ckSepoliaETH minter is somehow failing to sync blocks, so the mints will be delayed. We're looking into it!
+
+-------------------------
+
+Manu | 2023-10-12 15:11:15 UTC | #48
+
+hey everybody, the ckSepoliaETH minter is minting again! 
+
+What went wrong? The minter periodically looks up the current Ethereum block height, and then looks for Ethereum deposit events in block interval [last_scraped_height; current_height], and then updates last_scraped_height to current_height, indicating that we observed those events. The problem is that there is an off-by-one error here. As an example, we may at one point scrape the events for blocks [500, 600], and then [600, 700], but since these intervals are inclusive, the events in block 600 are now observed twice. If there happens to be a deposit event in block 600, it would now be processed twice. By a funny coincidence, this actually happened at block 4458589: it happened to be at the boundary of the scraping interval, and happend to contain a deposit transaction.
+
+What went well? We had asserts in place that would disallow ever minting ckETH twice for the same deposit event. So when we got to block 4458589, the minter ran into an assert that prevents it from minting again, causing the log-scraping routine to get stuck, as it panics due to this assert every time it tries to make progress. But getting stuck is much better than incorrectly minting ckETH! 
+
+We fixed the off-by-one error, and now you see that the minter is making progress again, and everybody that deposited SepoliaETH should see their ckSepoliaETH now.
+
+**Thanks to everybody that already tried to convert SepoliaETH into ckSepoliaETH, you all helped uncover this bug!**
+
+-------------------------
+
+b3hr4d | 2023-10-13 14:54:02 UTC | #50
+
+First off, a big thank you to the team working on ckETH. Your hard work is really making a difference and it's awesome to see.
+
+As an experienced Ethereum developer, I was excited to test ckETH while working on a payment system. I found it super easy and efficient to accept both ETH and ckETH directly with just a click of a button. This is a huge step forward, not just for the Internet Computer, but also for Ethereum, as it cuts out the need to create a new contract or deal with multiple JSON RPC calls for verification.
+
+I have created a payment system that accepts ETH directly into the canister, although the minting process takes a bit of time. However, this wasn’t a big issue as we can verify the transaction event directly from the canister using outcalls. 
+
+I'm also working on a tutorial video to share how I built the payment system using ckETH. I'll drop the video here soon!
+
+Thanks again for your hard work on ckETH. I’m looking forward to discussing more about it and seeing the progress in this forum.
+
+-------------------------
+
+Apollon | 2023-10-15 08:14:17 UTC | #51
+
+[quote="Maxfinity, post:43, topic:22819"]
+Hi Manu, can we have a working group so that the community can provide valuable feedback on the design of the bridging?
+[/quote]
+
+Max this is a good initiative. Having open working groups promote transparency, which ICP lacks at the moment. Waiting for official response from DFINITY. @Manu
+
+
+We are also archiving the discussions in this topic, including the time stamps and flags.
+
+
+Is DFINITY planning KYC for this feature like they did with last minute KYC announcement for ckBTC?
+
+![image|690x457](upload://vXFC4Qho3uPw6n3mwkVea4Xqo6P.png)
+
+
+As Jan mentions a "decnetralized solution" but having only one party, i.e. toniq labs providing API, which was decided by DFINITY does not seem decentralized.
+
+-------------------------
+
+Manu | 2023-10-16 12:29:11 UTC | #53
+
+[quote="Apollon, post:51, topic:22819"]
+Max this is a good initiative. Having open working groups promote transparency, which ICP lacks at the moment. Waiting for official response from DFINITY. @Manu
+[/quote]
+Yes, Max and I actually met to discuss in a bit more detail, and we are hoping that some parts of ckETH can be reused by bitfinity. Wrt transparency: note that this forum thread is exactly created for that purpose: we outlined our planned design, keep everybody up to date on progress, develop completely in the open with open source code, and actively ask for feedback. In your view, does this forum not achieve to give transparency? How could we do better?
+
+We do have [technical working groups](https://wiki.internetcomputer.org/wiki/Technical_working_groups), but overall they are not very well attended, so I think a forum discussion is a better approach. 
+
+[quote="Apollon, post:51, topic:22819"]
+Is DFINITY planning KYC for this feature like they did with last minute KYC announcement for ckBTC?
+[/quote]
+Just to be precise: there is no KYC in ckBTC, but there is chainalysis KYT. So this is not about knowing identities of users, but rather about avoiding money laundering.
+
+We do not plan to do something similar in ckETH. The canister does contain a list blocking addresses that are sanctioned by OFAC, see the [source code](https://github.com/dfinity/ic/blob/master/rs/ethereum/cketh/minter/src/blocklist.rs). Curious to hear your thoughts on this. 
+
+[quote="Apollon, post:51, topic:22819"]
+As Jan mentions a “decnetralized solution” but having only one party, i.e. toniq labs providing API, which was decided by DFINITY does not seem decentralized.
+[/quote]
+The [wiki page](https://wiki.internetcomputer.org/wiki/Know-Your-Transaction_(KYT)_Canister) explains that the KYT canister can actually work with multiple parties providing chainalysis API keys. So if anybody would like to help, please get a chainalysis KYT subscription and propose to add your principal as an additional API key provider.
+
+-------------------------
+
+dfisher | 2023-10-16 19:13:20 UTC | #54
+
+[quote="Manu, post:53, topic:22819"]
+We do not plan to do something similar in ckETH. The canister does contain a list blocking addresses that are sanctioned by OFAC, see the [source code](https://github.com/dfinity/ic/blob/master/rs/ethereum/cketh/minter/src/blocklist.rs). Curious to hear your thoughts on this.
+[/quote]
+
+Why aren't we using Chainalysis KYT for ckETH?
+
+-------------------------
+
+Apollon | 2023-10-17 10:28:00 UTC | #55
+
+Yeah we do know that. This design iteration came after the community outrage. Doesn't change the flawed approach DFINITY initially took while designing the feature.
+
+[quote="Manu, post:53, topic:22819"]
+The [wiki page ](https://wiki.internetcomputer.org/wiki/Know-Your-Transaction_(KYT)_Canister) explains that the KYT canister can actually work with multiple parties providing chainalysis API keys.
+[/quote]
+
+---
+As for ETH
+
+[quote="Manu, post:53, topic:22819"]
+The canister does contain a list blocking addresses that are sanctioned by OFAC, see the [source code](https://github.com/dfinity/ic/blob/master/rs/ethereum/cketh/minter/src/blocklist.rs)
+[/quote]
+
+I did not expect it to be uncensored either. What would DFINITY do if something like [Spinner.cash](https://spinner.cash) gets hit with OFAC sanctions?
+
+
+Its not about preventing money laundering or illicit activities. DFINITY has made it clear that it will do everything in its control to avoid legal liabilities, even if it means enforcing censorship and ignoring Neutrality.
+
+
+
+
+[quote="Manu, post:53, topic:22819"]
+In your view, does this forum not achieve to give transparency? How could we do better?
+[/quote]
+
+No it does not. For a "non profit" swiss corporation building decentralized cloud, DFINITY sure collects a lot of data in this governance forums and enforces censorship.
+
+
+**My Question to you is why did DFINITY not get chainalysis subscription for KYT?**
+
+**It only makes sense for DFINITY to Fund and Create a decentralized KYT canister controlled and funded by DFINITY, since they are the only devs who built this feature.**
+
+
+**Why do we have to rely and depend upon third party such as Toniq which along with DFINITY was Front running this feature for their Ordinals "Marketplace"**
+
+**WHY CANNOT DFINITY PROVIDE API?**
+
+if you feel the questions above are off topic, I could ask them same in KYT topic, would you (or DFINITY) answer there?
+
+-------------------------
+
+ICPSwap | 2023-10-17 14:51:50 UTC | #57
+
+Thanks to the updates on ckETH by Manu and the development team, the IC community can now experiment with a test version of #ckETH!
+
+ckSepoliaETH (ckETH test token) is now available on ICPSwap. We have minted some ckSepoliaETH and added liquidity for the purpose of testing its stability, conducting research, and preparing for the eventual launch of ckETH.
+
+Here are some mint guidelines we have put together to help interested users easily participate in the testing of minting. Please take a look:
+1/ Use your wallet and connect to ICPSwap: https://app.icpswap.com/wallet/token
+Click on "Add Token" and select ckSepoliaETH to add it.
+
+2/ Visit: https://jzenf-aiaaa-aaaar-qaa7q-cai.raw.icp0.io/dashboard
+Under "Principal → Bytes32 conversion," input your wallet's Principal ID from the first step to obtain a 0x address.
+
+3/ Visit Sepolia Testnet scan: https://sepolia.etherscan.io/address/0xb44b5e756a894775fc32eddf3314bb1b1944dc34#writeContract
+Click "Connect to Web3" and use MetaMask or another wallet to connect. 
+In the "deposit" field, enter the amount you want to mint. In the "_principal (bytes32)" field, input the 0x address obtained in the second step.
+Click "Write."
+
+4/ Visit the dashboard for ckSepoliaETH: https://jzenf-aiaaa-aaaar-qaa7q-cai.raw.icp0.io/dashboard
+Monitor the progress. After approximately ten minutes, once the ICP network and Sepolia Testnet data synchronization is complete, you can return to your ICPSwap wallet to check the balance of ckSepoliaETH.
+
+-------------------------
+
+plsak | 2023-10-18 08:45:02 UTC | #58
+
+Thanks! Worked fine for me, just had to get some SepoliaETH to the MetaMask first - the [faucet.sepolia.dev](https://faucet.sepolia.dev) didn't load (MetaMask linked there) but [sepoliafaucet.com](https://sepoliafaucet.com) worked fine - now I see the faucet mentioned in this topic already, but still it can be convenient to have this also under the post with your instruction.
+
+-------------------------
+
+bogwar | 2023-10-18 07:27:38 UTC | #59
+
+We explored the issue of KYT for ckETH and our conclusion was to not delay deployment by introducing a full blown KYT. It may be interesting to know that one of the factors that played a role in this decision was that exchanging ETH without KYT is the rule rather than the exception in the wider blockchain space.
+
+Nonetheless, the first version of the ckETH canister
+
+* Implements the OFAC blacklisting
+* Provides full traceability and transparency of transactions within ckETH
+
+so it provides some basic protection for legitimate ckETH holders.
+
+We plan to hand over control of ckETH to the NNS. That means that if the voters believe that KYT should be added to ckETH, this is possible in a future upgrade.
+
+-------------------------
+
+b3hr4d | 2023-10-21 17:54:56 UTC | #60
+
+[Building a Cross-Chain ETH Payment and E-Commerce Platform on the Internet Computer: A Step-by-Step Tutorial - Developers / Community Tutorials & Video - Internet Computer Developer Forum (dfinity.org)](https://forum.dfinity.org/t/building-a-cross-chain-eth-payment-and-e-commerce-platform-on-the-internet-computer-a-step-by-step-tutorial/23938)
+
+-------------------------
+
+Apollon | 2023-10-30 09:11:52 UTC | #61
+
+[quote="Apollon, post:55, topic:22819"]
+**My Question to you is why did DFINITY not get chainalysis subscription for KYT?**
+[/quote]
+
+Manu I have provided you answers for your question here
+
+[quote="Manu, post:53, topic:22819"]
+In your view, does this forum not achieve to give transparency? How could we do better?
+[/quote]
+
+
+We are still waiting for an official answer from the DFINITY Foundation.
+
+-------------------------
+
+Manu | 2023-10-30 09:18:29 UTC | #62
+
+happy Monday Apollon! @bogwar answered your questions about DFINITY's plans wrt KYT for ckETH [here](https://forum.dfinity.org/t/cketh-a-canister-issued-ether-twin-token-on-the-ic/22819/59?u=manu).
+
+-------------------------
+
+Apollon | 2023-10-30 09:30:33 UTC | #63
+
+I see no relevant answers @Manu
+
+
+Didn't DFINITY extend threshold ECDSA designed for BTC integration to sign ETH txns? 
+
+
+My question to you was
+
+> My Question to you is why did DFINITY not get chainalysis subscription for KYT Canister?
+
+We need relevant information to make better decisions. On why we need relevant Information. Happy Monday to you too @Manu 
+
+![image|589x500](upload://nlDQ0iDpdMRS1bo0EAPcCuVNYZf.png)
+
+-------------------------
+
+bogwar | 2023-10-30 11:28:22 UTC | #64
+
+Hey Apollon, 
+
+Threshold ECDSA is at a different level of abstraction (further down the stack) and the decision to do KYT for one application that uses (ckBTC) is not immediately linked to the decision to do KYT for another application (ckETH). 
+
+For ckETH it was a trade-off where we had to decide if the risks of not doing KYT via chainalysis (or some other providers)  is big enough to implement it in the first version of the canister, or go with a simpler implementation and refine this later (if deemed necessary via NNS).  We picked one side of the trade-off and I outlined the reasons. 
+
+hope this helps clarify how the decision was made.
+
+-------------------------
+
+borovan | 2023-10-30 11:52:20 UTC | #65
+
+Ah yes, the man with a huge vested interest in making sure Bitcoin stays at the relative complexity level of a pocket calculator compared with the supercomputers now being built.
+
+-------------------------
+
+Apollon | 2023-10-30 12:10:07 UTC | #66
+
+![image|223x226](upload://cl6f5pmGq0GGBDSuGNN0eyEE0L0.png)
+
+My live reaction to all the information in this thread
+
+-------------------------
+
+gatsby_esp | 2023-11-03 17:42:42 UTC | #67
+
+Hi!! When is the final release of cketh?
+
+-------------------------
+
+gregory-demay | 2023-11-10 09:29:29 UTC | #68
+
+Hello everybody, 
+
+we have an important update regarding ckSepoliaETH (see below). I would also like to thank everyone who tried out ckSepoliaETH :pray:! 
+
+# Update on ckSepolia ETH
+
+## Summary
+We will re-install the ckSepoliaETH minter(`jzenf-aiaaa-aaaar-qaa7q-cai`) and ledger (`apia6-jaaaa-aaaar-qabma-cai`) from scratch and start scrapping Ethereum logs from the latest finalized block at time of re-installation.
+This will effectively make the ckSepoliaETH minter forget about all past transactions and all accounts will be reset to 0 ckSepoliaETH.
+We encourage people having ckSepoliaETH to make the necessary withdrawals until *Friday November 17th 23:59 CET* to an Ethereum address of their choice if they wish to keep their Sepolia ETH.
+
+## Why?
+When we released the URLs to play around with the ckSepoliaETH minter and ledger, we did not have yet fully implemented the minter's stable memory that is necessary to keep track of all deposits and withdrawals across upgrades. We thought (and we still think) that it was best for people to try a not yet feature-complete version so that we can receive feedback as early as possible. As part of the normal development process several re-installations from scratch already have been made: none of the recorded deposits were lost (because they originate from events that appear in the [Ethereum logs](https://sepolia.etherscan.io/address/0xb44B5e756A894775FC32EDdf3314Bb1B1944dC34#events) that the minter constantly scraps) but previous withdrawals have been totally forgotten by the minter (the corresponding Ethereum transactions are visible [here](https://sepolia.etherscan.io/address/0x1789F79e95324A47c5Fd6693071188e82E9a3558)). As a result, the current minter and ledger state are incorrect (some accounts have too much ckSepoliaETH). Now that we are close to being feature-complete for the MVP we want to re-start the ckSepoliaETH minter and ledger with a clean slate.
+
+We insist that this behaviour is not a bug, but part of our normal development process that is also visible from the beginning in the minter's dashboard. As of now, the [minter](https://sepolia.etherscan.io/address/0x1789F79e95324A47c5Fd6693071188e82E9a3558) holds a bit more than 13k Sepolia ETH :moneybag:, so we thought it best to communicate transparently what's going on so that users are not wrongly surprised.
+
+## What's next?
+So far everything is going according to the plan and the development is close to completion. Unless an unexpected major problem occurs, this should be the last time the ckSepoliaETH minter and ledger are re-installed from scratch. Afterwards standard canister upgrades (that preserve the state) may occur on a regular basis. We will add a new post once the re-installation was completed so that people can get back to playing around with with ckSepoliaETH.
+
+-------------------------
+
+gregory-demay | 2023-11-27 15:28:32 UTC | #69
+
+Hello everybody,
+
+As announced in the [previous post](https://forum.dfinity.org/t/cketh-a-canister-issued-ether-twin-token-on-the-ic/22819/68), we did today a complete re-install of the ckSepoliaETH minter (`jzenf-aiaaa-aaaar-qaa7q-cai` ) and ledger (`apia6-jaaaa-aaaar-qabma-cai`) so that they forgot all transactions before the finalized block [#4775281](https://sepolia.etherscan.io/block/4775281).
+
+A few additional remarks:
+1. The unclaimed SepoliaETH from pas transactions has been moved to a [separate account](https://sepolia.etherscan.io/address/0x5Bf977149CA1A1fd558E8d497ed7f7a760b47Ef6).
+2. The ckSepoliaETH minter and ledger should now be considered as fairly stable: they should no longer be re-installed from scratch (unless unexpected major problem occurs) and standard canister upgrades (that preserve the state) may occur on a regular basis.
+
+Happy testing :partying_face:!
+
+-------------------------
+
+Manu | 2023-11-29 17:04:41 UTC | #70
+
+Hi everybody! 
+
+We'd like to share some exciting news: DFINITY plans to submit NNS proposals to install ckETH on Friday Dec 1st!
+* If the proposals are adopted, this would be the real mainnet ckETH that can be used by everybody.
+* The code has been running in ckSepoliaETH for almost two months and working well. In addition, DFINITY has performed an extensive internal security review of the ckETH code, without any major findings. That being said, this code is still relatively new and we should therefore treat ckETH as "experimental" initially.
+* This is only the beginning, so the ecosystem can start supporting and adopting ckETH. There are many more things to come, like nice UIs for conversions between ETH and ckETH, ckERC20 (such that we can have eg ckUSDC), and the [EVM RPC canister](https://forum.dfinity.org/t/evm-rpc-canister/23313).
+
+
+To make this a success, we need your help! Some things you can do:  
+* Verify the NNS proposals, vote, and spread the word!
+* Integrate ckETH into your dapps
+* Convert some of your ETH into ckETH
+* Add liquidity to ckETH liquidity pools 
+* Trade between ICP, ckBTC, and ckETH
+* Follow ckETH minter activity on the minter dashboard to see what’s happening, and verify that ckETH is fully backed by ETH 
+* Ask questions and share feedback here on the forum
+
+-------------------------
+
+singularity | 2023-11-29 17:21:21 UTC | #71
+
+Congratulations DFINITY!
+
+-------------------------
+
+JMVR | 2023-11-29 18:11:28 UTC | #72
+
+Excellent news! thanks to the team !
+
+-------------------------
+
+integral_wizard | 2023-11-29 20:50:36 UTC | #73
+
+Great job and excited to get this first step out.
+How can we get this into the best view for the ethereum community?
+I'm thinking Manu or Dom visiting BanklessHQ podcast? Is this smth you have considered?
+
+-------------------------
+
+romulusp | 2023-11-30 05:03:37 UTC | #74
+
+Congratulations ! Thank you!
+
+-------------------------
+
+Bugslayer | 2023-11-30 12:27:23 UTC | #75
+
+Great news! Congratulations Dfinity team.
+
+-------------------------
+
+ashuyadav09 | 2023-12-01 07:31:34 UTC | #76
+
+Can't Wait Congratulations to the team !🎊
+
+-------------------------
+
+aakh1361 | 2023-12-01 08:47:09 UTC | #77
+
+Congratulations        
+:partying_face:
+
+-------------------------
+
+Manu | 2023-12-01 10:37:57 UTC | #78
+
+The NNS proposals to install ckETH have now been submitted. 
+
+1. ckETH ledger [126170](https://www.google.com/url?q=https://dashboard.internetcomputer.org/proposal/126170&sa=D&source=calendar&ust=1701857226495146&usg=AOvVaw02HHE-qnqc45Kml3Zsyk-g)
+2. ckETH index [126173](https://www.google.com/url?q=https://dashboard.internetcomputer.org/proposal/126173&sa=D&source=calendar&ust=1701857226495146&usg=AOvVaw2H1fzAbR2wXcAME-nXVpTj)
+3. ckETH minter [126171](https://www.google.com/url?q=https://dashboard.internetcomputer.org/proposal/126171&sa=D&source=calendar&ust=1701857226495146&usg=AOvVaw3ca9Es79JiGCMLwI1mSRHt)
+
+Note that the canister ids are 
+- ckETH ledger: https://dashboard.internetcomputer.org/canister/ss2fx-dyaaa-aaaar-qacoq-cai
+- ckETH index: https://dashboard.internetcomputer.org/canister/s3zol-vqaaa-aaaar-qacpa-cai
+- ckETH minter: https://dashboard.internetcomputer.org/canister/sv3dd-oaaaa-aaaar-qacoa-cai
+
+Using the dashboard links above, you can see that these canisters are all controlled by `r7inp-6aaaa-aaaaa-aaabq-cai`, which is the NNS root canister, showing that these canister IDs are under control of the NNS and nobody else can control these canister IDs. 
+
+Please help verify these proposals, cast your vote, and help spread the word to other voters! Feel free to ask any questions wrt these proposals here.
+
+-------------------------
+
+ZackDS | 2023-12-01 11:23:07 UTC | #79
+
+What was wrong with Proposal [126172](https://dashboard.internetcomputer.org/proposal/126172) ?
+
+-------------------------
+
+Manu | 2023-12-01 12:15:27 UTC | #80
+
+Proposal 126172 was submitted with the wrong initialization arguments, so it wouldn't actually work even if adopted, which is why it was resubmitted with correct args in proposal 126173.
+
+-------------------------
+
+gatsby_esp | 2023-12-01 13:12:28 UTC | #81
+
+Will the dashboard show CKeth as soon as it passes? Or will it come in a future release?
+
+-------------------------
+
+Manu | 2023-12-01 13:39:32 UTC | #82
+
+https://dashboard.internetcomputer.org/ is a separate thing, so this will not automatically come with these proposals. However, the team is working on adding support for ckETH similar to what exists for ckBTC to the dashboard, and I think there's a good chance we will already see this next week.
+
+-------------------------
+
+IC_Maximillion | 2023-12-01 19:02:26 UTC | #83
+
+Voters who are not aware of the post above providing the proposal numbers, could easily overlook this mayor proposal. 
+![proposal|690x241](upload://3GwGSkkyjEjPx1wZ7rZs2rtVVTs.png)
+
+With the ckBTC proposals, if i remember right it was written in the short proposal description below the title something like, to implement ckBTC... + -
+
+-------------------------
+
+dfxjesse | 2023-12-02 18:59:04 UTC | #84
+
+I was watching the global R&D and seen this, I have a question in regards to the deposit function of the ETH helper smart contract. It takes in a principal - which is the principal of the ICRC-1 account to deposit on the IC:
+
+![Screenshot 2023-12-02 at 6.42.23 p.m.|690x417](upload://gUbFoWo8VZm02THn8c4jni3XUug.jpeg)
+
+The thing is, ICRC-1 wallets are not principals? They are of type Account which looks like:
+```
+{ owner : Principal; subaccount : ?Blob }
+```
+and if there is a subaccount converted to a string it looks something like:
+```
+k2t6j-2nvnp-4zjm3-25dtz-6xhaa-c7boj-5gayf-oj3xs-i43lp-teztq-6ae-dfxgiyy.102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+```
+I think the problem is that we don't have a name for these subaccount ICRC-1 wallet strings, and that the wallets on ICRC-1 are not just principals, I have seen across dApps that they just use default subaccounts and keep the original principal - resulting in people thinking that the ICRC-1 wallets are just principals.
+
+And it doesn't help that the image used in the R&D says you just input a principal for the ETH helper smart contract.
+
+Can someone clarify if the helper smart contract takes a:
+- Principal? 
+- converted principal + subacccount string? 
+- or an object of type `Account` 
+
+(All of which are valid ICRC-1 wallets).
+
+-------------------------
+
+wpb | 2023-12-04 01:39:29 UTC | #86
+
+[quote="Manu, post:78, topic:22819"]
+The NNS proposals to install ckETH have now been submitted.
+
+1. ckETH ledger [126170 ](https://www.google.com/url?q=https://dashboard.internetcomputer.org/proposal/126170&sa=D&source=calendar&ust=1701857226495146&usg=AOvVaw02HHE-qnqc45Kml3Zsyk-g)
+2. ckETH index [126173 ](https://www.google.com/url?q=https://dashboard.internetcomputer.org/proposal/126173&sa=D&source=calendar&ust=1701857226495146&usg=AOvVaw2H1fzAbR2wXcAME-nXVpTj)
+3. ckETH minter [126171 ](https://www.google.com/url?q=https://dashboard.internetcomputer.org/proposal/126171&sa=D&source=calendar&ust=1701857226495146&usg=AOvVaw3ca9Es79JiGCMLwI1mSRHt)
+[/quote]
+
+I'm cross posting here since this is where 3 of the NNS canister upgrade proposals were posted.  The link shows how the CodeGov neuron voted on each proposal and provides links to our verifications.
+
+https://forum.dfinity.org/t/nns-updates-dec-1-2023/25198/5?u=wpb
+
+-------------------------
+
+gregory-demay | 2023-12-04 08:51:32 UTC | #87
+
+Hi @dfxjesse 
+
+Thank you for your questions!
+
+> Can someone clarify if the helper smart contract takes a:
+>    * Principal?
+>    * converted principal + subacccount string?
+>    * or an object of type `Account`
+
+
+So the helper smart contract takes an IC principal converted to a 32-byte string (For the conversion you can use the ckETH minter dashboard or the binary `principal_to_hex`). By IC principal I really mean the 1:1 output of 
+```shell
+dfx identity get-principal
+```
+In particular the helper smart contract has **no** notion of subaccount. You can see [here](https://github.com/dfinity/ic/blob/eb283ab4f02409506ac438ffdc455c54256289b5/rs/ethereum/cketh/minter/src/deposit.rs#L35) how the events from the helper smart contract are minted to ckETH.
+
+I hope this clarified the deposit flow. Feel free to ask more questions if some things are still unclear.
+
+-------------------------
+
+ICPSwap | 2023-12-04 13:53:41 UTC | #88
+
+Congratulations! 
+
+we encountered a question while adding ckETH to the ICPSwap token list today. 
+
+We got basic information through the ckETH canister ID ss2fx-dyaaa-aaaar-qacoq-cai. However, it seems a bit off.
+https://info.icpswap.com/token/details/ss2fx-dyaaa-aaaar-qacoq-cai
+![image|690x165](upload://mh1BUS8Tb8fm52DPy2AhBnEV6r.png)
+
+The Transfer Fee is displayed as 20,000, and the Decimals are 8 (while ckSepoliaETH is 18). We initially thought there might be a data retrieval error, and the devs looked into it, but it appears the data is correct.
+
+We're seeking a double confirmation here: Is this data inaccurate, or should ckETH may have 18 Decimals, making the transfer fee 0.000002 ckETH (matching the proposal https://dashboard.internetcomputer.org/proposal/126170 saying: "The transfer fee is 2_000_000_000_000, which is around 0.004 USD")?
+
+-------------------------
+
+Manu | 2023-12-04 14:12:03 UTC | #89
+
+Yes, there unfortunately was a mistake in proposal https://dashboard.internetcomputer.org/proposal/126170, which did not specify the decimals and memo size. A second proposal has been submitted to correct this mistake: https://dashboard.internetcomputer.org/proposal/126309. Note that the wasm is the same, but there are two additional install args specified. 
+
+> We’re seeking a double confirmation here: Is this data inaccurate, or should ckETH may have 18 Decimals, making the transfer fee 0.000002 ckETH (matching the proposal [Proposal: 126170 - ICP Dashboard ](https://dashboard.internetcomputer.org/proposal/126170) saying: “The transfer fee is 2_000_000_000_000, which is around 0.004 USD”)?
+
+Right, so to be extra clear, the decimals should have been 18, making the transfer fee ~ 0.004 USD. Please double check proposal 126309.
+
+-------------------------
+
+ICPSwap | 2023-12-04 14:19:24 UTC | #90
+
+Got it, Thanks a lot for the answer, Manu!
+
+-------------------------
+
+timo | 2023-12-05 05:22:17 UTC | #91
+
+The new proposal is a reinstall of ss2fx-dyaaa-aaaar-qacoq-cai. Can someone use the ckETH ledger between now and the reinstall and create a balance and what would happen to that balance?
+
+-------------------------
+
+Manu | 2023-12-05 07:51:32 UTC | #92
+
+@timo no you cannot: there is no minter yet (as https://dashboard.internetcomputer.org/proposal/126171 is not adopted yet) and it is installed without any initial balances, so there is no way to get any balance on the ledger, so nothing can get lost in the reinstall.
+
+-------------------------
+
+Manu | 2023-12-05 10:25:02 UTC | #93
+
+All the relevant NNS propsals were adopted, so ckETH is now live!
+
+We've updated the README [here](https://github.com/dfinity/ic/blob/master/rs/ethereum/cketh/minter/README.adoc) outlining how you can now convert between ETH and ckETH. I encourage everybody to give this a try and report back if you run into problems. And of course proceed with caution: while ckETH already went through a lot of security review, it's prudent to treat it as experimental initially. 
+
+You can find the ckETH minter dashboard [here](https://sv3dd-oaaaa-aaaar-qacoa-cai.raw.icp0.io/dashboard), showing all the conversions between ETH and ckETH.
+
+-------------------------
+
+gatsby_esp | 2023-12-05 10:28:34 UTC | #94
+
+When will it be ready to use the converter on NNS?
+
+-------------------------
+
+Manu | 2023-12-05 10:32:00 UTC | #95
+
+I expect the token support in the NNS FE soon, but not conversions. [ICLighthouse](https://iclight.io/account) has support for ckETH and conversions live, so you could give that a try.
+
+-------------------------
+
+timo | 2023-12-05 14:47:05 UTC | #96
+
+Great news. Thanks for all the hard work! Amazing to have it done, it must have been a lot of work as ckETH is quite a sophisticated system.
+
+I tried it out and these are my comments/questions:
+
+In the principal to bytes conversion on the minter dashboard, the form box where you enter the principal may have some kind of spell-checker on. It may be a browser default setting on the user's side but maybe there is also a way to turn it off by some html tag. When you paste a principal you make see it underlined in red which means it is not a dictionary word. Just for privacy reasons we would like to have it turned off so the principal isn't sent around unnecessarily to other OS components.
+
+The README does not mention the minimal withdrawal amount but there is one.
+(EDIT: The dashboard mentions it.)
+
+Why is the minimal withdrawal amount so high at 30 mETH? I know that ETH fees are high and lower amounts make little sense. But the fees are not always high. Plus I can imagine that people might want to hold ckETH permanently and when they need to pay something in ETH send it directly via withdrawal, not in two steps. Smaller amounts might be needed in that case.
+
+The README does not mention how long wihtdrawals take. I guess they are just "fast", that's why?
+
+When I tried a withdrawal it lost about 1 mETH. The credited amount of ETH plus the ETH transaction fee shown on Etherscan is 1 mETH less then the ckETH that were withdrawn and deducted. Is that a fee that the ckETH ledger kept or where did it go?
+
+EDIT: Fixed two typos in the README but the PRs https://github.com/dfinity/ic/pull/149 and https://github.com/dfinity/ic/pull/148 got closed by a bot.
+
+-------------------------
+
+Manu | 2023-12-05 14:10:26 UTC | #97
+
+fantastic feedback @timo, thanks a lot, we'll get to work on improving the readme. To answer some of the questions now:
+
+>Why is the minimal withdrawal amount so high at 30 mETH? I know that ETH fees are high and lower amounts make little sense. But the fees are not always high. Plus I can imagine that people might want to hold ckETH permanently and when they need to pay something in ETH send it directly via withdrawal, not in two steps. Smaller amounts might be needed in that case.
+
+The withdrawal amount needs to at least cover the ETH network fees. In case the ETH network fees become higher than the withdrawal amount, we could end up with a stuck tx that we cannot resubmit with higher fees without the ckETH pot losing ETH (and ckETH not being fully backed anymore). We are thinking about ways to improve this, eg by making it dynamic, but for now we proposed to start with a safe margin. Ideas are welcome of course!
+
+> The README does not mention how long wihtdrawals take. I guess they are just “fast”, that’s why?
+
+Yes, if im not mistaken the minter looks every 6 minutes and submits transactions for the requested withdrawals. 
+
+> When I tried a withdrawal it lost about 1 mETH. The credited amount of ETH plus the ETH transaction fee shown on Etherscan is 1 mETH less then the ckETH that were withdrawn and deducted. Is that a fee that the ckETH ledger kept or where did it go?
+
+Yes, the minter currently charges a higher fee than the real ETH gas fee that occurred, which it eventually can use to pay for its own cycles usage. These are all things that can be changed via upgrade proposals, so this could also be fine-tuned in the future.
+
+-------------------------
+
+timo | 2023-12-05 14:35:40 UTC | #98
+
+Is the ckETH index canister identical in its interface to the ckBTC index canister or are there any differences? (Sorry, can't find the source code or did files for them, but in candid UI they look identical.)
+
+Is there a standard yet for index canisters for ICRC-1 tokens and do ckETH and ckBTC follow it?
+
+Asking so I can do wallet integration of ckETH.
+
+-------------------------
+
+kristofer | 2023-12-05 14:33:57 UTC | #99
+
+Congratulations again, this really is a great achievement! I think we can expect some really cool stuff to be built using ckETH. For instance, take the ability of canisters to act as decentralised oracles using HTTPS outcalls. That, combined with the new ability of canisters to hold ETH, plus gasless transactions, plus moving in and out of the ETH ecosystem really easily. This opens up. So. Many. New. Possibilities. 💥
+
+-------------------------
+
+timo | 2023-12-05 14:50:14 UTC | #100
+
+[quote="Manu, post:97, topic:22819"]
+Yes, the minter currently charges a higher fee than the real ETH gas fee that occurred, which it eventually can use to pay for its own cycles usage.
+[/quote]
+
+Linking this to the dashboard:
+
+Does "Total unspent transaction fees" refer to what the ledger kept for himself? 
+
+And "Total effective transaction fees" refers to what has been spent on the ETH network?
+
+So the sum of the two is what users have spent so far?
+
+-------------------------
+
+Manu | 2023-12-05 14:55:01 UTC | #101
+
+[quote="timo, post:98, topic:22819"]
+Is there a standard yet for index canisters for ICRC-1 tokens and do ckETH and ckBTC follow it?
+[/quote]
+
+There is no ICRC standard yet, it looks like there are plans though https://github.com/dfinity/ICRC/issues/5. But yes the ckBTC and ckETH index canisters have the same interface.
+
+-------------------------
+
+dfxjesse | 2023-12-05 14:56:23 UTC | #102
+
+Can we get the ckETH logo added to the Internet computer branding page:
+
+https://dfinity.frontify.com/d/pD7yZhsmpqos/internet-computer#/tokens-badges-1/tokens
+
+-------------------------
+
+Manu | 2023-12-05 16:14:45 UTC | #103
+
+Sounds reasonable! I'll forward the request
+
+edit: @dfxjesse this has been added
+
+-------------------------
+
+gregory-demay | 2023-12-05 15:22:29 UTC | #104
+
+Hi @timo 
+
+> Does “Total unspent transaction fees” refer to what the ledger kept for himself?
+> And “Total effective transaction fees” refers to what has been spent on the ETH network?
+> So the sum of the two is what users have spent so far?
+
+Basically the current behaviour of a single withdrawal is as follows (happy path). Assume that a user calls `withdraw_eth` (after having approved the minter) to withdraw `withdraw_amount` (e.g. 1ckETH) to some address. Then the minter is going to do the following
+
+1. Burn `withdraw_amount` on the ledger for the IC principal (the caller of `withdraw_eth`).
+2. Estimate the maximum current cost of a transaction (`21_000` gas) on Ethereum, say `max_tx_fee_estimate`. This `max_tx_fee_estimate` is somewhat large enough that it should be valid for the few next blocks.
+3. Issue an Ethereum transaction (via tECDSA) with value `withdraw_amount - max_tx_fee_estimate`
+4. When the transaction is mined, since on Ethereum transactions are at the cost of the sender, the minter's account will be charged with `(withdraw_amount - max_tx_fee_estimate) + actual_tx_fee == withdrawal_amount - (max_tx_fee_estimate - actual_tx_fee)`, where `actual_tx_fee` represents the actual transaction fee (can be retrieved from the receipt) and it's guaranteed by construction that `max_tx_fee_estimate - actual_tx_fee > 0`
+
+So all this to now answer your initial question:
+
+1. `actual_tx_fee` will be added to “Total effective transaction fees”
+2. The difference `max_tx_fee_estimate - actual_tx_fee` will be added to “Total unspent transaction fees”. This amount is currently not assigned (not minted back to some fee collector account for example) but we wanted to track it so that we have this option in the future if this is something that would be beneficial for ckETH.
+3. It is correct that the sum of the 2 (`actual_tx_fee + (max_tx_fee_estimate - actual_tx_fee)`) is `max_tx_fee_estimate` and corresponds to the cost of a withdrawal for the user.
+
+I have now additional content for the README. I hope this helped but please feel free to reach out if additional clarification is needed.
+
+-------------------------
+
+Sormarler | 2023-12-05 16:03:40 UTC | #105
+
+How much more is the fee?
+
+-------------------------
+

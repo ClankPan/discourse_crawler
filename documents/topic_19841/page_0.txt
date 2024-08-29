@@ -1,0 +1,60 @@
+hilljh82 | 2023-05-08 19:11:11 UTC | #1
+
+Hi,
+
+(hope this is posted to the correct group)
+
+I have been working on a project (like many others) in Motoko that uses `http_request` and `http_request_update`. Although I am able to get my project to work, I would like to make some suggestions that I think would improve developer experience.
+
+Right now, they way you transition from an regular HTTP request to one that is considered an update is set `upgrade` to true in the returned data object (excuse the incorrect terminology). Although this works, it feels more like a code smell, and goes against good software design principles/practices.
+
+Is there a reason we cannot have another method exposed from the canister that determines if the HTTP request should be upgrade? 
+
+For example, `upgrade_http_request (...)`. A canister developer could elect to override this method if the current HTTP request should be upgrade or not. This would prevent intermixing business-logic for an upgraded request with business-logic from an non-upgraded request. Moreover, it will isolate the logic from determining if a request should or should not be upgraded from the actual business-logic for handling the request. This will allow canister developers be better adhere to the SOLID principles of software design.
+
+Lastly, this design approach will also reduce complexity associated with having to understand that you may need to "upgrade" a request via a special return value on the object when handling HTTP calls. I am going to make an educated guess and say that many of the same HTTP verbs will have the same upgrade requirements. This approach will allow the development kit to provide the default implementation for upgrading. For example, POST/PATCH/PUT are automatically upgraded. This means that the average canister developer could just implement `http_request` and `http_request_update` without having to define the logic to determine if the request needs to be upgraded. If the canister defines the `upgrade_http_request(...)` method, then it will get the more domain-specific upgrade result from the canisters overridden method. 
+
+This is basically the realization of the [Template Method pattern](https://en.wikipedia.org/wiki/Template_method_pattern).  
+
+Thoughts?
+
+-------------------------
+
+kpeacock | 2023-05-08 19:11:14 UTC | #2
+
+I don't think this covers the cache hit / miss logic that I'm using in [https://mops.one/server](https://mops.one/server).
+
+For a GET request, I need to be able to programmatically choose whether to return a certified response if one is available, and to be able to upgrade if the request is not cached.
+
+-------------------------
+
+hilljh82 | 2023-05-08 19:33:18 UTC | #3
+
+@kpeacock From my understanding of how Motoko works, and looking into the CDK for Motoko, this approach should cover the hit / miss logic that you are using in your server. In your use case, you would override the `upgrade_http_request (request: Request)` method in the canister to determine if the request should be upgraded since you have a non-standard use case. In the `upgrade_http_request()`, you put the logic to check if there is a cache hit/miss. If there is a hit, you return false (no upgrade). If there is a miss, then you return true (i.e., upgrade). In the default case, not overriding the `upgrade_http_request()` method would utilize the default implementation (i.e., upgrade based on the current HTTP verb). 
+
+This behavior would be similar to how polymorphism works. 
+
+BTW, I have use cases that are similar to the one you are doing in the caching server, but I also have use cases where I don't need the upgrade to happen for a GET request. From a design point-of-view, it would be great if you can keep the logic separate instead of intermingled like spaghetti code. This will minimize  accidentally mix the concerns, and remove both an inherit and accidental complexity from the development kit.
+
+-------------------------
+
+NathanosDev | 2023-05-08 21:46:11 UTC | #4
+
+> Is there a reason we cannot have another method exposed from the canister that determines if the HTTP request should be upgrade
+
+`http_request` and `http_request_update` are application-level constructs, the IC doesn't have any opinion or knowledge of them. If you wanted to expose an additional method from your canister and have the IC call it to determine whether or not you want to upgrade a request then the IC would acquire additional responsibilities for application-level decisions that it had no knowledge of before.
+
+> prevent intermixing business-logic for an upgraded request with business-logic from an non-upgraded request
+
+You can separate this business logic in whatever way you like on an application level, you don't have to push this onto the network to get a separation of responsibilities.
+
+> this design approach will also reduce complexity associated with having to understand that you may need to “upgrade” a request via a special return value on the object when handling HTTP calls
+
+I don't think your suggestion to provide an additional method actually reduces complexity on the application level, it just moves it from one place to another. I'm not saying that's a bad thing to move it from an application's perspective, just that it's not actually reducing complexity. I'm not sure if this is worth spending time on handling the additional complexity it would introduce within the replica.
+
+> For example, POST/PATCH/PUT are automatically upgraded.
+
+This may not work for every use case (GraphQL being a notable case if we ever manage to make that work), so I would avoid making this happen automatically. Also, it's pretty wasteful. If your app will always need to upgrade for those verbs, then you can just make an `update` call for those verbs from the client side and avoid the extra round trip, assuming that your client already has `agent-js` or something similar.
+
+-------------------------
+

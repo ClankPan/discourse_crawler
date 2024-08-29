@@ -1,0 +1,64 @@
+icme | 2024-07-06 21:18:01 UTC | #1
+
+Update: this case doesn't result in a canister trapping, but it will exit with an error (can be caught by try/catch)
+
+TLDR: Your canister can error if under 1T when making outgoing calls to a large number of canisters in parallel. This number could be larger depending on the number of calls made in parallel (I believe it is 8B cycles reserved per outgoing call, which gets refunded after the call if not all 8B cycles are used)
+
+I was testing out making calls to a number of canisters in parallel this afternoon and kept hitting a `could not perform remote call` error.
+
+It took me awhile to figure out why this error was occurring, but I finally figured it out and am posting here in case someone else runs into the issue. (Btw this specific trap error message should probably be updated :sweat_smile: )
+
+Even though my canister had ~480 billion cycles at the time, I was making ~50 calls in parallel. As a result, each outgoing call to another canister is temporarily charged the maximum number of cycles and held as a reserve while waiting for a response. As a result, around the ~24th parallel outcall, my canister didn't have enough cycles to pay the outgoing call reserve fee, so the canister trapped with this message.
+
+After bumping up the number of cycles in my canister, all parallel calls succeeded.
+
+-------------------------
+
+dsarlis | 2024-07-03 08:54:43 UTC | #2
+
+The trap here seems to be Motoko specific. According to the [IC spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#inter-canister-method-calls), `ic0.call_perform` does not trap but rather returns a non-zero error code if a call cannot be made (one of the reasons could be that your canister is low on cycles).
+
+@claudio can you confirm if Motoko traps in this case by choice? It would be better probably to propagate the error code and let the caller figure out what to do (retry, drop the call etc).
+
+-------------------------
+
+claudio | 2024-07-03 09:43:05 UTC | #3
+
+@icme can you confirm it was a trap and not an error? I would actually expect this to be reported as an error, not a trap. The difference being that state changes will not be rolled back for the error.
+
+Since Motoko 0.8.0, users have been able to observe and handle `ic0.perform_call` failures by receiving and handling an error instead of trapping:
+
+https://github.com/dfinity/motoko/blob/master/Changelog.md#080-2023-01-27
+
+
+I created a little Motoko example here:
+
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1032031000
+
+function `test(100)` issues too many calls and exits with an error (reject code 4), not a trap.
+
+function `testtry(100)` issues too many calls within a try catch and catches the error with Motoko variant #call_error that you can use to detect such failures.
+
+If a local #call_error is unhandled, it gets propagated as an IC reject code 4, with the message text that you are observing.
+
+-------------------------
+
+icme | 2024-07-06 21:14:29 UTC | #4
+
+You're correct, it doesn't trap, just exits with an error! Edited the original thread post
+
+-------------------------
+
+icme | 2024-07-08 15:38:38 UTC | #5
+
+@dsarlis I think my main qualm here was the nondescript error message. Would be nice instead if it was something like `"insufficient reserve cycles - could not perform remote call"`
+
+-------------------------
+
+dsarlis | 2024-07-08 15:52:43 UTC | #6
+
+Here's a [proposal](https://github.com/dfinity/interface-spec/pull/310) that would help with providing better error messages. I can't say it's top priority but we'll try to push it forward opportunistically.
+
+-------------------------
+

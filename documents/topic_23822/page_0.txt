@@ -1,0 +1,159 @@
+RMCS | 2023-10-17 09:30:57 UTC | #1
+
+I'm in the progress of moving all our data to stable storage, but it seems that its not so stable. When i push upgrades the data gets wiped. I'm not sure what is causing this behaviour but i will explain the setup below;
+
+We have an index canister that manages the upgrades of the children (which migrated to stable storage).
+
+What we do to upgrade a child canister;
+- The child WASM in included into the index canister WASM
+- There are some checks done to see if its actually a new child WASM to prevent unnecessary upgrades 
+- The child canister upgrades are triggered on the `post_upgrade` step by; 
+```rs
+set_timer(Duration::from_secs(0), || {
+    ic_cdk::spawn(ScalableData::upgrade_children());
+});
+```
+which eventually goes loops over all child canister and call
+```rs
+canister.install_code(
+    InstallCodeMode::Upgrade,
+    data.child_wasm_data.bytes.clone(),
+    (),
+).await;
+```
+
+i run a script to generate the WASMs, and gzip them
+```bash
+#!/bin/sh
+
+canisters=(
+    "child"
+    "parent"
+)
+
+echo -e "${GREEN}> $ENV: Generating required files..${NC}"
+cargo test --test generate
+dfx generate --network ic
+
+for t in ${canisters[@]}; do
+    echo -e "${GREEN} $ENV > Building $t..${NC}"
+    dfx build --network ic $t
+
+    mkdir -p wasm
+    cp -r target/wasm32-unknown-unknown/release/$t.wasm wasm/$t.wasm
+    gzip -c wasm/$t.wasm > wasm/$t.wasm.gz
+
+    mkdir -p frontend/$t
+    cp -a src/declarations/$t frontend
+done
+
+rm -rf src/declarations
+echo -e "${GREEN} $ENV > Stopping local replica..${NC}"
+```
+
+Once that is done i run;
+```
+dfx canister install parent --network ic --wasm wasm/parent.wasm.gz --mode upgrade
+```
+
+For the child canisters i've setup the stable storage like this;
+```rs
+type Memory = VirtualMemory<DefaultMemoryImpl>;
+
+thread_local! {
+    pub static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+
+
+        // STABLE
+        pub static STABLE_DATA: RefCell<StableCell<Data, Memory>> = RefCell::new(
+            StableCell::init(
+                MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))),
+                Data::default(),
+            ).expect("failed")
+        );
+
+        pub static ENTRIES: RefCell<StableBTreeMap<String, Member, Memory>> = RefCell::new(
+            StableBTreeMap::init(
+                MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(4))),
+            )
+        );
+
+    // OLD NON STABLE
+    pub static DATA: RefCell<ic_scalable_misc::models::original_data::Data<Member>>  = RefCell::new(ic_scalable_misc::models::original_data::Data::default());
+}
+```
+Where we also still use the pre- post upgrades in case stable storage doesn't work as expected so we have a backup
+
+```rs
+#[pre_upgrade]
+pub fn pre_upgrade() {
+    DATA.with(|data| ic_methods::deprecated_pre_upgrade(data))
+}
+
+#[post_upgrade]
+pub fn post_upgrade() {
+    DATA.with(|data| ic_methods::deprecated_post_upgrade(data))
+}
+```
+
+So after upgrading the child canister through the index, all data is wiped, am i doing something wrong or is this a bug?
+
+I'm using `ic-stable-structures = "0.6.0"`
+
+-------------------------
+
+ielashi | 2023-10-17 11:03:01 UTC | #2
+
+Can you share how `deprecated_pre_upgrade` is implemented? My first guess is that `deprecated_pre_upgrade` is overwriting the stable storage in a way that corrupts the stable structures.
+
+I recommend looking at the [quickstart example](https://github.com/dfinity/stable-structures/blob/main/examples/src/quick_start/), which shows how you can have stable structures and heap data coexisting - take a special look at the pre/post upgrade hooks there and how the data on the heap is being written to stable memory.
+
+-------------------------
+
+RMCS | 2023-10-17 11:08:16 UTC | #3
+
+The deprecated methods look like this, i'm using `ic_cdk v0.11.0`
+
+```rs
+pub fn deprecated_pre_upgrade<T: Serialize + CandidType + DeserializeOwned>(
+    data: &RefCell<ic_scalable_misc::models::original_data::Data<T>>,
+) {
+    storage::stable_save((&*data.borrow(),)).unwrap();
+}
+
+pub fn deprecated_post_upgrade<T: Serialize + CandidType + DeserializeOwned>(
+    data: &RefCell<ic_scalable_misc::models::original_data::Data<T>>,
+) {
+    let (old_store,): (ic_scalable_misc::models::original_data::Data<T>,) =
+        storage::stable_restore().unwrap();
+    *data.borrow_mut() = old_store;
+}
+```
+
+and i did check that out, i had an other post about that here https://forum.dfinity.org/t/migrate-non-stable-storage-to-stable-storage-on-single-canister/23521
+
+Do need to say that at that time the focus was to keep non-stable persistent so i wouldn't loose it through upgrades.
+
+But i will check it out again, see if i can spot something
+
+-------------------------
+
+ielashi | 2023-10-18 06:53:21 UTC | #4
+
+@RMCS That's exactly the problem. You're using `stable_save` and `stable_restore` for data on the heap, while you're using the `MemoryManager` for stable structures. Unfortunately, `stable_save` and `stable_restore` end up clobbering the `MemoryManager` since it overwrites it.
+
+The `MemoryManager` must be the only way you write to stable memory to keep everything safe. In this case, you should serialize/deserialize the state on your heap into one of the memories of the `MemoryManager`. The quickstart example I linked to above shows how to do that. See the upgrade hooks in that example.
+
+-------------------------
+
+RMCS | 2023-10-18 10:11:32 UTC | #5
+
+I forgot to respond after confirming that the issue was resolved by checking out the post- pre upgrade from the example you provided.
+
+I blindly assumed that the old method would still work, also I was afraid of touching the existing pre- post upgrade code and loose the data if i did it wrong.
+
+But all is resolved, thank for the help!
+
+-------------------------
+

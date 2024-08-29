@@ -1,0 +1,224 @@
+gilbert | 2021-10-04 06:24:58 UTC | #1
+
+Is it possible to do a programmatic import in Motoko? It looks like that imports can only be done before any other instruction? I want to create canisters programmatically from different canisters featuring an actor class. i.e. within a function and depending on input (function argument).
+
+-------------------------
+
+rossberg | 2021-10-04 07:17:23 UTC | #2
+
+Can you give an example? Do you mean importing from a URI whose string is not static? That does not work, because the compiler needs to access and link it. There is no dynamic linking on the IC (yet?).
+
+Can't you import each of the possible actor classes and select one programmatically?
+
+-------------------------
+
+gilbert | 2021-10-04 11:08:03 UTC | #3
+
+Thanks rossberg for a quick answer. 
+Example: 
+I have x different canisters running with different actor classes. My app should allow to select one of those canisters and create a canister from this actor class. Importing all of the actor classes is not a good option since some of the actor classes will be created after the app creation.
+
+I understand the limitation. I shall try to use the management canister to create the required canisters and load the required wasm from a wasm storage container (which will have to be updated each time there is a new wasm to be added). Is this feasible?
+
+-------------------------
+
+skilesare | 2021-10-04 13:45:32 UTC | #4
+
+You should use actor types.  Deploy a canister of each actor type and give them an function called __create or something like that.  Then you can create an actor type
+
+
+```
+type creatable = actor {
+     __create() -> async Principal;
+};
+```
+
+When you want to create, keep all possible types in a registry:
+
+
+```
+let principal = switch(registry.get("name"){case(null){assert(false);}case(?v){v;}};
+let anActor : creatable = actor(principal);
+let newCanister = await anActor.__create();
+```
+
+Your actor needs to have
+
+```
+public func __create() : async Principal{
+   let newCanister = await MyActor.MyActor();
+   return Principal.fromActor(newCanister):
+};
+```
+
+-------------------------
+
+gilbert | 2021-10-11 06:39:39 UTC | #5
+
+Thank you skilesare. What you propose makes sense to me and I believe it should solve my problem. However, I have not managed to implement it yet. I am for the moment stumbling ( I am a beginner in Motoko) over the line:
+```
+let principal = switch(registry.get("name"){case(null){assert(false);}case(?v){v;}};
+```
+Here is my implementation which gives me errors in the lines marked with * :
+1. expression of type Any cannot produce expected type Text
+2. the switch has type Any because branches have inconsistent types,
+this case produces type  () the previous produce type Text
+
+import Map "mo:base/HashMap";
+import Text "mo:base/Text";
+
+actor {
+
+    let registry = Map.HashMap<Text, Text>(0, Text.equal, Text.hash);
+
+    public func insert(name : Text, address : Text): async () {
+        registry.put(name, address);
+    };
+
+    public query func lookup(name : Text) : async Text  {
+        let address = switch(registry.get(name)){   // error
+            case (null) {assert(false);};           // error
+            case (?v) {v;};                         // error
+        };
+    };
+};
+
+In spite of many hours spent on this I cannot find how to solve this.
+
+-------------------------
+
+rossberg | 2021-10-11 13:11:27 UTC | #6
+
+The problem is the `assert false`. Assertions are expressions of type `()`, so the null branch of the switch has type `()`, which is not what you want, since it needs to be compatible with `Text`.
+
+You need to replace the assertion with something that can produce whatever type. The following does the trick:
+```
+let address = switch (registry.get(name)) {
+    case null { assert false; loop {} };
+    case (?v) { v };
+};
+```
+Alternatively, you can call the library function `unreachable` from `base/Prelude` in place of the assertion:
+```
+func unreachable() : None { assert false; loop {} };
+```
+
+-------------------------
+
+skilesare | 2021-10-11 12:23:32 UTC | #7
+
+It is ugly, but I usually put an assert and the return something after that is actually unreachable. For example, if you need an Int you can do
+
+    {
+        assert(false);
+        //unreachable
+        0;
+    }
+
+-------------------------
+
+gilbert | 2021-10-11 13:12:34 UTC | #8
+
+Thanks a lot for your help. The instruction loop{} works fine, but trapping the canister is NOK for my application. I have the following solution which works fine until the last line:
+
+    public query func lookup(name : Text) : async ?Text  {
+        let result = registry.get(name);
+        if (result == null) {?"Wrong name!"}
+        else {
+            let principal = Principal.fromText(result);
+            let anActor : creatable = actor(principal);
+            let newCanister = await anActor.__create();    // misplaced await
+        }
+    };
+
+-------------------------
+
+gilbert | 2021-10-11 13:13:22 UTC | #9
+
+Furthermore, in the creatable canister:
+
+actor {
+    public func greet(name : Text) : async Text {
+        return "Hello, " # name # "!";
+    };
+    public func __create() : async Principal{
+        let newCanister = await MyActor.MyActor();
+        return Principal.fromActor(newCanister);
+    };
+};
+I get unbound variable MyActor! This is however, I believe, the exact same code as proposed by skilesare. What am I doing wrong?
+
+-------------------------
+
+skilesare | 2021-10-11 13:57:58 UTC | #10
+
+Hmm....maybe because this is an actor and not an actor class?  It is a confusing distinction, but look up actor class in the docs. It has a slightly different syntax.
+
+-------------------------
+
+gilbert | 2021-10-11 14:47:50 UTC | #11
+
+Same issue with actor class! And the problem with the "misplaced await" error in the calling canister!
+
+-------------------------
+
+skilesare | 2021-10-11 15:00:57 UTC | #12
+
+Ah..you are in a query.  Queries can't await other calls at the moment.  You need to remove the query keyword in your function. You might want two separate functions, a query that you can call that returns quickly and then if that is null call lookup_or_create that is a regular function.
+
+-------------------------
+
+gilbert | 2021-10-11 15:27:10 UTC | #13
+
+Thanks Austin. I understand now that I need to remove the query. But now the error with the text being an option text appears: result is ?Text and the Principal.fromText function needs Text. I guess I need to go back and learn more about pattern matching and option types ...
+
+-------------------------
+
+skilesare | 2021-10-11 18:16:34 UTC | #14
+
+Yes...those become very important and they were the most important thing I figured out to make myself somewhat competent in motoko.
+
+-------------------------
+
+gilbert | 2021-10-12 07:58:30 UTC | #15
+
+Thanks Austin, I appreciate your help. I figured everything out except the create function you proposed: 
+[quote="skilesare, post:4, topic:7681"]
+```
+public func __create() : async Principal{
+   let newCanister = await MyActor.MyActor();
+   return Principal.fromActor(newCanister):
+};
+```
+[/quote]
+
+I still have the error on  the line "let newCanister = await MyActor.MyActor();" with the unbound variable MyActor. 
+How is this supposed to work? Where can I find documentation on actor creation? I assume Actor.Actor() should create a new actor from Actor, but where is the Actor defined?
+
+-------------------------
+
+skilesare | 2021-10-12 11:23:02 UTC | #16
+
+That is the constructor of your actor class you are creating. Something like
+
+
+    import MyActor “MyActor”;
+
+    ……. Later
+
+
+     let anActor  = MyActor.MyActor(constructor args);
+
+-------------------------
+
+claudio | 2021-10-12 11:49:15 UTC | #17
+
+Warning: If you want to include the create method in the actor class being defined then you may run into the restriction that actor classes cannot instantiate themselves recursively when compiling for the IC.
+
+
+If that turns out to be a problem the approach in this PR may help:
+
+https://github.com/dfinity/motoko/pull/2337
+
+-------------------------
+

@@ -1,0 +1,161 @@
+dfxjesse | 2024-07-15 18:38:48 UTC | #1
+
+I'm having an issue with the Internet Identity authentication and actor set up with the "@dfinity/agent" package on my React app. It's becoming an elusive issue as it only appears maybe once out of every 10 - 20 log in attempts. I'll try to explain the issue the best I can and what I have tried. Maybe someone has ran into this before?
+
+![Screenshot 2024-07-15 at 7.18.24 p.m.|690x338](upload://rZ44YKIT8FAu0WRNwevpc8mCXh2.png)
+
+After logging in via Internet Identity the above error appears sometimes, I understand that either the public key or private key is not matching but I'm unsure how I can debug this further. My Agent flow looks something like:
+
+I have a file named `client.js` and in it I set up my actors with `Actor.createActor`. For example this is how I do it:
+
+```
+export const startClient = async () => {
+  const canisterId = process.env.REACT_APP_CANISTER_ID;
+
+  const authClient = await AuthClient.create();
+  const identity = await authClient.getIdentity();
+
+  return Actor.createActor(CanisterIDL, {
+    agent: new HttpAgent({
+      identity,
+      host: ICP_API,
+    }),
+    canisterId: canisterId,
+  });
+};
+```
+So when a user loads up my app `Identity` is the anonymous identity at first, and then when they log in it's set to the delegation identity to start making authenticated calls. Works most of the time.
+
+My guesses here is that maybe the anonymous identity is cached as when I receive the agent error I mentioned previously and I comment out the Identity in my actor initialisation like below, the calls go through okay.:
+
+ ```
+export const startClient = async () => {
+  const canisterId = process.env.REACT_APP_CANISTER_ID;
+
+  const authClient = await AuthClient.create();
+  const identity = await authClient.getIdentity();
+
+  return Actor.createActor(CanisterIDL, {
+    agent: new HttpAgent({
+     // identity,
+      host: ICP_API,
+    }),
+    canisterId: canisterId,
+  });
+};
+```
+
+I've tried this too and it doesn't do anything:
+```
+export const startClient = async () => {
+  const canisterId = process.env.REACT_APP_CANISTER_ID;
+
+  const authClient = await AuthClient.create();
+  const identity = await authClient.getIdentity();
+
+  const actor = Actor.createActor(CanisterIDL, {
+    agent: new HttpAgent({
+      identity,
+      host: ICP_API,
+    }),
+    canisterId: canisterId,
+  });
+
+  const defaultAgent = Actor.agentOf(actor);
+
+  defaultAgent.replaceIdentity(identity);
+
+  return actor
+};
+```
+But interestingly when I do this: 
+```
+export const startClient = async () => {
+  const canisterId = process.env.REACT_APP_CANISTER_ID;
+
+  const authClient = await AuthClient.create();
+  const identity = await authClient.getIdentity();
+
+  const actor = Actor.createActor(CanisterIDL, {
+    agent: new HttpAgent({
+      identity,
+      host: ICP_API,
+    }),
+    canisterId: canisterId,
+  });
+
+  const defaultAgent = Actor.agentOf(actor);
+
+  defaultAgent.invalidateIdentity();
+
+  return actor
+};
+```
+I get this error?
+
+![Screenshot 2024-07-15 at 7.32.48 p.m.|690x154](upload://e42cDshAWka9eiGWANJXCkCwpyy.png)
+
+Is the only solution here to refresh the whole login? When the app is reloaded the error persists, only when you do a fresh logout and login it can disappear.
+
+Im using `"@dfinity/agent": "^1.3.0"` and `"@dfinity/auth-client": "^1.3.0"`
+
+-------------------------
+
+kpeacock | 2024-07-15 19:08:31 UTC | #2
+
+To handle this error, I would do the following:
+
+```ts
+// invalidation is optional
+await authClient.logout();
+
+// Prompt the user with a login dialog 
+// (clicking a button is required)
+authClient.login({
+ onSuccess(()=>{
+   const newIdentity = authClient.getIdentity();
+   Actor.agentOf(actor).replaceIdentity(newIdentity); 
+ })
+})
+```
+
+`logout` will clear the local delegation for the `AuthClient` instance. You can then login and refresh the identity by prompting the user informing them their session has expired.
+
+If your application is retaining a stable reference to an Actor instance, you can replace the identity by calling `replaceIdentity` method on the Actor's `HttpAgent`. It is also perfectly acceptable to discard the class instance and create a new `Actor` if you prefer a more functional approach
+
+
+See:
+- [replace identity](https://agent-js.icp.xyz/agent/classes/HttpAgent.html#replaceIdentity)
+- [get identity](https://agent-js.icp.xyz/auth-client/classes/AuthClient.html#getIdentity)
+
+-------------------------
+
+dfxjesse | 2024-07-15 19:53:54 UTC | #3
+
+Wow thanks! I implemented this into my `onSuccess` like below
+
+```
+      onSuccess: async () => {
+        const identity = client.getIdentity();
+
+        const actor = await startClient();
+        const agent = Actor.agentOf(actor);
+        agent.replaceIdentity(identity);
+
+        ...
+        ...
+      },
+```
+
+And I've tested logging in and out many times now and the error has not returned :raised_hands: I'm going to take it as this was the fix!
+
+I left out the `await authClient.logout()` and it seems to still work without that, so I'm guessing `replaceIdentity` clears the previous local delegation by itself?
+
+-------------------------
+
+kpeacock | 2024-07-15 20:48:08 UTC | #4
+
+It doesn't clear the delegation, but the new `login` will replace it with a new one. `logout` is just a safety approach to make sure that `getIdentity` will fail while `login` is still pending
+
+-------------------------
+

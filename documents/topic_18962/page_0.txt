@@ -1,0 +1,439 @@
+ZhenyaUsenko | 2023-03-17 18:34:02 UTC | #1
+
+Hi everyone!
+
+It's been a long time since v8.0.0-alpha.1 came out and v8.0.0 release version is finally here
+Here is the description of changes v8.0.0 provides
+
+https://github.com/ZhenyaUsenko/motoko-hash-map
+
+# Completely new algorithm
+
+Since its first version, `Map` has been using the deterministic hash map algorithm proposed by Tyler Close. It uses a data array to store entries in an order of insertion. Another array (hash table) is used to map a hash (key) to an index in a data array (value). Although having some modifications, the main paradigms of a deterministic hash map agree with the `Map` behavior, meaning it will need to rehash (extend its data and hash arrays) when they fill up. Deleted items leave an empty space both in a data array and in a bucket. Despite having great performance characteristics, the above traits can be considered algorithm weaknesses in some scenarios.
+
+V8 `Map` completely overhauls this behavior and moves to an in-house built hash map algorithm that eliminates these weaknesses, the main advantage being that it completely eliminates the need of rehashing by using a tree-like structure to store its entries. As a supplement to the new hash map algorithm, as well as to preserve the feature of saving insertion order, V8 `Map` also supports DEQ links to the next/prev inserted item. Together these new features open up a wide variety of possibilities. Lets go through all improvements it provides.
+
+V7 `Map` algorithm leaves an empty space in a bucket on entry deletion. This leads to a problem where an entry deletion slows operations with other entries in the same bucket. More so, in the worst case scenario, subsequent delete/insert operations on a single key could lead to a half-linear complexity of operations on entries in the same bucket.
+
+V8 `Map` uses a tree-like structure to store entries using 4 links that bond an entry with 4 branches on an upper level. Each such layer uses 2 hash bits to determine a branch, meaning all branches forking from an ancestor will have their lower n-hash-bits equal to the ancestor's. This leads us to a simple way of deleting entries - we just replace them with any descendant leaf. This prevents any possible holes in a map, eliminates the need to rebalance the structure (opposed to conventional tree algorithms) while the tree structure itself eliminates the need to rehash (opposed to most hash map algorithms).
+
+V7 `Map` algorithm leaves an empty space in a data array on entry deletion. This leads us to 2 inconvenient consequences. Successive delete/insert operations will inevitably lead to rehashes even without size overflow (as deleted space still adds up). We can not easily implement DEQ methods (like `pop` and `peek`) as they could have up to a half-linear complexity in the worst case scenario.
+
+V8 `Map` algorithm uses DEQ links to preserve insertion order instead of an array. This opens up a lot of possibilities, such as full DEQ methods support, and the ability to insert entries mid-map, while eliminating the need to leave holes in a structure.
+
+Conventional hash map algorithms can only make use of all hash bits when they are max size. Although upper hash bits are not needed for such algorithms in small maps, it is in fact possible to choose keys that will have conflicting hashes and appear in one bucket. V8 `Map` eliminates this possibility as it will use up to all hash bits with any-size maps if an operation leads to a collision.
+
+To determine key equality, V8 `Map` now compares hash equality first to discard false-cases earlier, as hash comparison will be a lot faster for most key types.
+
+# New methods
+
+As the new algorithm supports DEQ links, there are many possibilities for new methods:
+
+- A lot of methods received their **Front**/**Desc** counterparts
+
+- Most DEQ-originating methods were added to V8 `Map`
+
+- V8 `Map` extends the default iterator logic and adds many new ways to traverse maps
+
+- Ability to insert entries mid-map (mid-deq), move entries, update values without a prior `get` call
+
+- Support for map mutation during iteration, maintaining iteration order predictable
+
+- Ability to easily convert `Map` to an `Array`, new ways to create `Map` from iterator
+
+## Set methods
+
+V7 `Map` version had 2 methods to add new entries: `put` and `set` where the only difference was that the latter ignores the result.
+
+V8 `Map` adds `putFront` and `setFront` counterparts to prepend new entries to a map (deq) instead of putting them at the end.
+
+New `replace` method was added to skip insertion and make changes only when the specified key already exists. Similarly, `add` and `addFront` methods allow you to insert a new entry and skip modification when the specified key already exists.
+
+**Move** methods (`putMove`, `putMoveFront`, `replaceMove`, `replaceMoveFront`) were added as a convenience for cases where you want to move a value to the back/front if it already exists.
+
+New methods (`putBefore`, `putAfter`) were added allowing you to put a new key/value pair before/after a specified key. These methods do not have their **Move** twins as they move existing entries after/before a specified key by default.
+
+## Update methods
+
+A set of update methods was added (`update`, `updateFront`, `updateMove`, `updateMoveFront`). They are similar to the `put` method but instead of a **newValue** they expect you to pass a function that receives an optional old value and returns an optional new value.
+
+As in the case of `put`, these support **Front**/**Move** variants which allow you to prepend new entries and move existing values to the back/front.
+
+## DEQ methods
+
+DEQ links existence allows you to use full DEQ functionality alongside map methods.
+
+New `pop` and `popFront` methods remove the last/first entry and return it.
+
+To get the last/first entry without removing it, you can use `peek` and `peekFront`.
+
+There are also `cycle` and `cycleFront` methods which take the last/first entry, move it to the front/back and return it.
+
+## Iterators
+
+Iterators were completely overhauled. `Map` extends the default iterator object that has a single `next` method and uses the next structure for its iterators (`prev`, `next`, `peekPrev`, `peekNext`, `current`, `started`, `finished`, `reset`, `movePrev`, `moveNext`) where `prev` iterates backward, `current` returns the current value without moving an iterator, `reset` moves an iterator to its initial position, `started` and `finished` return a boolean indicating an iterator state, `peekPrev` and `peekNext` return prev/next value without moving an iterator, `movePrev` and `moveNext` work similar to `prev` and `next` but return the iterator itself, instead of a value.
+
+Of course, a **for..in** loop will not be able to use these methods automatically, but manual calls will be very helpful in some situations.
+
+For the convenience of iterating backward with a **for..in** loop, there are new methods `keysDesc`, `valsDesc`, `entriesDesc`. These will iterate forward if you use `prev`, `peekPrev` and `movePrev` methods on them.
+
+Sometimes you don't want to iterate your map from the beginning and have a specific entry to start iterating from. Instead of skipping a number of iterations you can now use a new group of **From** iterators (`keysFrom`, `keysFromDesc`, `valsFrom`, `valsFromDesc`, `entriesFrom`, `entriesFromDesc`) which expect you to pass a key to start iterating from. By default this key will not be included in iteration (meaning you will start iterating from the next/prev item) but you can easily override this behavior by chaining `movePrev` or `moveNext` methods.
+
+V8 `Map` runs additional checks to make sure iteration order remains predictable when you remove/add an entry either before/after a currently iterating one. This behavior also extends to other iterating methods (like `map`, `filter`, `find`, `toArrayMap` and others).
+
+On top of that, all `Map` iterators are reusable, that is, after returning **null** once, the next `next` or `prev` call will start a new iteration cycle.
+
+## Conversions
+
+Before, you had `fromIter` method to create new maps from iterators which expected you to pass an iterator that returns a key/value tuple on every iteration. V8 `Map` adds a `fromIterMap` method, which allows you to map and filter iterator items. This is helpful if your iterator does not have the expected key/value structure by default. The corresponding `fromIterDesc` and `fromIterMapDesc` were also added to prepend iterator items to a map instead of appending them.
+
+For the convenience of converting your maps to arrays there are 4 new methods `toArray`, `toArrayDesc`, `toArrayMap`, `toArrayMapDesc`. If you just want an array with a full set of your map's key/value pairs, you can use `toArray`. If you want to map/filter entries before putting them to an array, use `toArrayMap`. To traverse your map backward while creating a resulting array, use `toArrayDesc` and `toArrayMapDesc`.
+
+## New hash functions
+
+V7 `Map` supported numeric hash functions for `Nat` (`nhash`) and `Int` (`ihash`) keys natively. With V8 `Map` support for all combinations on numeric keys were added (`nhash`, `n8hash`, `n16hash`, `n32hash`, `n64hash`, `ihash`, `i8hash`, `i16hash`, `i32hash`, `i64hash`). Also, `nhash` and `ihash` now use 64 lower bits for hash calculation instead of 32.
+
+## Misc methods
+
+Continuing the trend with **Desc** twins, `forEach`, `every` and `some` are also receiving the ability to move through a map backward using corresponding `forEachDesc`, `everyDesc` and `someDesc` methods. To keep the naming scheme aligned, the `findLast` method was renamed to `findDesc`.
+
+The new `empty` method is a shorthand for `size == 0` check.
+
+For the ease of cloning a map, a `clone` method was added, which removes the need to use `filter` together with a function that returns true, or similar methods.
+
+# Optimized files
+
+Some code changes lead to worse readability while improving performance by a small margin. It is better to avoid such changes. That is what I am doing for the `Map`. But the perfectionist part inside me still eagerly wants to leave these optimizations on. That's why I'm creating a script to automatically parse the source files and generate fully optimized code (down to removing **return** keywords which scratches off 1 cycle). The parser is a very simple regexp search, which is only suitable for my cases and does not has full syntax understanding whatsoever.
+
+# Performance metrics
+
+As a consequence of using a tree-like structure, which on average needs more iterations to find a key (has worse algorithm complexity than a common hash map algorithm), V8 `Map` has a decrease in performance when comparing best case scenarios for both maps. Due to high code optimizations it was possible to decrease this performance deviation to 30% on average. V8 `Map` will be faster in a general case scenario as it's algorithm eliminates a lot of (if not all) performance flaws of the previous one and has low-to-none performance deviation in a best vs worst case.
+
+Here is a performance comparison between some of the data structures using **Nat**/**Nat** key/value types. The number of entries is 100_000.
+
+**Delete Desc** is a cycle cost of deleting all items starting from the last. It has deviations from a regular **Delete** for some algorithms.
+
+**Heap Space** is an **rts_heap_size** call at the end of the first **Delete** stage. It includes garbage for **Insert**, **Get**, **Update** and **Delete** operations.
+
+**Space** is an **rts_heap_size** call in the next message (when all garbage collection is done), which is the amount of space needed to store 100_000 entries.
+
+|Structure|Insert|Get|Update|Delete|Delete Desc|Heap Space|Space|
+|---|---|---|---|---|---|---|---|
+|`V8 Map`|91_496_534|59_378_554|83_895_094|124_591_501|105_893_982|8_000_000|5_600_000|
+|`V7 Map`|91_238_554|30_270_177|41_784_888|80_128_837|77_557_928|20_665_288|3_448_660|
+|`Stable Hash Map`|2_707_678_519|1_144_832_218|1_200_854_954|1_171_944_898|1_175_349_479|398_126_032|3_724_452|
+|`Stable RB Tree`|2_374_238_947|264_585_170|1_582_756_699|613_056_039|612_856_037|487_921_556|7_600_028|
+|`Trie`|1_274_569_564|432_541_994|1_172_783_140|1_015_169_296|1_115_608_817|351_920_140|6_894_652|
+
+Percentage table, comparing all structures to V8 `Map`
+
+|Structure|Insert|Get|Update|Delete|Delete Desc|Heap Space|Space|
+|---|---|---|---|---|---|---|---|
+|`V8 Map`|1.000|1.000|1.000|1.000|1.000|1.000|1.000|
+|`V7 Map`|0.997|0.510|0.498|0.643|0.732|2.583|0.616|
+|`Stable Hash Map`|29.593|19.280|14.314|9.406|11.099|49.766|0.655|
+|`Stable RB Tree`|25.949|4.456|18.866|4.921|5.787|60.990|1.357|
+|`Trie`|13.930|7.284|13.979|8.148|10.535|43.990|1.231|
+
+# Upgrade strategy
+
+- Rename all `findLast` methods to `findDesc`
+
+- Add **HashUtils** as a second parameter to `map`, `filter` and `mapFilter` calls
+
+- The **new** method now expects you to pass **HashUtils** as a first param
+
+- Migrate all your stable maps using `let newMap = Map_8.fromIter(Map_7.entries(oldMap), Map_8.x_hash)`
+
+# Custom hash upgrade strategy
+
+- IMPORTANT! Your custom hash function must exclude **0xffffffff** hash value as this one is reserved
+
+- **Nat32** should be used as a hash type instead of **Nat**
+
+- New **HashUtils** has a third compound `getNullKey` (a function that should return any key with corresponding type, the value does not matter as it will never be compared to any other key or be passed to a hash function)
+
+-------------------------
+
+rncrmn | 2023-03-17 16:27:04 UTC | #2
+
+@ZhenyaUsenko do you have plan to add this to the base library?
+
+-------------------------
+
+ZhenyaUsenko | 2023-03-18 18:27:12 UTC | #3
+
+I am good with it being in the base repo, interesting to know what Motoko team thinks about it.
+Among my concerns is the introduction of breaking changes in the future versions... being more constrained with the improvements I can provide. It is always better to avoid breaking changes in such libraries with multiple data structure as it could hold the upgrade for those willing to apply only non-breaking changes.
+
+-------------------------
+
+timo | 2023-03-21 06:25:15 UTC | #4
+
+Is the code that computes the performance comparison also available publicly?
+
+-------------------------
+
+ZhenyaUsenko | 2023-03-21 09:09:38 UTC | #5
+
+That's what I use to track performance changes after every code change. This code was a bit modified for the tests above (e.g. uses Nat/Nat key/value pairs to be comparable to other structures as they do not natively support Nat32 hashing).
+
+```
+let { ihash; nhash; n32hash; n64hash; thash; phash; bhash; lhash } = Map;
+
+type PerfStats = {
+  cost: [{ #setCost: Nat64; #getCost: Nat64; #updateCost: Nat64; #deleteCost: Nat64; #deleteDescCost: Nat64 }];
+  space: [{ #setSpace: Nat; #getSpace: Nat; #updateSpace: Nat; #deleteSpace: Nat }];
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+public shared func testPerf(): async PerfStats {
+  let map = Map.new<Nat32, Nat32>(n32hash);
+
+  let startSpace = Prim.rts_heap_size();
+
+  let setCost = IC.countInstructions(func() {
+    var i = 0:Nat32;
+
+    while (i != 100000) { Map.set(map, n32hash, i, i); i +%= 1 };
+  });
+
+  let setSpace = Prim.rts_heap_size() - startSpace:Nat;
+
+  let getCost = IC.countInstructions(func() {
+    var i = 0:Nat32;
+
+    while (i != 100000) { ignore Map.get(map, n32hash, i); i +%= 1 };
+  });
+
+  let getSpace = Prim.rts_heap_size() - startSpace:Nat - setSpace:Nat;
+
+  let updateCost = IC.countInstructions(func() {
+    var i = 0:Nat32;
+
+    while (i != 100000) { Map.set(map, n32hash, i, i); i +%= 1 };
+  });
+
+  let updateSpace = Prim.rts_heap_size() - startSpace:Nat - setSpace:Nat - getSpace:Nat;
+
+  let deleteCost = IC.countInstructions(func() {
+    var i = 0:Nat32;
+
+    while (i != 100000) { Map.delete(map, n32hash, i); i +%= 1 };
+  });
+
+  let deleteSpace = Prim.rts_heap_size() - startSpace:Nat - setSpace:Nat - getSpace:Nat - updateSpace:Nat;
+
+  var i = 0:Nat32;
+
+  while (i != 100000) { Map.set(map, n32hash, i, i); i +%= 1 };
+
+  let deleteDescCost = IC.countInstructions(func() {
+    var i = 100000:Nat32;
+
+    while (i != 0) { i -%= 1; Map.delete(map, n32hash, i) };
+  });
+
+  return {
+    cost = [#setCost(setCost), #getCost(getCost), #updateCost(updateCost), #deleteCost(deleteCost), #deleteDescCost(deleteDescCost)];
+    space = [#setSpace(setSpace), #getSpace(getSpace), #updateSpace(updateSpace), #deleteSpace(deleteSpace)];
+  };
+};
+```
+
+-------------------------
+
+ZhenyaUsenko | 2023-03-29 21:39:24 UTC | #6
+
+Map v8.1.0. Small update this time
+
+Added **contains** method. Functions similarly to **has** (checks key existence) but returns `null` if a map is empty
+
+Could be useful, for example, in some situations where an empty map is used to mark *disabled* state of some functionality. In such cases a combined check of either disabled functionalty or key existence can be made with `Map.contains(map, xhash, key) != ?false`
+
+Plans for the next minor version
+
+1) Set operations (`union`, `intersection`, `difference`, `symmetricDifference` as well as their **Desc** twins)... maybe `symmetricDifference` needs a different name as this one is a bit too long
+2) Documentation update (method signatures with brief descriptions). Current one doesn't even mention the **Set** data structure existence
+
+-------------------------
+
+Zane | 2023-03-29 21:51:06 UTC | #7
+
+Have you considered uploading this on mops? IIRC there is already a version but it's a fork and now outdated.
+
+-------------------------
+
+ZhenyaUsenko | 2023-03-29 22:05:15 UTC | #8
+
+You are not the first one asking for this... will do it shortly. I am using vessel myself
+
+-------------------------
+
+ZhenyaUsenko | 2023-03-29 22:47:25 UTC | #9
+
+https://j4mwm-bqaaa-aaaam-qajbq-cai.ic0.app/map
+
+-------------------------
+
+Safik | 2023-05-05 06:24:48 UTC | #10
+
+This is added to mops?
+
+-------------------------
+
+ZenVoich | 2023-05-05 06:42:23 UTC | #11
+
+[quote="Safik, post:10, topic:18962, full:true"]
+This is added to mops?
+[/quote]
+
+https://mops.one/map
+
+-------------------------
+
+ZhenyaUsenko | 2023-09-15 08:27:45 UTC | #12
+
+# Map V9 is out!
+
+## It is 2.25 times more space efficient than V7
+## It is 4.00 times more space efficient than V8
+
+https://github.com/ZhenyaUsenko/motoko-hash-map
+
+The primary goal of this release is to fix the issue some people started experiencing some time ago which can prevent canister upgrades when your map grows too big.
+
+https://forum.dfinity.org/t/heap-out-of-bounds-use-motoko/10497/28?u=zhenyausenko
+
+**V9** reverts its internal structure to the one that is more similar to **V7** (as linked nature on **V8** was the subject of upgrade issues) but keeps all the improvements described in the original post (like DEQ methods, improved iterators, bidirectionality). The only things that were taken out (impossible to support with the current internal structure) are:
+* **putBefore** and **putAfter** are no longer present
+* mutation during iteration is no longer supported
+* (not a direct functionality downgrade) a shift in internal structure makes rehashes necessary again, decreasing the worst case complexity of some methods to linear
+
+**V8** map is moving to another repo (**Motoko Hash Tree**) and will be supported in the future. Its algorithm still has some advantages that can not be achieved with more common hash map algorithms. Though, its usage will be discouraged until we get a motoko compiler that fully fixes serialization/deserialization on upgrades for linked data structures.
+
+https://github.com/ZhenyaUsenko/motoko-hash-tree
+
+On top of fixing the upgrade issue **V9** provides huge improvements in terms of consumed space. On average it will consume `1.7` times less space than **V7** and `2.7` times less space than **V8**. In the best case scenario these differences jump up to `2` and `3.5` times respectively. **V9** also does not experience an increase in space consumption with Incremental GC enabled (unlike **V7** and **V8**) which will further increase the multipliers to `2.25` and `4`. Here I need to note that although **V8** seems terrible in terms of space consumption looking at those multipliers, its worst case scenario was always better than **V7** (more testing below).
+
+Here is a performance comparison between recent Map versions using 100_000 **(Nat32, Nat32)** entries.
+
+|Structure|Insert|Get|Update|Delete|Delete Desc|Space + Garbage|Space|
+|---|---|---|---|---|---|---|---|
+|V9 Map|100_565_493|31_135_243|32_997_376|93_732_517|91_153_853|6_292_948|2_097_264|
+|V8 Map|78_535_383|54_324_546|73_834_132|109_237_393|93_839_974|8_000_016|5_600_016|
+|V7 Map|78_533_461|27_591_504|37_182_651|66_453_451|64_171_242|18_706_608|3_448_676|
+
+Percentage table, comparing other versions to **V9**.
+
+|Structure|Insert|Get|Update|Delete|Delete Desc|Space + Garbage|Space|
+|---|---|---|---|---|---|---|---|
+|V9 Map|1.000|1.000|1.000|1.000|1.000|1.000|1.000|
+|V8 Map|0.781|1.745|2.238|1.165|1.029|1.271|2.670|
+|V7 Map|0.781|0.886|1.127|0.709|0.704|2.973|1.644|
+
+The next table shows the amount of bytes each map version occupies per single **(Nat32, Nat32)** entry. Both the default GC and incremental GC were tested.
+
+|Structure|Min|Max|Incremental Min|Incremental Max|
+|---|---|---|---|---|
+|V9 Map|16.00|42.66|16.00|42.66|
+|V8 Map|56.00|56.00|64.00|64.00|
+|V7 Map|32.00|63.50|36.00|67.50|
+
+# Upgrade strategy
+
+* Motoko compiler v0.9.8 (or higher) is required for Map **V9**
+* Add **HashUtils** as a second parameter to **pop** and **cycle** methods
+* The **new** method no longer requires **HashUtils** as a first param
+* Migrate all your stable maps using `let newMap = Map_9.fromIter(Map_8.entries(oldMap), Map_9.x_hash)`
+* Custom **HashUtils** no longer needs its third compound `getNullKey` which was a point of misunderstanding for some people (it also no longer requires to exclude **0xffffffff** hash value)
+
+-------------------------
+
+ZenVoich | 2023-09-07 11:32:53 UTC | #13
+
+@ZhenyaUsenko Could you please publish V9 on mops as well?
+
+-------------------------
+
+ZhenyaUsenko | 2023-09-07 14:49:14 UTC | #14
+
+Done. Sorry for the delay
+https://mops.one/map
+
+-------------------------
+
+ZenVoich | 2023-09-07 14:55:35 UTC | #15
+
+Nice, thank you! (min 20 chars)
+
+-------------------------
+
+ZhenyaUsenko | 2023-09-09 11:21:34 UTC | #16
+
+Recently I got some reports about "Map V9 not working"
+
+Therefore, it is important to note that **Motoko compiler v0.9.8 is required** for Map V9
+
+https://github.com/ZhenyaUsenko/motoko-hash-map/issues/9
+
+I'll update **Upgrade strategy** accordingly
+
+-------------------------
+
+ZhenyaUsenko | 2023-09-26 13:14:13 UTC | #17
+
+# **Map** README update
+
+Since its first version, the **Map** library had just a bunch of code example in its README. It was not the easiest way to recognize different aspects of various methods, and even know what's actually in there as the full list of methods was only briefly mentioned in some of the release notes.
+
+Today I am fixing this and providing a comprehensive description of each and every method present in the library, including **Map** interface, **Set** interface, **Iterator** interface and **Hash Utils**.
+
+https://github.com/ZhenyaUsenko/motoko-hash-map
+
+-------------------------
+
+paulous | 2023-11-06 01:03:30 UTC | #18
+
+9v Seems to work since dfx 0.15.
+
+Question: Can or should I pass Map as a prop to other modules. Having issues passing the phash. Maybe I am thinking about it the wrong way and I should just pass what I need as an Array. Thanks 👍
+
+-------------------------
+
+skilesare | 2023-11-06 11:12:24 UTC | #19
+
+Can you post the sample code?  If another module needs an array you can usually dump them with Map.entries, Map.keys, or Map.vals depending on what you need.
+
+-------------------------
+
+paulous | 2023-11-07 00:01:44 UTC | #20
+
+Thanks! that helps. I want to split up my test CRUD app into different modules. Just testing things out. What I can/ can't do. Basically I am just trying to access the map from different modules and just not sure the best way to go about doing that. What you said makes sense and I will try that. Thanks again!
+
+-------------------------
+
+augchan42 | 2024-01-06 14:41:57 UTC | #21
+
+Just wanted to double confirm that this map is stable and has no need for pre/post upgrade functions?  As stable keyword isn't used in the code sample and it's not mentioned prominently except for the Github about.
+
+-------------------------
+
+ZhenyaUsenko | 2024-01-06 14:48:58 UTC | #22
+
+That's correct. **Map** internal structure does not contain any functions (or any other types that are forbidden by **stable** keyword) so you can easily declare it as **stable**. All **stable** variables will persist between upgrades.
+
+-------------------------
+
+augchan42 | 2024-01-06 15:04:02 UTC | #23
+
+This look ok?  It compiled for me
+```
+stable var transactionLog : Map.Map<Nat64, TransactionInfo> = Map.new<Nat64, TransactionInfo>();
+```
+
+I'm on dfx 0.15.2
+
+-------------------------
+

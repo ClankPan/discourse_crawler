@@ -1,0 +1,207 @@
+NS01 | 2024-04-12 09:34:30 UTC | #1
+
+Hopefully an easy one to answer - Is there a NNS/ SNS method which lists completed (launched) SNS projects? 
+
+If not it would be really handy to have this as it could help projects automate adding new SNS projects to their apps etc.
+
+-------------------------
+
+peterparker | 2024-04-12 11:19:01 UTC | #2
+
+The SNS aggregator, a canister controlled by NNS, provides those certified information: https://3r4gx-wqaaa-aaaaq-aaaia-cai.icp0.io/
+
+The NNS dapp uses it at runtime, and I use it in [proposals.network](https://proposals.network/) (and soon in Oisy Wallet 🤫) at build time to create a JSON file of the projects that have been launched. This reminds me that I should review this process because the resulting JSON file is 1 MB, and I actually only need the IDs and names—thanks for the reminder.
+
+A few months ago, I provided a PR to improve the documentation on the landing page of the SNS aggregator (landing code is [here](https://github.com/dfinity/nns-dapp/blob/main/rs/sns_aggregator/src/index.html)), but it has never been proposed to mainnet. So, here's the code (before I shrink it) I used in [proposals.network repo](https://github.com/peterpeterparker/proposals.network):
+
+```
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const AGGREGATOR_PAGE_SIZE = 10;
+const SNS_AGGREGATOR_CANISTER_URL = 'https://3r4gx-wqaaa-aaaaq-aaaia-cai.icp0.io';
+const AGGREGATOR_CANISTER_VERSION = 'v1';
+
+const AGGREGATOR_URL = `${SNS_AGGREGATOR_CANISTER_URL}/${AGGREGATOR_CANISTER_VERSION}/sns`;
+
+const DATA_FOLDER = join(process.cwd(), 'src', 'lib', 'data');
+const STATIC_FOLDER = join(process.cwd(), 'static', 'logo', 'snses');
+
+if (!existsSync(DATA_FOLDER)) {
+	mkdirSync(DATA_FOLDER, { recursive: true });
+}
+
+if (!existsSync(STATIC_FOLDER)) {
+	mkdirSync(STATIC_FOLDER, { recursive: true });
+}
+
+const aggregatorPageUrl = (page) => `list/page/${page}/slow.json`;
+
+const querySnsAggregator = async (page = 0) => {
+	const response = await fetch(`${AGGREGATOR_URL}/${aggregatorPageUrl(page)}`);
+
+	if (!response.ok) {
+		// If the error is after the first page, is because there are no more pages it fails
+		if (page > 0) {
+			return [];
+		}
+
+		throw new Error('Error loading SNS projects from aggregator canister');
+	}
+
+	const data = await response.json();
+
+	if (data.length === AGGREGATOR_PAGE_SIZE) {
+		const nextPageData = await querySnsAggregator(page + 1);
+		return [...data, ...nextPageData];
+	}
+
+	return data;
+};
+
+const saveLogos = async (snses) => {
+	const logos = snses.map(({ canister_ids: { root_canister_id, governance_canister_id } }) => ({
+		logoUrl: `${AGGREGATOR_URL}/root/${root_canister_id}/logo.png`,
+		rootCanisterId: root_canister_id,
+		governanceCanisterId: governance_canister_id
+	}));
+
+	const downloadLogo = async ({ logoUrl, governanceCanisterId }) => {
+		const response = await fetch(logoUrl);
+
+		if (!response.ok) {
+			throw new Error(`Error unable to download logo ${logoUrl}`);
+		}
+
+		const blob = await response.blob();
+
+		writeFileSync(
+			join(STATIC_FOLDER, `${governanceCanisterId}.png`),
+			Buffer.from(await blob.arrayBuffer())
+		);
+	};
+
+	await Promise.all(logos.map(downloadLogo));
+};
+
+export const findSnses = async () => {
+	try {
+		const data = await querySnsAggregator();
+
+		// 3 === Committed
+		const snses = data.filter(
+			({
+				swap_state: {
+					swap: { lifecycle }
+				}
+			}) => lifecycle === 3
+		);
+
+		writeFileSync(join(DATA_FOLDER, 'snses.json'), JSON.stringify(snses));
+
+		await saveLogos(snses);
+	} catch (err) {
+		throw new Error('Error querying Snses', err);
+	}
+};
+
+await findSnses();
+```
+
+Side note about icons:
+
+In addition to extracting JSON information, the above scripts also generate the icons of the SNSes. The SNS Aggregator exposes these icons, and they are used in the NNS dapp. However, they do not implement Certification v2, so they aren’t cached. By copying and deploying these icons with my project, I can set HTTP headers, as this is supported by Juno.
+
+Using a logo directly from the SNS aggregator looks like: https://3r4gx-wqaaa-aaaaq-aaaia-cai.icp0.io/v1/sns/root/3e3x2-xyaaa-aaaaq-aaalq-cai/logo.png
+
+Update:
+
+I have updated the code in proposals.network to trim the JSON data. Above code snippet is the original code to extract all information.
+
+-------------------------
+
+NS01 | 2024-04-12 13:56:08 UTC | #3
+
+Awesome - I'll have to buy you a beer if I'm ever over your way!
+
+-------------------------
+
+peterparker | 2024-04-12 14:51:04 UTC | #4
+
+Haha, with pleasure!
+
+![Shaun Of The Dead Simon Pegg GIF - Shaun Of The Dead Simon Pegg Nick Frost - Discover & Share GIFs](upload://3pIKMC4Hs3hy0yvrpJkbdtZUQ8q.gif)
+
+-------------------------
+
+skilesare | 2024-04-12 19:49:23 UTC | #5
+
+[quote="peterparker, post:2, topic:29615"]
+`querySnsAggregator`
+[/quote]
+
+Do you know if this has standard candid endpoints to retrieve this data from another canister?
+
+-------------------------
+
+peterparker | 2024-04-12 20:04:30 UTC | #6
+
+Don't think so at the moment according [dashboard](https://dashboard.internetcomputer.org/canister/3r4gx-wqaaa-aaaaq-aaaia-cai) but I guess that if there is a use case, the request can be forwarded to the team.
+
+That said, with Candid, you should be able to call the SNS Wasm canister to get the list of SNSes and then call each canister to get their information. This is essentially what the aggregator does periodically to aggregate the data (my understanding). Just lots of calls.
+
+-------------------------
+
+NS01 | 2024-04-12 21:07:52 UTC | #7
+
+[quote="peterparker, post:6, topic:29615"]
+SNS Wasm canister
+[/quote]
+
+Do you have the canister ID for this.. and any secret way of finding other cool NNS/ ICP canisters. I thought I had most of them but never heard of this one.
+
+-------------------------
+
+Dylan | 2024-04-12 21:26:44 UTC | #8
+
+[quote="NS01, post:7, topic:29615"]
+Do you have the canister ID for this… and any secret way of finding other cool NNS/ ICP canisters.
+[/quote]
+
+You can scroll to the bottom of the [NNS Subnet page](https://dashboard.internetcomputer.org/subnet/tdb26-jop6k-aogll-7ltgs-eruif-6kk7m-qpktf-gdiqx-mxtrf-vb5e6-eqe?ca-s=25) on the ICP Dashboard and find a list of its canisters, which includes the SNS-WASM Canister.
+
+-------------------------
+
+peterparker | 2024-04-13 06:23:50 UTC | #9
+
+Thanks @Dylan for the answer. I can also add that the process I described above is implemented in `@dfinity/sns-js` if you use the [initSnsWrapper](https://github.com/dfinity/ic-js/tree/main/packages/sns#explorative-way) function.
+
+```
+import { createAgent } from "@dfinity/utils";
+import { initSnsWrapper } from "@dfinity/sns";
+
+const agent = await createAgent({
+  identity,
+  host: HOST,
+});
+
+const snsWrapper = await initSnsWrapper({
+  rootOptions: {
+    canisterId: rootCanisterId,
+  },
+  agent,
+  certified,
+});
+
+const { metadata, swapState } = wrapper;
+const [data, token] = await metadata({});
+
+console.log("Sns:", data, token, swapState);
+```
+
+You can find the implementation of this "explorative" way there: [https://github.com/dfinity/ic-js/blob/d4e1a709490d9c77820f3835a7367008030c8468/packages/sns/src/sns.ts#L33](https://github.com/dfinity/ic-js/blob/d4e1a709490d9c77820f3835a7367008030c8468/packages/sns/src/sns.ts#L33)
+
+This was the original method for the NNS dapp to load the SNSes information, but given that it required a significant load, particularly when the information was fetched using a query+update strategy for security reasons, it was decided to create the SNS aggregator. This provides the information through certified queries, which less resource-intensive for the consumer and also faster.
+
+-------------------------
+

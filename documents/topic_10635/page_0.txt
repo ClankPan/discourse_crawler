@@ -1,0 +1,1082 @@
+ulan | 2022-02-18 16:27:14 UTC | #1
+
+# Summary
+
+Currently, the amount of computation a smart contract can perform per WebAssembly call is limited by the block time. Deterministic time slicing allows for long(er) running, multi-round computations by suspending the execution of an update message at the end of one round and resuming it later.
+
+# Status
+
+Discussing
+
+# Key people involved
+
+[Andriy Berestovskyy](mailto:andriy.berestovskyy@dfinity.org) (@berestovskyy), [Bogdan Warinschi](mailto:bogdan.warinschi@dfinity.org) (@bogwar), [Ulan Degenbaev](mailto:ulan.degenbaev@dfinity.org)(@ulan).
+
+# Timeline
+
+[x] 1-pager posted on the forum for review: February 2, 2022.
+[] Community Conversation: TBD.
+[] NNS Motion Proposal (to approve design + project): TBD
+[] If the NNS Motion Proposal passes, implementation and deployment would take a few months: April 2022.
+
+# Objective
+
+The current implementation of the Internet Computer (IC) does not support multi-round WebAssembly execution. In other words, if a WebAssembly function starts executing in one round, then its execution must finish before the next round can start. This introduces a trade-off between the fast finality and the amount of work a smart contract can do in a single update message execution.
+
+To ensure fast finality, IC imposes a limit on the number of instructions per WebAssembly call. If the limit is exceeded, then the execution traps with an error:
+`Canister <id> exceeded the cycles limit for single message execution`.
+
+The problem is that the existing limit is not sufficient in some important cases:
+
+* Pre- and post-upgrade hooks of smart contracts. They potentially serialize and deserialize the entire Wasm memory.
+* Garbage collection in Motoko smart contracts. The garbage collection potentially touches every byte of the Wasm memory.
+
+Besides these cases, a smart contract may need to perform other long-running computations specific to its domain.
+
+The goal of this project is to fix the problem by supporting multi-round WebAssembly execution of update messages. Note that supporting long-running query messages is out of scope of this proposal.
+
+# Proposal
+
+The proposal is to implement *deterministic time slicing* (DTS) – a mechanism that automatically suspends WebAssembly execution when it reaches the per-round instruction limit and resumes the execution in a subsequent round. The mechanism should be transparent to the smart contract and the developers, such that pausing and resuming are not observable. Specifically, DTS should guarantee atomicity and isolation of a long-running execution:
+
+* **atomicity**: if an error occurs in any chunk of the execution, then the smart contract rolls back to the state before the entire execution has started.
+* **isolation**: other update messages do not run until the entire execution completes. Queries may be executed concurrently, but they must use the state before the execution has started.
+
+![\ 610x285](upload://q4LHhNJHAZGpqNCTn8CvmYPAOmG.png)
+*Figure 1. Pausing and resuming WebAssembly execution in the sandbox process.*
+
+# Developer experience
+
+The main observable effect of DTS is increased instruction limit per WebAssembly execution. Many messages that currently fail due to the instruction limit error, will succeed once DTS is implemented. Developers do not need to take any actions to benefit from DTS.
+
+The initial implementation will gradually increase the instruction limit by 10-50 times. Thus allowing a single message execution to span up to 50 rounds. Multi-round executions will likely have a small performance and memory overhead, which will be reflected in the execution fees. The performance and the costs of single-round messages will not be affected.
+
+As a consequence, the cost of infinite-loop bugs will increase by 50x. One of the follow-up features being considered is to allow developers to lower the instruction limit per method if they know the upper bound and want to guard against the infinite-loop bugs.
+
+# Implementation
+
+The initial implementation is estimated to take about 4 SWE-months. Most of the changes will be in the execution layer of IC. The main risks and challenges:
+
+* Multi-round messages will likely have higher performance and memory overhead.
+* The message scheduler needs to support multi-round messages while preserving the compute allocation and fairness guarantees.
+* Pausing and resuming mechanism may increase complexity of the IC.
+
+-------------------------
+
+skilesare | 2022-02-02 12:42:26 UTC | #2
+
+This is a huge feature and will personally allow me to shift a significant amount of focus to other things.
+
+I wish that I'd be able to specify which functions I'd like to have this property at run time so that I don't have massive costs overruns due to infinite loop bugs.  Much like method upgrading, it can always call the LONGUPDATE if UPDATE fails and most of the time my client will know if it should call LONGUPDATE in the first place.
+
+-------------------------
+
+senior.joinu | 2022-02-02 13:19:44 UTC | #3
+
+This is indeed a very huge feature and I would love to see it implemented.
+
+But I have a couple of questions:
+1. As far as I understand, these long-running updates will be executed one-by-one according to the consensus. This means, that a single update call would occupy a canister for up to 50 consensus ticks (~100 sec) with no other update message (including async responses) being executed within this time window. For some frequently used canisters this could lead to message queue overflow. What is the plan for such scenarios?
+2. How does this proposal connects to Multi-threading proposal?
+
+Thanks in advance!
+
+-------------------------
+
+ComputerInternetMan | 2022-02-02 14:33:31 UTC | #4
+
+Feels analogous to how we built telephony. Will have a big impact in how we can implement Rust and interconnect. Mission-critical for Iridium.
+
+-------------------------
+
+berestovskyy | 2022-02-02 21:30:37 UTC | #5
+
+@skilesare  
+1. Once this feature is implemented, the message limits will be increasing gradually, i.e. from 5B to 10B, then to 50B etc. So no worries about infinite loop bills 😉
+2. Later, the runtime per-message instruction limits are planned, but it's part of another feature.
+
+@senior.joinu 
+1. You're totally right, no other updates will be scheduled until the long-running execution is complete, but queries will run. Scaling Canisters horizontally might be the way, but it's a big change from the dev (or IC) perspective.
+2. I have no details about multi-threading proposal, maybe @ulan knows? Sounds like a challenge to me, as multithreading is usually non-deterministic... 😢
+
+-------------------------
+
+ulan | 2022-02-03 17:00:07 UTC | #6
+
+Thanks all for showing the support!
+
++1 to @berestovskyy's reply. To add more details:
+
+>I wish that I’d be able to specify which functions I’d like to have this property at run time so that I don’t have massive costs overruns due to infinite loop bugs. 
+
+This is one of the features we are considering to work on after the initial implementation of DTS.
+
+> 1. How does this proposal connects to Multi-threading proposal?
+
+DTS is orthogonal to multi-threading as in having DTS wouldn't make multi-threading easier or harder.
+
+-------------------------
+
+pattad | 2022-02-16 16:36:53 UTC | #7
+
+Looks like a super important feature to me!
+
+-------------------------
+
+lastmjs | 2022-02-18 02:11:31 UTC | #8
+
+Does this affect queries and updates identically? Why do query calls have an execution limit, and why would DTS allow us to increase it?
+
+-------------------------
+
+ulan | 2022-02-18 10:30:02 UTC | #9
+
+> Does this affect queries and updates identically?
+
+DTS will not apply to queries and queries will keep the existing limit. 
+
+The main motivation for having an instruction limit for queries is to bound the resource consumption. That's because queries run concurrently to update messages and do not block the progress of IC. Each query keeps a reference to the corresponding replicated state when the query started. If we allow long-running queries, then we may get into a situation where IC has executed many rounds while the query is still running and keeping a very old state in memory. (This is a similar concern that block inter-canister query calls: https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/44)
+
+-------------------------
+
+lastmjs | 2022-02-18 16:16:11 UTC | #10
+
+[quote="ulan, post:1, topic:10635"]
+Currently, the amount of computation a smart contract can perform per WebAssembly call is limited by the block time. Deterministic time slicing allows for long(er) running, multi-round computations by suspending the execution at the end of one round and resuming it later.
+[/quote]
+
+This is a bit confusing, because a smart contract performs computations in query calls as well as update calls. This proposal doesn't readily explain that the computational limits are only being increased for update computation.
+
+I just want to point out that increasing the cycle limit for query calls could also be very important.
+
+-------------------------
+
+ulan | 2022-02-18 16:27:48 UTC | #11
+
+Good point. I added "update messages" and a clarifying sentence about queries not being supported.
+
+-------------------------
+
+jzxchiang | 2022-02-19 17:28:06 UTC | #12
+
+Are these limits present in the local replica? Or do they only show up on mainnet?
+
+-------------------------
+
+akhilesh.singhania | 2022-02-21 13:21:56 UTC | #13
+
+[quote="jzxchiang, post:12, topic:10635, full:true"]
+Are these limits present in the local replica? Or do they only show up on mainnet?
+[/quote]
+
+The same limits are present in the local replica.  This is very much intentional to allow developers to develop canisters under mainnet conditions.
+
+[quote="lastmjs, post:10, topic:10635"]
+I just want to point out that increasing the cycle limit for query calls could also be very important.
+[/quote]
+
+Agreed!  Our assessment is that increasing the limit for update calls is more urgent.  Increasing the limit for query calls will require a different set of optimisations to be performed and different design considerations.  Would definitely be worth digging into this in future.
+
+-------------------------
+
+senior.joinu | 2022-02-22 14:59:31 UTC | #14
+
+I was thinking...
+If this feature is implemented, it means that there is no more reason for a consensus timer to tick every 2 seconds. Since any computation can be split into slices and execute during several blocks, there is no need to wait so much time. Moreover it is now more preferable to process more blocks during the same time interval, because it will result in faster total execution time for some cases.
+
+Do you guys consider lowering the consensus interval? Is the current consensus interval dictated by the network latency (and there is no way to lower it) or it is artificial and you can affect it that way?
+
+-------------------------
+
+ulan | 2022-02-25 15:53:54 UTC | #15
+
+I am not an expert in consensus, but I think the block rate is set mainly based on the estimated network latency between any two nodes. See "5.9 Delay functions" in https://dfinity.org/whitepaper.pdf
+
+DTS will probably help in making the block rate more stable (i.e. ensuring that the block rate doesn't drop because of slow execution).
+
+-------------------------
+
+skilesare | 2022-02-25 21:06:38 UTC | #16
+
+[quote="akhilesh.singhania, post:13, topic:10635"]
+The same limits are present in the local replica. This is very much intentional to allow developers to develop canisters under mainnet conditions.
+[/quote]
+
+Is this new? I’ve been fighting with the fact that the local replica doesn’t have cycle simulation for months. This is great news if we now have cycle simulation on the local replica.
+
+-------------------------
+
+akhilesh.singhania | 2022-02-28 13:44:16 UTC | #17
+
+Cycles and instructions are two different things.  We do not have cycles simulation on the local replica.  We have instruction simulation though.  Instruction simulation is putting limits on how long a message can execute for.  Cycles simulation is actually paying for resources that a canister is using.
+
+-------------------------
+
+skilesare | 2022-02-28 13:51:19 UTC | #18
+
+I regularly have functions that work fine on the local replica and hit a limit in production. Is there a switch  to turn this on?
+
+-------------------------
+
+jzxchiang | 2022-03-01 01:45:19 UTC | #19
+
+I think the confusion also stems from the wording...
+
+> To ensure fast finality, IC imposes a limit on the number of instructions per WebAssembly call. If the limit is exceeded, then the execution traps with an error:
+`Canister <id> exceeded the cycles limit for single message execution.`
+
+Shouldn't the error message say "exceeded the instruction limit"?
+
+-------------------------
+
+ulan | 2022-03-01 08:42:49 UTC | #20
+
+@akhilesh.singhania: doesn't `dfx` use the configuration of the system subnet by default, which has much higher instructions limits? I heard that there was a feature request to add a flag to use the application subnet configuration, but don't know whether it materialized or not.
+
+>Shouldn’t the error message say “exceeded the instruction limit”?
+
+Good point! I'll prepare a fix for this message.
+
+-------------------------
+
+akhilesh.singhania | 2022-03-01 09:16:34 UTC | #21
+
+[quote="ulan, post:20, topic:10635"]
+@akhilesh.singhania: doesn’t `dfx` use the configuration of the system subnet by default, which has much higher instructions limits? I heard that there was a feature request to add a flag to use the application subnet configuration, but don’t know whether it materialized or not.
+[/quote]
+
+Good catch Ulan!  Yes, this is why @skilesare is seeing the problem he reported above.  We should really try to get the local replica to emulate the mainnet as closely as possible.
+
+-------------------------
+
+dymayday | 2022-04-25 19:39:58 UTC | #22
+
+That feature would alleviate a massive pain in the developer experience, so I'm super enthusiast to see it implemented.
+
+Is this still in the pipes ? Any news or update on this ?
+
+-------------------------
+
+ulan | 2022-04-25 20:01:42 UTC | #23
+
+Thanks, it is great to hear that the feature will be useful! We are implementing it and hoping to get the initial prototype around end of May/June.
+
+-------------------------
+
+icme | 2022-08-14 11:09:57 UTC | #24
+
+Just wanted to check back in regarding the progress on the Deterministic Time Slicing feature.
+
+I've been load testing insertion into several data structures recently (Buffer, HashMap, RBTree), all of which seem to start hitting the message instruction limit on canisters much earlier than their heap capacity, regardless of their insertion runtimes ( i.e. O(1) vs. O(log(n) ).
+
+I'd be interested in further testing out how these data structures perform as they scale within canisters, and DTS would be key in doing so.
+
+Just curious @ulan or @dieter.sommer - is some variant of Deterministic Time Slicing enabled for the bitcoin integration project, or are all update types of transactions/operations able to be completed over a single round of consensus?
+
+-------------------------
+
+ulan | 2022-08-15 06:46:21 UTC | #25
+
+The implementation of DTS is close to completion. We hope to merge the main remaining changes in 1-2 weeks. After that we need to do stress testing to ensure that we didn't not miss anything. Once that's done I'll update this thread and give a more concrete timeline for shipping. 
+
+> (Buffer, HashMap, RBTree) all of which seem to start hitting the message instruction limit on canisters much earlier than their heap capacity, regardless of their insertion runtimes
+
+That is expected for `HashMap` because it occasionally copies the entire backing store in `O(n)` time, but  the result for `RBTree` is surprising because it should have the worst case runtime of `O(m * log(n))` where `m` is the number of operations and `n` is the number of elements.  As long as `m` is not large for each message (e.g. doesn't exceed 10^6), I would expect it to not hit the instruction limit.
+
+> is some variant of Deterministic Time Slicing enabled for the bitcoin integration project, or are all update types of transactions/operations able to be completed over a single round of consensus?
+
+AFAIK @ielashi has carefully designed the operations to not exceed a single round.
+
+-------------------------
+
+ielashi | 2022-08-15 08:56:49 UTC | #26
+
+[quote="icme, post:24, topic:10635"]
+Just curious @ulan or @dieter.sommer - is some variant of Deterministic Time Slicing enabled for the bitcoin integration project, or are all update types of transactions/operations able to be completed over a single round of consensus?
+[/quote]
+
+At the moment, the Bitcoin API is implemented in the replica, which means we're not subject to the same cycles limitation as Wasm canisters. We've added some measures so we don't spend too much time on execution within the round, however these measures are rather crude.
+
+We're now in the process of migrating the Bitcoin API into a wasm canister, and there we'll be subject to the same cycles limitation as all other canisters. Some computations like block ingestion do require a lot of cycles, even more than what DTS will initially support, and for that we'll be implementing a simple slicing logic within the canister to stay within the cycles limit.
+
+-------------------------
+
+icme | 2022-08-15 14:36:42 UTC | #27
+
+[quote="ulan, post:25, topic:10635"]
+The implementation of DTS is close to completion. We hope to merge the main remaining changes in 1-2 weeks. After that we need to do stress testing to ensure that we didn’t not miss anything. Once that’s done I’ll update this thread and give a more concrete timeline for shipping.
+[/quote]
+
+Great to hear, thanks for the update!
+
+[quote="ielashi, post:26, topic:10635"]
+Some computations like block ingestion do require a lot of cycles, even more than what DTS will initially support, and for that we’ll be implementing a simple slicing logic within the canister to stay within the cycles limit
+[/quote]
+
+How many rounds of consensus and cycles do you see some of these operations taking?
+
+Also, would love to hear a bit more about the strategies/techniques behind what this simple slicing logic looks like - is it implemented on the replica level or directly in the API (in a way that is currently accessible to IC developers)?
+
+-------------------------
+
+ielashi | 2022-08-16 06:48:31 UTC | #28
+
+[quote="icme, post:27, topic:10635"]
+How many rounds of consensus and cycles do you see some of these operations taking?
+[/quote]
+
+I have seen some large blocks take up to 385B instructions to be ingested. With a 5B instruction limit, that translates to ~77 execution rounds. A large block can have tens of thousands of inputs/outputs, which translates to tens of thousands of insert/remove operations on our `StableBTreeMap` data structures. These numbers are using the code that we have in the replica as-is. I expect there would be some low-hanging optimizations that would help reduce the required number of instructions.
+
+> Also, would love to hear a bit more about the strategies/techniques behind what this simple slicing logic looks like - is it implemented on the replica level or directly in the API (in a way that is currently accessible to IC developers)?
+
+We'll be adding the slicing logic in the canister itself. It hasn't been written yet, but it'll be highly specific to the case of block ingestion, so it's unfortunately not something that can be packaged up and used elsewhere. I'll share pointers to the slicing code as soon as its available.
+
+On the API level, you may have noticed we added pagination to our `get_utxos` endpoint, which was one way we were able to stay within the instructions limit for these requests.
+
+-------------------------
+
+ulan | 2022-09-10 08:01:24 UTC | #29
+
+**Quick update**: we are aiming to enable deterministic time slicing on master in the week of September 19th and to roll it out to the mainnet in the subsequent week.
+
+-------------------------
+
+jzxchiang | 2022-09-16 01:02:18 UTC | #30
+
+Do you mind sharing the GitHub PR and/or the "Bless Replica Version" NNS proposal when they become available? This is quite an important feature. Thanks!
+
+-------------------------
+
+ulan | 2022-09-20 15:26:54 UTC | #31
+
+> Do you mind sharing the GitHub PR and/or the “Bless Replica Version” NNS proposal when they become available?
+
+Absolutely! I'll share the PR and the proposal. We are currently fixing two blockers that may delay the launch a bit.
+
+-------------------------
+
+ulan | 2022-09-28 14:35:14 UTC | #32
+
+> We are currently fixing two blockers that may delay the launch a bit.
+
+One of these blockers turned out to be more tricky than we thought. We are still working on it.
+
+-------------------------
+
+icme | 2022-09-28 17:02:49 UTC | #33
+
+Are any of the blockers something that the community can give input on/or help with in an advisory capacity?
+
+-------------------------
+
+ulan | 2022-09-29 14:34:17 UTC | #34
+
+Thanks for the offer! It is more of an implementation issue about how to ensure correctness of DTS state in certain cases. We have an idea on how to solve and are currently implementing it.
+
+-------------------------
+
+lastmjs | 2022-09-30 14:15:18 UTC | #35
+
+Never give up, never surrender! You're doing such excellent work
+
+-------------------------
+
+ulan | 2022-10-18 16:15:20 UTC | #36
+
+We fixed the blocker and will be incrementally rolling out DTS in the following weeks.
+
+The version that enables DTS for `install_code` messages will be deployed on `k44fs` [[proposal to elect a replica binary](https://dashboard.internetcomputer.org/proposal/86738), [proposal to update k44fs](https://dashboard.internetcomputer.org/proposal/86939)].
+
+-------------------------
+
+icme | 2022-10-18 21:09:36 UTC | #37
+
+Awesome news!
+
+@ulan Is it possible to set limits on DTS (i.e. the rounds of consensus it takes to process a message) for specific APIs as a cycle-drain/DDOS prevention mechanism? For example, I'd like to say that this API can span a maximum of 5 rounds of consensus before failing/trapping (instead of using up all 50 rounds worth of cycles).
+
+
+@Severin any ETA on when DTS might be included in dfx (for local testing purposes)? Also, will we be able to profile how many rounds of consensus it takes to process a specific update call?
+
+-------------------------
+
+Severin | 2022-10-19 08:31:56 UTC | #38
+
+[quote="icme, post:37, topic:10635"]
+ETA on when DTS might be included in dfx (for local testing purposes)?
+[/quote]
+
+We plan a new 0.12.0 beta release next week. <s>I'll try to get it in there.</s> EDIT: Managed to update the replica without any problems ([PR](https://github.com/dfinity/sdk/pull/2702)). The DTS-enabled replica will be included in the next beta release!
+
+[quote="icme, post:37, topic:10635"]
+will we be able to profile how many rounds of consensus it takes to process a specific update call?
+[/quote]
+No special tooling that I'm aware of. @ulan any chance you know about something?
+
+-------------------------
+
+ulan | 2022-10-19 08:40:49 UTC | #39
+
+@icme: We are rolling out DTS slowly to make sure we don't introduce regressions.
+
+The plan is:
+* Roll out DTS for `install_code` messages keeping the instruction limit the same but slicing it into multiple rounds (because `install_code` messages already have large limits).
+* Roll out DTS for update calls and responses increasing the instruction limit by 2x.
+
+If that goes well, we will increase the limits more. The final values of the limits are to be defined.
+
+Note that we are not planning to support DTS for queries and heartbeats because they are expected to be short-running. If heartbeat needs to do a long-running computation, then it can make a self-call, which will be an update message and will run with DTS.
+
+> Is it possible to set limits on DTS (i.e. the rounds of consensus it takes to process a message) for specific APIs as a cycle-drain/DDOS prevention mechanism?
+
+Right now it is not possible, but we are discussing a canister settings parameter that would allow the controller to set a lower limit that would apply to all methods of the canister. Would that work in your use case?
+
+Supporting individual limits per Wasm methods seems difficult due to the performance and memory overhead because of the need to parse and store this information for each canister.
+
+> No special tooling that I’m aware of. @ulan any chance you know about something?
+
+The `ic0.performance_counter()` would be a way to infer that. Dividing that number by the slice size in instructions would give the number of rounds. The slice size is defined in the replica and is currently set to 2B (it may change though if we find that other values work better).
+
+-------------------------
+
+icme | 2022-10-19 17:45:57 UTC | #40
+
+[quote="ulan, post:39, topic:10635"]
+> Is it possible to set limits on DTS (i.e. the rounds of consensus it takes to process a message) for specific APIs as a cycle-drain/DDOS prevention mechanism?
+
+Right now it is not possible, but we are discussing a canister settings parameter that would allow the controller to set a lower limit that would apply to all methods of the canister. Would that work in your use case?
+
+Supporting individual limits per Wasm methods seems difficult due to the performance and memory overhead because of the need to parse and store this information for each canister.
+[/quote]
+
+For the most part, a global canister setting to set a lower limit should be fine:
+
+One use cases that I can thing of off the top of my head as to why I'd want something like this:
+
+1) To run a daily sync or job that performs some sort of MapReduce across much of the data in the canister. I'd like for this job to be able to span multiple rounds of consensus, but maybe I don't want just any update call to be able to span multiple rounds of consensus.
+
+2) Based on the size of the data structure and/or any GC required (i.e. in Motoko), some calls that access or modify large data structures (i.e. insert/delete in a BTree) will periodically need to span multiple rounds of consensus if the operation is inefficient (i.e. scan + filter) or the GC is invoked. For these APIs, I'd like to give them permission to span multiple rounds. <br/>
+However,  for a simple API that sets a more primitive parameter or performs a simple computation there's no reason for this API to span multiple rounds. Maybe this suggests I'm failing to check size limits of my input parameters, or that I have an expensive operation in my code :person_shrugging:
+
+
+I'm not convinced that the per API limits can't just be solved by the developer testing and putting in these checks themselves, but the lower overall canister limit would definitely be useful.
+
+-------------------------
+
+ulan | 2022-10-20 14:37:25 UTC | #41
+
+Thanks! I agree with your conclusion.
+
+A small side note about Motoko GC (or GC in general): a GC in theory may happen in any message that does an allocation. For example, one update message may allocate many objects but do not reach the threshold for triggering GC. Then the next update message may allocate a single object and go over the threshold and trigger GC.
+
+-------------------------
+
+icme | 2022-11-01 10:09:30 UTC | #42
+
+[quote="ulan, post:39, topic:10635"]
+Roll out DTS for update calls and responses increasing the instruction limit by 2x.
+[/quote]
+
+For reference, both my current (and many Motoko developers’) cases, I think many of us would like to see 4-10x on this limit in order to get around some of the current GC limitations and use as much of the full heap as possible.
+
+-------------------------
+
+ulan | 2022-11-01 12:17:08 UTC | #43
+
+Thanks, that matches our experiments with Motoko GC. The plan is to get some coverage for the 2x limit. If everything is okay, then we will gradually increase the limit to ca. 30B - 50B instructions (6x-10x of the current limit).
+
+The 2x increase is being rolled out to all subnets this week, btw.
+The install_code DTS has already been rolled out to all subnets without issues.
+
+-------------------------
+
+ulan | 2022-11-01 12:29:55 UTC | #44
+
+I'll give an update on DTS in the upcoming session of Monthly Global R&D tomorrow.
+
+-------------------------
+
+lastmjs | 2022-11-01 12:55:22 UTC | #45
+
+Could we discuss more why we wouldn't want DTS for queries? For example, imagine a database doing queries. Those could be complex and take a little bit. I hit the instruction limit various times when developing Sudograph Beta (very unoptimized queries, but still).
+
+-------------------------
+
+ulan | 2022-11-01 13:37:52 UTC | #46
+
+If there are use cases and user demand for slow queries, then we can add DTS for queries. I wasn't aware of such use cases and my intuition was that queries are short-running.
+
+If we decide to add DTS for queries, then we probably also need some way of charging for queries because long-running execution will consume CPU/memory resources.
+
+-------------------------
+
+lastmjs | 2022-11-01 13:41:10 UTC | #47
+
+I think it's reasonable that complex database queries will run into the cycle limits relatively easily, but I don't have hard data on an optimized DB solution. I imagine this will be the case though, if I had to make my best guess.
+
+-------------------------
+
+Manu | 2022-11-01 13:41:11 UTC | #48
+
+I agree that it would be nice to be charging for queries before we allow for long running queries, but it is a bit odd if we don't immediately allow long queries, because then some messages would work in replicated mode but not in query mode right?
+
+-------------------------
+
+ulan | 2022-11-01 13:54:35 UTC | #49
+
+> it is a bit odd if we don’t immediately allow long queries, because then some messages would work in replicated mode but not in query mode right
+
+No, it is consistent. A query method both in replicated and non-replicated mode has the same non-DTS instruction limit of 5B instructions. In other words, running query as update, doesn't activate DTS for it.
+
+Update methods run with DTS.
+
+-------------------------
+
+ulan | 2022-11-01 13:57:42 UTC | #50
+
+Maybe I misunderstood you. I guess you meant that if we take the same function `foo()` and put it inside a query method, then it will run out of instructions. But it we put it inside an update method, then it might succeed? If so, then yes. There is inconsistency.
+
+-------------------------
+
+Manu | 2022-11-01 16:06:50 UTC | #51
+
+Ah makes sense, no your first comment answered my question.
+
+-------------------------
+
+icme | 2022-11-22 18:10:53 UTC | #52
+
+Hey :wave: , just checking in on this feature - are we currently at 2X increase on DTS?
+
+What does the timeline look like for getting to 6-10X on this feature?
+
+(asking on behalf of a few eager Motoko devs) :sweat_smile:
+
+-------------------------
+
+ulan | 2022-11-23 09:41:55 UTC | #53
+
+Hi @icme! 
+
+Yes, we are currently at 2x limit. DTS looks good so far in production, so I think we could go to 6x relatively quickly: in a couple of replica versions.
+
+There is one non-technical issue that we discovered with Motoko that needs to be resolved before we go to 6x.
+
+The issue is out-of-memory handling in Motoko. Currently the low instruction limit for updates acts as a safeguard against Motoko canisters hitting the hard 4GB limit. When the memory usage of a Motoko canister increases and reaches 1-2GB, then update messages start failing with out-of-instructions errors. At that point upgrading the canister is still possible (because upgrade messages have higher instruction limit), so the owner of the canister can salvage the canister and its data by upgrading it to a new version that uses less memory.
+
+With the 6x DTS, the canister will be able to grow to 4GB with update messages. Once the canister reaches 4GB and updates start failing due to out-of-memory, then upgrades will also fail. This means that the canister becomes stuck without any fix.
+
+I have an idea to solve this problem by introducing a "freezing threshold" for memory. It would be a canister settings parameter with the default value of 3GB. When the canister reaches that limit, then updates start failing, but upgrades continue to work. The owner of the canister would be able to increase or decrease the parameter.
+
+-------------------------
+
+icme | 2022-11-23 20:17:24 UTC | #54
+
+
+
+[quote="ulan, post:53, topic:10635"]
+Yes, we are currently at 2x limit. DTS looks good so far in production, so I think we could go to 6x relatively quickly: in a couple of replica versions.
+[/quote]
+
+This is awesome @ulan  :tada: thanks for the update - can't wait to test it out!
+
+[quote="ulan, post:53, topic:10635"]
+Once the canister reaches 4GB and updates start failing due to out-of-memory, then upgrades will also fail. This means that the canister becomes stuck without any fix.
+[/quote]
+
+Just to be clear, this memory limit is because of overflowing the heap/main memory, and is different than the upgrades failing due to upgrade cycles limitations, correct? I believe streaming serialization was implemented (see @claudio's comment in link) that allows very close to (slightly less than) 4GB of heap memory to be serialized to stable memory during upgrades.
+
+https://forum.dfinity.org/t/so-is-the-actual-storage-we-can-use-in-one-canister-2gb-at-most-due-to-upgrades/12623/4
+
+
+Also, with respect to the "freezing threshold" idea
+
+[quote="ulan, post:53, topic:10635"]
+I have an idea to solve this problem by introducing a “freezing threshold” for memory. It would be a canister settings parameter with the default value of 3GB. When the canister reaches that limit, then updates start failing, but upgrades continue to work. The owner of the canister would be able to increase or decrease the parameter.
+[/quote]
+
+I think it would be great if this would be a system func "hook" that a canister developer could tie into and trigger an action once this threshold is hit.
+
+With CanDB I'm doing something similar (but not implemented at the language/system level obviously). I currently have two fixed limits that are lower than the 4GB heap limits. These limits are:
+1. An `INSERT_THRESHOLD`, after which no new items can be inserted
+2. An `UPDATE_THRESHOLD`, after which no new items can be modified (i.e prevents a user from appending to the attribute metadata associated with a record)
+
+I use these thresholds to both trigger auto-scaling actions as well as to permit or reject additional inserts/updates to the CanDB data store in a canister.
+
+-------------------------
+
+icme | 2022-11-23 23:11:09 UTC | #55
+
+Based on some initial tests, I found that 2X DTS was able to push heap memory to roughly 2X its previous limits before hitting the GC. Big improvement - and looking forwards to 6X DTS.
+
+This was pre-DTS
+![Screen Shot 2022-11-22 at 10.19.52|549x374](upload://fz7Jgb3nbPgtBUxvIiUB2Ei8DHD.png)
+
+This is at 2X DTS
+![Screen Shot 2022-11-23 at 14.28.03|690x427](upload://iLPr3UrcETCuDrj4uY2uJKF3mfI.png)
+
+
+Reference: for these tests, I'm just inserting into a `RBTree<Nat, Nat>`.
+
+<br/>
+
+@ulan I think with large blob data and 2X DTS we still might be able to push canisters to grow to 4GB anyways (for example, inserting 1.5-1.9MB chunks), so this 4GB update issue will still exist.
+
+-------------------------
+
+ulan | 2022-11-24 13:29:54 UTC | #56
+
+[quote="icme, post:54, topic:10635"]
+Just to be clear, this memory limit is because of overflowing the heap/main memory, and is different than the upgrades failing due to upgrade cycles limitations, correct?
+[/quote]
+
+Yes, exactly. It is about the memory limit. Streaming serialization allocates a small buffer, which may also fail if the update calls use all the available 4GB memory.
+
+> I think it would be great if this would be a system func “hook” that a canister developer could tie into and trigger an action once this threshold is hit.
+
+That would be some kind of memory pressure callback? I.e. a user defined function is called by the system when the canister's Wasm memory reaches a user-defined threshold. I like the idea. Perhaps, it could be generalized to canister lifecycle callbacks/notification: low cycles notification, low memory notification, execution failure notification, etc.
+
+> With CanDB I’m doing something similar (but not implemented at the language/system level obviously). I currently have two fixed limits that are lower than the 4GB heap limits. 
+
+You're way ahead of many developers that don't think about potential out-of-memory.
+
+> Based on some initial tests, I found that 2X DTS was able to push heap memory to roughly 2X its previous limits before hitting the GC. Big improvement - and looking forwards to 6X DTS.
+
+Thanks for running the test! It's great to see DTS helping.
+
+> I think with large blob data and 2X DTS we still might be able to push canisters to grow to 4GB anyways (for example, inserting 1.5-1.9MB chunks), so this 4GB update issue will still exist.
+
+I agree.
+
+-------------------------
+
+ulan | 2022-12-02 15:13:48 UTC | #57
+
+Small update: we increased the limit to 20B instructions. It will be rolled out to all subnets next week. Further increases are blocked by the memory freezing threshold feature.
+
+-------------------------
+
+ulan | 2022-12-06 09:43:39 UTC | #58
+
+@icme: I learned today that Motoko can sometimes perform GC in a heartbeat. I thought previously that Motoko always calls user function as a separate update message that does GC if needed, but my understanding was incorrect. If your canister has a heartbeat, then it might fail with out-of-instructions.
+
+I'll try implement DTS for heartbeat as soon as possible.
+
+-------------------------
+
+claudio | 2022-12-07 17:36:57 UTC | #59
+
+In the meantime, the Motoko team will try to prepare a release that avoids the GC during heartbeat that users can elect to use by installing from the GitHub release page (without waiting for a release of dfx).
+
+UPDATE: a release, for manual installation, is here:
+https://github.com/dfinity/motoko/releases/tag/0.7.4
+
+-------------------------
+
+skilesare | 2023-01-22 21:35:37 UTC | #60
+
+[quote="ulan, post:57, topic:10635, full:true"]
+Small update: we increased the limit to 20B instructions. It will be rolled out to all subnets next week. Further increases are blocked by the memory freezing threshold feature.
+[/quote]
+
+How's it going?  Any chance of 2x again anytime soon?
+
+-------------------------
+
+ulan | 2023-01-23 13:50:05 UTC | #61
+
+> How’s it going? Any chance of 2x again anytime soon?
+
+The community seems to be in favor of the proposal: https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794 
+
+I will submit an NNS motion proposal after confirming with the DFINITY stakeholders. We have started working on the implementation. The current estimate is about 2 weeks. After that we should be able to double the limit.
+
+Another update: the implementation of DTS for heartbeats and timers is in review and will be merged soon.
+
+-------------------------
+
+timo | 2023-01-28 10:58:56 UTC | #62
+
+Is it 20B in local deployment, too?
+
+I have some calls that run for 40s before they fail with exceeding cycles per call. Either the execution is very slow or the limit is higher on the local replica.
+
+-------------------------
+
+icme | 2023-01-29 00:07:19 UTC | #63
+
+Would be nice if these limits were configurable or in lock step on the local replica side.
+
+Local configuration would allow developers to stay in lock step with the mainnet config, and modifying the limit could help devs identify the performance of inefficient long running update calls.
+
+-------------------------
+
+Severin | 2023-01-30 10:22:51 UTC | #64
+
+[quote="timo, post:62, topic:10635"]
+Is it 20B in local deployment, too?
+[/quote]
+
+Depends on the version you're using, and the subnet type. The latest dfx betas have DTS enabled (anything starting from 0.13.0-beta.0 AFAIR).
+
+[quote="timo, post:62, topic:10635"]
+I have some calls that run for 40s before they fail with exceeding cycles per call. Either the execution is very slow or the limit is higher on the local replica.
+[/quote]
+Any chance you're running your local replica in `system` subnet mode? `dfx start -vv` starts with debug messages enabled - It should show a detailed configuration of your settings
+
+-------------------------
+
+ulan | 2023-01-30 12:34:33 UTC | #65
+
+20B instructions should take about 10s on average. If you have many active canisters, then execution may take longer. Execution may also take longer if the call uses more heavy instructions such as accessing memory.
+
+> Local configuration would allow developers to stay in lock step with the mainnet config, and modifying the limit could help devs identify the performance of inefficient long running update calls.
+
+Unfortunately, the limits are baked into the replica binary. Making them configurable externally is possible, but is a chunk of work. I wonder if debug printing the `ic0.performance_counter()` solves the problem you mentioned?
+
+-------------------------
+
+timo | 2023-01-30 13:30:02 UTC | #66
+
+[quote="Severin, post:64, topic:10635"]
+The latest dfx betas have DTS enabled (anything starting from 0.13.0-beta.0 AFAIR).
+[/quote]
+
+I have dfx 0.12.2-beta.0. Judging by the time it can take (40s) DTS must be on. I'll try 0.13.0-beta too.
+
+[quote="Severin, post:64, topic:10635"]
+Any chance you’re running your local replica in `system` subnet mode? `dfx start -vv` starts with debug messages enabled - It should show a detailed configuration of your settings
+[/quote]
+
+It says "subnet type: Application".
+
+[quote="ulan, post:65, topic:10635"]
+20B instructions should take about 10s on average. If you have many active canisters, then execution may take longer. Execution may also take longer if the call uses more heavy instructions such as accessing memory.
+[/quote]
+
+I have only 1 canister. But what is running is the Motoko GC so I guess that qualifies as "heavy instructions". I have seen 40s. Based on that I am worried about user experience. If that happened in production it would shut out all users for 40s.
+
+-------------------------
+
+ulan | 2023-01-30 13:54:22 UTC | #67
+
+> But what is running is the Motoko GC so I guess that qualifies as “heavy instructions”. I have seen 40s. Based on that I am worried about user experience. If that happened in production it would shut out all users for 40s.
+
+@luc-blaeser is working on incremental GC to improve the latency in such cases.
+
+Is there a way for us to reproduce your test to look deeper into it?
+
+-------------------------
+
+timo | 2023-01-30 14:52:23 UTC | #68
+
+The code is
+```
+import Prim "mo:⛔";
+import Array "mo:base/Array";
+
+actor {
+    stable let d1 = Array.init<?[var Nat32]>(2**15,null);
+    stable var end = 0;
+
+    public query func size() : async Nat = async end;
+    public query func name() : async Text = async "v0";
+
+    type Mem = {
+        version: Text;
+        memory_size: Nat;
+        heap_size: Nat;
+        total_allocation: Nat;
+        reclaimed: Nat;
+        max_live_size: Nat;
+    };
+    public query func mem() : async Mem {
+      {
+        version = Prim.rts_version();
+        memory_size = Prim.rts_memory_size();
+        heap_size = Prim.rts_heap_size();
+        total_allocation = Prim.rts_total_allocation();
+        reclaimed = Prim.rts_reclaimed();
+        max_live_size = Prim.rts_max_live_size(); 
+      } 
+    };
+
+    public func benchN(n : Nat) : () {
+        var i = 0;
+        while (i < n) {
+            d1[end] := ?Array.init<Nat32>(2**15,0);
+            end += 1;
+            i += 1;
+        };
+    };
+};
+```
+If you run this with the copying GC (default) and a large enough number that it will hit the cycle limit then you can observe the time. For me,  
+```
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(10000)'
+```
+runs for >40s before it fails with "Canister rrkah-fqaaa-aaaaa-aaaaq-cai exceeded the instruction limit for single message execution."
+
+If you run this sequence
+```
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+```
+then you can see the increasing time the garbage collector takes. A call that doesn't trigger GC takes 3s. The ones that trigger GC take 10s (2nd call), 20s (4th call) and 36s (7th call) for me. At this point there are ~230m objects in the heap. The GC cannot handle much more within the cycle limit.
+
+-------------------------
+
+timo | 2023-01-30 15:08:38 UTC | #69
+
+The compacting GC seems to burn through the cycles much faster. If I run
+```
+time dfx canister call rrkah-fqaaa-aaaaa-aaaaq-cai benchN '(1000)'
+```
+6 times then the last call fails with out of cycles after 12s. I guess this means that growing the memory is what costs significant time (the copying GC doubles it) and accessing the memory is what burns cycles (and both GCs produce the same accesses).
+
+-------------------------
+
+apotheosis | 2023-01-31 02:16:14 UTC | #70
+
+[quote="Severin, post:64, topic:10635"]
+dfx start -vv
+[/quote]
+
+Does this work on local? I am using dfx 0.13.0-beta.0 and still see errors.
+
+-------------------------
+
+Severin | 2023-01-31 09:25:03 UTC | #71
+
+What errors are you referring to? I was suggesting to use `-vv` to check the replica settings, which works with with 0.13.0-beta.0, at least on my machine
+
+-------------------------
+
+apotheosis | 2023-01-31 10:55:45 UTC | #72
+
+I see this `exceeded the instruction limit for single message execution.` So even after upgrading DFX to that version, I am not sure that it is working.
+
+-------------------------
+
+Severin | 2023-01-31 11:41:42 UTC | #73
+
+In that case you're likely also exceeding the limit with DTS enabled. If you access `performance_counter` and debug print the values, you should get up to ~20B, which is the instruction limit with DTS enabled. If your function runs for more than that, you'll hit the instruction limit and have to either wait until the limit gets increased or rewrite your function
+
+-------------------------
+
+timo | 2023-01-31 11:43:20 UTC | #74
+
+DTS was already activated sometime before 0.13, at least in 0.12.2-beta.0, possibly earlier. So I wouldn't expect any differences when upgrading to 0.13.0-beta.0.
+
+-------------------------
+
+ulan | 2023-01-31 11:48:15 UTC | #75
+
+Are you running a query or an update call? Queries currently have a lower instruction limit of 5B. In order to increase the limit, we first need to introduce some way of charging for queries.
+
+-------------------------
+
+apotheosis | 2023-01-31 14:33:24 UTC | #76
+
+Seems like this function will need to wait a bit! It is a PLONK, but we have a few other schemes that work a bit better ;)
+
+-------------------------
+
+LightningLad91 | 2023-03-09 13:50:16 UTC | #77
+
+Hello. Is there any documentation that explains how to work with DTS? I tried looking on internetcomputer.org but I didn’t see any results for “DTS” or “Time Slicing”. Thanks.
+
+-------------------------
+
+ulan | 2023-03-09 14:40:03 UTC | #78
+
+DTS kicks in automatically for message types that support it and allows for larger instruction limit. No action is required from the developer. Here is the table with the current instruction limits: https://internetcomputer.org/docs/current/developer-docs/production/instruction-limits
+
+-------------------------
+
+domwoe | 2023-03-09 14:47:01 UTC | #79
+
+It would be nice to have a section on DTS and how it works though at some point. Here would be probably a good place: https://internetcomputer.org/how-it-works/execution-layer/ ^^
+
+-------------------------
+
+ulan | 2023-03-09 15:00:23 UTC | #80
+
+@domwoe: Thanks! I agree and will add DTS explanation there. So far we have: https://internetcomputer.org/capabilities/multi-block-transactions, but it is very high-level.
+
+-------------------------
+
+LightningLad91 | 2023-03-09 17:56:24 UTC | #81
+
+@ulan @domwoe thank you both. I agree even a small section would be great.
+
+-------------------------
+
+icme | 2024-02-11 17:08:46 UTC | #82
+
+@ulan Are there any plans to continue raising the DTS limit past 4X?
+
+Now that canisters are able to hold up to 400GB, being able to run map reduce types of computations on that larger data will either require more rounds of consensus, or more complicated logic to chunk up the computations (more difficult developer experience).
+
+I'd also imagine that the DeAI initiatives would be interested in having this limit raised.
+
+-------------------------
+
+ulan | 2024-02-13 07:28:19 UTC | #83
+
+> @ulan Are there any plans to continue raising the DTS limit past 4X?
+
+Yeah, we are planning to increase the limit to 8X-10X (40B - 50B instructions). Hopefully, it will happen in 1-2 months. Going beyond that is possible, but would require a strong use case because we are getting close to the hard limit of 500 DTS rounds.
+
+-------------------------
+
+lastmjs | 2024-02-13 14:03:23 UTC | #84
+
+I hope we can just keep pushing it as far as possible, we hit this limit on a regular basis and I'm pretty sure we're not the only ones. For ICP to be a place of general-purpose computation we can't have these kinds of limits.
+
+This is one of the key limits I discuss with people as they contemplate deploying to ICP.
+
+-------------------------
+
+timo | 2024-02-13 16:59:31 UTC | #85
+
+Does the hard limit come from checkpointing?
+
+-------------------------
+
+NS01 | 2024-02-13 19:53:23 UTC | #86
+
+Really looking forward to this. The 221Bravo.app backend is constantly trying to get around this limit.
+
+-------------------------
+
+jeshli | 2024-03-02 16:13:34 UTC | #87
+
+So the 4x was already implemented and is what enables Updates to have 20B instructions (thus the 10x is a 2.5x from there)? 
+
+Would Queries not run into the same issues because they do not reach consensus (implying DTS does not extend Query capacity but is also not needed for it)? Query instruction limits are constrained because they are free. Are there any known technical limitations of Query instruction limits?
+
+-------------------------
+
+free | 2024-03-04 07:45:45 UTC | #88
+
+[quote="timo, post:85, topic:10635, full:true"]
+Does the hard limit come from checkpointing?
+[/quote]
+
+Yes, message execution cannot be persisted across checkpoints (and a newly joining or catching up replica would need that in-progress state to start from). Meaning that at checkpoint heights all DTS executions have to be aborted and then restarted from scratch after the checkpoint.
+
+[quote="jeshli, post:87, topic:10635"]
+Are there any known technical limitations of Query instruction limits?
+[/quote]
+
+Yes, the state that the query is executing on needs to be kept around until query execution completes. And although regular (not composite) queries only require the state of the respective canister, the implementation currently holds on to the full (subnet-wide) replicated state (which can easily be tens of GB of extra memory). And then there are composite queries, where you cannot know ahead of time which canisters are going to get called, if any, so you kind of need to hold on to the full replicated state.
+
+-------------------------
+
+jeshli | 2024-03-04 18:24:49 UTC | #89
+
+Thank you deeply for conveying the conceptual limitations of query calls. For context, I am interested in performaing AI inference on Chain and am hoping to establish a clear theoretical limit on WASM instructions per query so that I can build with an eye to the future. What I have been able to digest from your response: 
+
+* DTS is required for query calls because 
+   - for a regular query the state of the canister @ time of the call is held in memory until the call is completed
+   - for a composite query the state of the entire subnet @ time of the call is held in memory until the call is completed
+* The canister (entire state) must persist in memory not just the elements specific to the query call.
+* The longer that the call takes, the more of an issue this could be for the entire subnet functionality by clogging ram. 
+* I could write an efficient canister intended only to do a single process process, a single specific query, which requires no excess RAM other than for the query process. However, there is concern that enabling the function in general would lead to general misuse and poor subnet performance.
+* The limit using DTS would be the same as the upcoming limit for Updates of around 50 billion WASM instructions. 
+
+I appreciate any corrections and clarifications that you can provide.
+
+I have heard that in the initialization of a canister that the limit is 200 billion WASM instructions. I'm curious how that works and if there is documentation as to why. Also someone mentioned that 500 billion WASM instructions might be some sort of absolute limit.
+
+I suspect that the idea has already been brought up internally to enable the option preselect the canisters of interest for a composite query so as to avoid preserving the entire subnet state.
+
+-------------------------
+
+icme | 2024-03-04 18:41:13 UTC | #90
+
+[quote="jeshli, post:89, topic:10635"]
+DTS is required for query calls
+[/quote]
+As a potentially simpler solution for the time being, can you rewrite your query APIs into update APIs? They'll be slower, but you'll be able to take advantage of DTS and use multiple rounds of consensus right away.
+
+-------------------------
+
+free | 2024-03-04 18:54:35 UTC | #91
+
+You don't need DTS for query calls. DTS stands for Deterministic Time Slicing. Queries don't need determinism. Or time slicing.
+
+I don't work in Execution or Runtime, but AFAICT one could technically just bump the instruction limit for queries. Among the downsides of doing so would be having to hold on to the state for longer and taking up one of the (limied, not sure what the exact number is) of query execution threads for an extended time (so if you had enough long-running queries, it may happen that no new queries can be executed for a few seconds; for any canister). There are quite likely other reasons that I didn't think about that would make it less than ideal to just bump the instruction limit for queries.
+
+-------------------------
+
+timo | 2024-03-04 19:37:32 UTC | #92
+
+@jeshli's original question, I am guessing, was not about composite queries. For a long-running non-composite query, theoretically, only a single replica needs to hold the state of the single canister that is being queried in memory for the time it takes to execute the query. If there was a way to pay for this, so as to avoid attacks, then the query could run arbitrarily long and regardless of checkpoints. If it runs too long then other replicas will no longer have the same state available and at that point the caller loses the possibility to query another replica just to compare the answers. There are many scenarios in which the caller has no desire to do that anyway.
+
+There are ways to introduce payments for queries such as advance payments or query quotas.
+
+[quote="free, post:88, topic:10635"]
+And then there are composite queries, where you cannot know ahead of time which canisters are going to get called, if any, so you kind of need to hold on to the full replicated state.
+[/quote]
+
+For composite queries, say A is queried first by a user and then A queries B, the replica does not need to snapshot the whole subnet, nor does it need to know in advance to which canister the downstream query is directed (in this case B). The replica can snapshot A's state when the query is made, and then snapshot B's state sometime later when A makes the query call to B. It should not matter that the snapshots for A and B were not taken at the same time because we generally don't guarantee timing for anything, not for queries nor for updates.
+
+-------------------------
+
+free | 2024-03-05 07:52:38 UTC | #93
+
+As said, only retaining the state of a single canister as opposed to the whole subnet's is not something that's supported yet. I believe it is technically possible, but it would likely take time and effort to design and implement.
+
+Also, IMHO one would have to significantly rate limit long-running queries because, as opposed to the average web server that can handle hundreds of concurrent requests, we impose a hard limit (4? 10?) on the number of concurrent queries doe to (I believe) each of them requiring its own canister sandbox process (whereas the average web server may not even need separate threads for each concurrent request it handles).
+
+Regarding composite queries having a consistent snapshot of the subnet state, this is for better or worse the case now: if the user queries canister A, who queries canister B, who queries canister C, all three canisters' states will be from the same block height. I don't thing that's necessary; it may not even be desirable; but as with everything, applications may already rely on this property.
+
+I will admit that this last one is a weak argument. But he first two (and who knows what others, as said, I'm just an interested observer, not a member of the Execution or Runtime teams) are annoyingly solid.
+
+-------------------------
+
+timo | 2024-03-05 08:47:31 UTC | #94
+
+Yes, understood that it's not supported yet. I was speculating about what can (or would) be technically possible because I think the original question was phrased "Are there any known technical limitations".
+
+The limit on concurrent requests and the fact that they are expensive compared to traditional web servers could maybe be addressed by increasing the number of query-serving replicas in a subnet.
+
+[quote="free, post:93, topic:10635"]
+it may not even be desirable; but as with everything, applications may already rely on this property.
+[/quote]
+
+I hope that applications don't rely on it. That would be a very weird property to rely on because if you run the same as a composite update call then you don't have that guarantee.
+
+-------------------------
+
+free | 2024-03-05 09:18:04 UTC | #95
+
+[quote="timo, post:94, topic:10635"]
+The limit on concurrent requests and the fact that they are expensive compared to traditional web servers could maybe be addressed by increasing the number of query-serving replicas in a subnet.
+[/quote]
+
+Sure. But permanently increasing the number of query-only replicas would come at a significant cost increase. And would likely be inefficient. And (surprisingly enough) we don't support query-only replicas, it's all just an idea at this point. And dynamically adjusting the number of replicas is yet another hugely complex feature away.
+
+So yeah, it's all technically possible, but it will be expensive (both to canisters and in terms of development effort) and IMHO it's not by far the most pressing issue to solve (compare it with cheap integrated blob storage, or orders of magnitude more XNet bandwidth, as just a couple of examples).
+
+-------------------------
+
+ulan | 2024-03-19 10:46:47 UTC | #96
+
+Quick update on the DTS instruction limit.
+
+I merged the change that increases the instruction limit for updates, timers, heartbeats to 40B (2x of the previous 20B limit): [feat: Increase the instruction limit for update calls to 40B · dfinity/ic@8e51868 · GitHub](https://github.com/dfinity/ic/commit/8e51868034e81665212622b9d9bbe8cf3b622935)
+
+This should be included in the next replica release (to be deployed on the mainnet next week).
+
+We are close to shipping the configurable Wasm memory limit feature (we were waiting for it in order to increase the limits).
+
+-------------------------
+

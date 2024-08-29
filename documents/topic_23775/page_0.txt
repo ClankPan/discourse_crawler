@@ -1,0 +1,192 @@
+skilesare | 2023-10-15 21:42:26 UTC | #1
+
+I was looking to find a good topic for some questions for certification v2.
+
+I'm a bit distraught that v1 is being considered to be deprecated as it is hard enough to understand.  After reading https://docs.google.com/document/d/1eS9iQE33ehCgSEsB1_42rfjGZnSF6PkBQfm9_EkutQs/edit about v2 I'm even more confused. Please forgive my simpleness here, but I think I need a bit of a "dummies guide" for this.  A few simple questions:
+
+1. The certifying of headers is super strange to me. I get the examples that someone can 'fake' a cache control or redirect, but does that mean that I need to think at the time of asset upload(or generation) about what RESPONSE headers I'm going to send?  Do I put them in a separate place?  Do I need to predict my users request headers? That seems super odd...does that mean I could certify my assets to only be served if the request has a google chrome browser tag in the browser header?  What would be the use case for a request validation that can be predicted?
+
+2.  I guess some specifics would be good: In this example in @nomeata 's example https://github.com/nomeata/ic-certification/blob/main/demo/main.mo#L74C14-L74C19 the page assets need to go in http_assets path and it is just a hash of the data that gets added to the Tree.  Joachim did the lords work in getting juggling all the CBOR and Encoding for us for v1, but I'm kind of at a loss at where to start to modify it to get the headers in with the data as well(unless they go somewhere else and we need to return two branches of a tree).
+
+3. It looks like there is some kind of Certification Expression syntax, but I'm not following exactly how it should work:
+
+```
+IC-CertificateExpression: default_certification(ValidationArgs{certification: Certification{request_certification: RequestCertification{certified_request_headers: ["host"], certified_query_parameters: ["filter"]}, response_certification: ResponseCertification{certified_response_headers: ResponseHeaderList{headers: ["Content-Type","X-Frame-Options","Content-Security-Policy","Strict-Transport-Security","Referrer-Policy","Permissions-Policy"]}}}})
+```
+Do I just dump the above out in text and it tells the service worker what headers to validate and what headers not to validate?  I think I'm following the thread, but want to make sure.  In this example I'd have to predict all these values ahead of time so I can put them somewhere and certify them?(see question 2..where?).
+
+4. It also looks like I have to certify that expression as well for every page?  I just include that with other response headers in some kind of structure?
+
+I'm sorry to be dense, but perhaps we can hash it all out(hey-o) and get the Motoko ic-certification library updated with this new scheme? I'm also concerned about seeing some Protobuff references and 
+EBMF as that concerns me that we're going to need to bootstrap yet more base motoko libraries to support this.
+
+@Severin @NathanosDev
+
+-------------------------
+
+NathanosDev | 2023-10-15 23:32:45 UTC | #2
+
+> I think I need a bit of a “dummies guide”
+
+Yes, certification v2 is incredibly complex.
+
+I do have plans to create some "dummies" guides. At the moment all we have is the [the spec](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#response-verification), which is very technical and not very friendly for developers.
+
+My current priority is [getting rid of the service worker](https://forum.dfinity.org/t/deprecating-the-service-worker/23401), and then I'll be working on Rust libraries to provide support for canisters that need to use this certification outside of the SDK's asset canister. In theory, most developers shouldn't need much documentation outside of how to use those libraries.
+
+I can't say if we'll also build a Motoko version of these libraries. It's definitely something I'd be personally interested in working on, but if not I'd be more than happy to help out anyone who would like to create the Motoko counterpart of these libraries.
+
+With these libraries out in the wild, I'll switch focus to documentation, user guides, and all that good stuff.
+
+> The certifying of headers is super strange to me.
+
+Not all headers need or even should be certified. In general, you only need to certify headers that can affect browser or application behavior.
+
+> Does that mean that I need to think at the time of asset upload(or generation) about what RESPONSE headers I’m going to send?
+
+Yes, but if you're only certifying headers that affect browser behavior then you should know these ahead of time anyway. Things like CORS, caching (incl ETAG), content-encoding, and content type. Are there any scenarios that you're concerned about deciding these headers ahead of time?
+
+> Do I put them in a separate place?
+
+I'm not sure if I understand exactly what you mean. You are free to store any known headers however you like, but I would store them in a similar way to your assets. In terms of the hash of those headers, that doesn't need to be stored, only the [hash of the whole response](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#response-hash-calculation).
+
+> Do I need to predict my users request headers?
+
+Only request headers that will cause changes in your certified response headers or body need to be certified. If the value of a request header will not have any meaningful change in your response then there's no need to certify it. I think it should be feasible to think of these ahead of time since you will have decided on your body and response headers and how they may be affected by request headers beforehand anyway since these changes will need to be coded into your canister.
+
+> does that mean I could certify my assets to only be served if the request has a google chrome browser tag in the browser header?
+
+You can do that if you like 😅
+
+> What would be the use case for a request validation that can be predicted?
+
+Some scenarios where this may be applicable are changing the language/encoding of your response or ETAG-based caching. Otherwise, there's no need to certify request headers.
+
+> I’m kind of at a loss at where to start to modify it to get the headers in with the data as well
+
+This is unfortunately difficult to answer in a short forum response. I will provide better documentation on this at some point in the future, but in the meantime, I'd be happy to get in touch directly and try to work through the missing pieces.
+
+> Do I just dump the above out in text and it tells the service worker what headers to validate and what headers not to validate?
+
+Yes, that's exactly what it does. We can look at some examples:
+
+This CEL expression will tell the service worker to skip certification for this response:
+```
+default_certification (
+  ValidationArgs {
+    no_certification: Empty { }
+  }
+)
+```
+
+This one will tell the service worker to skip certification for the request, and certify the response but only include the `Cache-Control` header.
+
+```
+default_certification (
+  ValidationArgs {
+    certification: Certification {
+      no_request_certification: Empty {},
+      response_certification: ResponseCertification {
+        certified_response_headers: ResponseHeaderList {
+          headers: ["Cache-Control"]
+        }
+      }
+    }
+  }
+)
+```
+
+This one will tell the service worker to only certify the `Cache-Control` request header, as well as the `q` query param, along with the `Cache-Control` response header:
+
+```
+default_certification (
+  ValidationArgs {
+    certification: Certification {
+      request_certification: RequestCertification {
+        certified_request_headers: ["Cache-Control"],
+        certified_query_parameters: ["q"]
+      },
+      response_certification: ResponseCertification {
+        certified_response_headers: ResponseHeaderList {
+          headers: ["Cache-Control"]
+        }
+      }
+    }
+  }
+)
+```
+
+> It also looks like I have to certify that expression as well for every page?
+
+Yes. For every URL you need to decide on your CEL expression, hash the CEL expression, [hash the request](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#request-hash-calculation) ([implementation example](https://github.com/dfinity/response-verification/blob/main/packages/ic-response-verification/src/hash/request_hash.rs)), [hash the response](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#response-hash-calculation) ([implementation example](https://github.com/dfinity/response-verification/blob/main/packages/ic-response-verification/src/hash/response_hash.rs)) and then arrange those hashes into the tree under the corresponding path.
+
+I hope this helps clear up some of the confusion. Feel free to DM me if you'd like to set something up to discuss the development of the Motoko library.
+
+-------------------------
+
+skilesare | 2023-10-15 23:59:24 UTC | #3
+
+[quote="NathanosDev, post:2, topic:23775"]
+Yes, but if you’re only certifying headers that affect browser behavior then you should know these ahead of time anyway. Things like CORS, caching (incl ETAG), content-encoding, and content type. Are there any scenarios that you’re concerned about deciding these headers ahead of time?
+[/quote]
+
+My biggest concern is future compatibility and needing to somehow re-calculate the entire tree of certifications if there's some new header that needs to be added. Are NFT has a number of importance of expose the info with every NFT in the collection. These are generally exposed to Jason files so that's easy to query and get all the info about a particular Nft. We also allow multi library to be put into each nft at each of that is certified as well. I'm just trying to think about how we would even convey to a user who's trying to upload their library. What they need to do about this. We want it to be extensible and allow the user to decide, but it's one thing to know  you want to upload three pictures, it's another to have to think about how long you want them cached for.
+
+[quote="NathanosDev, post:2, topic:23775"]
+that doesn’t need to be stored, only the [hash of the whole response](https://internetcomputer.org/docs/current/references/http-gateway-protocol-spec#response-hash-calculation).
+[/quote]
+
+I guess this answers my question. Looks like we're going to have to have some kind of structure that looks like an HTTP response and that will be encoded somehow? We take the hash of the whole thing and store that? Does it still go in a particular sub tree of the canister certification?
+
+
+
+Very helpful responses all around. I'll reach out directly and maybe we can work through it and figure out a path to get motoko working.
+
+-------------------------
+
+skilesare | 2023-10-16 00:01:56 UTC | #4
+
+I guess the other thing that I was considering as a use case with some thing like certifying json objects individually, so that I can return back dynamic lists, but each item came with its certification.(a bit of the data centrism stuff that Johan was thinking about previously.)
+
+Maybe there's some additional extensions that could extend to content?
+
+-------------------------
+
+Severin | 2023-10-16 06:59:33 UTC | #5
+
+[quote="NathanosDev, post:2, topic:23775"]
+I can’t say if we’ll also build a Motoko version of these libraries. It’s definitely something I’d be personally interested in working on, but if not I’d be more than happy to help out anyone who would like to create the Motoko counterpart of these libraries.
+[/quote]
+
+@kpeacock is at least interested in creating these libraries. AFAIK we also have a bounty somewhere that would require v2 to be implemented in Motoko
+
+[quote="skilesare, post:1, topic:23775"]
+Do I need to predict my users request headers?
+[/quote]
+In the asset canister I just ignore request headers. Works fine enough
+
+[quote="skilesare, post:1, topic:23775"]
+does that mean I could certify my assets to only be served if the request has a google chrome browser tag in the browser header? What would be the use case for a request validation that can be predicted?
+[/quote]
+Possible, but probably useless. It requires an exact string match, and agent identifiers are too varied for that. But if you could differentiate between browsers like this you could serve separately optimized pages depending on the browser and know for sure that the right version is delivered. 
+
+[quote="skilesare, post:3, topic:23775"]
+My biggest concern is future compatibility and needing to somehow re-calculate the entire tree of certifications if there’s some new header that needs to be added.
+[/quote]
+Same here, and I'm not looking forward to the ticket where I have to fix that... On the asset canister we at least have a separate call for every asset, so we could do the work there, but even then it will be a pain
+
+
+BTW [this](https://github.com/dfinity/sdk/tree/master/src/canisters/frontend/ic-certified-assets/src/asset_certification) is what will become the basis for a certification library in Rust. I tried to make it as easy to use as possible. For now you could simply copy/paste it into your project if you want to play with it
+
+-------------------------
+
+domwoe | 2023-10-16 10:18:50 UTC | #6
+
+[quote="Severin, post:5, topic:23775"]
+AFAIK we also have a bounty somewhere that would require v2 to be implemented in Motoko
+[/quote]
+
+To close the circle :slight_smile: https://forum.dfinity.org/t/open-bnt-13-motoko-certified-assets-canister/23536/3
+
+-------------------------
+

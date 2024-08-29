@@ -1,0 +1,221 @@
+brady | 2023-01-05 15:35:27 UTC | #1
+
+Hey devs. I'm trying to get my Motoko canister to dynamically create a canister and then install wasm code in the same function to the newly generated canister (via the IC management canister). But when I call the methods `install_code` and `uninstall_code` in particular, I always get a `{"err":{"Unauthorized":null}}` response. 
+
+I have made sure that when creating the canister, both the parent canister and the caller are set as controllers, but it doesn't seem to matter:
+
+```
+let create_canister = await managementCanister.create_canister({
+            settings = ?{
+                freezing_threshold = null;
+                controllers = ?[Principal.fromActor(this), caller];
+                memory_allocation = null;
+                compute_allocation = null;
+            }
+        });
+```
+
+Strangely enough methods like `stop_canister` and `delete_canister` are working completely fine.
+Here is the snippet where I call `install_code` : 
+
+```
+let install_wasm = await managementCanister.install_code({
+            arg = [];
+            wasm_module = wasm;
+            mode = #install;
+            canister_id = create_canister.canister_id;
+        });
+```
+
+I've tested both on my local network and on the IC with the same error. I can't find the public source code for the management canister to troubleshoot what logic might be throwing the error. What am I doing wrong?
+
+-------------------------
+
+Severin | 2023-01-05 16:04:54 UTC | #2
+
+I do not see the error. Here's some code that I have deployed live that's working that does the same thing, maybe you can try copy/pasting it in?
+```
+        let IC0 : Management = actor ("aaaaa-aa");
+        let this = Principal.fromActor(self);
+        var cycle_to_add = coupon.cycle;
+        let canister_id = switch (Queue.popFront(canisters_reserve)) {
+          case (?canister_id) { canister_id };
+          case null {
+            Cycles.add(cycle_to_add);
+            cycle_to_add := 0;
+            (await IC0.create_canister({ settings = ?{ controllers = ?[this] } })).canister_id;
+          };
+        };
+        await IC0.install_code({
+          mode = #install;
+          canister_id = canister_id;
+          wasm_module = binary;
+          arg = Blob.fromArray([]);
+        });
+```
+
+-------------------------
+
+brady | 2023-01-05 17:18:48 UTC | #3
+
+What is the description of your type `Management ` @Severin ?
+
+In my interface description, `create_canister` takes in 4 parameters in the settings object and the `install_code.arg` parameter is type `[Nat8]` not Blob. Even then, I don't see what the error code "Unauthorized" has to do with any of this
+
+-------------------------
+
+peterparker | 2023-01-05 17:43:53 UTC | #4
+
+If it could help I do following - creating canister, updating settings and then install
+
+```
+private func initNewStorageBucket(manager : Principal, user : UserId) : async (Principal) {
+    Cycles.add(1_000_000_000_000);
+
+    let {canister_id} = await ic.create_canister({settings = null});
+
+    await canisterUtils.updateSettings(canister_id, manager);
+
+    let arg : Blob = to_candid (user);
+
+    await ic.install_code({
+      arg;
+      wasm_module = Blob.fromArray(storageWasm);
+      mode = #install;
+      canister_id;
+    });
+
+    return canister_id;
+  };
+
+...
+
+public func updateSettings(canisterId : Principal, manager : Principal) : async () {
+      let controllers : ?[Principal] = ?[canisterId, manager];
+
+      await ic.update_settings(({
+        canister_id = canisterId;
+        settings = {
+          controllers = controllers;
+          freezing_threshold = null;
+          memory_allocation = null;
+          compute_allocation = null;
+        };
+      }));
+    };
+```
+
+Beside settings, do you notice something different?
+
+Do you call `install_code` from the same parent canister as the one you set as controller `Principal.fromActor(this)`?
+
+-------------------------
+
+Severin | 2023-01-05 18:00:18 UTC | #5
+
+[quote="brady, post:3, topic:17813"]
+What is the description of your type `Management ` @Severin ?
+[/quote]
+```
+  type Management = actor {
+    create_canister : ({ settings : ?CanisterSettings }) -> async ({
+      canister_id : CanisterId;
+    });
+    install_code : ({
+      mode : { #install; #reinstall; #upgrade };
+      canister_id : CanisterId;
+      wasm_module : Blob;
+      arg : Blob;
+    }) -> async ();
+    update_settings : ({ canister_id : CanisterId; settings : CanisterSettings }) -> async ();
+    deposit_cycles : ({ canister_id : Principal }) -> async ();
+  };
+```
+
+I also don't see how the error could be related...
+
+-------------------------
+
+skilesare | 2023-01-05 18:29:31 UTC | #6
+
+I'm looking all over for documentation and examples on the motoko sugar discussed here:   https://github.com/dfinity/motoko/blob/master/Changelog.md#070-2022-08-25 and https://github.com/dfinity/motoko/pull/3386
+
+Does anyone have a playground example or article on this?
+
+-------------------------
+
+claudio | 2023-01-06 11:43:44 UTC | #7
+
+The documentation is very terse at the moment, with no separate tutorial style page yet:
+
+https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/language-manual#actor-class-management
+
+Our tests, which could form the basis of worked examples, are here:
+
+Simple uses:
+
+https://github.com/dfinity/motoko/blob/master/test/run-drun/actor-class-mgmt.mo
+
+More involved: a basic distributed map, upgrading its bucket actors using a protocol after upgrade.
+
+https://github.com/dfinity/motoko/blob/master/test/run-drun/map-upgrades/
+
+Note these are not polished, but maybe you'll still find them useful.
+
+Part of the reason this is not yet described in an accessible tutorial is that it is still unsafe - 
+I had plans to add some more safety checks, trapping an upgrade if the upgrade is incompatible by doing a dynamic check.
+
+-------------------------
+
+claudio | 2023-01-06 12:32:40 UTC | #8
+
+[quote="brady, post:1, topic:17813, full:true"]
+...
+I've tested both on my local network and on the IC with the same error. I can't find the public source code for the management canister to troubleshoot what logic might be throwing the error. What am I doing wrong?
+[/quote]
+
+Could you maybe share a GH repo with the code and script that fails? That probably the easiest way to track it down.
+
+
+Also, are you supplying cycles when you create the canister?
+
+-------------------------
+
+claudio | 2023-01-06 12:41:09 UTC | #9
+
+Stupid question, but are the calls that are failing actually Motoko calls, or dfx calls? I don't think you can call the management canister from dfx directly.
+
+-------------------------
+
+chenyan | 2023-01-06 17:54:08 UTC | #10
+
+Can you try create_canister with a null setting, e.g. `await managementCanister.create_canister({
+            settings = null });`. This ensures the parent canister to be the controller of the child canister.
+
+Regarding the type of `create_canister`, `[Nat8]` and `Blob` has the same Candid type, but `Blob` is more efficient and recommended.
+
+-------------------------
+
+brady | 2023-01-09 17:20:15 UTC | #11
+
+Thank you for the troubleshooting everyone. I figured out the error was completely something I overlooked in my code. I was in fact calling my method from an unauthorized canister/principal 🤦‍♂️ which after the fact sounds really stupid to have to admit on the forum.
+
+But I will now try to look into motoko sugar syntax pointed out by @skilesare to see if it is a possible alternative to calling the management canister:
+https://github.com/dfinity/motoko/blob/master/Changelog.md#070-2022-08-25
+
+Once again, thank you for the troubleshooting!
+
+-------------------------
+
+Severin | 2023-01-10 07:52:43 UTC | #12
+
+[quote="brady, post:11, topic:17813"]
+I figured out the error was completely something I overlooked in my code.
+[/quote]
+
+As they say: Shit happens. To everyone.
+
+Thanks for reporting back with the resolution!
+
+-------------------------
+

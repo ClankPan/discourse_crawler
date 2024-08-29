@@ -1,0 +1,777 @@
+kpeacock | 2021-12-21 18:10:25 UTC | #1
+
+
+# Payments - Invoice Canister
+
+As we look to refine the developer experience around payments, we concluded that in some instances the ledger canister interface may be too “low level”. For example, a canister that would like to access/implement a payment system would need to implement from scratch things like protection against double spending against the ledger interface. For that reason, we propose to design an interface that will make it easier for a typical canister to add payment functionality.
+
+## Goals
+
+Goals for this project are as follows:
+1. Solution should be simple to include and develop against locally
+2. Canister can easily check its balance
+3. Canister can verify that a payment has been satisfied
+4. User can submit payment from a wallet
+5. Design should be compatible with BTC, ETH, and SNS ledgers as they become available
+  
+
+## Non-goals
+
+* We do not intend to change the ICP ledger
+* This interface won't specifically handle minting cycles or other secondary ledger features
+* Handling escrow payments
+* Automating recurring payments
+
+## Open Questions
+
+* Should this be a new canister type in `dfx`, a single centralized canister on the NNS subnet, or both?
+
+## The Interface
+```
+// interface.did
+type Token = variant {
+	ICP: Text;
+	// More to come
+};
+
+type AccountIdentifier = variant { 
+	Text;
+	Principal;
+},
+
+type PrivateInfo = {
+	// human-readable description of the transaction
+	description: Text;
+	meta: Blob;
+};
+
+type Invoice = record {
+	id: Hash; // uuid
+	creator: Principal;
+	privateInfo: PrivateInfo;
+	amount: Nat;
+	amount_transferred: Nat;
+	token: Token;
+	verifiedAtTime: opt Time;
+	paid: Bool;
+	refunded: Bool;
+	expiration: Time;
+	destination: AccountIdentifier;
+	refundAccount: opt AccountIdentifier;
+};
+
+type InvoiceCreateArgs = record {
+	amount: Nat;
+    token: Token;
+	destination: opt AccountIdentifier;
+	privateInfo: opt PrivateInfo;
+	refundAccount: opt AccountIdentifier;
+};
+
+type TransferArgs = record {
+    amount: Nat;
+    token: Token;
+	destination: AccountIdentifier;
+	source: opt AccountIdentifier;
+};
+
+type BalanceArgs = record {
+	token: Token;
+};
+
+service {
+	create_invoice(InvoiceCreateArgs) -> (Invoice);
+	refund_invoice(Hash) -> (Result);
+	get_invoice(Hash) -> (Invoice) query;
+	get_balance(BalanceArgs) -> Nat;
+	transfer(TransferArgs) -> (Result);
+	validate_payment(Hash) -> Status;
+};
+```
+
+
+## Design Choices
+
+The goal here was to design a flow where a client application such as a webpage, could initiate a payment flow that could be used to gate services or transfer ownership of assets.
+
+The Invoice Canister will consolidate payments into a single balance per token, which will be the location that you can then transfer from and check your balance. The implementation may differ slightly for Bitcoin versus ICP, but the Invoice Canister will handle the implementation and abstract those differences into a single API.
+
+### Basic Payment Flow ( hypothetical )
+
+A canister smart contract can receive a request to purchase, create an invoice, and store the Principal of the caller and the UUID of the invoice.
+
+Once the payment has been satisfied, the canister can check the status of the payment with `validate_payment`, while the Invoice canister checks the ledger. The canister can then present the status to the client, and satisfy the payment flow.
+
+Here is an example flow diagram:
+
+![Screen Shot 2021-12-21 at 9.18.39 AM|690x492](upload://xBPOKzbUItAq6uS93QblmorlCDm.png)
+
+-------------------------
+
+skilesare | 2021-12-21 19:09:57 UTC | #2
+
+Looks good!  I'll dive in with a deeper review when I get a chance.
+
+Please consider putting in Namespaced Interfaces:  https://forum.dfinity.org/t/proposal-to-adopt-the-namespaced-interfaces-pattern-as-a-best-practice-for-ic-developers/9262
+
+-------------------------
+
+skilesare | 2021-12-21 19:14:57 UTC | #3
+
+Are transfer and get balance just standard ledger functions or are they specific to invoices?
+
+[quote="kpeacock, post:1, topic:9843"]
+```
+service {
+	invoice_create(InvoiceCreateArgs) -> (Invoice);
+	invoice_refund(Hash) -> (Result);
+	invoice_get(Hash) -> (Invoice) query;
+	invoice_get_balance(BalanceArgs) -> Nat;
+	invoice_transfer(TransferArgs) -> (Result);
+	invoice_validate_payment(Hash) -> Status;
+};
+```
+[/quote]
+
+-------------------------
+
+kpeacock | 2021-12-21 19:19:07 UTC | #4
+
+It's an abstraction across multiple ledgers. You can create an invoice for any token supported by the Invoice Canister, and `invoice_transfer` and `get_balance` would use the default `AccountIdentifier` for that token.
+
+It may vary across ledgers, but for ICP for example, it will consolidate your balance to a single subaccount, conceptually like a "bank account" abstraction
+
+-------------------------
+
+nomeata | 2021-12-21 22:10:35 UTC | #5
+
+The `Hash` type is not defined. Is it `blob`? (I guess it’s more pseudo-code at this moment yet, the syntax is a bit off to be parsed by Candid.)
+
+-------------------------
+
+kpeacock | 2021-12-21 23:46:42 UTC | #6
+
+it is pseuodocode for now. We haven't defined how we want to do the UUID implementation yet, and I wrote the interface freehand, so I'm not surprised if there are a couple typos
+
+-------------------------
+
+yrgg | 2021-12-21 22:27:54 UTC | #7
+
+This is very awesome! What is the anticipated release date for this invoice canister system? I would love to use it asap.
+
+-------------------------
+
+kpeacock | 2021-12-21 22:30:02 UTC | #8
+
+We're targeting Q1 2022
+
+-------------------------
+
+roman-kashitsyn | 2021-12-22 11:46:36 UTC | #9
+
+Thanks, @kpeacock, great to see progress on this front so quickly!
+
+Some first thoughts on the interface:
+
+> type Token = variant {
+
+We should probably make token type just a text (maybe something like `type Token = record { symbol : text };` for extra type safety). Adding more constructors to a variant in return position is not a backward compatible change, and we probably want to support more tokens in future.
+
+> type AccountIdentifier = variant { 
+	Text;
+	Principal;
+},
+
+We should probably also support ICP ledger `AccountIdentifier` here which is a blob.
+
+> type BalanceArgs = record {
+	token: Token;
+};
+
+We probably need an account identifier there as well.
+
+> PrivateInfo
+
+Is it called "private" because the service doesn't care about this data? I think that naming might be a bit confusing.
+
+> get_invoice(Hash) -> (Invoice) query;
+> get_balance(BalanceArgs) -> Nat;
+> validate_payment(Hash) -> Status;
+
+It seems somewhat inconsistent that `get_invoice` is a query but the other two methods aren't. Since we don't have inter-canister queries yet, I suggest we make `get_invoice` and `validate_payments` update calls so that they can talk to other canisters for scalability reasons (you might want to distribute Hash -> Invoice hash table across many canisters). If `get_balance` will need to talk to another canister (e.g., ICP ledger), it also has to be an update call.
+
+> transfer(TransferArgs) -> (Result);
+
+Should we have a variant of `transfer` that accepts an invoice? Otherwise how do you move invoice to `paid` state? Will the service sync the corresponding block chain and look at the blocks searching for invoice confirmations?
+
+> UUID
+
+Just curious, what's the reasoning behind using UUIDs and not, say, SHA-256 hash of the immutable fields of `Invoice` record?
+
+I think we should also specify how fees fit into that model, the current interface doesn't mention fees at all.
+
+Also, I'm not sure I understand how `transfer` is going to be implemented. For example, one cannot simply put an intermediary canister between a client and the ICP ledger because ICP ledger uses the identity of the caller to validate payments, and an intermediary would not be able to preserve the caller (unless we instruct the Ledger to trust the intermediary).
+
+-------------------------
+
+kpeacock | 2021-12-22 00:58:46 UTC | #10
+
+Some initial thoughts:
+
+> We should probably also support ICP ledger `AccountIdentifier` here which is a blob.
+
+That makes sense
+
+>PrivateInfo
+
+The purpose here is to have the ability to store information that only the canister responsible for creating the invoice can access. The basic information will be public, but the description and metadata are private.
+
+> It seems somewhat inconsistent that `get_invoice` is a query
+
+We discussed whether the various calls should be queries, and decided that the `Invoice` data was likely to be contained on a single Invoice Canister. It could conceivably scale to a point where the data can't be contained on a single canister though, at which point we couldn't maintain the query, so fair point.
+
+> Should we have a variant of `transfer` that accepts an invoice?
+
+Transfer is meant to skip the invoice functionality. If the Invoice Canister is maintaining a balance of a given token for your canister, you can choose to send it whenever you want. 
+
+On the ICP Ledger, the Invoice Canister would be maintaining a balance for you on a subaccount that it controls, which is how it will be able to make calls to the ledger on your behalf. `transfer` is how you can move the funds off to a personal wallet, or to a subaccount controlled by your own canister, if you implement ledger functionality directly
+
+> Just curious, what’s the reasoning behind using UUIDs and not, say, SHA-256 hash of the immutable fields of `Invoice` record?
+
+Our goal is simply to have a unique ID for each invoice with no collisions. A SHA-256 hash may be totally acceptable, given the `verifiedAtTime` and `expiration` fields
+
+-------------------------
+
+jzxchiang | 2022-01-11 21:05:34 UTC | #11
+
+A few questions:
+
+* Will this design support an end user authorizing a third party to make a payment on their behalf? The canonical use case is a DEX. Most of the proposed IC token standards use an ERC-20-like `approve` / `transferFrom` flow, but IIUC your current design doesn't support that. (In fact, I'm not sure an invoice-style payment scheme is even compatible with third-party payments.)
+
+* Since the invoice canister is essentially a wrapper around various token canisters, this design relies heavily on inter-canister calls. But inter-canister queries are still not supported, which will make simple balance queries take seconds to complete (as is reflected in the fact that `get_balance` is an update in your interface). Will this mean that an inter-canister query [implementation](https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/32) gets prioritized in the coming few months? (That would be awesome...)
+
+* The ICP ledger canister uses certified variables to enhance query security. Community-created token standards may follow suit. Can and how will those security guarantees transfer over to invoice canisters?
+
+-----
+
+> * Should this be a new canister type in `dfx` , a single centralized canister on the NNS subnet, or both?
+
+I think that depends on whether every dapp should have their own invoice canister, or instead share a common invoice canister? Another idea is to make this an open internet service on the SNS? Just throwing out ideas.
+
+-------------------------
+
+kpeacock | 2022-01-11 22:35:12 UTC | #12
+
+This could be used in conjunction with third party payments, but it wouldn't enable them, necessarily. The invoice could easily be the destination of a payment from a DEX, and the patterns I'm using would hopefully be useful to someone building a DEX as a reference. 
+
+As for queries, we could probably certify queries against the invoices with some extra work. I wouldn't commit to proper queries anywhere else though, because the priority for this project is to abstract multiple types of ledgers whose interfaces haven't been fully established yet, such as BTC and ETH. 
+
+> Will this mean that an inter-canister query [implementation](https://forum.dfinity.org/t/inter-canister-query-calls-community-consideration/6754/32) gets prioritized in the coming few months
+
+Probably not. Queries within subnets are possible, but there's no movement right now on cross-subnet queries
+
+
+I'm leaning toward releasing this as an MVP that people can self-deploy and offer feedback on for a while first, and then we can possibly set it up as a central service with an SNS down the road
+
+-------------------------
+
+jorgenbuilder | 2022-01-15 22:04:30 UTC | #13
+
+I'm ready to self deploy and test 🙂
+
+-------------------------
+
+HASANELMAHLI | 2022-01-17 23:47:14 UTC | #14
+
+شكرا لك صديقي على الجهد المبذول في كتابة المنشور 
+:+1:
+
+-------------------------
+
+kpeacock | 2022-01-18 16:51:01 UTC | #15
+
+Should be coming soon! I've got the core built out, and I need to get the whole suite end-to-end tested
+
+-------------------------
+
+kpeacock | 2022-01-19 02:29:05 UTC | #16
+
+Update - I've successfully tested the core payment flow for ICP locally. There's a bunch of work to clean up the repo and harden it with testing, but it's coming along!
+
+Here's the latest, closer-to-finalized interface.
+
+```
+type VerifyInvoiceSuccess = 
+ variant {
+   AlreadyVerified: record {invoice: Invoice;};
+   Paid: record {invoice: Invoice;};
+ };
+type VerifyInvoiceResult = 
+ variant {
+   Err: VerifyInvoiceErr;
+   Ok: VerifyInvoiceSuccess;
+ };
+type VerifyInvoiceErr = 
+ record {
+   kind:
+    variant {
+      Expired;
+      InvalidInvoiceId;
+      NotFound;
+      NotYetPaid;
+      TransferError;
+    };
+   message: opt text;
+ };
+type VerifyInvoiceArgs = record {id: nat;};
+type TransferArgs = 
+ record {
+   amount: float64;
+   destination: AccountIdentifier;
+   source: opt AccountIdentifier;
+   token: Token;
+ };
+type TokenVerbose = 
+ record {
+   decimals: int;
+   meta: opt record {Issuer: text;};
+   symbol: text;
+ };
+type Token = record {symbol: text;};
+type Time = int;
+type Invoice = 
+ record {
+   amount: nat;
+   amountPaid: nat;
+   creator: principal;
+   destination: AccountIdentifier;
+   details: opt Details;
+   expiration: Time;
+   id: nat;
+   paid: bool;
+   refundAccount: opt AccountIdentifier;
+   refunded: bool;
+   token: TokenVerbose;
+   verifiedAtTime: opt Time;
+ };
+type GetInvoiceSuccess = record {invoice: Invoice;};
+type GetInvoiceResult = 
+ variant {
+   Err: GetInvoiceErr;
+   Ok: GetInvoiceSuccess;
+ };
+type GetInvoiceErr = 
+ record {
+   kind: variant {
+           InvalidInvoiceId;
+           NotFound;
+         };
+   message: opt text;
+ };
+type GetInvoiceArgs = record {id: nat;};
+type GetCallerIdentifierSuccess = record {
+                                    accountIdentifier: AccountIdentifier;};
+type GetCallerIdentifierResult = 
+ variant {
+   Err: GetCallerIdentifierErr;
+   Ok: GetCallerIdentifierSuccess;
+ };
+type GetCallerIdentifierErr = 
+ record {
+   kind: variant {InvalidToken;};
+   message: opt text;
+ };
+type GetCallerIdentifierArgs = record {token: Token;};
+type GetBalanceSuccess = record {balance: nat;};
+type GetBalanceResult = 
+ variant {
+   Err: GetBalanceErr;
+   Ok: GetBalanceSuccess;
+ };
+type GetBalanceErr = 
+ record {
+   kind: variant {
+           InvalidToken;
+           NotFound;
+         };
+   message: opt text;
+ };
+type GetBalanceArgs = record {token: Token;};
+type Details = 
+ record {
+   description: text;
+   meta: blob;
+ };
+type CreateInvoiceSuccess = record {invoice: Invoice;};
+type CreateInvoiceResult = 
+ variant {
+   Err: CreateInvoiceErr;
+   Ok: CreateInvoiceSuccess;
+ };
+type CreateInvoiceErr = 
+ record {
+   kind:
+    variant {
+      InvalidAmount;
+      InvalidDestination;
+      InvalidDetails;
+      InvalidRefundAccount;
+      InvalidToken;
+    };
+   message: opt text;
+ };
+type CreateInvoiceArgs = 
+ record {
+   amount: nat;
+   details: opt Details;
+   refundAccount: opt AccountIdentifier;
+   token: Token;
+ };
+type AccountIdentifier = 
+ variant {
+   "blob": blob;
+   "principal": principal;
+   "text": text;
+ };
+service : {
+  accountIdentifierToBlob: (AccountIdentifier) -> (blob);
+  create_invoice: (CreateInvoiceArgs) -> (CreateInvoiceResult);
+  get_balance: (GetBalanceArgs) -> (GetBalanceResult);
+  get_caller_identifier: (GetCallerIdentifierArgs) ->
+   (GetCallerIdentifierResult) query;
+  get_invoice: (GetInvoiceArgs) -> (GetInvoiceResult);
+  refund_invoice: () -> () oneway;
+  remaining_cycles: () -> (nat) query;
+  transfer: (TransferArgs) -> ();
+  verify_invoice: (VerifyInvoiceArgs) -> (VerifyInvoiceResult);
+}
+```
+
+-------------------------
+
+paulyoung | 2022-01-19 04:29:46 UTC | #17
+
+I’m curious if there’s a reason you’re doing things like:
+
+```
+type VerifyInvoiceResult = 
+ variant {
+   Err: VerifyInvoiceErr;
+   Ok: VerifyInvoiceSuccess;
+ };
+```
+
+Instead of:
+
+```
+type VerifyInvoiceResult = Result<VerifyInvoiceSuccess, VerifyInvoiceErr>
+```
+
+-------------------------
+
+kpeacock | 2022-01-19 20:03:15 UTC | #19
+
+I'm doing it because the `Result` type uses lowercase `Ok` and `Err`, while the Rust `Result` uses uppercase, and I wanted to try to make it consistent. None of the utility methods of `Result` are particularly useful to me, so I figured I wasn't missing out on much.
+
+Also, I'm protected from any upgrades to the Result base type that could accidentally break compatibility during an upgrade
+
+-------------------------
+
+lijixy | 2022-01-20 02:49:09 UTC | #20
+
+Hi kpeacock, how I payment ICP by python?
+
+-------------------------
+
+kpeacock | 2022-01-20 17:40:52 UTC | #21
+
+This is a community library for a Python IC agent https://github.com/rocklabs-io/ic-py. You'll be able to call the Invoice canister to get an accountidentifier that will serve as a simple custodial account to receive and make payments
+
+-------------------------
+
+Munlite | 2022-01-21 13:27:16 UTC | #22
+
+Hello! I have a question about the canister. Is it possible to send ICP from one wallet to another using a canister? As in Ethereum
+
+-------------------------
+
+kpeacock | 2022-01-21 19:11:45 UTC | #23
+
+Yes, this canister will allow you to transfer ICP from one canister to another. We will also support ETH once that is available.
+
+-------------------------
+
+Munlite | 2022-01-24 14:39:15 UTC | #24
+
+Is there a method similar to transferFrom?
+
+-------------------------
+
+0rions | 2022-01-23 10:45:09 UTC | #25
+
+Thanks for the interface, which data structure would you recommend to store the invoices ?
+
+-------------------------
+
+kpeacock | 2022-01-24 16:47:15 UTC | #26
+
+I'll provide Rust and Motoko examples, but it can be as simple as a `[Invoice]`. You may want to optimize for lookups by caller, or metadata in the `Details`, though, so it ultimately will depend on your use case
+
+-------------------------
+
+Munlite | 2022-01-25 12:48:00 UTC | #27
+
+Is there a method similar to transferFrom as in Ethereum?
+
+-------------------------
+
+kpeacock | 2022-01-25 17:06:51 UTC | #28
+
+No, I'm not adding support for holding multiple balances in the Invoice canister. My design goal is to be more like Stripe than like Ethereum
+
+-------------------------
+
+Munlite | 2022-01-25 17:18:50 UTC | #29
+
+Thanks for the answer!
+
+-------------------------
+
+diegop | 2022-01-25 18:31:35 UTC | #30
+
+[quote="kpeacock, post:28, topic:9843"]
+My design goal is to be more like Stripe than like Ethereum
+[/quote]
+
+Under rated statement.
+
+-------------------------
+
+lastmjs | 2022-04-15 15:09:38 UTC | #31
+
+You mentioned this could be a centralized service with an SNS...what about if it become a system canister of the NNS?
+
+If we could have atomic ICP/SNS/Ledger transactions (sending these tokens with update calls), I imagine the need for this infrastructure would disappear. I wonder then if it would make sense to have it come under the control of the NNS until we can send ledger tokens in update calls atomically.
+
+Of course this idea is dependent on DFINITY committing to implement the sending of ledger tokens in update calls. This would be an amazing DX and I hope it will be considered.
+
+-------------------------
+
+kpeacock | 2022-04-15 16:23:27 UTC | #32
+
+Once the BTC integration is done, the financial integrations team will take over the invoice canister, and that's when they would decide whether to make it a system service
+
+-------------------------
+
+Iceypee | 2022-04-15 17:47:45 UTC | #33
+
+I don't get how this is different then the ledger canister right now when you say there needs to be protection against double spending. Can't we already send ICP tokens from principal ID's already with the ledger canister in Motoko?  Otherwise, how is plug and stoic wallet doing it?
+
+-------------------------
+
+jzxchiang | 2022-04-16 05:31:11 UTC | #34
+
+> Of course this idea is dependent on DFINITY committing to implement the sending of ledger tokens in update calls. This would be an amazing DX and I hope it will be considered.
+
+Why can we not currently send ledger tokens in update calls? Isn't that just calling the `transfer` method on the ICP ledger canister?
+
+-------------------------
+
+skilesare | 2022-04-16 14:29:50 UTC | #35
+
+[quote="jzxchiang, post:34, topic:9843"]
+Why can we not currently send ledger tokens in update calls? Isn’t that just calling the `transfer` method on the ICP ledger canister?
+[/quote]
+
+The pattern that I’ve been using is for the client to transfer tokens to the dapp account and then claim the payment by sending the block/transaction number to the dapp. The dapp confirms the payment and deposits credit to the clients account.
+
+I think the pattern people want is for a transaction to be charged with tokens like on ethereum. You can put tokens in your .buy() function and the dapp can take them or not.  Like how cycles work but with the ability for a client to do it. Currently only canisters can send cycles. The issue is that handling all tokens is hard. Eth had to add erc20 to generalize the payment patterns and they lost the native send functionality.
+
+This seems like an easy problem to solve with crypto. Just let the client create a signed withdraw receipt that the remote app can cash(like a check). You have to get fancy to avoid replay, and some data would likely have to be added to the ledger, but I’m confident that all the crypto engineers at DFINITY could figure it out.
+
+And yes, intercanister query would speed things up.
+
+-------------------------
+
+RmbRT | 2022-04-27 08:53:01 UTC | #36
+
+So, as it stands, there is no way for a canister to subscribe to the ICP ledger, to be notified of incoming payments? I need the payment receipt functionality for a grant of ours that just got approved. We were under the impression that this was already implemented.
+
+-------------------------
+
+Hic | 2022-05-08 13:05:53 UTC | #37
+
+I've been struggling with implementing this exact functionality.  Has there been any updates on this @kpeacock? Also, your personal site has been super helpful in learning IC development, so thank you.
+
+-------------------------
+
+Mathias | 2022-05-08 15:35:09 UTC | #38
+
+How exactly would that allow for atomic transactions, I'm not completely following on this? Are system services on each subnet and could work for each canister on that subnet atomically?
+
+Generally, I don't fully understand if or why not cross-canister transactions on the same subnet are not atomic?
+
+-------------------------
+
+inviscidpixels | 2022-05-08 16:50:16 UTC | #39
+
+Did you figure out a solution? Is a AWS lambda call not sufficient?
+
+-------------------------
+
+RmbRT | 2022-05-08 23:22:48 UTC | #40
+
+Well, we'll go with the idiomatic, although highly limited solution. I don't really understand why it even works. Because the dfx_notify call by the user is still an inter-canister call and according to my understanding, is just as insecure as directly calling from within the initial transfer call, but maybe I'm missing something here.
+I have no idea about AWS lambda, but I'd rather not rely on AWS. I'll just bite the bullet on this one.
+
+-------------------------
+
+Fulco | 2022-05-18 18:27:42 UTC | #41
+
+It seems like everybody can call the `create_invoice` function including the anonymous principal. 
+
+Would it be an idea to:
+
+1. Let the actor have an optional parameter of an allowlist of principals who can create an invoices to prevent somebody malicious from filling up the canister with junk invoices. 
+
+2. Have somebody explicitly confirm through a parameter in the create_invoice canister that they meant to pass the anonymous principal to prevent mistakes. 
+
+I'd be happy to help out with a pull request if you agree with these changes
+
+-------------------------
+
+kpeacock | 2022-05-18 18:54:38 UTC | #42
+
+Yes, that is one of the open issues here: https://github.com/dfinity/invoice-canister/issues/25
+
+I haven't been able to finish the project after it got deprioritized, but the allowlist was how I planned to resolve it
+
+-------------------------
+
+Fulco | 2022-05-18 18:57:51 UTC | #43
+
+Ah apologies should have checked the issues.
+
+-------------------------
+
+inviscidpixels | 2022-05-18 18:58:03 UTC | #44
+
+Existing NFT projects (on other chains as well) usually employ a "whitelist" (for other purposes) that could provide a practical use case for creating an allowlist of principals known not to be malicious. 
+
+For instance, 1st time creation of an invoice for a new user could have a callback to register that principal to the allowlist, which then could be weighted depending on reputation should be a scalar. 
+
+Multiple invoice canisters could then also pipe their allowlists to an independent canister, to provide for a decentralized allowlist that all (legitimate) projects could benefit from. Removing from that list could be managed by a DAO (or a specific SNS implementation for this purpose on this decentralized allowlist canister) in case "someone goes bad" in a way that reflects the nature of decentralized governance. Theoretically this could be a good use case for an ecosystem benefiting black hole canister as well.
+
+-------------------------
+
+cryptoschindler | 2022-05-26 19:32:00 UTC | #45
+
+[quote="kpeacock, post:42, topic:9843"]
+I haven’t been able to finish the project after it got deprioritized, but the allowlist was how I planned to resolve it
+[/quote]
+
+This seems to be critical infrastructure and I'd guess a lot of people are waiting for this (me included). Why was it deprioritized?
+
+-------------------------
+
+Zane | 2022-05-26 23:00:31 UTC | #46
+
+As far as I remember he said it was passed to another team, financial integration team or something like that.
+
+-------------------------
+
+dfx-json | 2022-05-27 18:34:23 UTC | #47
+
+Hello all - eng manager from the SDK team here. Here is the path forward for the invoice canister and IC based payments workflows in general:
+
+- the invoice canister authored by Kyle will be provided as sample code [here](https://github.com/dfinity/invoice-canister). Ultimately, it's a showcase of how invoices and payments *can* be facilitated on Internet Computer, but due to [considerations raised](https://github.com/dfinity/invoice-canister/issues) by our security team at DFINITY, we as an organization, have decided not to officially endorse it as the defecto invoice solution on Internet Computer
+- instead, we will work on a set of tools that will help facilitate payments workflows and release this as a library at a later date. This work will be performed by the Financial Integrations team at DFINITY. I don't have a timeline for this, but rough estimates would place it somewhere in '23.
+
+If you have any questions about this, let me know, and I'd be happy to answer!
+
+-------------------------
+
+paulyoung | 2022-05-29 19:24:12 UTC | #48
+
+[quote="cryptoschindler, post:45, topic:9843"]
+This seems to be critical infrastructure and I’d guess a lot of people are waiting for this (me included)
+[/quote]
+
+Would Quark help?
+
+https://twitter.com/DepartureLabs/status/1511020127025782789
+
+https://twitter.com/SuddenlyHazel/status/1526989565969539072
+
+https://twitter.com/SuddenlyHazel/status/1526989567089311747
+
+-------------------------
+
+bundubuduri | 2022-06-01 04:16:28 UTC | #49
+
+It may be because with the ledger canister you can verify how much an address holds, but not who made the transaction. This solutions gives you that option with: `destination: AccountIdentifer` and `verify_invoice`
+
+-------------------------
+
+Zane | 2022-07-07 10:44:54 UTC | #50
+
+I tried their testnet and it not only shows NNS balance but also allows you to transfer tokens from the NNS to their dApp with a single click, right now its faked so I wonder is that actully possible? I knew principals had no access to infos from the NNS or other dApps.
+
+-------------------------
+
+kpeacock | 2022-07-12 23:03:44 UTC | #51
+
+The Invoice Canister has officially landed in the examples repo! 🎉
+
+https://github.com/dfinity/examples/tree/master/motoko/invoice-canister
+
+We have some cleanup tasks, most importantly adding in access control for invoice creation, but feel free to use this as a reference for your canister logic.
+
+https://github.com/dfinity/examples/issues/292
+
+-------------------------
+
+Iceypee | 2022-08-03 00:20:04 UTC | #52
+
+hey is there not an atomicity issue at the responds with invoice state step? I.e. lets say you were making the invoice buy nft's or something. 
+But after the invoice canister responds with a verified invoice state, if the dapp canister fails to mint, then you have a verified invoice without provision of service. 
+
+I.e. 
+func verify_invoice_and_provide_service(){
+var txreceipt = await verify_invoice();
+-------------------------------------------> potential atomicity hole
+provide_synchronous_service()
+more_synchronous_code()
+}
+
+Basically if provide_a_synchronous_service() is synchronous as named, is it garunteed to go through? Cause I can see issues occuring at that middle step. One being what if the canister ran out of cycles at exactly that step? Or am I wrong? If an intercanister call is able to run its code (i.e. verify the invoice internally), is the response a garuntee that the dapp canister will execute the rest of the synchronous code below (given theres no other async calls below)? 
+![Screen Shot 2021-12-21 at 9.18.39 AM|690x492](upload://xBPOKzbUItAq6uS93QblmorlCDm.png)
+
+-------------------------
+
+kpeacock | 2022-08-03 15:37:48 UTC | #53
+
+The verify step can be called idempotently - it updates to `verified` after the first call, and after that it returns an `alreadyVerified` variant. The dapp canister can use its own logic to handle errors, retries, and refunds
+
+-------------------------
+
+Iceypee | 2022-08-03 18:31:02 UTC | #54
+
+yea but what if i was dependent on that initial verified response and not the alreadyverified response. Is the only way to ensure that a synchronous service is ran in conjunction with the initial verified state is to inbuild the service into the invoice and not an external canister?
+
+-------------------------
+
+kpeacock | 2022-08-03 19:29:28 UTC | #55
+
+synchronicity was not a design goal - the Invoice Canister verification flow is based on a polling model that will be "eventually true", while requiring minimal code to integrate with.
+
+If your use case has a particular need to execute something at the time the verification takes place, it may very well be preferable to copy portions of the logic directly into your service logic, and skip the invoice canister entirely
+
+-------------------------
+
+Iceypee | 2022-08-03 19:48:10 UTC | #56
+
+I see, that makes sense.
+
+-------------------------
+

@@ -1,0 +1,195 @@
+vldmkr | 2023-09-25 16:24:49 UTC | #1
+
+Hello ICP community,
+
+I am developing a mechanism to allow certain off-chain operations to be performed on behalf of a particular Principal in the ICP ecosystem. The main challenge is to ensure that these off-chain operations are actually initiated and approved by the owner of that Principal. This is similar to ensuring that operations from an Ethereum address are actually performed by its owner.
+
+### Ethereum Address Verification (for analogy):
+In the Ethereum ecosystem, address ownership verification typically involves:
+1. **Address Input:** The user provides their Ethereum address.
+2. **Unique Message Creation:** A unique challenge or message is generated for the user to sign.
+3. **Signature Prompt:** The MetaMask prompts the user to sign the generated message.
+4. **Capture Signature:** The signature is captured after signing.
+5. **Signature Verification:** The signature is verified against the user's Ethereum address using the ECDSA recovery method. If the recovered public key matches the given address, then the user has proven that he controls the address.
+
+### Proposed Principal Verification Process in ICP:
+After researching the source code, reading the documentation and forum, this process has been adapted in the context of ICP as follows:
+1. **Identity Initialization and User Login**: Initialize Identity and prompt user login via Internet Identity service.
+2. **Principal Retrieval**: Retrieve the authenticated user's Principal.
+3. **Unique Message Creation on Backend**: Generate a unique message for the user’s session to sign.
+4. **Message Signing Using User's Identity Session Key**: The user signs the unique message with their Identity Session Key.
+5. **Delegation Chain Retrieval**: Retrieve the Delegation Chain containing the Delegation corresponding to the Session Key.
+6. **Sending Data to Backend**: Send the signed message, corresponding Delegation, and Identity’s public key to the backend.
+7. **Challenge Construction from Delegation**: Construct a challenge from the received Delegation for Canister Signature verification.
+8. **Canister Signature Verification**: Verify the Canister Signature using the constructed challenge, Identity’s public key, Root Subnet key, and the signature of the Delegation to validate the Session Key.
+9. **Session Signature Verification**: Finally, the session's public key (extracted from the Delegation) is used to verify the unique message originally created on the backend, confirming the legitimacy of the user's session.
+
+I'd appreciate any feedback or insights on this proposed method, especially any potential security concerns or areas for improvement.
+
+Thank you in advance!
+
+-------------------------
+
+benji | 2023-09-26 10:26:41 UTC | #2
+
+When it's a bit more formalized, you're welcome to contribute here https://github.com/dfinity/ICRC
+
+For message signing we probably need a standard similar to EIP-191
+
+-------------------------
+
+frederikrothenberger | 2023-09-26 10:32:09 UTC | #3
+
+Hi @vldmkr
+
+I'm not quite clear why in step 7 the challenge is created from the delegation?
+
+But the flow should work in general. Given the session public key, the II delegation and a signed challenge, you can verify that the challenge was signed with the session public key, that the session public key was authorized by II and that the II issued public key derives to the expected principal.
+
+However, you need to be careful about "time of check, time of use" vulnerabilities in that flow: The delegation for the session public key might be valid for up to 30-days. The delegation validity gives the maximum amount of time that can pass between an II sign-in and the challenge signing.
+If your application has stricter constraint in that regards, you need to check for it explicitly. The issuance timestamp is included in the delegation.
+
+-------------------------
+
+sea-snake | 2023-09-26 11:59:27 UTC | #4
+
+As far as I'm aware there are currently 4 signatures supported by the IC.
+
+- ECDSA
+- ED25519
+- SECP256K1
+- Canister signature
+
+A challenge could be signed by any of the above. And additionally the identity that signs the challenge could be delegated in a chain of any of the above signatures.
+
+Example implementation of verifying a challenge with all of these different possible signature algorithms: https://github.com/slide-computer/identity/blob/master/src/signature/index.ts
+
+Example of checking the signature with a delegation chain: https://github.com/slide-computer/identity/blob/master/src/signature/identity.ts
+
+At the moment the I've noticed the following common usage for each algorithm:
+
+- ECDSA -> default for Internet Identity AuthClient on web
+- ED25519 -> commonly used for seed phrase on web
+- SECP256K1 -> DFX identity
+- Canister signature -> Internet Identity delegation signature
+
+-------------------------
+
+vldmkr | 2023-09-27 02:28:09 UTC | #5
+
+Hello @benji,
+
+Thank you for finding this interesting. I'm still relatively new to the Internet Computer ecosystem, having only started this journey just a few weeks ago, and am still in the process of understanding its intricate workings and functionalities.
+
+Once I gain a deeper understanding and feel more confident about the details, I'm definitely interested in contributing to the ICRC proposals.
+
+-------------------------
+
+vldmkr | 2023-09-27 03:47:25 UTC | #6
+
+Thank you for your insights, @frederikrothenberger.
+
+To give a more in-depth perspective, I am working on a research project, that you can find here: https://github.com/uniot-io/icp-canister-signature-verifier. The main files of interest are [lib.rs](https://github.com/uniot-io/icp-canister-signature-verifier/blob/7f49e24a22797371ad02e6d78143abea38894674/src/rs/src/lib.rs) and [app.js](https://github.com/uniot-io/icp-canister-signature-verifier/blob/7f49e24a22797371ad02e6d78143abea38894674/src/frontend/app.js).
+
+The Rust code is essentially a WebAssembly module that defines a [`verify_canister_sig`](https://github.com/uniot-io/icp-canister-signature-verifier/blob/7f49e24a22797371ad02e6d78143abea38894674/src/rs/src/lib.rs#L17) function that verifies the canister's signature. It takes in the challenge, the delegation's signature, the canister's public key in DER format, and the root's public key in DER format.
+
+In the JavaScript part, I've structured the signature verification process into two main classes: [`SignatureResearch`](https://github.com/uniot-io/icp-canister-signature-verifier/blob/7f49e24a22797371ad02e6d78143abea38894674/src/frontend/app.js#L20) and [`VerifierResearch`](https://github.com/uniot-io/icp-canister-signature-verifier/blob/7f49e24a22797371ad02e6d78143abea38894674/src/frontend/app.js#L90) . The `SignatureResearch` class manages the user's identity, retrieves the delegation chain, and allows the user to sign a generated time-stamped message. On the other hand, the `VerifierResearch` class is responsible for principle reconstruction and comparison, checking the session key's expiration, and verifying the canister and message signatures.
+
+For a clearer understanding, here's a sequence of operations:
+1. **User Login**: A user initiates the process by clicking the login button.
+2. **Initialize Identity**: The `SignatureResearch` class is used to log the user in via the Internet Identity service.
+3. **Initialize Verification**: The `VerifierResearch` class is initialized with the authenticated user's public key and the corresponding delegation.
+4. **Generate Unique Message**: A unique time-stamped message is generated for the user's session to sign.
+5. **Sign Message**: The user signs this unique message using their identity session key.
+6. **Verify Principal**: The principal obtained from the Identity is verified to match the expected one.
+7. **Verify Session (Rust Implementation)**: The Rust implementation (`verify_canister_sig` function in `lib.rs`) is used to verify the session based on the constructed challenge, delegation signature, identity's public key and root key.
+8. **Verify Session (JS Implementation)**: An alternative verification using JS is conducted.
+9. **Verify Message Signature**: The signature of the generated message is verified to ensure it was indeed signed by the user's session key.
+10. **Check Session Key Expiration**: The expiration of the session key is checked against the timestamp of the signed message.
+
+If there are any further suggestions or clarifications needed, I'd be happy to hear them.
+
+-------------------------
+
+vldmkr | 2023-09-27 04:35:00 UTC | #7
+
+Hi @sea-snake,
+
+I appreciate your detailed response and the shared resources. They have played a significant role in structuring my knowledge. I took the time to look closely at your implementation of the [`isCanisterSignatureValid`](https://github.com/slide-computer/identity/blob/8a45fe15537fbc631af0004c4da9b3847d103c9a/src/signature/canister.ts#L13) function and adapted a [similar process](https://github.com/uniot-io/icp-canister-signature-verifier/blob/7f49e24a22797371ad02e6d78143abea38894674/src/frontend/app.js#L142) in my project.
+
+Comparing this to the [Rust implementation in the IC main repository](https://github.com/dfinity/ic/blob/34abd6be1bec7c8dd52ec313e2b194b8e6052230/rs/crypto/internal/crypto_lib/basic_sig/iccsa/src/api.rs#L48), I noticed a difference in the verification steps. The Rust implementation seems to have additional steps to verify the signature:
+
+* Your TypeScript implementation focuses primarily on certificate validation, using the `Certificate.create` method to ensure the authenticity of the certificate.
+* The Rust approach appears to be more comprehensive. After parsing the public key and signature, it conducts:
+  * Certificate verification through `verify_certified_data`.
+  * Signature tree construction with `canister_sig_tree`.
+  * Path lookup in the signature tree using `lookup_path_in_tree` to ensure the provided message is correctly represented within the signature tree.
+
+I'm curious, is this due to a design choice for simplicity and use-case specificity, or are there plans to further align with the steps found in the full implementation?
+
+Thanks again for your valuable input!
+
+-------------------------
+
+sea-snake | 2023-09-27 08:00:31 UTC | #8
+
+When you create the certificate, the certificate create method calls [verify](https://github.com/dfinity/agent-js/blob/main/packages/agent/src/certificate.ts#L178) which basically does these steps to verify the signature :slight_smile: 
+
+Instead of implementing certificate verification from scratch, I tried to use what was already available in agent-js.
+
+But I haven't looked into the details yet, still need to check if this implementation is correct or if I need to adapt it for my use case.
+
+For example in this use cases the max age in the verification should be increased since an Internet Identity delegation can be valid up to 30 days, not 5 minutes. I see on line 237, Certificate.create is already used internally with a 30 day expiry to validate delegations.
+
+Edit:
+Now you mention it, I see indeed that I forgot to also check if the certificate itself is valid for the data it's supposed to certify.
+
+I should check if it's within the certificate instance after it has been successfully created.
+
+I now remember doing that in the `@dfinity/assets` lib at line 488: https://github.com/dfinity/agent-js/blob/main/packages/assets/src/index.ts#L488
+
+Though in this case I have both the certificate and tree, with a delegation, I think that's only the certificate. Will have to dive more into this 😅
+
+Could you link me to the rust implementation you've mentioned?
+
+-------------------------
+
+vldmkr | 2023-09-30 03:03:25 UTC | #9
+
+Hi @sea-snake,
+
+Your feedback has been quite helpful. I've been busy working on my implementation and wanted to share my progress.
+
+For my project, I created a WASM module that exports the `verify_canister_sig` function. You can find the implementation here: https://github.com/uniot-io/icp-canister-signature-verifier/blob/8b127c12bc8f46dd424385698dd2bdc1fecb59a5/src/rs/src/lib.rs
+This function uses the `iccsa::verify` function from the ICP crypto library under the hood: https://github.com/dfinity/ic/blob/34abd6be1bec7c8dd52ec313e2b194b8e6052230/rs/crypto/internal/crypto_lib/basic_sig/iccsa/src/api.rs#L48
+
+I've been working on aligning my Js implementation with the Rust one, and have managed to implement full signature verification by referencing the implementation in `@dfinity/assets` that you shared. Here's a brief overview:
+* `parsePublicKey` extracts the canister ID and seed from a public key.
+* `verifyCertifiedData` checks the validity of the certificate, ensuring that it hasn't expired and matches the provided tree.
+* `lookupPathInTree` ensures that the signed message is correctly represented within the signature tree.
+* Finally, the main `verifyCanisterSig` function ties everything together and performs the entire verification process.
+
+You can find the code here: https://github.com/uniot-io/icp-canister-signature-verifier/blob/8b127c12bc8f46dd424385698dd2bdc1fecb59a5/src/frontend/canister.js
+
+I'd appreciate it if you сould take a moment to review this implementation. If it matches your use cases, it may be useful in your project as well. Feel free to use it :slightly_smiling_face:
+
+-------------------------
+
+sea-snake | 2023-09-30 11:33:36 UTC | #10
+
+Very nice, I'll update my implementation with these changes :smiley: 
+
+I'll probably move all this into it's own npm lib for verifying IC identity signatures.
+
+-------------------------
+
+domwoe | 2023-09-30 15:42:41 UTC | #11
+
+Awesome work @vldmkr!
+
+It would be nice to have a small sample project of a Node.js that is able to verify canister signatures in general and allows authentication with Internet Identity in particular.
+
+The former general pattern could be used to implement an authorization server as a canister for an off-chain resource.
+
+-------------------------
+

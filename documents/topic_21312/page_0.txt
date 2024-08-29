@@ -1,0 +1,123 @@
+ZenVoich | 2023-07-12 07:50:02 UTC | #1
+
+dfx `0.14.2`
+moc `0.9.6`
+
+For example
+
+`foo.mo`
+```
+actor class Foo() {
+  public func add(data : Blob) {}; // expect Blob
+};
+```
+
+`bar.mo`
+```
+import Foo "canister:foo";
+
+actor class Bar() {
+  public func addToFoo(data : Blob) : async () {
+    Foo.add(data); // send Blob
+  };
+};
+```
+
+On deploy I get error:
+```
+type error [M0096], expression of type
+  Blob
+cannot produce expected type
+  [Nat8]
+```
+
+Interestingly, with the `--mode reinstall` flag, I can deploy without errors.
+
+-------------------------
+
+claudio | 2023-07-12 08:51:00 UTC | #2
+
+This is confusing but actually expected, I think.
+
+Since you are importing the class instance as a canister (not Motoko actor class library) moc doesn't know it's a Motoko canister. The candid interface will say `add : [vec Nat8] -> ()` and `Foo` will have imported type `[Nat8] -> async {}` after re-translation from Candid to Moc.
+
+The code would work if you imported the actor class directly as a library and communicated with an instance of that class, because Moc then uses the Motoko type of the actor class direclty, not the generated Candid interface.
+
+-------------------------
+
+ZenVoich | 2023-07-12 09:17:12 UTC | #3
+
+[quote="claudio, post:2, topic:21312"]
+The code would work if you imported the actor class directly as a library and communicated with an instance of that class, because Moc then uses the Motoko type of the actor class direclty, not the generated Candid interface.
+[/quote]
+
+I want to use different moc build args for `Foo` (`--max-stable-pages`)
+
+[quote="claudio, post:2, topic:21312"]
+Since you are importing the class instance as a canister (not Motoko actor class library) moc doesn’t know it’s a Motoko canister. The candid interface will say `add : [vec Nat8] -> ()` and `Foo` will have imported type `[Nat8] -> async {}` after re-translation from Candid to Moc.
+[/quote]
+
+Candid supports `blob` type, right? Why doesn't moc generate `blob` instead of `vec nat8`?
+
+In `.dfx` folder I see that it generates blob in contructor.did and vec nat8 in service.did
+
+-------------------------
+
+claudio | 2023-07-12 18:53:21 UTC | #4
+
+In Candid, `blob` is just an abbreviation for `vec nat8` (but not in Motoko).
+
+You can convert the data to an array if you don't mind the expense (`Blob.toArray(data)`).
+
+Another hacky workaround would be to cast `Foo` to another actor type that has the `blob` method. It should work, is gross, but cheaper than the array conversion.
+
+Something like
+```
+{
+   let foo = actor (Principal.toText(Principal.fromActor(Foo))) : actor { add : Blob -> () } 
+   foo.add(data);
+}
+```
+
+-------------------------
+
+ZenVoich | 2023-07-13 08:35:18 UTC | #5
+
+[quote="claudio, post:4, topic:21312"]
+You can convert the data to an array if you don’t mind the expense (`Blob.toArray(data)`).
+[/quote]
+
+Will it consume 4x more bytes if I use [Nat8] instead of Blob for inter-canister calls(message size)?
+
+Not my case, but if it's not just a blob argument there, but more complex nested type, shared between canisters, there would be more inconvenience.
+
+[quote="claudio, post:4, topic:21312"]
+In Candid, `blob` is just an abbreviation for `vec nat8` (but not in Motoko).
+[/quote]
+I don't understand why _Motoko_ doesn't generate `blob`, since  for _Motoko_ they are two different types.
+
+Feels like a bug, not a feature to be honest.
+
+-------------------------
+
+claudio | 2023-07-13 19:18:03 UTC | #6
+
+
+> Will it consume 4x more bytes if I use [Nat8] instead of Blob for inter-canister calls(message size)?
+
+In the message (Candid binary), no, in memory, yes.
+
+>Not my case, but if it's not just a blob argument there, but more complex nested type, shared between canisters, there would be more inconvenience.
+
+yep.
+
+> I don't understand why _Motoko_ doesn't generate `blob`, since  for _Motoko_ they are two different types.
+
+Well, it does, but Candid `blob` is just  Candid `vec nat8`. There is no distinct `blob` type to generate.
+
+> Feels like a bug, not a feature to be honest.
+
+Well, bug is a bit strong, but needless minimalism, maybe. Life would be simpler if Candid just had a distinct blob type, I think. I mean, it does for `principal`, IIRC.
+
+-------------------------
+

@@ -1,0 +1,224 @@
+kevinli | 2021-10-03 07:40:16 UTC | #1
+
+I'm interested in exposing a url from a canister where someone can send an http request to it and receive back an image. I was wondering how to do something like this:
+https://e3izy-jiaaa-aaaah-qacbq-cai.raw.ic0.app/?tokenid=onxj3-rakor-uwiaa-aaaaa-b4aaq-maqca-aabc7-a
+If I have a backend/storage canister that stores a bunch of images as Blobs, is it possible to process these requests and return those Blobs as deserialized images?
+Or do I need to create a separate frontend that queries the backend for the Blob, deserializes the images there, and then returns the image?
+
+-------------------------
+
+spencer | 2021-10-03 15:53:14 UTC | #2
+
+I’ve been looking into this as well, and have decided to go with the latter approach of returning all images and videos as blobs first retrieved to a local cache on the browser then calling createobjecturl to render the images.
+
+Out of curiosity, what project is that image link from? How did they do that?
+
+-------------------------
+
+nomeata | 2021-10-03 17:31:50 UTC | #3
+
+Is your backend canister implemented in rust or motoko?
+
+But in both cases it is not hard to return raw HTTP, by exposing the `http_query` method, at least if you are content with `<canisterid>.raw.ic0.app` URLs and the fact that this is not safe against malicoius nodes.
+
+There just isn’t much documentation yet, and [not even the spec is out yet](https://forum.dfinity.org/t/make-http-gateway-spec-public-open-source/6999), but you cargo-cult from various example projects.
+
+Serving it in a way that works from `<cansiterid>.ic0.app` (i.e. certified) is also possible, but significantly harder.
+
+Or you can just use [dfx’s default “certified asset canister”](https://github.com/dfinity/certified-assets) to store the files, then HTTP access works out of the box. Again, I believe we are missing a tutorial for how to use that canister in your poject, e.g. upload files to it.
+
+-------------------------
+
+spencer | 2021-10-03 18:11:52 UTC | #4
+
+@nomeata Do you know of any such example projects? I'm using motoko backend.
+
+-------------------------
+
+nomeata | 2021-10-03 21:08:57 UTC | #5
+
+https://github.com/nomeata/motoko-certified-http and you can ignore the certification stuff I guess.
+
+-------------------------
+
+kevinli | 2021-10-03 21:59:03 UTC | #6
+
+@nomeata 
+Interesting, so if I basically just include this part:
+```
+public query func http_request(req : HttpRequest) : async HttpResponse {
+    // check if / is requested
+    if ((req.method, req.url) == ("GET", "/")) {
+      // If so, return the main page with with right headers
+      return {
+        status_code = 200;
+        headers = [ ("content-type", "text/plain"), certification_header() ];
+        body = main_page()
+      }
+    } else {
+      // Else return an error code. Note that we cannot certify this response
+      // so a user going to https://ce7vw-haaaa-aaaai-aanva-cai.ic0.app/foo
+      // will not see the error message
+      return {
+        status_code = 404;
+        headers = [ ("content-type", "text/plain") ];
+        body = "404 Not found.\n This canister only serves /.\n"
+      }
+    }
+  };
+```
+the assets will be queryable simply by doing ```<canisterid>.raw.ic0.app```?
+
+-------------------------
+
+nomeata | 2021-10-04 07:32:43 UTC | #7
+
+That will serve the content of `main_page()` at `https://<canisterid>.raw.ic0.app/`, as you can see at <https://ce7vw-haaaa-aaaai-aanva-cai.ic0.app/>.
+
+But you want to serve images, and probably at different URLs. So you can add something like
+```
+    else if ((req.method, req.url) == ("GET", "/my_image.png")) {
+      return {
+        status_code = 200;
+        headers = [ ("content-type", "image/png") ];
+        body = the_image_blob
+      }
+```
+
+And if it’s not a fixed set of images, your URL routing logic becomes more complicated…
+
+Also, this code doesn’t do streaming of HTTP responses, so don’t expect it to work with files larger than 2MB.
+
+Another source for inspiration could be the “old” asset canister, as it used to come with `dfx`. That’s also written in Motoko, and does more complicated things with assets. It got removed from the `sdk` repo, but we have history: <https://github.com/dfinity/sdk/tree/b334a69408e7fc873e09d2d82c3fe827665fcfa1/src/distributed/assetstorage>.
+
+-------------------------
+
+kevinli | 2021-10-04 07:36:49 UTC | #8
+
+@nomeata 
+Ah, okay, so how would one pass in a path variable and parse that? 
+Let's say I want something like:
+```
+else if ((req.method, req.url) == ("GET", "/images/:imageId")) {
+      return {
+        status_code = 200;
+        headers = [ ("content-type", "image/png") ];
+        body = { grab the correct blob from storage with imageId }
+      }
+```
+How could I achieve this with a dynamic path variable?
+
+-------------------------
+
+nomeata | 2021-10-04 09:19:58 UTC | #9
+
+You probably want to analyze `req.url` with [`Text.stripStart`](https://sdk.dfinity.org/docs/base-libraries/text) to see if it starts with `/images/` and get the remainder… there is no URL routing library for Motoko yet so you have to implement that yourself. But it’s just “plain programming” at this point :-)
+
+-------------------------
+
+cryptoschindler | 2021-10-04 11:49:25 UTC | #10
+
+If we were to use a custom implemented asset canister that exposes the same interface as the one provided by the SDK, can we still use `dfx deploy` to upload assets into it if we specify `type : assets`?
+
+I'm not too familiar with rust, can you maybe explain where the `ic_asset` here is coming from?
+https://github.com/dfinity/sdk/blob/dacd7ecb1dc64fd7113ea84eea406596a6390eb7/src/dfx/src/lib/installers/assets/mod.rs#L23
+
+-------------------------
+
+nomeata | 2021-10-04 13:57:03 UTC | #11
+
+[quote="cryptoschindler, post:10, topic:7669"]
+If we were to use a custom implemented asset canister that exposes the same interface as the one provided by the SDK, can we still use `dfx deploy` to upload assets into it if we specify `type : assets` ?
+[/quote]
+
+I would assume so. 
+
+[quote="cryptoschindler, post:10, topic:7669"]
+can you maybe explain where the `ic_asset` here is coming from
+[/quote]
+Not at first glance. Maybe @roman-kashitsyn can help.
+
+-------------------------
+
+nomeata | 2021-10-04 17:06:08 UTC | #12
+
+I just came across this code, which is probably a better example for serving HTTP requests from Motoko: 
+
+https://github.com/ORIGYN-SA/motoko_http_handler/blob/master/src/motoko_http_handler/main.mo#L56
+
+-------------------------
+
+spencer | 2021-10-06 23:26:15 UTC | #13
+
+@kevinli 
+You can use the code I'm working on here:
+https://github.com/spencerbug/spencerneilan.com/commit/4fe57ccac37307163e288e52ec69deb3e33345d9
+I'm working on something similar to you, trying to make a kind of google storage bucket, but that can also be used for direct links to videos/images/any type of file. Hope that helps
+
+-------------------------
+
+peterparker | 2021-10-07 11:06:37 UTC | #14
+
+[quote="spencer, post:13, topic:7669"]
+google storage bucket
+[/quote]
+
+I was literally trying to generate a random secret token as in firebase storage and saw you post. Your [random fileid generator](https://github.com/spencerbug/spencerneilan.com/blob/4fe57ccac37307163e288e52ec69deb3e33345d9/src/backend/storage/Buckets.mo#L38) looks super interesting, thanks for the share!
+
+-------------------------
+
+spencer | 2021-10-09 23:48:01 UTC | #15
+
+Credit goes to @Gabriel !
+
+-------------------------
+
+paulyoung | 2022-01-23 01:34:09 UTC | #16
+
+[quote="cryptoschindler, post:10, topic:7669"]
+can you maybe explain where the `ic_asset` here is coming from?
+[/quote]
+
+@cryptoschindler I think it’s here:
+
+https://github.com/dfinity/agent-rs/blob/a8bb38e2079c935fc4deec0128c05319a43e5551/ic-asset/src/sync.rs#L16
+
+-------------------------
+
+heyuanxun | 2022-01-24 03:58:21 UTC | #17
+
+I want to return some chunk information through https://deqv7-6qaaa-aaaai-qfkna-cai.raw.ic0.app/ .
+But as you see the Callback did not work.
+It just return  the first chunk.
+So,how can i return information thurough Callback to return chunk information.
+This my code https://github.com/xiaoyuanxun/http_demo/blob/main/src/http/main.mo
+Hope someone would help me
+I will be very grateful.
+
+-------------------------
+
+cyberowl | 2022-02-09 05:26:43 UTC | #18
+
+What has been the performance on that approach for say fetching 200 images?
+
+-------------------------
+
+heyuanxun | 2022-02-10 09:02:44 UTC | #19
+
+Because query call response limit 3M.So it may be  to use a little time
+
+-------------------------
+
+cyberowl | 2022-02-10 09:07:39 UTC | #20
+
+Yeah seems like it should be fast. Going to be testing soon and see how it goes.
+
+-------------------------
+
+pattad | 2022-05-16 16:08:37 UTC | #21
+
+I've compiled a little example here:
+https://github.com/pattad/imgTank
+
+-------------------------
+

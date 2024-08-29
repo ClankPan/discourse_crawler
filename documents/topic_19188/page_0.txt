@@ -1,0 +1,153 @@
+solavrov | 2023-04-01 16:29:07 UTC | #1
+
+I deployed a simple counter on the IC and found that it takes 3-4 seconds for the IC to update counter's value. How is it possible to interact with a web application if it needs so much time for data updating? Did I make something wrong or it is a real disadvantage of the IC?
+
+Frontend: https://tbptb-fyaaa-aaaal-qbwvq-cai.ic0.app/
+Backend: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.ic0.app/?id=tgovv-iaaaa-aaaal-qbwva-cai
+
+Backend source:
+
+
+```
+actor {
+
+  stable var counter: Nat = 0;
+
+  public func inc(): async () {
+    counter += 1;
+  };
+
+  public query func read(): async Nat {
+    return counter;
+  };
+
+  public func bump(): async Nat {
+    counter += 1;
+    return counter;
+  };
+
+};
+```
+
+Frontend source:
+
+
+```
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Counter</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body>
+        <main>
+            <div id="counter"></div>
+            <button id="button">+1</button>
+        </main>
+    </body>
+</html>
+```
+
+
+```
+import { counter_backend } from "../../declarations/counter_backend";
+
+let button = document.getElementById("button");
+let counter = document.getElementById("counter");
+
+button.addEventListener("click", async function() {
+  button.setAttribute("disabled", true);
+  await counter_backend.inc();
+  button.removeAttribute("disabled");
+});
+
+async function refresh() {
+  counter.innerHTML = await counter_backend.read();
+}
+
+async function main() {
+  window.setInterval(refresh, 100)
+}
+
+main();
+```
+
+-------------------------
+
+NathanosDev | 2023-03-31 22:27:22 UTC | #2
+
+Polling the backend canister every 100ms is very frequent. Could you try increasing the value of that interval to see if it helps?
+
+@peterparker wrote an article about polling the IC here: https://forum.dfinity.org/t/blog-poll-the-ic-with-web-workers/15830. He uses 2,000ms, maybe you could use that as a starting point and then possibly move the polling into the web worker to reduce the interference with the main JS thread.
+
+-------------------------
+
+free | 2023-04-01 09:51:01 UTC | #3
+
+Any geographically replicated system will take a few seconds to complete a transaction. If you have a single server in front of a single, lightly loaded database, it is of course possible to complete a transaction in significantly under a second. But in a large distributed system (think Amazon, when you click the "Buy" button; or any credit card processor when you make a payment) it takes seconds to ensure that your transaction has been replicated widely enough that, if the specific server you interacted with directly falls over immediately after your interaction, your transaction (purchase, payment) doesn't just disappear in a puff of smoke.
+
+The difference between the IC and the average small web2 application is that:
+1. The IC always does replication, else it wouldn't be tamper proof or censorship resistant. So it's more like Amazon or Visa in that respect, as opposed to a lightweight web2 app.
+2. You get all of this replication, tamper and censorship resistance without having to do a whole lot. Building something like Amazon or Visa has from scratch and making it reliable is A LOT of effort.
+
+That being said, you can have fast IC transactions. All you need is a subnet made up of replicas in the same data center/continent; or a single replica. Making it more like the average Web2 app. This just wasn't a priority thus far.
+
+Also, you can use frontend tricks to hide the latency. E.g. Amazon used to (and maybe still does) immediately react to your clicking the "Buy" button, only to show an error message a few seconds later, saying "sorry, your purchase has failed". Last summer I had to purchase a plane ticket 3 or 4 times; and got charged every single time only to get an email a few minutes afterwards telling me that the purchase had actually failed and I was (eventually) going to be refunded the money. I.e. it wasn't only a frontend trick, the backend I was talking to accepted my purchase only to later fail to make the purchase with the airline.
+
+So whenever you see a large, replicated application respond within milliseconds, it's often just UI trickery (e.g. in your case, incrementing the counter in the UI upon clicking rather than wait for the query to give you the incremented value). And oftentimes it's also backend trickery, where only a record of your request is persisted; and when your request is actually executed, it can fail and you'll only find out minutes later. If you happen to check your email.
+
+So yeah, the IC needs a couple of seconds to actually execute a transaction, because it runs in "rounds": every second a block is created, containing all requests made in the past second; this block needs to travel around the world a couple of times before all subnet replicas agree on it (something that takes about a second); then, all subnet replicas execute your message (which may take up to a second); and then they need another second to agree on the state of the subnet after the execution (which again requires some messages to be sent around the world 2 or 3 times). Plus, in your case, because you don't have `inc()` return the incremented value and instead rely on querying (much too often, BTW), it may take an additional second before the query actually gets to a replica instead of being served from the cache (which also has a time-to-live of 1 second).
+
+-------------------------
+
+solavrov | 2023-04-03 17:08:44 UTC | #4
+
+I turned off window.setInterval(refresh, 100). Did not help. It still takes 4 seconds to save counter value on the IC.
+
+-------------------------
+
+solavrov | 2023-04-03 18:57:12 UTC | #5
+
+[quote="free, post:3, topic:19188"]
+replication
+[/quote]
+
+OK. I understand. But what if I want to create a site for playing, for example, speed chess over the Internet? Transferring moves via IC variables is a bad decision because it takes too long. What should I do? Is it possible to create such a site on the IC?
+
+-------------------------
+
+basvandijk | 2023-04-03 21:48:43 UTC | #6
+
+[quote="solavrov, post:5, topic:19188"]
+But what if I want to create a site for playing, for example, speed chess over the Internet?
+[/quote]
+ 
+Have a WebRTC connection between the two browsers playing chess over which you send the moves with low latency. Then persist those moves to the IC periodically.
+
+This is what OpenChat does to make chatting low latency:
+
+https://medium.com/dfinity/openchat-a-truly-decentralized-alternative-to-whatsapp-d0d051479b9a
+
+-------------------------
+
+free | 2023-04-03 22:27:48 UTC | #7
+
+[quote="solavrov, post:4, topic:19188, full:true"]
+I turned off window.setInterval(refresh, 100). Did not help. It still takes 4 seconds to save counter value on the IC.
+[/quote]
+
+See my last paragraph above: it can take up to a second for your request to be included into a block; up to a second for said block to be finalized (i.e. for the replicas to agree on the block); then up to a second for that block to be executed; up to a second for the result of the execution to be certified (i.e. for the replicas to agree on the state after execution); and around a second before your agent library finds out about it by polling.
+
+Also, in your particular case, instead of having `inc()` return the value of your counter and displaying it immediately (which would be more reliable, as that response is certified by the whole subnet) you spend another second trying to execute queries to retrieve the value of the counter (less reliable, as the response would come from a single replica; and slow, because the query will actually only be executed once a second, and all your other requests will get an earlier cached response).
+
+All that being said, we constantly measure the roundtrip time of cross-subnet (XNet) messages -- canister A sends a request to canister B; canister B executes it and sends a response to canister A; canister A handles the response. All in all this is very much the same path that an ingress message would follow; twice, once for the request and once for the response. And it takes just over 5 seconds. Which suggests that the roundtrip latency of an ingress message should not be above 3 seconds, if done properly (e.g. use the response of the update rather than running a separate query afterwards).
+
+[quote="solavrov, post:5, topic:19188"]
+But what if I want to create a site for playing, for example, speed chess over the Internet?
+[/quote]
+
+You can follow Bas' suggestion and have the two browsers communicate directly over WebRTC instead of via the canister. Or you could (not right now, but there is no technical hurdle) have a subnet consisting of replicas on the same continent or even the same data center; or a subnet consisting of a single replica. With such a setup you can have latency very similar to a non-replicated Web2 application (i.e. a backend sitting in front of a SQL DB). Reason being that it would take zero time for a replica to finalize a block or certify a state; and very close to zero for replicas within milliseconds or tens of milliseconds of network roundtrip time of each other.
+
+-------------------------
+

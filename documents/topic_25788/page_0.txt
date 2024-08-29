@@ -1,0 +1,103 @@
+gatsby_esp | 2023-12-21 15:07:38 UTC | #1
+
+Hi,
+This morning the ghost team launched a mint event, where 500k transactions over a 2 hour span seem to slowed down the whole IC network to the minimum. The SNS network was affected, the dashboard wouldn't even load.
+Can anybody explain this? Is 250kTransactions/hour too much for the IC?
+Thanks
+
+-------------------------
+
+Manu | 2023-12-21 16:19:17 UTC | #2
+
+Hey! I tried to follow a bit what was going on, so I'll quickly share what I observed, although I didn't dive into all the details yet. What I observed is quite different from you sketch.
+
+I did not see any negative impact on the IC overall, and actually also not on the subnet where the GHOST ledger is (x33ed). The subnet was nowhere near the limits judging by the metrics, and (as an anecdotal data point) I had no issues sending other SNS tokens around during the peak of the ghost inscriptions. 
+
+I did see big congestion on the Ghost ledger and index canisters. I believe the problem was the following:
+* a ton of people tried to create ghost transactions, faster than the ledger can handle
+* in ICP, message ordering (consensus) and message execution are separate. All messages made it through consensus, but the messages could not be executed at the same rate. This means that a queue of messages for the ledger and index canisters builds up. 
+* what we then saw is very high latency: if you tried to send an update to the ledger or index canister, you had to wait up to 5 minutes, or your message even expired, because you wait so long in this queue. 
+
+This problem is hard to avoid when more people want to create transactions than the single canister can process. One thing that made this worse is the fact that Ghost (and I believe all SNSes) still use the old index canister, which makes a lot of additional calls to the ledger canister. ckBTC and ckETH use a new index canister, which does not add load to the ledger, and that would've likely led to a higher ledger  transaction throughput. 
+
+A separate problem is the internetcomputer.org dashboard which seemed to struggle with the load. This is of course very impactful for the users as many people rely on this to see that their transactions made it, but we should not confuse the dashboard being slow/unavailable with the internet computer being unavailable, the dashboard is a separate service. I'm sure the relevant team will work on ensuring this service can handle such events better.
+
+-------------------------
+
+gatsby_esp | 2023-12-21 16:39:14 UTC | #3
+
+Thanks for the explanation Manu. What does it take to SNSs to implement ICRC-2 and what would be the difference in termes of magnitude the ledger could handle? For instance x10 throughput vs ICRC1?
+
+-------------------------
+
+free | 2023-12-21 16:40:41 UTC | #4
+
+To give a bit more context, [at peak](https://dashboard.internetcomputer.org/subnet/x33ed-h457x-bsgyx-oqxqf-6pzwv-wkhzr-rm2j3-npodi-purzm-n66cg-gae) the SNS subnet was handling 200 updates and 2000 queries per second.
+
+The Ghost ledger was indeed only handling some 70 transactions per second (or 250k per hour, as you noted). But each of those Ghost transactions resulted in multiple subnet updates (since the Ghost ledger was apparently making downstream calls and also had to handle their responses). Hence the 70 -> 200 multiplier.
+
+Even so, the subnet's block rate was barely affected (dropping by at most 15%, see dashboard link above). And all queries were being executed within 100-200 ms (with the vast majority below 5 ms).
+
+As Manu said, the perceived slowdown came from the increased Ghost ledger latency (a single-threaded canister can only execute so many updates per second, so they had to wait behind one another). And from the dashboard becoming unresponsive, presumably because everyone was trying to find out what was going on. And the dashboard is a rather heavyweight application, so it cannot handle hundreds of page loads per second.
+
+-------------------------
+
+gatsby_esp | 2023-12-21 16:42:24 UTC | #5
+
+Thank you! And what would have to do SNSs to escalate the max throughput? For instance, imagine I want to process 2M transactions / hour. Wouldn't be crazy thinking of a bullrun
+
+-------------------------
+
+free | 2023-12-21 16:56:16 UTC | #6
+
+I don't know much about SNSs specifically, but basic optimizations (such as the new index canister that Manu mentioned) could technically get you at least partway from 250k to 2M transactions/hour (or from 70 to 500 transactions per second -- tps).
+
+Beyond that, one could go with sharding, i.e. distributing the load across multiple canisters and/or subnets. Take a look at [the High Performance Ledger project](https://forum.dfinity.org/t/annoucement-hpl-a-ledger-for-10k-tps/23951). It aims for 10k tps and already achieved a sustained 5k tps, so another 10x above your aim of 2M transactions/hour.
+
+-------------------------
+
+DoVanDong199x | 2023-12-21 19:01:59 UTC | #7
+
+thank for sharing <3
+
+-------------------------
+
+Severin | 2023-12-22 07:31:17 UTC | #8
+
+[quote="gatsby_esp, post:3, topic:25788"]
+What does it take to SNSs to implement ICRC-2 and what would be the difference in terms of magnitude the ledger could handle? For instance x10 throughput vs ICRC1?
+[/quote]
+
+SNS ledgers already support ICRC-2, but it is possible the feature is not turned on everywhere. From what I can tell I don't think it would affect performance much at all. `icrc1_transfer` and `icrc2_transfer_from` produce basically the same workload, with `icrc1_transfer` being a little bit more efficient in theory since it can skip approval bookkeeping (although I have not tested any numbers). I would expect `icrc2_approve` to be a slightly less expensive operations than the other ones, but also not by a lot. IMO the two ways to substantially affect throughput of a single canister ledger are 1) how you interact with it and 2) maybe a batch transfer API would help.
+
+-------------------------
+
+GHOST | 2023-12-22 08:08:33 UTC | #9
+
+> This problem is hard to avoid when more people want to create transactions than the single canister can process. One thing that made this worse is the fact that Ghost (and I believe all SNSes) still use the old index canister, which makes a lot of additional calls to the ledger canister. ckBTC and ckETH use a new index canister, which does not add load to the ledger, and that would’ve likely led to a higher ledger transaction throughput.
+
+Is it just a matter of submitting an UpgradeSnsToNextVersion? 
+The community member submitted a Proposal last time, and it was approved. But it seems like it wasn't executed successfully. [https://dashboard.internetcomputer.org/sns/4m6il-zqaaa-aaaaq-aaa2a-cai/proposal/13]
+
+-------------------------
+
+aterga | 2023-12-22 10:33:29 UTC | #10
+
+Hi @GHOST, 
+
+As far as I see from other sources, the proposal you're referring to [has been executed successfully](https://nns.ic0.app/proposal/?u=4m6il-zqaaa-aaaaq-aaa2a-cai&proposal=13), upgrading your SNS Governance to Git commit ID `1e391f489ae2e79961f36c8c709e8692dbb46f33` (this can be checked by running `dfx canister --network ic metadata 4l7o7-uiaaa-aaaaq-aaa2q-cai git_commit_id`). The upgrade has been proposed [here](https://dashboard.internetcomputer.org/proposal/123495).
+
+I'm not sure why the Dashboard shows Adopted and not Executed in this case, I'll get back to you when this is clarified.
+
+However, please note that there's currently no way to get your SNS to work with ICRC-2, this would require the NNS team to propose publishing further upgrades for a few other canisters. This will most likely happen early next year, stay tuned!
+
+-------------------------
+
+aterga | 2023-12-22 15:14:02 UTC | #11
+
+Update regarding the minor Dashboard issue. It has already been fixed.
+
+Thanks for reporting!
+
+-------------------------
+

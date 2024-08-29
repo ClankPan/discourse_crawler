@@ -1,0 +1,94 @@
+gmsj0001 | 2021-12-03 02:28:48 UTC | #1
+
+As we know, stable memory will keep preserve during canister update. So why not use them as a file system? I wonder if anyone is working on or have implemented libc wasi file apis. That will allow most current C/C++ projects can compile to IC without much modify.
+
+-------------------------
+
+nomeata | 2022-01-05 10:20:44 UTC | #2
+
+Something like https://github.com/rafalh/rust-fatfs should be rather simple to port to the IC. I am not sure how much modification it takes to make use existing libraries’s use of the file system go through such a library.
+
+-------------------------
+
+Icdev2dev | 2022-01-19 18:33:13 UTC | #3
+
+Progress is being made on writing a file-system as **ext4-like** on ic using stable memory. 
+ 
+A couple of questions/comments: 
+
+- The read/write base semantics on stable memory do not return errors. If on one replica an error happens on a write; but the error is swallowed, the following reads will be in-consistent from that replica visa-ve other replicas. Is the assumption that a write will ALWAYS succeed valid in real life? 
+```
+pub fn stable_read(offset: u32, buf: &mut [u8])
+pub fn stable_write(offset: u32, buf: &[u8])
+``` 
+- The stable_read/stable_write semantics seem to indicate that there is no advantage on bunching writes/reads close together (i.e. the extents in i-node can span multiple blocks without a appreciable performance penality). Is this a correct assumption? 
+- Because we cannot rely on certain 'local' aspects of the replica (main one being time), the time element of a ext4 file-system is not currently being modeled.
+
+-------------------------
+
+nomeata | 2022-01-19 21:09:35 UTC | #4
+
+* I am not sure what kind of errors you expect. Execution is always deterministic, so when programming on a canister, you don’t have to worry about what happens on one replica vs. another one. So the assumption is valid.
+
+* Semantics usually don’t say much about performance. At some point, the instruction counting for stable memory access may make certain access patterns cheaper. For now, don’t worry about it. Or if you do want to worry, assume that locality within a 64k pages is beneficial.
+
+* You can use `ic0.time` to get a suitable timestamp (but careful, don't assume it to be_strictly_ monotonous – but that should be the same for a system clock with low resolution)
+
+-------------------------
+
+Icdev2dev | 2022-01-19 21:33:48 UTC | #5
+
+Thanks! On the 
+
+[quote="nomeata, post:4, topic:9268"]
+* I am not sure what kind of errors you expect. Execution is always deterministic, so when programming on a canister, you don’t have to worry about what happens on one replica vs. another one. So the assumption is valid.
+[/quote]
+
+SInce the write has to physically persist somewhere(ssd, spinning disk, ram memory), I thought it is possible for that write to fail due to physical nature of any memory. Further since the same write is seen by multiple replicas , that execution path may not be exactly deterministic in the sense that one replica might report a failure. How is this physical error,  then , handled if it is an impossibility?
+
+-------------------------
+
+jzxchiang | 2022-01-20 07:18:42 UTC | #6
+
+Just a wild guess, but I'm guessing any errors with physical persistence and errors that appear on one replica but not another are handled by the IC consensus protocol and therefore abstracted away from the IC system client.
+
+-------------------------
+
+Icdev2dev | 2022-01-20 07:53:01 UTC | #7
+
+Indeed...but there's no way that detect that flaw ( and therefore no way to repair ). If your hypothesis is correct, the flawed replica for that query path is forever shunned by consensus. Over time then, the other writes will fail in other replicas.
+
+Typically without complete lock-step determinism , in face of physical reality (like hard disks actually failing), there are workarounds...like hotswapping a hard disk with read-repair in a system like Apache Cassandra. 
+
+In this case  , unless i am reading the ic stable memory spec wrongly or there are other clever hardware sync-ups behind the scene, the fs is forbidden to repair (repair with what?) even if it sees an error.
+
+Edit: perhaps the only way would be to store multiple copies of data blocks on the same replica; but that again would break the deterministic model....i.e. the code would just execute on the replica which needed the repair and not all replicas.
+
+-------------------------
+
+jzxchiang | 2022-01-21 07:25:51 UTC | #8
+
+Oh, I'm sure the IC tracks which nodes have failed disks, and if they remain failed the node provider will face reduced rewards. After all, there's an [SLA](https://support.internetcomputer.org/hc/en-us/articles/4402238313748-What-are-the-Node-Rewards-for-providing-computing-power-to-the-IC-How-often-are-the-rewards-distributed-) that's enforced on-chain (I think).
+
+-------------------------
+
+paulyoung | 2022-01-26 07:38:49 UTC | #9
+
+I made a start on something here:
+
+https://github.com/paulyoung/icfs
+
+I'm running into some errors that I don't understand and creating issues in that repo as I encounter them. Any help is appreciated.
+
+Any useful `fatfs` error information that originates from Rust's `error!` macro isn't visible. I tried to get a debug build of the canister deployed to my local network, but when I tried that I ran into a file size limit:
+
+`The replica returned an HTTP Error: Http Error: status 400 Bad Request, content type "", content: The request body is bigger than 5242880 bytes.`
+
+-------------------------
+
+paulyoung | 2022-04-07 23:07:27 UTC | #10
+
+https://forum.dfinity.org/t/icfs-internet-computer-file-system/11995
+
+-------------------------
+

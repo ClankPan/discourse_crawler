@@ -1,0 +1,301 @@
+Jesse | 2022-04-19 21:42:03 UTC | #1
+
+I'm trying to add transaction history to my wallet. I used [this](https://github.com/aviate-labs/icp-canister/blob/main/src/icp/main.mo#:~:text=/-,main,-.mo) example to guide my code. In doing so, I was able to successfully deploy my canisters with no errors reported in the terminal. However, when i call the function `actor.readTransaction()` from the front end, I get the following error:
+
+```
+Uncaught (in promise) Error: Call was rejected:
+  Request ID: 6123c971bb668b522cf585e7a7c1b6976e2b2265be7dfb6181fa5e050b82b488
+  Reject code: 4
+  Reject text: IC0302: Canister kfj4k-naaaa-aaaap-qab7q-cai has no update method 'readWalletTransaction'
+```
+
+here is a snippet of the relevant code:
+
+main.mo:
+```
+public shared(msg) func readTransaction(indexKey : Nat) : async Ledger.Result<Ledger.Result<LedgerCandid.Block, LedgerCandid.CanisterId>, Text>{
+        let callerId = msg.caller;
+        
+        let callerProfile = Trie.find(
+            profiles,
+            key(callerId), //Key
+            Principal.equal 
+        );
+
+        switch(callerProfile){
+            case null{
+                #Err("no profile found");
+            }; 
+            case ( ? profile){
+                let userJournal = profile.journal;
+                let tx = await userJournal.readWalletTransaction(indexKey);
+                return tx;
+            };
+        };
+
+    };
+```
+
+journal.mo: 
+```
+import Ledger "Ledger";
+import LedgerCandid "LedgerCandid";
+
+private let ledger  : Ledger.Interface  = actor(Ledger.CANISTER_ID);
+
+private let ledgerC : LedgerCandid.Interface = actor(Principal.toText(Principal.fromActor(this)));
+
+public func readWalletTransaction(key: Nat) : async Ledger.Result<Ledger.Result<LedgerCandid.Block, LedgerCandid.CanisterId>, Text> {
+        let blockIndex = Trie.find(
+            txBlockIndices,
+            natKey(key),
+            Nat.equal
+        );
+
+        switch(blockIndex){
+            case null{
+                #Err("no block index found");
+            };
+            case ( ? index){
+                let tx = await ledgerC.block(index);
+                return tx;
+            };
+        };
+    };
+```
+
+LedgerCandid.mo:
+```
+import Ledger "Ledger";
+
+module {
+    public type Block = {
+        parent_hash : Hash;
+        timestamp   : Ledger.Timestamp;
+        transaction : Transaction;
+    };
+
+    public type CanisterId = Principal;
+
+    public type Hash = ?{
+        inner: Blob;
+    };
+
+    // NOTE: this is not a Blob, like in the other ledger interface!
+    public type AccountIdentifier = Text;
+
+    public type Transaction = {
+        transfer        : Transfer;
+        memo            : Ledger.Memo;
+        created_at_time : Ledger.Timestamp;
+    };
+
+    public type Transfer = {
+        #Burn : {
+            from   : AccountIdentifier;
+            amount : Ledger.ICP;
+        };
+        #Mint : {
+            to     : AccountIdentifier;
+            amount : Ledger.ICP;
+        };
+        #Send : {
+            from   : AccountIdentifier;
+            to     : AccountIdentifier;
+            amount : Ledger.ICP;
+        };
+    };
+
+    public type TipOfChain = {
+        certification : ?Blob;
+        tip_index     : Ledger.BlockIndex;
+    };
+
+    public type Interface = actor {
+        block        : (blockHeight : Nat64) -> async Ledger.Result<Ledger.Result<Block, CanisterId>, Text>;
+        tip_of_chain : ()                    -> async Ledger.Result<TipOfChain, Text>;
+    };
+};
+```
+
+Ledger:
+```
+module {
+    public let CANISTER_ID : Text = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+
+    public type Result<T, E> = {
+        #Ok  : T;
+        #Err : E;
+    };
+
+    public type TransferResult = Result<BlockIndex, TransferError>;
+
+    // Amount of ICP tokens, measured in 10^-8 of a token.
+    public type ICP = {
+        e8s : Nat64;
+    };
+
+    // Number of nanoseconds from the UNIX epoch (00:00:00 UTC, Jan 1, 1970).
+    public type Timestamp = {
+        timestamp_nanos: Nat64;
+    };
+
+    // AccountIdentifier is a 32-byte array.
+    // The first 4 bytes is big-endian encoding of a CRC32 checksum of the last 28 bytes.
+    public type AccountIdentifier = Blob;
+
+    // Subaccount is an arbitrary 32-byte byte array.
+    // Ledger uses subaccounts to compute the source address, which enables one
+    // principal to control multiple ledger accounts.
+    public type SubAccount = Blob;
+
+    // Sequence number of a block produced by the ledger.
+    public type BlockIndex = Nat64;
+
+    // An arbitrary number associated with a transaction.
+    // The caller can set it in a `transfer` call as a correlation identifier.
+    public type Memo = Nat64;
+
+    // Arguments for the `transfer` call.
+    public type TransferArgs = {
+        // Transaction memo.
+        // See comments for the `Memo` type.
+        memo : Memo;
+        // The amount that the caller wants to transfer to the destination address.
+        amount : ICP;
+        // The amount that the caller pays for the transaction.
+        // Must be 10000 e8s.
+        fee : ICP;
+        // The subaccount from which the caller wants to transfer funds.
+        // If null, the ledger uses the default (all zeros) subaccount to compute the source address.
+        // See comments for the `SubAccount` type.
+        from_subaccount : ?SubAccount;
+        // The destination account.
+        // If the transfer is successful, the balance of this account increases by `amount`.
+        to : AccountIdentifier;
+        // The point in time when the caller created this request.
+        // If null, the ledger uses current IC time as the timestamp.
+        created_at_time : ?Timestamp;
+    };
+
+    public type TransferError = {
+        // The fee that the caller specified in the transfer request was not the one that the ledger expects.
+        // The caller can change the transfer fee to the `expected_fee` and retry the request.
+        #BadFee : { expected_fee : ICP };
+        // The account specified by the caller doesn't have enough funds.
+        #InsufficientFunds : { balance: ICP };
+        // The request is too old.
+        // The ledger only accepts requests created within a 24 hours window.
+        // This is a non-recoverable error.
+        #TxTooOld : { allowed_window_nanos: Nat64 };
+        // The caller specified `created_at_time` that is too far in future.
+        // The caller can retry the request later.
+        #TxCreatedInFuture;
+        // The ledger has already executed the request.
+        // `duplicate_of` field is equal to the index of the block containing the original transaction.
+        #TxDuplicate : { duplicate_of: BlockIndex; };
+    };
+
+
+    // Arguments for the `account_balance` call.
+    public type AccountBalanceArgs = {
+        account : AccountIdentifier;
+    };
+
+    public type Interface = actor {
+        transfer        : TransferArgs       -> async TransferResult;
+        account_balance : AccountBalanceArgs -> async ICP;
+    };
+};
+```
+
+edit: When i test my backend using the candid interface, everything executes without a problem. I think the issue is somewhere within the frontend canister.
+
+-------------------------
+
+claudio | 2022-04-19 22:39:27 UTC | #2
+
+I believe the issue here is that `readWalletTransaction` isn't a shared function in an actor, but just a local asynchronous function. Try moving its definition into the actor you expect it to reside in.
+
+-------------------------
+
+Jesse | 2022-04-20 01:15:00 UTC | #3
+
+@claudio, I added the `shared` keyword to the `readWalletTransaction()` method and It still yielded the same error message. I decided to go with a different strategy in an attempt to move beyond the issue (and because the new strategy was better for keeping track of incoming transactions in addition to outgoing transactions).
+
+Instead of querying the blockchain to get the transaction data, I decided to create a 
+
+`stable Trie.Trie<Nat, Transaction>` 
+
+where `Transaction` is structured like so:
+
+```
+type Transaction = {
+        balanceDelta: Nat64;
+        increase: Bool;
+        recipient: Account.AccountIdentifier;
+        timeStamp: Int;
+        remainingBalance: Ledger.ICP;
+    };
+```
+so now, the code looks like this:
+
+main.mo: 
+
+```
+public shared(msg) func readTransaction() : async Result.Result<Trie.Trie<Nat, Transaction>, Error> {
+        let callerId = msg.caller;
+        
+        let callerProfile = Trie.find(
+            profiles,
+            key(callerId), //Key
+            Principal.equal 
+        );
+
+        switch(callerProfile){
+            case null{
+                #err(#NotFound);
+            }; 
+            case ( ? profile){
+                let userJournal = profile.journal;
+                let tx = await userJournal.readWalletTxHistory();
+                return #ok(tx);
+            };
+        };
+
+    };
+```
+
+Journal.mo:
+```
+
+private stable var txHistory : Trie.Trie<Nat, Transaction> = Trie.empty();
+
+public shared(msg) func readWalletTxHistory() : async Trie.Trie<Nat, Transaction> {
+        return txHistory;
+};
+```
+
+
+everything builds just fine and I'm able to test that the `readTransaction()` function works properly using the candid interface. But I'm still getting the same error in the browser console. I made sure to put the `shared` keyword in there, but still no luck. I think it has something to do with the frontend canister since the function works just fine when I test it via the candid interface.
+
+-------------------------
+
+claudio | 2022-04-20 23:22:20 UTC | #4
+
+I don't know what is going on, but perhaps the canister kfj4k-naaaa-aaaap-qab7q-cai is actually implementing an older interface, or the principal is wrong.
+
+Looking at: 
+
+https://ic.rocks/principal/kfj4k-naaaa-aaaap-qab7q-cai
+
+I don't see a `readWalletTransaction` method either, so perhaps the original error was correct.
+
+-------------------------
+
+Jesse | 2022-04-20 23:45:04 UTC | #5
+
+Thank you. This confirms it. The child canisters aren’t being upgraded.
+
+-------------------------
+

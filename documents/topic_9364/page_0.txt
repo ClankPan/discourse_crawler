@@ -1,0 +1,175 @@
+Ashley | 2021-12-06 11:24:23 UTC | #1
+
+Hi there - I need to add many new properties/members to many types on DSocial. But I fear I'll lose my data.
+
+My platform is live with many uploads per day, the last thing I want is to silently lose data on an upgrade now or in future versions of dfx. Can someone confirm the following is okay? From my understanding, I can add new properties/members to Types with '?' operator e.g.
+
+Current code:
+
+```
+public type Video = {
+    id : VideoId;
+    hash : Text;
+    thumb : Text;
+    title : Text;
+    desc : Text;
+  };
+```
+
+new version:
+
+```
+public type Video = {
+    id : VideoId;
+    hash : Text;
+    thumb : Text;
+    title : Text;
+    desc : Text;
+    duration: ?Int;
+    shares: ?Int;
+    ctr: ?Float;
+    viewTimeRate: ?Float;
+  };
+```
+
+These are all stored in `HashMap.HashMap<VideoId, Video>` and a stable array `[(VideoId, Video)]`.
+
+Will this work now without deleting data and in the future?
+
+-------------------------
+
+anthonymq | 2021-12-06 14:49:25 UTC | #2
+
+If they are all optional fields you are good to go. Tried it myself.
+Maybe you can test it locally before deploying on the ic
+
+-------------------------
+
+kpeacock | 2021-12-06 16:24:32 UTC | #3
+
+It also looks compatible to me, but I want to echo the good practice of running your upgrades locally before trying in prod
+
+-------------------------
+
+skilesare | 2021-12-06 18:19:19 UTC | #4
+
+I've been thinking about a pattern here (like with https://forum.dfinity.org/t/proposal-to-adopt-the-namespaced-interfaces-pattern-as-a-best-practice-for-ic-developers/9262/4) where when one has a change to make in your data you actually go through the proactive steps of marking one Video and Video_v2.  Once you've done this you can specifically move the collection and set defaults in the post upgrade step by copying your collection VideoCollection of type Video to a VideoCollection_v2 of type  Video_v2.  After that upgrade, you could get rid of the definition of Video and VideoCollection on the next upgrade because it will be empty.
+
+Good idea? Good practice?  I'm not sure, would be interested in the community's comments.
+
+-------------------------
+
+claudio | 2021-12-06 20:23:27 UTC | #5
+
+DO NOT DO THIS! 
+
+If this change is made to the types of stable variables as  you appear to be doing then you will in fact lose your data.
+
+The type of a stable variable can only be evolved to a Motoko super type since the upgrade must be able to consume the last value of that variable.
+
+-------------------------
+
+claudio | 2021-12-06 20:39:26 UTC | #6
+
+There is actual some more documentation on this here:
+
+https://smartcontracts.org/docs/language-guide/upgrades.html
+
+And a detailed example (for some reason not linked from the nav bar) here:
+
+https://smartcontracts.org/docs/language-guide/compatibility.html
+
+-------------------------
+
+claudio | 2021-12-06 20:43:54 UTC | #7
+
+Even if it happens to work right now, that's actually an accidental artifact of the current implementation. A (near) future version of dfx will actually verify compatibility before upgrade, and the latest releases of Motoko also let you manually check compatibility of stable variable signatures (and use a candid tool (didc) to check the public interfaces.
+
+-------------------------
+
+jzxchiang | 2021-12-06 23:53:58 UTC | #8
+
+Wait, why? Based on the definition of "stable-compatible" in the link you provided, OP's new type is compatible with her old type. I thought adding new fields are OK..
+
+-------------------------
+
+claudio | 2021-12-07 16:56:23 UTC | #9
+
+> A stable signature `<stab-sig1>` is *stable-compatible* with signature `<stab-sig2>` , if, and only,
+> 
+> * every immutable field `stable <id> : T` in `<stab-sig1>` has a matching field `stable <id> : U` in `<stab-sig2>` with `T <: U` .
+> * every mutable field `stable var <id> : T` in `<stab-sig1>` has a matching field `stable var <id> : U` in `<stab-sig2>` with `T <: U` .
+> 
+> Note that `<stab-sig2>` may contain additional fields. Typically, `<stab-sig1>` is the signature of an older version while `<stab-sig2>` is the signature of a newer version.
+> 
+> The subtyping condition on stable fields ensures that the final value of some field can be consumed as the initial value of that field in the upgraded code.
+
+Adding new stable variable declarations is ok (the initializer will be used to determine the initial value of a new stable variable).
+
+Adding fields to the record type of a single stable variable is not ok (a record can only lose fields when moving to a super-type). 
+
+More generally, changing the type of the variable to something which isn't a Motoko super-type of the original type, is not ok.
+
+-------------------------
+
+skilesare | 2021-12-07 18:13:54 UTC | #10
+
+Do you have thoughts on the pattern I suggested?
+
+-------------------------
+
+Ashley | 2021-12-07 19:35:57 UTC | #11
+
+Thanks everyone for your comments, but I'm now very confused. What is the best method to add new fields to a type in Motoko?
+
+In real world apps, we are constantly iterating and changing.
+
+What exactly should I do to add new fields to type that is also future proof?
+
+Please keep it Motoko specific. Thanks in advance!
+
+-------------------------
+
+claudio | 2021-12-09 08:07:05 UTC | #12
+
+
+This post proposes one solution. Not super elegant but safe. 
+
+
+https://forum.dfinity.org/t/loosing-data-when-upgrading-records/8672
+
+The idea is to define a new stable variable with the richer type and initialize it from the old one, inserting appropriate values for new fields.
+
+The second link above on Compatibility  has a similar example at the very end. 
+
+If you don't like having to come up with new names, you can define your state variable as a variant type and add a new variant whenever you need to change the type. The Life example on the GH dfinity/examples repo does something like that.
+
+-------------------------
+
+jamesbeadle | 2023-09-06 15:55:44 UTC | #13
+
+Hi Claudio,
+Is there a solution to this? I need to update some types and don't want to risk losing data but can't find anything I can follow to ensure this doesn't happen?
+
+Thanks,
+James
+
+-------------------------
+
+claudio | 2023-09-07 12:54:02 UTC | #14
+
+The main thing is to not ignore the warning produced by dfx.
+
+Generally, there's more changes that are allowed to the external interface than are allowed to the types of stable variables.
+
+Have you read this?
+https://internetcomputer.org/docs/current/motoko/main/compatibility
+
+Generally, the external Candid interface of a Motoko canister can evolve to a subtype (you can add methods, with more informative results and less informative arguments).
+
+For stable variables, you can evolve their Motoko types to Motoko super-types and add new stable variables. If you are changing the type of a stable variable to something other than a plain supertype, your best bet is to introduce a new stable variable, initialized from the old one, by a transformation that adds the optional fields etc.
+
+Test the upgrade locally on a throw-away canister before doing it for real on mainnet.
+
+-------------------------
+

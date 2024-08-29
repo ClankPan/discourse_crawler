@@ -1,0 +1,179 @@
+bob11 | 2021-10-31 05:22:25 UTC | #1
+
+ToniqLabs uploads GBs and GBs of assets to the IC every week. When we upload, there is a good chance that the subnet crashes, or is at least severely impacted by data upload. Here is a screenshot of https://dashboard.internetcomputer.org/subnet/opn46-zyspe-hhmyp-4zu6u-7sbrh-dok77-m7dch-im62f-vyimr-a3n2c-4ae when we started to upload some assets. Notice that finalization rate goes down, cycles used goes way up, and state increases over time. The problem is that oftentimes it is so taxing on a subnet that it just dies (errors), and requires pulling the state to figure out where your upload left off, and then restarting the upload.
+
+![Screen Shot 2021-10-30 at 11.16.24 PM|690x357](upload://4pR5NN4rhZtEaXD9vkGwwskHG4u.png)
+
+This is a problem for us right now. Moonwalkers took a LONG time to upload, partly because they were massive, and partly because the subnet kept failing on us.
+
+I'd love some insight into why this is happening and what can be done to fix it.
+
+Thanks!!
+
+-------------------------
+
+diegop | 2021-10-31 05:37:19 UTC | #2
+
+Thanks for letting folks know. I will ping the team to make sure folks see this.
+
+-------------------------
+
+free | 2021-10-31 06:19:05 UTC | #3
+
+The subnet is not crashing, it is merely rate limiting updates. Because of the many memory writes, the orthogonal persistence implementation accumulates lots of "heap deltas" (modified heap pages) and, in order to avoid running out of RAM and crashing, stops handling any more transactions until the next checkpoint.
+
+Here is a chart of the heap delta:
+![Screenshot from 2021-10-31 07-09-05|690x156](upload://80sJvGekuCochUqf6BZR2Bp5KJ9.png)
+
+The gap just about an hour ago is likely because your canister ran out of cycles. The likely reason for that is the large ingress messages and high number of instrunctions:
+![Screenshot from 2021-10-31 07-10-22|690x153](upload://tFelFfz8FmiDAmnpsGovpJHrFQR.png)
+
+-------------------------
+
+free | 2021-10-31 06:29:10 UTC | #4
+
+Finalization rate drops during the execution of these large ingress messages and recovers when the subnet is no longer accepting any for a while:
+![Screenshot from 2021-10-31 07-20-58|690x152](upload://pKnbTCLl1iAIG0vd2gukxh5Hscn.png)
+
+
+This is merely because it takes a couple of seconds to execute each of those large ingress messages:
+![Screenshot from 2021-10-31 07-23-35|690x152](upload://sch6ySnLFRdB6bOEO7fyCgyXIQC.png)
+
+This affects the latency of any other transactions executing at the same time (execution round takes 2 seconds instead of <1) and the interval between checkpoints (these happen every 500 rounds by default, with those 500 rounds are stretched over longer a period) but not much else.
+
+-------------------------
+
+free | 2021-10-31 06:59:58 UTC | #5
+
+[quote="bob11, post:1, topic:8240"]
+Notice that finalization rate goes down
+[/quote]
+
+See above, this is merely an effect of executing large ingress messages. Not entirely sure why uploading a couple of MB of images requires 4B instructions, but that's what I'm seeing. (These metrics cover the whole subnet not just your canister(s), but there was very little other traffic happening on that subnet before your uploads, so I'll just assume here that what I'm seeing is due to your uploads.)
+
+[quote="bob11, post:1, topic:8240"]
+cycles used goes way up
+[/quote]
+
+Also an effect of the large ingress messages and large number of instructions. Are you doing image handling in your canister? I.e. rebuilding an image out of tiles? That may account for the CPU usage.
+
+[quote="bob11, post:1, topic:8240"]
+and state increases over time
+[/quote]
+
+This is merely because of the uploads. Your canister is holding more and more images. I'm seeing a gradual increase from 1.25 GB to 1.5 GB over the first half of the 3 hour interval covered by the charts above (uploads, I suppose), then a step increase to 3 GB.
+
+[quote="bob11, post:1, topic:8240"]
+The problem is that oftentimes it is so taxing on a subnet that it just dies (errors)
+[/quote]
+
+The errors are ingress messages timing out. Ingress messages have a maximum TTL of 5 or 6 minutes and because the subnet stops handling transactions for up to 5 minutes; and the messages themselves require a couple of seconds each to execute; I'm seeing 5 ingress messages expiring just around the time (and everytime) when transaction execution resumes.
+
+[quote="bob11, post:1, topic:8240"]
+and requires pulling the state to figure out where your upload left off, and then restarting the upload.
+[/quote]
+
+There should be no need for that. I understand that transactions hanging for 5 minutes and timing out is annoying as heck, but apart from the timed out transactions, all others should reliably execute and succeed (unless, of course, the canister itself fails them). But regardless, all updates that return success will have resulted in the write going through; all updates returning errors (timeout or trap) will have resulted in no changes to the state. There should be no need to do anything beyond retrying failed updates. If you find that's not the case, then it's definitely an issue that requires investigation.
+
+[quote="bob11, post:1, topic:8240"]
+I’d love some insight into why this is happening and what can be done to fix it.
+[/quote]
+
+I hope my comments above covered the first part (what's happening). Regarding the second (what can be done to fix it), a couple of things can.
+
+For one, you can rate limit your uploads, so the subnet doesn't run out of heap delta so early in the 500 rounds checkpoint interval. This is merely a workaround and not something you, as a canister developer, should have to deal with. We need to figure out better ways of handling huge heap deltas. I know we're already working on offloading them to disk instead of keeping them in RAM. Maybe it would also be feasible to have a dynamoc checkpointing interval instead of a fixed one, as long as it's deterministic (e.g. "every 500 rounds or the heap delta reaches the configured limit"); IIUC this is also connected to the DKG interval, so I'll ask the Consensus team about it.
+
+Second, regarding cycle burn rate, you can try figuring out why your canister needs 4B instructions to handle what is presumably 2 MB worth of images. It's not going to change anything about the heap delta and the resulting suspension of transaction execution, resulting in huge latency and expired ingress messages, but it should make it cheaper to upload assets.
+
+Third, you can better keep track of the status of each ingress message you send. If it fails for any reason, retry it. If it succeeds, you're all done. There should be no need to pull the state to figure out what went through and what didn't.
+
+Happy to answer any other questions you may have.
+
+-------------------------
+
+northman | 2021-10-31 13:15:28 UTC | #6
+
+If I understand correctly, a canister that changes state of a single boolean value from true to false could take 5 minutes if an ingesting canister is on the same subnet and is concurrently causing heap deltas to be created.
+
+Perhaps rate limiting should not be left in the hands of the developer if one dapp is able to impact the performance of an entire subnet.  It is very simple to mount a denial of service attack simply by doing a large upload if your canister is resident on the same subnet.
+
+Is there a performance monitoring canister on a subnet or a system variable that can be queried that  indicates what the performance looks like in the subnet?  Similar to a ping?  It would ge nice to warn users - expect delays.  One could always measure the nanoseconds between calls in a loop but that may exacerbate the problem?
+
+It may be true that  "the subnet did not crash" but a users/dapp owner's perspective may be quite different and less nuanced.
+
+-------------------------
+
+abk | 2021-11-01 07:48:36 UTC | #7
+
+[quote="northman, post:6, topic:8240"]
+Perhaps rate limiting should not be left in the hands of the developer if one dapp is able to impact the performance of an entire subnet. It is very simple to mount a denial of service attack simply by doing a large upload if your canister is resident on the same subnet.
+[/quote]
+
+100% correct @northman. We actually put out a fix for this in [this recent release](https://dashboard.internetcomputer.org/proposal/26833) (see the item "Execution: Introduce per canister heap delta limit to share the heap delta capacity in a fairer manner between canisters.") That change basically adds rate limiting of the generated heap delta on a per-canister basis. So if a single canister does many writes then it should no longer prevent the whole subnet from making progress. Instead, just that canister may be prevented from running for several rounds.
+
+-------------------------
+
+free | 2021-11-01 07:52:52 UTC | #8
+
+Also, there's ongoing work to use `mmap`-ed memory for heap deltas, so the OS can easily offload that memory to disk as necessary som the maximum heap delta can be dictated by available disk rather than available RAM (so there will virtually be no max heap limit anymore). This is just another of the ICs growing pains.
+
+-------------------------
+
+free | 2021-11-01 10:12:09 UTC | #9
+
+@bob11, any chance you could share the relevant canister code (and what kind of traffic the canister was handling at the time)? The Motoko team want to understand why the canister was touching so much memory (in order to find a general solution to the underlying problem, whatever it turns out to be).
+
+-------------------------
+
+claudio | 2021-11-01 13:57:18 UTC | #10
+
+Did a little digging - not sure this is the code, but if the code use patterns like this:
+https://github.com/Toniq-Labs/extendable-token/blob/1f7ef3e2cff3f95509f607ba022326fe280f7039/examples/advanced.mo#L68
+then that could potentially touch a quadratic amount of memory, dirtying lots of pages even if not much data survives/remains live. Depends on the size of the data of course.
+
+(Array.append typically copies its arguments and allocates a new array. Do that in a loop and you touch lots of memory, most of which will be gc'ed but still expands the wasm memory footprint)
+
+-------------------------
+
+matthewhammer | 2021-11-01 18:17:39 UTC | #11
+
+[quote="claudio, post:10, topic:8240"]
+Array.append typically copies its arguments and allocates a new array
+[/quote]
+
+Nice find!
+
+If it is indeed caused by code like this (seems quite possible), then the easiest solution is to move away from any use of  `Array.append`, in any context.
+
+It's always a worse version of doing `.append` on a `Buffer`, which does not suffer from the same time and space issues as `Array.append`.
+
+Here's an issue for more discussion: https://github.com/dfinity/motoko-base/issues/296
+
+-------------------------
+
+stephenandrews | 2021-11-03 10:23:29 UTC | #12
+
+Nice write up - definitely need to look to optimize our code then. We use Array.append a lot though - what is the best alternative?
+
+-------------------------
+
+claudio | 2021-11-03 12:15:10 UTC | #13
+
+It looks like @matthewhammer is in the process of drafting some guidance on this here (https://github.com/dfinity/motoko-base/issues/296).
+
+In the particular example above, you should be able to avoid the quadratic behaviour by constructing a suitable array from _registry.entries  and appending it just once.
+
+Something like:
+
+```
+let entries = Iter.toArray(_register.entries());
+let extra = Array.map(ext, func((k,v)) { ... });
+_registeryState := Array.append(_registryState, extra);
+```
+
+But there are many ways to skin this cat.
+
+(It's not really the append that is the problem -  it's O(n) - but the fact that you are calling append repeatedly in the implicit loop of Iter.iterate, make the loop 0(n^2))
+
+-------------------------
+

@@ -1,0 +1,131 @@
+senior.joinu | 2021-08-29 15:27:15 UTC | #1
+
+As the title says.
+
+I understand that it helps to save resources greatly. But I had a showerthought lately that if all the variables were certified by default, that would allow to safely make cross-canister query calls from update calls.
+
+As I understand, now it works this way (correct me, if I'm wrong):
+1. You make an update call to a canister method, that should fetch some data from another canister, process it and return a result.
+2. Each such fetch is performed via consensus (since it is crucial to receive honest subnet response) no matter whether the remote method marked as `update` or `query`.
+3. As a result, we have a very slow update call, since each such a fetch is basically another transaction. For example, if we only do a single fetch operation inside our update call, the approx. total time a user awaits the response would be like 3 consensus ticks (~2.5s * 3 = ~7.5s) - 3-step transaction.
+
+But, if all our data is certified by default, there is no need for a subnet to pass inter-canister query calls through the messaging mechanism. Instead, during the update call, each node in a subnet could treat these fetch query calls as deterministic actions and just make a real p2p interaction with any node in the target subnet. This would make our previous complex 3-step transaction into just a single (but a little more time-consuming) transaction, that would finish in a single consensus tick (~2.5s). 
+
+And the more inner fetches we have, the better this optimization works. For a very complex call with, for example, 10 subsequent inner fetches it is like ~50s vs. ~5s (since there is also p2p time).
+
+Yes, there are caveats, like what if the remote subnet changed its state during our long update call? In that case, subnets could store several latest certificates, covering, for example last 30 seconds of state updates. Just like Ethereum stores their certificates, but not forever - only for a short period of time.
+
+I'm sure, the team have analyzed this kind of mechanics, but for some reason they've chosen to stick with the current implementation. I wanted to know why.
+
+Thanks in advance.
+
+-------------------------
+
+nomeata | 2021-08-29 16:04:33 UTC | #2
+
+You can’t just “certify all variables”. Variables are an internal concept of services, and what’s exposed is the “query”. But a query involves computation, certification happens ahead of time, so you cannot, _in general_, certify all possible query executions this way.
+
+What you can do, _if you understand the service in question_ is to prepare certified data that the service can return together with the query, and allow clients to check that. But that is unavoidably always service specific. See [my explainer video](https://dfinity.org/technicals/response-certification) for the steps needed to return certified responses from queries, it’s unfortunately non-trivial.
+
+(The slides in the video are a bit off and wrong, and a new version with that fixed is supposedly in the making. Until then, pay attention to what you hear, not what you see.)
+
+There may be ways to actually certify all queries in a generic way (i.e. on the platform level, not the service level), and while that might be almost as fast as our current queries, there’d still be some overhead. I personally think such genuine “certified queries” are worth it, and should even be the default, but there is some real implementation cost before we can have that, if ever.
+
+-------------------------
+
+senior.joinu | 2021-08-30 00:28:53 UTC | #3
+
+[quote="nomeata, post:2, topic:6785"]
+There may be ways to actually certify all queries in a generic way
+[/quote]
+
+Yes, this is exactly what I meant.
+Just like Ethereum merkle-izes it's complete state, a subnet could do the same. I understand, that this is very much differs from how it is implemented now, but this could give the IC outstanding performance for such complex scenarios with integrations between canisters.
+
+-------------------------
+
+nomeata | 2021-08-30 10:29:43 UTC | #4
+
+No, I don’t think that’s what I mean.
+
+The complete state is merkelized, of course!  But the complete state of a canister may be multiple GB of data, some of which is confidential. So while on Ethereum you can probably easily give save access to the state of a smart contract, let users download that an run the query locally, this is out of the question on the Internet Computer. The query definitely needs to be executed on the node(s).
+
+And proving that the _result_ of some computation is correct is hard, much harder than proving that some merkelized data structure contains some values.
+
+Remember that queries do not simply just return a fixed value, but can do arbitrary computation – averaging numbers, searches, complex data base queries.
+
+@diegop, I have once written a fairly good explanation of that in the document “Certified variables won’t fly” (https://docs.google.com/document/d/1vwWbCWGJ0n-aGq362gbRev_Apfkh5Mp3Uv4h7Lby24A/view). Would you mind making that document read-only for the world?
+
+-------------------------
+
+senior.joinu | 2021-09-19 21:58:03 UTC | #5
+
+Hm....
+
+What if instead of asking a single node to respond for a query call, we would ask every node in the subnet for a little chunk of the same response encoded with some error correction algorithm?
+
+For example, I make a query request to the subnet. Each node executes it locally, splits the result into `N` chunks (where `N` - number of nodes in the subnet), encodes these chunks with some Reed-Solomon so the node now has `2*N` encoded chunks and then responds me with `chunks[i] + chunks[i+1]`, where `i` is the node's consensus rank in this (or previous) round. The same does every other node.
+
+I'm now left with 2*N chunks from which I only need N to decode the original response. 
+
+_______________
+I understand this is a little out of nowhere proposal. But, could this work?
+
+-------------------------
+
+nomeata | 2021-09-20 06:06:17 UTC | #6
+
+It's a neat idea! And if you replace “error correction” with something slightly stronger, namely “cryptogtaphic signatures” (threshold or multisig), then your proposal is what I have been asking for: actually _certified_ queries. And it suffices if only one actually send the data and the others just their signature.
+
+I think the complexities that have prevented us from having this feature lay mostly in things like “asking each node at the same state version” than in the way how the responses are aggregated.
+
+If we had that, we would not need complicated merkle schemes in application code, all canisters could run on `ic0.app` (no insecure `.raw`!), and also nontrivial queries could be secure. I have not given up hope yet…
+
+-------------------------
+
+senior.joinu | 2021-09-20 11:16:19 UTC | #7
+
+I mean, error correction should handle this by design, isn't it? The same way it should handle malicious nodes sending fake responses.
+
+[quote="nomeata, post:6, topic:6785"]
+mostly in things like “asking each node at the same state version”
+[/quote]
+
+Like... it is okay for nodes to respond whatever the heck they want. But we assume the majority would send valid responses. And we only need a majority of chunks to decode the message. This is the property of erc.
+
+-------------------------
+
+nomeata | 2021-09-20 12:43:14 UTC | #8
+
+Error correction codes are usually not safe against active malicious users; you need cryptographic hashes for that. I think once thought through, we’d end up at very similar designs, so I’ll just say we are in agreement, and essentially want the same: A response produced by _multiple_ nodes that is only valid if sufficiently many nodes agree.
+
+-------------------------
+
+davidxiao | 2022-02-09 04:48:00 UTC | #9
+
+it's interesting and from dapp developer perspective, reckon it's not so good to offer a non-reliable(non-certified) query API as default(reliable, security over performance)?
+
+and, if possible, it'll be great to have both options available for tooling like `cdk-rs`? or better from platform level
+
+BTW, @nomeata , is there any work on this still? or any update to share? :slight_smile: 
+
+thanks
+
+-------------------------
+
+nomeata | 2022-02-09 10:37:50 UTC | #10
+
+[quote="davidxiao, post:9, topic:6785"]
+BTW, @nomeata , is there any work on this still? or any update to share? :slight_smile:
+[/quote]
+
+Nothing that I know of, but I don't have any insight into dfinity-internal developments.
+
+-------------------------
+
+Gabriel | 2022-04-05 15:30:47 UTC | #11
+
+@diegop do you mind making that file read-only and accessible for everyone?
+
+-------------------------
+

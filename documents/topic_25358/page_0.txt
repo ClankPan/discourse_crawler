@@ -1,0 +1,206 @@
+saikatdas0790 | 2023-12-08 13:26:57 UTC | #1
+
+## Problem
+We are running upgrades to introduce virtual memory manager to all of our individual user canisters. The canister memory usage is going up quite steadily.
+
+
+ ![Image of memory state on subnet](upload://8WoR8KG1BOYZ0SDk2UV6pMcfPzR.png)
+
+## What we were trying to achieve
+We are moving some of the data on our canister to stable memory using `stable-structures`. As a first upgrade step we introduced virtual memory manager to perform upgrades as later it would help us to deal with stable memory along side heap memory.
+
+
+## Changes
+
+Prior to the upgrade hooks were using `BufferedStableReader` and `BufferedStableWriter` as shown in the code snippet below
+
+```
+pub const BUFFER_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
+#[ic_cdk::pre_upgrade]
+fn pre_upgrade() {
+    CANISTER_DATA.with(|canister_data_ref_cell| {
+        let canister_data = canister_data_ref_cell.take();
+        stable_memory_serializer_deserializer::serialize_to_stable_memory(
+            canister_data,
+            BUFFER_SIZE_BYTES,
+        )
+        .expect("Failed to serialize canister data");
+    });
+}
+
+pub fn serialize_to_stable_memory<S: Serialize>(
+    state: S,
+    buffer_size: usize,
+) -> Result<(), impl Error> {
+    let writer = BufferedStableWriter::new(buffer_size);
+    serialize(state, writer)
+}
+
+
+#[ic_cdk::post_upgrade]
+fn post_upgrade {
+  match stable_memory_serializer_deserializer::deserialize_from_stable_memory::<CanisterData>(
+        BUFFER_SIZE_BYTES,
+    ) {
+        Ok(canister_data) => {
+            CANISTER_DATA.with(|canister_data_ref_cell| {
+                *canister_data_ref_cell.borrow_mut() = canister_data;
+            });
+        }
+        Err(e) => {
+            panic!("Error: {:?}", e);
+        }
+    }
+}
+
+pub fn deserialize_from_stable_memory<S: DeserializeOwned>(
+    max_buffer_size: usize,
+) -> Result<S, impl Error> {
+    let stable_size = ic_cdk::api::stable::stable_size() as usize * WASM_PAGE_SIZE_IN_BYTES;
+    let buffer_size = min(max_buffer_size, stable_size);
+    let reader = BufferedStableReader::new(buffer_size);
+    deserialize(reader)
+}
+
+```
+
+After the upgrade we introduced memory manager as shown in the code snippet below:
+
+memory.rs
+```
+use ic_stable_structures::{DefaultMemoryImpl, memory_manager::{MemoryId, VirtualMemory, MemoryManager}};
+use std::cell::RefCell;
+
+// A memory for upgrades, where data from the heap can be serialized/deserialized.
+const UPGRADES: MemoryId = MemoryId::new(0);
+
+
+
+pub type Memory = VirtualMemory<DefaultMemoryImpl>;
+
+thread_local! {
+    // The memory manager is used for simulating multiple memories. Given a `MemoryId` it can
+    // return a memory that can be used by stable structures.
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+}
+
+pub fn get_upgrades_memory() -> Memory {
+    MEMORY_MANAGER.with(|m| m.borrow_mut().get(UPGRADES))
+}
+```
+
+The new upgrade hooks were changed to use these virtual memory manager as shown below in the code snippet:
+
+
+```
+// pre_upgrade
+
+#[ic_cdk::pre_upgrade]
+fn pre_upgrade() {
+    let mut state_bytes = vec![];
+    CANISTER_DATA.with(|canister_data_ref_cell| {
+        ser::into_writer(&*canister_data_ref_cell.borrow(), &mut state_bytes)
+    })
+    .expect("failed to encode state");
+
+    let len = state_bytes.len() as u32;
+    let mut memory = memory::get_upgrades_memory();
+    let mut writer = Writer::new(&mut memory, 0);
+    writer.write(&len.to_le_bytes()).unwrap();
+    writer.write(&state_bytes).unwrap();
+}
+
+
+//post_upgrade
+#[ic_cdk::post_upgrade]
+fn post_upgrade() {
+    let heap_data = memory::get_upgrades_memory();
+    let mut heap_data_len_bytes = [0; 4];
+    heap_data.read(0, &mut heap_data_len_bytes);
+    let heap_data_len = u32::from_le_bytes(heap_data_len_bytes) as usize;
+
+    let mut canister_data_bytes = vec![0; heap_data_len];
+    heap_data.read(4, &mut canister_data_bytes);
+    
+
+    let canister_data = de::from_reader(&*canister_data_bytes).expect("Failed to deserialize heap data");
+    CANISTER_DATA.with(|canister_data_ref_cell| {
+        *canister_data_ref_cell.borrow_mut() = canister_data;
+    });
+}
+
+```
+
+These upgrades were carried out in a two stage format, updating the pre_upgrade hook and then updating the post_upgrade hook.
+
+### Respective Github PRs
+- PR for stage1: https://github.com/go-bazzinga/hot-or-not-backend-canister/pull/198
+- PR for stage2: https://github.com/go-bazzinga/hot-or-not-backend-canister/pull/199
+
+## Help needed
+
+- Our assumption for the problem is virtual memory manager is not using stable memory that was previously used by BufferedStableReader/Writer to write heap data to stable memory during upgrades which is causing duplication of data during upgrades. Is this assumption correct?
+- How do we move ahead with our goal of introducing stable memory for some of our data in our canister and using virtual memory manager to deal with heap memory along with stable memory? 
+
+We would like to use `stable-structures` for using the `StableBTreeMap` implementation alongside others for storing most of our data but some frequently accessed data would still live on the heap which is where `VirtualmemoryManager` comes in.
+
+Is there a way for us to free up the allocated data on the subnet post the migration? Also, we would appreciate some confirmation that validates our migration strategy? Are we doing something wrong?
+
+Thoughts?
+@ielashi @ulan
+
+-------------------------
+
+ulan | 2023-12-08 13:38:36 UTC | #2
+
+Hi @saikatdas0790 
+
+I wrote to you in slack. I guess it would be faster to have a meeting and discuss.
+
+I would recommend to pause the upgrade until the root cause is understood.
+
+-------------------------
+
+ielashi | 2023-12-08 15:31:16 UTC | #3
+
+This line is the problem:
+
+```
+static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+```
+
+The `MemoryManager` simulates having multiple memories in stable memory. Whenever you use any of its virtual memories, it doesn't allocate exactly the size that you need. It instead allocates memory in "buckets" of a constant size. This approach simplifies tracking which piece of stable memory belongs to which virtual memory.
+
+By default, the MemoryManager allocates memory in buckets of 128 Wasm pages (8MiB). I believe what you should be seeing is that the stable memory of each canister will rise to be ~8MiB. That would explain the increase in memory usage.
+
+There's an option on the `MemoryManager` to set the size of the bucket that you'd like to use. In your case, given that you have many small canisters, I recommend using a bucket size of 1 Wasm page.
+
+```
+static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init_with_bucket_size(DefaultMemoryImpl::default(), 1));
+```
+
+> Is there a way for us to free up the allocated data on the subnet post the migration?
+
+There is, but it's not simple unfortunately. The IC currently doesn't support shrinking stable memory, so really the only way currently to reclaim that memory would be to move the data to other canisters that are using the updated code. I'll throw around the idea of offering a system api for shrinking stable memory as it is useful in a number of cases.
+
+-------------------------
+
+saikatdas0790 | 2023-12-08 14:08:56 UTC | #4
+
+Thank you @ulan and @ielashi 
+
+We are making the changes as pointed out, testing locally and pushing out a new SNS proposal to resolve this. Thank you for the speedy responses.
+
+-------------------------
+
+hpeebles | 2023-12-09 00:23:22 UTC | #5
+
+I really think developers should be forced to specify the bucket size. We (on OpenChat) got burned by this too because we also used the default of 8MB.
+We didn’t know it was something to consider, had we been forced to pick then we would’ve dug into what it meant.
+
+-------------------------
+

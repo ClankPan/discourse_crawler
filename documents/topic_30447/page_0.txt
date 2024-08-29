@@ -1,0 +1,154 @@
+icnerd | 2024-05-07 16:34:10 UTC | #1
+
+I'm trying to convert BTC to CkBTC in my local setup, but I'm failing.
+
+here is my [deployment script](https://github.com/pramitgaha21/etcher/blob/main/deploy.sh)
+```bash
+dfx deploy --specified-id ml52i-qqaaa-aaaar-qaaba-cai ckbtc_minter --argument '(variant{
+        Init = record {
+                btc_network = variant { Regtest };
+                ledger_id = principal "mc6ru-gyaaa-aaaar-qaaaq-cai";
+                ecdsa_key_name = "dfx_test_key";
+                retrieve_btc_min_amount = 10_000;
+                max_time_in_queue_nanos = 420_000_000_000;
+                min_confirmations = opt 1;
+                mode = variant { GeneralAvailability };
+                kyt_fee = opt 1_333;
+                kyt_principal = opt principal "pvm5g-xaaaa-aaaar-qaaia-cai"                
+}
+})'
+
+PRINCIPAL="$(dfx identity get-principal)"
+
+dfx deploy --specified-id mc6ru-gyaaa-aaaar-qaaaq-cai ckbtc_ledger --argument '(variant{
+        Init = record{
+                token_symbol = "ckBTC";
+                token_name = "Chain Ley Local Bitcoin";
+                minting_account = record { owner = principal "ml52i-qqaaa-aaaar-qaaba-cai" };
+                transfer_fee = 11_500;
+                metadata = vec {};
+                initial_balances = vec {};
+                archive_options = record {
+                        num_blocks_to_archive = 10_000;
+                        trigger_threshold = 20_000;
+                        controller_id = principal "'$PRINCIPAL'";
+                        cycles_for_archive_creation = opt 1_000_000_000_000;
+                        max_message_size_bytes = null;
+                        node_max_memory_size_bytes = opt 3_221_225_472;
+        };
+        feature_flags = opt record { icrc2 = true };
+}
+})'
+
+dfx deploy --specified-id pvm5g-xaaaa-aaaar-qaaia-cai ckbtc_kyt --argument '(variant{
+        InitArg = record {
+                api_key = "";
+                minter_id = principal "ml52i-qqaaa-aaaar-qaaba-cai";
+                maintainers = vec {principal "'$PRINCIPAL'" };
+                mode = variant { AcceptAll };
+}
+})'
+
+dfx deploy --specified-id mm444-5iaaa-aaaar-qaabq-cai ckbtc_index --argument '(opt variant{
+        Init = record{
+                ledger_id = principal "mc6ru-gyaaa-aaaar-qaaaq-cai";
+}
+})'
+```
+
+Here is the steps I followed,
+
+```bash
+$ dfx identity get-principal
+u3chv-6rta2-bf3vt-ttvj7-epxse-o6e4d-qf3ng-pjky2-zqvld-dutpz-sqe
+```
+
+```bash
+$ dfx canister call ckbtc_minter get_btc_address '(record{ owner= opt principal "u3chv-6rta2-bf3vt-ttvj7-epxse-o6e4d-qf3ng-pjky2-zqvld-dutpz-sqe"; subaccount= null })'
+("bcrt1qtpdealdncn2jfkh9spka3k4yvzu9fhyvwd8q8y")
+```
+
+```bash
+$ docker compose exec bitcoind bitcoin-cli generatetoaddress 1 bcrt1qtpdealdncn2jfkh9spka3k4yvzu9fhyvwd8q8y
+```
+
+```bash
+$ docker compose exec bitcoind bitcoin-cli -generate 101
+```
+
+```bash
+$ dfx canister call ckbtc_minter update_balance '(record { owner = opt principal "u3chv-6rta2-bf3vt-ttvj7-epxse-o6e4d-qf3ng-pjky2-zqvld-dutpz-sqe"; subaccount=n
+ull })'
+(
+  variant {
+    Ok = vec {
+      variant {
+        Checked = record {
+          height = 408 : nat32;
+          value = 1_250_000_000 : nat64;
+          outpoint = record {
+            txid = blob "\6a\12\85\4c\8b\cc\7a\68\f3\da\61\da\a0\10\68\48\29\e7\97\71\3a\40\b0\3c\d1\75\55\59\5f\c2\69\9f";
+            vout = 0 : nat32;
+          };
+        }
+      };
+    }
+  },
+)
+```
+
+```bash
+$ dfx canister call ckbtc_ledger icrc1_total_supply
+(0 : nat)
+```
+
+-------------------------
+
+PaulLiu | 2024-05-08 00:06:07 UTC | #3
+
+The ckBTC minter dashboard can also help with debugging. It should be accessible by this URL:
+
+```http://ml52i-qqaaa-aaaar-qaaba-cai.localhost:PORT/dashboard```
+
+Replace `PORT` with the actual port number of your local dfx/replica.
+
+-------------------------
+
+PaulLiu | 2024-05-08 00:08:05 UTC | #4
+
+Also, since you are running a local bitcoin in `RegTest` mode, please make sure its block height is advanced to make progress.
+
+-------------------------
+
+icnerd | 2024-05-08 02:47:31 UTC | #5
+
+I see this error in the log,
+```
+Failed to mint ckBTC for UTXO 711c2f5231cfdbc7b113f5c72f8ad34ec5eeadba40041c00ec62fb876da3ffe1:0: 
+TemporarilyUnavailable("cannot mint ckbtc: IC0503: Canister mc6ru-gyaaa-aaaar-qaaaq-cai trapped explicitly: the memo field size of 41 bytes is above the allowed limit of 32 bytes (reject_code = 5)")
+```
+
+-------------------------
+
+PaulLiu | 2024-05-08 06:26:55 UTC | #6
+
+[quote="icnerd, post:1, topic:30447"]
+`ckbtc_ledger`
+[/quote]
+
+You can try re-deploy ckBTC ledger with a bigger `max_memo_length`, e.g. 80 bytes.
+
+-------------------------
+
+Manu | 2024-05-08 07:09:08 UTC | #7
+
+Exactly, I think Paul found the problem. You can see in this proposal https://dashboard.internetcomputer.org/proposal/123422 that the ckBTC ledger was upgraded to use 80 byte memos.
+
+-------------------------
+
+icnerd | 2024-05-08 07:27:17 UTC | #8
+
+thank you, it works now..
+
+-------------------------
+

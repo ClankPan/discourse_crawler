@@ -1,0 +1,256 @@
+infu | 2022-09-10 11:16:04 UTC | #1
+
+TL;DR Polymorphic recursion occurs when you try to do something like 
+```
+type Something<A> = { 
+map: <B>( (A) -> B ) -> Something<B> 
+}
+```
+and is not currently supported. However there is a workaround for what I was trying to do https://forum.dfinity.org/t/motoko-compiler-bug-polymorphic-recursion/15290/13?u=infu
+
+
+---
+
+
+OOPS! You've triggered a compiler bug.
+
+Works:
+```
+  public class Something<A>() {
+        public func map<B>() : Something<B> {
+            Something<B>()
+          };
+      };
+```
+Works:
+```
+  public class Something<A>() {
+      public func map<B>( f : (A) -> B ) : () {
+      };
+  };
+```
+
+Combining these two gives error:
+```
+  public class Something<A>() {
+      public func map<B>(f: (A) -> B) : Something<B> {
+        Something<B>()
+      };
+  };
+```
+If it's a bug, any ideas on how to go around it before it gets fixed ? 
+
+Tried with two different motoko versions
+```
+Motoko 0.7.0 (source gkg65w0i-1jxsxgpi-jyzd1iws-ci2znrp1)
+
+Fatal error: exception Stack overflow
+Raised by primitive operation at Mo_types__Type.rel_typ in file "mo_types/type.ml", line 741, characters 6-81
+Called from Stdlib__list.for_all2 in file "list.ml", line 173, characters 24-31
+Called from Mo_types__Type.rel_list in file "mo_types/type.ml", line 669, characters 6-38
+Called from Mo_types__Type.rel_typ in file "mo_types/type.ml", line 741, characters 6-81
+Called from Mo_types__Type.rel_fields in file "mo_types/type.ml", line 761, characters 6-36
+Called from Stdlib__list.for_all2 in file "list.ml", line 173, characters 24-31
+Called from Mo_types__Type.rel_list in file "mo_types/type.ml", line 669, characters 6-38
+Called from Mo_types__Type.rel_fields in file "mo_types/type.ml", line 761, characters 6-36
+Called from Stdlib__list.for_all2 in file "list.ml", line 173, characters 24-31
+Called from Mo_types__Type.rel_list in file "mo_types/type.ml", line 669, characters 6-38
+Called from Mo_types__Type.rel_fields in file "mo_types/type.ml", line 761, characters 6-36
+Called from Stdlib__list.for_all2 in file "list.ml", line 173, characters 24-31
+Called from Mo_types__Type.rel_list in file "mo_types/type.ml", line 669, characters 6-38
+Called from Mo_types__Type.rel_fields in file "mo_types/type.ml", line 761, characters 6-36
+Called from Stdlib__list.for_all2 in file "list.ml", line 173, characters 24-31
+...
+```
+
+```
+Motoko 0.6.20 (source 640crzw6-q5fr2cc2-j0arj8l2-rfv2v0jh)
+Fatal error: exception Stack overflow
+Raised by primitive operation at Mo_types__Type.rel_typ in file "mo_types/type.ml", line 725, characters 6-81
+Called from Stdlib__list.for_all2 in file "list.ml", line 173, characters 24-31
+Called from Mo_types__Type.rel_list in file "mo_types/type.ml", line 653, characters 6-38
+Called from Mo_types__Type.rel_typ in file "mo_types/type.ml", line 725, characters 6-81
+Called from Mo_types__Type.rel_fields in file "mo_types/type.ml", line 745, characters 6-36
+...
+```
+
+@claudio
+
+-------------------------
+
+ggreif | 2022-09-05 17:21:33 UTC | #2
+
+This smells like a known bug, https://github.com/dfinity/motoko/issues/3057. There is a duplicate too: https://github.com/dfinity/motoko/issues/3135.
+
+-------------------------
+
+infu | 2022-09-05 19:56:55 UTC | #3
+
+I see. I want to make a library which can be chained like Somelib(..).map(x => x +2).concat(x => ...).another(....)
+I guess I have to give up on the idea, or this can be fixed soon?
+
+-------------------------
+
+icme | 2022-09-06 07:12:03 UTC | #4
+
+Have you tried using something like the functor pattern? - I used it in [motoko-color](https://github.com/ByronBecker/motoko-color/blob/main/src/Writer.mo)
+
+As long as all of those map/concat methods are in your object it should work.
+
+-------------------------
+
+infu | 2022-09-06 09:40:01 UTC | #5
+
+Thanks for the tip! Icme saves the day
+
+-------------------------
+
+infu | 2022-09-06 12:05:31 UTC | #6
+
+Unfortunately, it's a suboptimal solution. 
+I could use something like this, but that `<A>` isn't working there
+![image|690x144, 75%](upload://5i9jMmfkL40WmRpt4huLwFIpc7B.png)
+
+I tried replacing it with `<Any>` and returning the proper type later
+![image|690x234, 75%](upload://yCSeOeLMyPGCQz50RgI8lRRVIBD.png)
+
+Then trying to use it like this:
+![image|690x93, 75%](upload://cFr0CBtJmpV4ncCFBC7ThyL46JQ.png)
+
+Gives error `Pattern of type Nat cannot consume expected type Any`
+
+So the working solution is to type `<FromType, ToType>` in every function.
+![image|690x237, 75%](upload://8kWl9Pahaf7Niwhv4yyCEghXzja.png)
+..
+![image|690x76, 75%](upload://b8yt3WzrXiGzS1uNJOaIldMATNT.png)
+This could work, let's see how it plays out when I add more code
+
+Trying to create local types inside a function... 
+![image|690x82, 75%](upload://zn4bOKbXTM9wDHAazKIupzeWd4c.png)
+Also gives error `references type parameter X__10 from an outer scope`
+
+After adding some more code and stumbling on things like `expression of type  B__13 cannot produce expected type  B__14` I am giving up. I think it's not possible to replace the original class pattern with object with functions. Not to mention the module code looks less clean. You will probably end up passing bogus transforming functions all around like 
+![image|690x32, 100%](upload://nQ6Zj1OeGp4IK2mrSFlrVOTOftP.png)
+Just to keep the type checking happy. This is where I realized I will also need to add transformations everywhere. So this is the new code (not working and missing probably 10 more lines of code doing weird stuff.
+![image|690x411, 75%](upload://mYgUytFKh5G95zatgAxXWT60wSZ.png)
+
+vs the original
+![image|690x440, 75%](upload://ivTwDLTJ1kDD3nHYHRQtGFbSmtx.png)
+But hey, it was a good waste of time ;)
+
+-------------------------
+
+infu | 2022-09-06 12:10:58 UTC | #7
+
+If you have been wondering what I am trying to do -> Reactive programming (Observables/ ReactiveX/ RxJS like library)
+
+So this code can work:
+![image|623x500](upload://k2TqJcCQb9SrO03SIRDNQolwb5s.png)
+
+-------------------------
+
+claudio | 2022-09-06 14:04:13 UTC | #8
+
+Yep, this is related to https://github.com/dfinity/motoko/issues/3057
+
+We don't know how to support polymorphic recursion/non-regular types in Motoko's type system but don't have a decent check to rule it out yet either.
+
+If you can, I'd try to separate the operations that require different instantiations of the recursive type from the definition of that recursive type itself. I.e. try to make map a static function that takes an observable rather than including it as a member of the observable type.
+
+-------------------------
+
+paulyoung | 2022-09-06 14:29:53 UTC | #9
+
+[quote="infu, post:7, topic:15290"]
+I am trying to do → Reactive programming (Observables/ ReactiveX/ RxJS like library)
+[/quote]
+
+I wrote this a while back in case it’s of any interest.
+
+https://github.com/dfinity/motoko-base/tree/e4efcb9bbd8c8eeff41b3d461b679e43d1d66f44/examples/rx
+
+(Git committer/author info lost during open sourcing)
+
+-------------------------
+
+infu | 2022-09-06 15:30:13 UTC | #10
+
+**That's helpful!** Learned a few things. No operators tho, they are causing the polymorphic recursion.
+
+When I try to put them outside, usage will look like this. Loses readability and that's a deal breaker for the intended purposes (having something easy to use like the "jQuery for smart contracts")
+![image|690x219](upload://kU5MS2ryhN6GKDI3SftQXnj9YaH.png)
+There is probably still a workaround, just don't know it yet.
+
+Also tried this
+![image|690x122](upload://eJRkSycQBUXeFFLkRHskoVyxbPa.png)
+And it also produced the same stack overflow error.
+
+My reasoning - If ReactiveX is the best way of handling async problems and IC smart contract features are mainly async problems, then maybe it will be the perfect tool for the job.
+
+-------------------------
+
+ggreif | 2022-09-06 19:19:22 UTC | #11
+
+You are unnecessarily eta-expanding:
+
+`func(x) = Nat16.fromInt x`
+
+is equivalent to `Nat16.fromInt`.
+
+(just commenting)
+
+-------------------------
+
+infu | 2022-09-06 21:31:25 UTC | #12
+
+Thanks for noting. I will be happy to know if you see anything that can be done better in my code. Usually, I find these tricks in someone else's code.
+
+I got it to work this way. All the types are known in advance and placed as variants.
+![image|514x500](upload://zOZWcVXBUoKPfKaerrY8ozVClPy.png)
+
+But it kind of loses the benefits of the type-checking system, which is awesome. (I can put whatever #variant I want and the compiler won't mind. :thinking: Maybe it's because I didn't fully wire it all.
+
+This shorter version looks neat
+![image|560x222, 75%](upload://9MiUdzELeRsMhFGY1xWwgetdnM1.png)
+
+-------------------------
+
+infu | 2022-09-10 10:21:38 UTC | #13
+
+I got to this, which is actually looking pretty simple/good and is the closest to chaining interface I could get.
+
+Working code:
+```
+let ob = Observable<Nat>( func (subscriber) {
+    subscriber.next(3);
+    subscriber.next(5);
+    subscriber.next(12);
+});
+
+pipe3(
+    ob,
+    map( func (val : Nat) : Nat16 {
+         Nat16.fromNat(val + 10)
+    }),
+    map( func (val : Nat16) : Nat {
+         Nat16.toNat(val + 30)
+    })
+).subscribe( {
+    next = func (v) {
+    Debug.print("next " # debug_show(v));
+    }
+});
+
+```
+``` 
+Output:
+next 43
+next 45
+next 52
+```
+Module here https://gist.github.com/infu/8a015965bbc882fa6ecdc204d8dbdb8f
+
+Pipe function is outside of the class and you need to change its name whenever you add more parameters pipe2, pipe3, pipe4, etc.
+
+-------------------------
+

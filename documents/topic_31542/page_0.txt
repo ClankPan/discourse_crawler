@@ -1,0 +1,88 @@
+sudoshreyansh | 2024-06-04 11:36:29 UTC | #1
+
+I am working on implementing a NFT collection based on ICRC7 spec. But the problem is the data (collection metadata, token balances, etc) might be large. So it is sharded across multiple canisters which may span multiple subnets.
+The ICRC7 spec specifies query methods for getting the metadata and the token balances. But since the data is distributed, it needs to be a composite query across subnets, which isn't possible.
+
+-------------------------
+
+skilesare | 2024-06-04 15:07:06 UTC | #2
+
+Can you explain how you are using this? The IC has responses limited to 2MB and most of the functions have paging features.  Are you saying you want to store more than 400GB of metadata on one canister? Or to have on the order of millions of NFTs?
+
+Most ICRC3 components have built-in archiving for moving the actual log to archive servers.  See https://mops.one/search/icrc3-mo which is used in https://mops.one/icrc-nft-mo.
+
+-------------------------
+
+sudoshreyansh | 2024-06-05 10:09:03 UTC | #3
+
+Actually, we have an application whose data is sharded across canisters. It was a design decision made earlier and we don't want to mess with that. But we also want to provide an ICRC7-compliant interface to this application.
+
+-------------------------
+
+sudoshreyansh | 2024-06-10 04:36:25 UTC | #4
+
+To summarize, we have a hard constraint that our data is distributed in multiple canisters across subnets. We want to provide ICRC7-compliant interface. But the standard defines query methods to access this distributed data, and cross-subnet composite queries are not supported yet.
+
+We had thought of some possible solutions:
+- We defined the methods that require the data as update, and tried to do query calls on it. But it failed.
+- We thought of having local proxy canisters in each subnet that contained our data. And defining the ICRC7 query methods in the subnet proxy. So the query call would be a composite query within the subnet which works. But the client needs to first figure out which subnet proxy to query, and that moves away from the standard.
+
+The issue would be resolved if cross-subnet composite query calls get supported.
+
+Looking for suggestions!
+@ulan @dieter.sommer
+
+-------------------------
+
+dieter.sommer | 2024-06-10 06:37:17 UTC | #5
+
+Hi @sudoshreyansh!
+
+> But the problem is the data (collection metadata, token balances, etc) might be large. So it is sharded across multiple canisters which may span multiple subnets.
+
+Do I get this correctly that you essentially want to have an ICRC-7-compliant service that is distributed over multiple canisters and subnets? This would indeed require X-subnet composite queries for an optimal solution. Just to clarify the API you have in mind: You want to expose ICRC-7 on a single canister on one subnet that then queries the canisters on other subnets for the assets the client wants to read. Thus, you don't want ICRC-7 APIs on multiple subnets, i.e., each of the shards (as this would not be ICRC-7 compliant). Can you confirm that this is what you have in mind?
+
+-------------------------
+
+sudoshreyansh | 2024-06-10 07:37:19 UTC | #6
+
+Yes @dieter.sommer that's correct.
+
+-------------------------
+
+dieter.sommer | 2024-06-10 08:11:26 UTC | #7
+
+Thank you for your clarification. As you rightfully mention, having X-net replicated queries available would clearly solve the challenge right away. Without those, let's have a look at other possible approaches to the solution. They are all based on having a single canister on one subnet exposing an ICRC-7 interface, while having further data canisters on the same or different subnets throughout the Internet Computer.
+
+1. Having data canisters which expose an update method to retrieve the data. This update method is called from the ICRC-7 canister to obtain the data required to address a client's response. The update method is not part of the ICRC-7 standard, but part of the backend implementation of your canister. This should do the job, however, may lead to high cycles costs due to X-Subnet update calls to retrieve the data. Once X-net replicated queries are available, you can just replace the update calls with queries, but can keep the same architecture otherwise.
+2. Like 1, but the update calls are only used to retrieve pointers to the metadata, which are then sent back to the client (user). The client then uses the pointers to retrieve the actual data from all applicable canister concurrently. This takes 2 more seconds for data split over multiple subnets when implemented with concurrent calls. Having the client interact with multiple backend canisters in different subnets is, in general, an approach that makes multi-subnet architectures more efficient. When a browser-based client accesses the assets in this scenario, you can have them pre-certified using certificates, if the assets are sufficiently static.
+
+Before we have X-Net composite queries, queries between canisters won't solve your problem in my opinion, so you need to revert to update calls and read either the full data or just pointers to the data.
+
+Regarding option 2, we are currently working on a standard that also talks about how to address canister resources using URLs in the Ledger and Token Working Group every other Tuesday. This would be exactly applicable for this scenario.
+
+-------------------------
+
+sudoshreyansh | 2024-06-12 19:21:14 UTC | #8
+
+Thanks for the answer @dieter.sommer.
+Regarding option 1, do you mean to expose the ICRC-7 query methods as update so that they can do x-subnet calls? But then we lose the ICRC-7 compliance. I tried calling update methods from a query call but seems like that's not possible.
+In both the options, we won't be getting ICRC-7 compliance. Are there any alternative solutions that would help us achieve it? It's not necessary to have a single proxy canister with ICRC-7 API. Any solution that allows us to achieve  an ICRC-7 compliant service, provided the only hard constraint that our data is distributed across subnets would work.
+
+-------------------------
+
+dieter.sommer | 2024-06-12 21:07:14 UTC | #9
+
+Hi @sudoshreyansh!
+
+You are right, sorry, the option is still not 100% compatible with ICRC-7. Right now the only viable option seems to be to keep a directory of metadata with pointers to the real metadata that may be on other subnets in a single subnet and access this via query methods in the ICRC-7 compliant canister. Then a client can read the metadata with pointers to the actual (large) metadata items on other subnets using an ICRC-7 call and then read the metadata from the canisters on the other subnets using those pointers.
+Maybe @ulan has another idea on how to solve this.
+
+-------------------------
+
+ulan | 2024-06-19 09:20:08 UTC | #10
+
++1 to your suggestion about having the main ICRC-7 canister, @dieter.sommer. The NFT images can be stored in other subnets, but the metadata and the ledger data could be stored in a single canister IIUC.
+
+-------------------------
+

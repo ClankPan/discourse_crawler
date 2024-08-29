@@ -1,0 +1,239 @@
+3oltan | 2024-03-08 10:44:45 UTC | #1
+
+We had assets available on-chain for a long time, but today we faced ERR_HTTP2_PROTOCOL_ERROR issue when trying to access the files... Here is a link with an example: https://nszbk-7iaaa-aaaap-abczq-cai.raw.icp0.io/-/64ba621a76bd639aa6484af4/-/logo.png, is there any issues going on at the moment and when this is expected to be resolved?
+
+-------------------------
+
+rbirkner | 2024-03-08 11:01:59 UTC | #2
+
+Hey @3oltan, 
+
+we are not aware of any issue right now, but we are looking into it as we have yesterday rolled out a new release.
+
+-------------------------
+
+3oltan | 2024-03-08 11:06:19 UTC | #3
+
+Here is another example for the file: https://nszbk-7iaaa-aaaap-abczq-cai.raw.icp0.io/-/64ba621a76bd639aa6484af4/-/p4.png this one is not loading properly but is accessible. We also can access the same files through prptl.io like: https://prptl.io/-/nszbk-7iaaa-aaaap-abczq-cai/-/64ba621a76bd639aa6484af4/-/p4.png
+
+-------------------------
+
+rbirkner | 2024-03-08 11:58:52 UTC | #4
+
+Hey @3oltan 
+
+we looked into it and realized that the canister returns range headers that do not follow the spec:
+```
+# curl -v -r 0-1048576 --unix-socket /run/ic-node/icx-proxy.socket http://nszbk-7iaaa-aaaap-abczq-cai.raw.icp0.io/-/64ba621a76bd639aa6484af4/-/logo.png
+
+...
+< accept-ranges: bytes
+< content-range: bytes 0-1048576/58128
+```
+Where the expected `content-range` should look like `Content-Range: <unit> <range-start>-<range-end>/<size>` ([see here](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Range)).
+
+-------------------------
+
+skilesare | 2024-03-08 12:06:43 UTC | #5
+
+Are you all now sending down that you accept ranges where as before you were not?
+
+-------------------------
+
+skilesare | 2024-03-08 12:08:03 UTC | #6
+
+We have two streaming strategies where one handled range requests manually and only worked via our proxy.  You can find the code here: https://github.com/ORIGYN-SA/origyn_nft/blob/main/src/origyn_nft_reference/http.mo
+
+-------------------------
+
+rbirkner | 2024-03-08 12:08:06 UTC | #7
+
+Exactly, what changed on the boundary node side is that now they are making range requests and before they weren't.
+
+-------------------------
+
+skilesare | 2024-03-08 12:08:57 UTC | #8
+
+:man_facepalming: Why would you make a range request if it wasn't asked for by the client.
+
+-------------------------
+
+rbirkner | 2024-03-08 12:12:32 UTC | #9
+
+Shouldn't the end of the range in this line [here](https://github.com/ORIGYN-SA/origyn_nft/blob/main/src/origyn_nft_reference/http.mo#L240) here should be according to the actual content being served instead of specifying the end requested by the client?
+
+-------------------------
+
+skilesare | 2024-03-08 12:13:46 UTC | #10
+
+You can see where we split the streaming strategy here based on whether we find a range request or not. We DO NOT expect a range request under most circumstances so that we can use certification for those files. No range request = classic streaming strategy.  If there is a range request we handle it completely differently. https://github.com/ORIGYN-SA/origyn_nft/blob/bf874a83d8ac270fd21d883acb9b675a1c8124da/src/origyn_nft_reference/http.mo#L743
+
+-------------------------
+
+rbirkner | 2024-03-08 12:15:33 UTC | #11
+
+Indeed, the slicing works well for raw, but does not support certification just like that. We will roll back.
+
+-------------------------
+
+skilesare | 2024-03-08 12:19:53 UTC | #12
+
+Happy to work through getting this all to work and update what we're doing but may need some time to test/adjust.
+
+Can you spot where we are not adhering to the spec?
+
+On the line you pointed out we return our rEnd because that is the just one chunk path way. We store files in chunks of 2MB.  So if it is less than one chunk the math is a bit easier.  These files that arent' working are likely bigger than 2MB and thus taking the other pathway.
+
+-------------------------
+
+rbirkner | 2024-03-08 12:22:17 UTC | #13
+
+The fix for now: We disable it on `non-raw` as with certification it will not work. We keep it for `raw`. Sorry for the problems!
+
+-------------------------
+
+rbirkner | 2024-03-08 12:24:33 UTC | #14
+
+Regarding where the error is:
+The problem is that whatever range is request, the canister sets then end of the range to the requested range end, whereas it should set it to min(actual file end and requested range end). It doesn't matter if the response is larger than 2MB or not. 
+
+The boundary node requests chunks of 1MB. You can see that the request fails for https://nszbk-7iaaa-aaaap-abczq-cai.raw.icp0.io/-/64ba621a76bd639aa6484af4/-/logo.png because the file is smaller than 1MB and the header is wrong.
+
+However, it works for the first chunk of https://nszbk-7iaaa-aaaap-abczq-cai.raw.icp0.io/-/64ba621a76bd639aa6484af4/-/p4.png as the file is larger than 1MB and the header will only be wrong for the second range request as the chunk is smaller than the requested range.
+
+-------------------------
+
+skilesare | 2024-03-08 12:24:07 UTC | #15
+
+We had to do all of this hoop jumping because safari and apple do strange things with movie files. If I recall, they ask for the file normally and then they cut the connection if they see it is a media file, then request 1 byte to get the size then start sending range requests.  I see that I return accept-ranges here on our Large content(classic streaming strategy), so maybe this is where things get wonky?  The first request for a png would likely not have a range request but then I tell you I accept ranges? Would you go back and get the second chunk a different way?
+
+-------------------------
+
+skilesare | 2024-03-08 12:26:27 UTC | #16
+
+So this is NOT correct?
+
+```
+("Content-Range", "bytes " # Nat.toText(rStart) # "-" # Nat.toText(rEnd) # "/" # Nat.toText(size)),
+```
+
+Doesn't this say that this chunk is in bytes and is the rStart to rEnd of / totalBytes?
+
+-------------------------
+
+rbirkner | 2024-03-08 12:29:16 UTC | #17
+
+It is correct unless the size of the chunk is smaller than the requested byte range.
+
+-------------------------
+
+skilesare | 2024-03-08 12:31:38 UTC | #18
+
+With our current code, I don't think we will ever serve you past the first chunk with a range request unless you provide us with our custom streaming strategy token.
+
+What I think is happening now(please correct me if I'm wrong) is:
+
+1. You request a file that is greater than 2MB.
+2. We return the first chunk with standard streaming strategy, but I have an accept ranges header in it so you all switch to requesting chunks via range over using the classic streaming strategy.
+3. Your code does the range request but doesn't have the right streaming token because I require the first request to be a range request to go down that path.
+
+Maybe can you link to the boundary node code and I can take a look to try to resolve?
+
+-------------------------
+
+skilesare | 2024-03-08 12:33:46 UTC | #19
+
+[quote="rbirkner, post:17, topic:28239, full:true"]
+It is correct unless the size of the chunk is smaller than the requested byte range.
+[/quote]
+
+kk...So if rEnd > rSize { rEnd = rSize -1}?
+
+-------------------------
+
+rbirkner | 2024-03-08 12:38:47 UTC | #20
+
+The streaming strategy is something independent of the range request:
+We have two components: `nginx` and `icx-proxy`.
+* `nginx`: the range requests have been introduced here. `nginx` will just request chunks of 1MB in size until it got the last chunk. `nginx` will automatically keep on requesting until it got the full file. Here is no streaming strategy involved.
+* `icx-proxy`: will just turn the HTTP request into a query call and will try to turn the response into an HTTP response. However, since the canister can only serve a certain response size, it will have to chunk it if the response is larger. This is done using the streaming strategy. `icx-proxy` will apply the streaming strategy to assemble the response.
+
+The streaming strategy is only active if the response from the canister is larger than the maximum response size. Since `nginx` always requests chunks of 1MB in size, it is always smaller than the response size and will not go through the streaming strategy. If it would request chunks of size 10MB, then `icx-proxy` would have to use a streaming strategy. 
+
+Does that make sense or did I explain it too complicated?
+
+-------------------------
+
+rbirkner | 2024-03-08 12:39:34 UTC | #21
+
+>kk…So if rEnd > rSize { rEnd = rSize -1}?
+
+Yes, exactly.
+
+-------------------------
+
+skilesare | 2024-03-08 12:42:11 UTC | #22
+
+I think it makes sense, but is a pretty big change since files were 'just requested' before without any byte specification.  It is actually much simpler but we need some time to refactor the code.
+
+-------------------------
+
+rbirkner | 2024-03-08 12:44:36 UTC | #23
+
+We are rolling back within the next hour or two. The rollout just takes a moment. Then, you are back on the old behavior for all certified endpoints. 
+
+Do you also use raw?
+
+-------------------------
+
+skilesare | 2024-03-08 13:03:37 UTC | #24
+
+Yes...we use raw in a number of places. Would it be possible to have nginx branch and only use the chunk request method if a range request is present in the initial request, but the classic behavior otherwise(in the mean time)?
+
+-------------------------
+
+rbirkner | 2024-03-08 13:16:45 UTC | #25
+
+We can roll it back completely and then enable it again only on raw. It's not great for @lastmjs, but we know it works and will enable it again asap.
+
+-------------------------
+
+lastmjs | 2024-03-08 13:41:37 UTC | #26
+
+So it will be enabled on raw again ASAP?
+
+I'm not sure I followed all of that, but if it will work on raw again that will be great. I would love to discuss how to get certification to work eventually with range requests.
+
+I'm also curious why nginx is set to request 1 MB chunks. Canisters can return up to 3 MB in one message response, was it determined that 1 MB is optimal? And what would happen if a canister returned less than 1 MB?
+
+It's a little strange that the canister can't actually control the ranges returned...since nginx always requests 1 MB. I wonder if this will cause problems/confusion for developers.
+
+-------------------------
+
+skilesare | 2024-03-08 13:41:41 UTC | #27
+
+None of our files are certified at this point so everything goes through raw. (We have some cert code but it isn't enabled yet as we v2 was coming and we knew @tomijaga was working on it for motoko)
+
+-------------------------
+
+rbirkner | 2024-03-08 13:49:20 UTC | #28
+
+Sorry @lastmjs, it's bad news for you for the moment:
+We are disabling it again everywhere to give @skilesare and team some time to roll out the fix to their canisters. Once that is done, we will enable it again.
+
+For now, we can have a single boundary node that is not part of the loadbalancer running with the range requests enabled such that you guys can test.
+
+-------------------------
+
+lastmjs | 2024-03-08 14:37:43 UTC | #29
+
+Good luck, I appreciate all of the work put in to make this work, the reception has been great
+
+-------------------------
+
+rbirkner | 2024-03-08 17:26:01 UTC | #30
+
+We have completed the rollback. Everything should work again as before.
+
+-------------------------
+

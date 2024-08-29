@@ -1,0 +1,277 @@
+GLdev | 2022-05-14 15:41:05 UTC | #1
+
+I'm trying to pass some arguments when installing / upgrading a canister from **dfx** and I can't seem to figure it out.
+
+In the rust canister I have this code:
+
+```
+#[derive(CandidType, Deserialize, Debug, Default)]
+struct SendArgs {
+    greet: String,
+}
+
+#[init]
+fn init() {
+    let call_arg = ic_cdk::api::call::arg_data::<(Option<SendArgs>,)>().0;
+    ic_cdk::print(format!("Init: {:?}", call_arg));
+[...]
+}
+```
+
+When installing the code from another rust canister, like [here](https://github.com/GLicDEV/quickstart_scaling/blob/ca9f581c270314670f6de92e25df3b6f87927a19/src/quickstart_scaling_index/src/businesslogic.rs#L314), this works and I can read call_arg. I just can't seem to figure out how to send this from dfx.
+
+Things I've tried:
+
+```
+dfx deploy ic_test --argument '(record {greet="Test"})' --mode reinstall
+dfx deploy ic_test --argument '(opt record {greet="Test"})' --mode reinstall
+
+dfx canister install --mode reinstall --argument '(opt record {greet="test"})' ic_test
+
+```
+
+All I get is
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Init: None
+
+I also tried **arg_data::<(Option<String>,)>()** and **arg_data::<(String,)>()** without any success. I think the issue is with how I send the data from dfx.
+
+For context, I'm trying to call ::arg_data from post_update, so we can use a neat pattern that @Seb showed us during the Friday call.
+
+-------------------------
+
+paulyoung | 2022-05-15 06:01:33 UTC | #2
+
+How about something like this?
+
+```
+#[init]
+fn init(foo: String) {
+  ic_cdk::print(format!("foo: {:?}", foo));
+}
+```
+
+-------------------------
+
+GLdev | 2022-05-15 06:34:54 UTC | #3
+
+```
+#[init]
+fn init(foo: String) {
+    ic_cdk::print(format!("Init: {:?}", foo));
+}
+```
+\+
+```
+dfx start --clean
+dfx canister create ic_test
+dfx canister install --argument '("Test")' ic_test
+
+[OR]
+
+dfx deploy ic_test --argument '("Test")'
+```
+
+Output
+**Error: The Replica returned an error: code 5, message: "Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped explicitly: Custom(No more values on the wire, the expected type text is not opt, reserved or null)"**
+
+```
+#[init]
+fn init(foo: Option<String>) {
+    ic_cdk::print(format!("Init: {:?}", foo));
+}
+```
+
+Same inputs, output is always:
+
+**[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Init: None**
+
+-------------------------
+
+paulyoung | 2022-05-15 06:40:34 UTC | #4
+
+Maybe @senior.joinu or @nomeata can shed some light on this.
+
+https://forum.dfinity.org/t/how-to-provide-a-canister-with-constructor-arguments/4553
+
+-------------------------
+
+paulyoung | 2022-05-15 06:51:04 UTC | #5
+
+[quote="GLdev, post:3, topic:12977"]
+`dfx deploy ic_test --argument '("Test")'`
+[/quote]
+
+Can you try `opt "Test"`?
+
+-------------------------
+
+GLdev | 2022-05-15 06:55:16 UTC | #6
+
+dfx deploy ic_test --argument '(opt "Test")' with init(foo: String):
+
+Error: The Replica returned an error: code 5, message: "Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped explicitly: Custom(No more values on the wire, the expected type text is not opt, reserved or null)"
+
+dfx deploy ic_test --argument '(opt "Test")' with init(foo: Option<String>):
+
+No error, but output is None.
+
+I have a feeling it's something that dfx does when adding the parameter, I'm checking the repo now
+
+-------------------------
+
+GLdev | 2022-05-15 08:08:35 UTC | #7
+
+A-ha! Some progress. Following my hunch that dfx does something weird (rust to rust works, afterall) I tried sending raw arguments, like so:
+
+```
+$ didc encode '("Test")'
+4449444c0001710454657374
+
+$ dfx deploy ic_test --argument 4449444c0001710454657374 --argument-type raw
+```
+
+And now I get **[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Init: "Test"**
+
+And now my old code works as well
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] PU: Some("Test")
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Post upgrade ended
+```
+
+So both post_upgrade(args: T) and post_upgrade(){ic_cdk::api::call::arg_data()} work fine. It's just that dfx has some issues when sending idl. Works with raw, though it would be a bit awkward to also use didc...
+
+-------------------------
+
+paulyoung | 2022-05-15 12:21:46 UTC | #8
+
+Please create an issue 🙂
+
+https://github.com/dfinity/sdk/issues/new
+
+-------------------------
+
+GLdev | 2022-05-15 19:28:55 UTC | #9
+
+done 
+
+.............................................................20char 20 more 20202020
+
+-------------------------
+
+GLdev | 2022-05-16 04:22:54 UTC | #10
+
+Posting here as well so this gets documented for other people trying the same things:
+
+@chenyan figured out that the problem was my did file. It needs to include the params at a service level, so dfx can work. (e.g. service : **(text) ->** { ... })
+
+Old did file:
+```
+service : {
+  add : (text) -> (bool);
+  getAll : () -> (vec text) query;
+  greet : (text) -> (text) query;
+}
+```
+
+New did file:
+```
+service : (text) -> {
+  add : (text) -> (bool);
+  getAll : () -> (vec text) query;
+  greet : (text) -> (text) query;
+}
+```
+
+Just a heads up, if you're currently using the __get_candid_interface_tmp_hack trick to __export_service() this doesn't pick up the fact that you need those params in the init fn so it doesn't add the proper definition. Waiting on a response from github to see if this was ever intended, or it's something just not needed.
+
+-------------------------
+
+GLdev | 2022-05-16 04:32:25 UTC | #11
+
+Right, so now I'm a bit more clear on what happened. I am using the following pattern to output the did file:
+
+```
+// Auto export the candid interface
+candid::export_service!();
+
+#[query(name = "__get_candid_interface_tmp_hack")]
+#[candid_method(query, rename = "__get_candid_interface_tmp_hack")]
+fn __export_did_tmp_() -> String {
+    __export_service()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_candid() {
+        let expected = String::from_utf8(std::fs::read("ic_test.did").unwrap()).unwrap();
+
+        let actual = __export_service();
+
+        if actual != expected {
+            println!("{}", actual);
+        }
+
+        assert_eq!(
+            actual, expected,
+            "Generated candid definition does not match expected did file"
+        );
+    }
+}
+```
+
+The tests makes sure that I get an error every time the candid interface changes, however I didn't know how to decorate the init fn so the proper signature got used. I had tried using ``` #[candid_method(update)] ``` but that didn't work, as it would add the init() fn to the methods, but not update the service signature. The proper way to annotate the init() fn is this: ``` #[candid_method(init)]```
+
+This now produces the correct did singnature:
+
+```
+service : (text) -> {
+  add : (text) -> (bool);
+  getAll : () -> (vec text) query;
+  greet : (text) -> (text) query;
+}
+```
+
+-------------------------
+
+paulyoung | 2022-05-19 02:37:16 UTC | #12
+
+Where is `ic_test.did` relative to the file containing the Rust code that tries to read it?
+
+I have `lib.rs` in the same directory as the `.did` file but get a `"No such file or directory"`. I tried a few different paths.
+
+-------------------------
+
+GLdev | 2022-05-19 04:32:58 UTC | #13
+
+For the example above? It's in the same dir as the Cargo.toml
+
+```
+$ tree
+.
+├── Cargo.lock
+├── Cargo.toml
+├── dfx.json
+├── README.md
+└── src
+    └── ic_test
+        ├── Cargo.toml
+        ├── ic_test.did
+        └── src
+            ├── env.rs
+            ├── lib.rs
+            └── lifetime.rs
+
+3 directories, 9 files
+```
+
+-------------------------
+
+lastmjs | 2022-09-07 19:33:49 UTC | #14
+
+This just solved my problem, thank you
+
+-------------------------
+

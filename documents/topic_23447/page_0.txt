@@ -1,0 +1,108 @@
+ulan | 2023-10-02 06:42:38 UTC | #1
+
+## Subnet storage capacity increase
+
+The replica version [76fd768b](https://dashboard.internetcomputer.org/proposal/124790) increases the subnet storage capacity from 450GiB to 700GiB. This is the first milestone in a larger effort to push the subnet storage capacity into the [terabytes](https://internetcomputer.org/roadmap).
+
+Historically, the IC nodes had 3.2TB of NVMe space available at Genesis. Since a node may store multiple versions of the replicated state, the subnet capacity was conservatively limited to 450GiB. Besides that, more optimizations were needed in the state manager to scale beyond that limit.
+
+Recently, the node providers in collaboration with DFINITY upgraded the nodes to increase the available NVMe space by 10x, from 3.2TB to 32TB. In parallel, DFINITY engineers have been working on performance optimizations in the state manager. All this work made it possible to increase the storage capacity to 700GiB. There are more potential state manager optimizations, which would allow further increases of the storage capacity, such as, for example, the rewrite of the storage layer to replace the XFS reflink operation during checkpointing.
+
+## Resource reservation mechanism
+
+We took the newly added 250GiB as an opportunity to start tackling a long-standing problem with the storage charging mechanism. As you might know, currently canisters pay for storage dynamically every few minutes following the “pay-as-you-go” model. Such a fine-grained payment is convenient for developers, but at the same time it doesn’t handle spikey usage patterns well.
+
+Consider a scenario where someone allocates the entire subnet storage for a few hours and pays only for those hours. The end result is that during those hours, the operation of other canisters on the same subnet might be disrupted as they might fail to allocate new storage. The problem here is that the cost of such a spikey usage is low due to the “pay-as-you-go” model.
+
+As a mitigation, the newly added 250GiB will be subject to a new resource reservation mechanism designed to encourage consistent, long-term use and discourage sudden, large spikes in storage usage. The mechanism is enabled only on _application_ subnets, because _verified application_ and _system_ subnets do not need such protection since malicious actors cannot deploy canisters there.
+
+The reservation mechanism works as follows:
+
+* As long as the subnet remains under the previous limit of 450GiB, the storage payment remains the same as before, following the _“pay-as-you-go”_ model. This is the case for all subnets as of this writing.
+* When the subnet grows above 450GiB, then the new reservation mechanism activates. Every time a canister allocates new storage bytes, the system sets aside some amount of cycles from the main balance of the canister. These reserved cycles will be used to cover future payments for the newly allocated bytes. The reserved cycles are not transferable and the amount of reserved cycles depends on how full the subnet is. For example, it may cover days, months, or even years of payments for the newly allocated bytes. It is important to note that the reservation mechanism applies only to the newly allocated bytes and does not apply to the storage already in use by the canister.
+
+The goal of the reservation mechanism is to discourage the spiky usage pattern by making it more expensive while at the same time keeping costs the same for long-term users. As explained above, the reservation mechanism activates only above the previous subnet storage limit of 450GiB.
+
+## Details of the changes
+
+* A new field named `reserved_cycles` is added to the canister state. The new field keeps track of the reserved cycles that were set aside from the main balance of the canister and were not spent yet. The new field will appear in the result of `canister_status` call to the IC management canister.
+* A new field name `reserved_cycles_limit` is added to canister settings. It serves as an upper limit on `reserved_cycles`. Setting the limit to 0 is a way to disable the reservation mechanism for the canister. Such opted-out canisters would not be able to allocate from the newly added 250GiB, which means that these canisters will trap if they try to allocate storage when the subnet usage grows above 450GiB. In other words, such canisters will effectively operate under the previous subnet storage capacity of 450GiB. The default value of the new `reserved_cycles_limit` is 5T cycles.
+* Storage allocation operations such as `memory.grow`, `stable_grow`, `stable64_grow`, setting `memory_allocation` are adjusted to move cycles from the main balance to `reserved_cycles`. The amount of cycles depends on how full the subnet storage is: [code](https://github.com/dfinity/ic/blob/534407592c04702bd1d9e93652213b9665bdf130/rs/cycles_account_manager/src/lib.rs#L638). The amount of cycles per byte grows linearly with the subnet usage. It starts from 0 at 450GiB usage and goes to [~10 years](https://github.com/dfinity/ic/blob/9f1c58231b9f7da032e5bfaa2193e94e018c00da/rs/config/src/subnet_config.rs#L410C65-L410C76) worth of storage fees at 700GiB. These config parameters are up to discussion and may change after the community feedback.
+* The periodic charging for storage is adjusted to first burn cycles from `reserved_cycles` and only when that reaches 0, to start using the main balance.
+* The freezing threshold computation is also updated to take `reserved_cycles` into account. This means that even if the main balance is below the freezing threshold, the canister may still be functional if it has enough reserved_cycles.
+
+## Next steps
+
+Normally, changes in the protocol first go through the community discussion, then the NNS proposal, and then roll out to the mainnet. In this case, because of the possibility that this vulnerability of the protocol could be abused, we followed [the approach for security fixes](https://dashboard.internetcomputer.org/proposal/48792), where the fix is deployed first and then discussed later. Note that there are no changes for the first 450GiB that were available before. The new mechanism activates only above that threshold.
+
+The plan:
+
+1. Implement and deploy the reservation mechanism on the mainnet [done].
+2. Implement the canister status and settings changes in dfx and agents [WIP]. A new version of dfx will be released soon.
+3. **Discuss the reservation mechanism and other solutions [we are here now].**
+4. Address issues raised by the community.
+5. Submit an NNS motion proposal.
+6. If the proposal is rejected, then we need to find and implement an alternative solution.
+7. If the proposal is accepted, then update the protocol specification.
+
+## What does it mean for you?
+
+* If your canisters are on a verified application or system subnet, then you don’t have to do anything because the reservation mechanism is disabled on such subnets.
+* If you want to opt out, then you can set a new `reserved_cycles_limit` canister setting to 0 for all your canisters. In that case, the previous limit of 450GiB will apply to your canisters.
+* Discuss the problem and the reservation mechanism. Your feedback would be very much appreciated.
+
+-------------------------
+
+ulan | 2023-10-04 07:43:55 UTC | #2
+
+> 1. Implement the canister status and settings changes in dfx and agents [WIP]. A new version of dfx will be released soon.
+
+This is available in `dfx 0.15.1-beta.1`. Thanks @ericswanson for implementing it.
+
+-------------------------
+
+peterparker | 2023-10-04 13:08:23 UTC | #3
+
+[quote="ulan, post:1, topic:23447"]
+If your canisters are on a verified application or system subnet...
+[/quote]
+
+Looking forward to even memory :muscle:
+
+No stupid question: verified application or system subnets are those listed on the dashboard right?
+
+-------------------------
+
+Severin | 2023-10-05 06:51:15 UTC | #4
+
+The [subnet overview on the dashboard](https://dashboard.internetcomputer.org/subnets) says which subnets are which type. This list is exhaustive.
+
+IIUC this means 'yes' to your question :slightly_smiling_face:
+
+-------------------------
+
+ulan | 2023-11-14 13:23:43 UTC | #5
+
+I received one feedback internally about the following scenario:
+1) A canister allocates N bytes
+2) The canister deallocates N bytes
+3) The canister allocates N bytes again
+
+The second allocation is going reserve cycles regardless of the cycles reserved by the first allocation. In other words, the system doesn't keep track of individual allocations and their reservation times (which would be inefficient and memory consuming). Each allocation is considered independently from previous allocations, deallocations, and reserved cycles.
+
+Note that currently there is no easy way to deallocated storage except for uninstall and re-installing the canister, so this would be more of a corner case rather than a normal case.
+
+-------------------------
+
+ulan | 2023-11-24 09:56:36 UTC | #6
+
+The NNS motion proposal: https://dashboard.internetcomputer.org/proposal/126094
+
+-------------------------
+
+ulan | 2023-11-28 14:27:19 UTC | #7
+
+The spec change: https://github.com/dfinity/interface-spec/pull/257
+
+-------------------------
+

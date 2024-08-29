@@ -1,0 +1,93 @@
+shalexbas | 2021-06-16 17:42:59 UTC | #1
+
+Hey,
+
+https://sdk.dfinity.org/docs/language-guide/actors-async.html#_traps_and_commit_points says that the points at which tentative state changes and message sends are irrevocably committed are:
+* await, return ,... but also **throw**
+Why is state not reverted after a throw statement? If division by zero happens or an assert fails then the state is also reverted, right? BUt why not through throw statement?
+Is it possible to catch the thrown error in the local canister? In this case state revert make no sense, but if the thrown error is not catched in the local canister then the state should be reverted, why is it not the case?
+
+Thanks
+
+-------------------------
+
+nomeata | 2021-06-17 16:59:11 UTC | #2
+
+This is the explicit `throw` of Motoko, which maps to issuing a “reject” on the system level. On the system level, calls have either a _reply_ or a _reject_ as their response.
+
+Don’t confuse `throw` (aka reject) with the concept of a _trap_, which happens when you divide by zero. That is not catchable within WebAssembly. Mildly confusing, it often appears that a trap causes a reject, but that is not always the case, and in some sense a trap _in the canister_ causes a the _system_ to response with a reject on the canister’s behalf.
+
+-------------------------
+
+shalexbas | 2021-06-17 19:24:43 UTC | #3
+
+Isn't "reject" not something that tells the caller that something went bad on the calling-side? In this case the caller knows his call failed and can assume that it didn't lead to some state changes on the calling side. I don't know, to me is an trap and an uncaught exception conceptually the same. For example in Java JPA, if an uncaught exceptions occurres inside a transaction then the transaction fails and the state will be reverted thats why it looks a bit weird that an uncaught exception through a `throw` sends a reject but don't revert its state to last commit point.
+
+```
+it often appears that a trap causes a reject, but that is not always the case
+```
+In which cases can a trap **not**  lead to a reject if it is uncatchable?
+
+-------------------------
+
+nomeata | 2021-08-29 21:56:39 UTC | #4
+
+Rejects don't carry lots of hard guarantees, they are mostly convention. Canisters can generate them at will, and still commit their state changes. They are not like traps or exceptions.
+
+Traps are a wasm concept and relate to a single _message_ execution. A canister can respond to a _call_ in any of possibly multiple callcack handlers, and if an trap occurs in one while others are still outstanding (and thus could respond), this trap does not generate a reject.
+
+-------------------------
+
+jzxchiang | 2021-09-17 04:10:44 UTC | #5
+
+Follow-up question: when an unexpected situation happens (like looking up an unknown ID in a Trie), should the canister return a `null` in an `Option<T>` or is it ever OK for the canister method to trap instead? What is the use case of a trap?
+
+I'm guessing it returns something different to the client.
+
+-------------------------
+
+nomeata | 2021-09-17 07:25:51 UTC | #6
+
+It depends :-).
+
+Traps are good for _unexpected_ error conditions that cannot be recovered from, and where you simply want to ignore the current message. Option is good when the caller of your code likely wants to handle that case programmatically.
+
+-------------------------
+
+jzxchiang | 2021-09-17 07:30:47 UTC | #7
+
+Hm interesting. When you mean ignore the current message, I'm assuming that applies more to updates, since any state change will be reverted? Whereas I guess if you return an Option, the state change is kept.
+
+-------------------------
+
+nomeata | 2021-09-17 07:57:01 UTC | #8
+
+Exactly!  Maybe this summarizes the intention of a canister well:
+
+* Trap (via `assert false`, or soon `Debug.trap`): “I am completely lost, better be safe and don’t record any state changes”. Same as division by 0 for example.
+* Rejecting (via `throw`): “The call cannot be performed, likely because the caller did something stupid, but I am still pretty sure that my state is in good order, so it can be committed”. Also “Call failed, but I maybe want to record the fact that this caller tried something”.
+* Replying, with `null` or `#error "messages"`: “The caller did everything right, I am also still healthy, and and as part of the expected way of things I am returning some kind of negative result (e.g. key not present in a key value store)”.
+* Replying, with data: “All well, here you go, have a good day”.
+
+-------------------------
+
+jzxchiang | 2021-09-18 04:42:35 UTC | #9
+
+Great response. I had no idea throws committed state but traps reverted state (even though both result in the canister responding with a reject, i.e. an Error in JS land if using `agent-js`).
+
+It's also interesting that a public method can throw a Motoko `Error` without having to specify that possibility in the method signature. This is different from returning a `Result<Ok, Err>`, where the error type is explicit in the type.
+
+For example, the compiler thinks this is totally fine:
+
+public func bar(): async Nat {
+       throw Error.reject("bar got rejected!");
+  };
+
+-------------------------
+
+jzxchiang | 2021-10-18 01:06:27 UTC | #10
+
+If the main advantage of `throw` over `assert` is the ability to commit state changes, shouldn't the `assign_role` function in this code [snippet](https://sdk.dfinity.org/docs/developers-guide/tutorials/access-control.html#_modify_the_default_dapp) modify `role_requests` at the top of the function instead of at the bottom? So that the request is logged even if the function throws?
+
+-------------------------
+

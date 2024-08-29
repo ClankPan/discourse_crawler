@@ -1,0 +1,101 @@
+saikatdas0790 | 2023-08-07 05:51:53 UTC | #1
+
+That's it. That's the question.
+
+Alternatively, like we have [notify](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.notify.html) calls on the IC, is there an equivalent call for https outcalls or do I have to use the async function and await the response?
+
+Finally, I noticed that I get output like this when I set the value to 0.
+
+![image|690x93](upload://46TtP2M6UpU3IhMTs5HkxRkhNhW.png)
+
+Is it fine to let the call panic or should I be providing some minimal value to the argument?
+
+-------------------------
+
+rumenov | 2023-08-07 12:31:49 UTC | #2
+
+Hello @saikatdas0790 ,
+
+The HTTP protocol doesn't really have the notion of notify (or pushing data). So the best way to simulate it is to ignore the response.
+
+The `max_response_bytes` option is just an optimization to lower potential extensive costs in cases where you don't know how big the response will be. Given you want to push requests, I would assume that the responses are actually small and you can just not set `max_response_bytes`.
+
+If you need to set it, please read through [the sdk](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-http_request) to understand the semantics of the field.
+
+-------------------------
+
+saikatdas0790 | 2023-08-07 12:55:06 UTC | #3
+
+That's the thing. I just want to push but if I don't set the `max_response_bytes`, I'll be paying for the entire 2MB on every request which is definitely not what I want.
+
+Here:
+![image|690x68](upload://4dLb1rXSPfguJwlYO7aVtcqCz2S.png)
+
+Just trying to confirm if it's okay to set this value to **0** and let the call panic? Will the panic lead to some sort of rollback or any other unwanted behaviour that I should avoid?
+
+-------------------------
+
+Severin | 2023-08-07 13:46:58 UTC | #4
+
+From what I understand the panic only happens _after_ the call goes out, so you should be fine to just ignore it. But I would recommend you test it once in a proper setup and then you should know how it works. And in case there's a special rule for 0 then I would bet that 1 would allow you to sneak it through :slightly_smiling_face:
+
+-------------------------
+
+saikatdas0790 | 2023-08-07 14:44:01 UTC | #5
+
+Hi @Severin,
+
+So, I tested using a value of **1** and I see the same exact error, so I think it should be fine.
+
+![image|690x91](upload://rhG7AZBt79N70oP2fpVe9hoylnq.png)
+
+The API server seems to be receiving the calls both with **0** and **1**, so, I don't think it should be a problem. I tested both locally and on mainnet.
+
+Here's another followup question. I'm looking at the request as received on the REST endpoint, and this is what it looks like:
+![image|690x123](upload://855BpqAj7fR3kjavcXFhrTsJGUQ.png)
+
+And this is what my request arg code looks like:
+```rust
+    let request_arg = CanisterHttpRequestArgument {
+        url: url_to_ping,
+        max_response_bytes: Some(0),
+        method: HttpMethod::POST,
+        headers: vec![HttpHeader {
+            name: "canister-id".to_string(),
+            value: ic_cdk::id().to_string(),
+        }],
+        ..Default::default()
+    };
+```
+But basically, I seem to be receiving 13 requests, in quick succession, at a time which is as expected.
+
+For deduplication, I remember reading that it's advised to pass in an idempotence key/ID to discern between distinct requests. Is there some guidance on how to generate this? Should we just use the random number generator to generate this or is there another prescribed mechanism?
+
+I'm using the canister ID in this case to deduplicate by maintaining a local cache on the API server to check if a request from the same canister ID has been received in the last minute, and if yes, to treat the incoming request as a duplicate. Oh, and these requests run on an hourly timer, so I imagine this should be fine? Do you see any pitfalls that I'm not seeing?
+
+-------------------------
+
+sea-snake | 2023-08-07 22:59:08 UTC | #6
+
+Keep in mind anyone might be able to call your endpoint directly besides your canister to trigger the processes behind it more often then hourly. If you need to be certain nobody else can trigger it besides your canister, maybe add something like a signature of the current time window, then the endpoint can verify that signature to know the http call came from your canister and not from somewhere else. 
+
+Also if the endpoint expects data from your canister, a signature over this data could guarantee it comes from your canister. Avoid using any form of hardcoded auth tokens if possible, the http request payload is distributed publicly between nodes as far as I understand.
+
+-------------------------
+
+saikatdas0790 | 2023-08-08 03:17:56 UTC | #7
+
+All good advice, thank you :slight_smile: 
+
+I'm doing auth slightly differently, so should be fine.
+
+-------------------------
+
+Severin | 2023-08-08 05:25:39 UTC | #8
+
+I don't think there's any recommendations on idempotency key generation. If you want you can require some cryptographic traits (e.g. signed by an API key), but in most cases I'd say that any random string is just fine. 
+
+Your timer-based solution works too, but in a project with multiple collaborators (or you have a memory like I have and will likely forget about the 1h cycle in a few weeks/months) I'd consider it a potential future footgun if someone copies the mechanism in a place that's on a different cycle
+
+-------------------------
+

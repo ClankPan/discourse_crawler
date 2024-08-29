@@ -1,0 +1,351 @@
+icaten | 2023-02-08 20:28:40 UTC | #1
+
+Once an await is called does this mean remaining code up until the catch of a try will also be caught? 
+
+For example:
+```
+func example() : async () {
+  try {
+    // If the intercanister call traps, the try will catch. 
+    let result = await intercanisterCall();
+    // Now that subsequent message execution has been enqueued (iiuc), 
+    // does this mean that the following will also be caught?
+    let triggerTrap = Principal.fromText("🤯🤦🦟"); 
+  } catch e {
+    Debug.print("Caught exception " #debug_show(e));
+  } 
+};
+```
+Edit: For the sake of this question, assume the the first expression at the beginning of the try *would always be* the/an await call. 
+
+Not that I'm trying to intentionally misuse try/catches in Motoko, but if I can take advantage of this to for instance reliably release a lock this would be helpful to know. 
+
+Thanks.
+
+-------------------------
+
+claudio | 2023-02-09 14:21:34 UTC | #2
+
+The short answer is no.
+
+A trap that happens locally rejects the entire message. 
+
+The caller will see the trap as an Error returned from the awaited future, but the callee,  and its error handlers, will not be able to catch or mask the trap.
+
+-------------------------
+
+icaten | 2023-02-09 23:40:22 UTC | #3
+
+Indeed, thanks. This suggests in general when using a try/catch each should be used exclusively for the await call it contains... so if some block had multiple different await calls "in a row", each should have their own try/catch?
+
+This is a really important point for the developer docs--particularly in the context of not being necessarily useful for locks. A couple of different video/discussions I've seen all use the example of ["unguarded refunding"](https://www.youtube.com/watch?v=PneRzDmf_Xw). 
+
+![theexample|690x393](upload://fen4qTL0oleInQs7RfB5qUzIaDk.jpeg)
+
+Is there a suggested wayfor dealing with the fact when using a lock involving calling a canister that could fail, it could end up leaving the lock locked preventing subsequent calls by the same caller? One could wrap all dependent logic in its own async expression, but this adds yet more delay to something that might require multiple update calls already, and I'd like to not introduce any additional delays as much as possible. 
+
+One option could be using a time out that is checked at the same time the initial check to see if it's in use, but I was hoping there might be something already built-in to Motoko?
+
+-------------------------
+
+timo | 2023-02-10 06:16:53 UTC | #4
+
+[quote="claudio, post:2, topic:18422"]
+The caller will see the trap as an Error returned from the awaited future
+[/quote]
+
+It should be noted that in this particular example, where there is an internal `await` statement, the Error received by the caller does not indicate to the caller whether the trap happened before or after the await statement. Since the await statement is a commit point, the caller can not tell if changes before the await statement got committed or not. Caller and callee have to be programmed in a way such that that is not important.
+
+If you have that taken care of, i.e. all commit points are "sane" and the caller doesn't have to care what got executed and what didn't then I think it is also ok to have multiple await statements in a single try block.
+
+-------------------------
+
+claudio | 2023-02-10 17:38:16 UTC | #5
+
+```
+func example() : async () {
+  try {
+    // If the intercanister call traps, the try will catch. 
+    let result = await intercanisterCall();
+    // Now that subsequent message execution has been enqueued (iiuc), 
+    // does this mean that the following will also be caught?
+    let triggerTrap = Principal.fromText("🤯🤦🦟"); 
+  } catch e {
+    Debug.print("Caught exception " #debug_show(e));
+  } 
+```
+In this code, with Motoko 0.8 onwards, the catch clause should at least let you distinguish between
+a failure to call intercanisterCall() (due to queue full) and the result of the call being an error by inspecting the error code of `e`, which should be `(#call_error n)` for some n in the former case and some other tag in the latter.
+
+But you still cannot catch the trap from the call to Principal.fromText(), even after the `await`, though I'm wondering if we might be able to exploit an IC feature to support that (the IC call cleanup mechanism).
+
+-------------------------
+
+claudio | 2023-02-12 10:16:09 UTC | #6
+
+Perhaps the example is oversimplifying but the code in here:
+
+![image|690x393](upload://A0dmGVnjr6hML07abcYR4oOsgEP.jpeg)
+
+seems broken to me.
+
+The problem is that the await can fail with an `Error` (the caller rejected the call), in which case `refund()` will exit with an error, but the lock will not be released. Doing the await in a `try` `catch` that releases the lock on all paths would avoid that.
+
+Also, placing the call itself can fail (queue full errors etc), in which case, with Motoko 0.8.0 onwards, the lock will not be released. Before Motoko 0.8.0, the failed call would trap and the lock would never be seen to be taken but rolled back.
+
+-------------------------
+
+icaten | 2023-02-11 05:04:50 UTC | #7
+
+Just to recap:
+
+_TLDR: Try/catch do not work like they do in Javascript. In Motoko use them exclusively for their own asynchronous logic._
+
+Each try/catch (at least currently and for the foreseeable future) should **only** be used "exclusively" for its own piece of logic that might trap. In other words, when wrapping an intercanister call, it should only wrap that and nothing else since anything else won't be caught (such as a division of zero done locally after the await has returned) and multiple separate intercanisters calls made within the same function should each have their own try/catch.
+
+[New changes](https://github.com/dfinity/motoko/pull/3630) to Motoko (as of 0.8.0) enable catching most (if not almost all) traps of an external canister call. It should be noted this introduces a possible breaking change:
+
+> "#OpenIssues(Feedbackwanted)" One minor worry with this PR is that it is a breaking change. Previously a block of code that sends multiple messages, one of which fails to send, would trap, rolling back all the sends to the previous commit point. Now, the successful sends will remain enqueued, and the error/exception will flow to the nearest handler. If there is none, the method will exit with a canister_reject error, which will still send the other enqueued messages and commit state changes.
+
+Finally, in this case of a lock being used, there's not yet a built-in available way to guarantee its release (however that may change); and a single try/catch within a method's block **should not** be used to wrap associated logic to release the lock in the event of trapping. 
+
+In the meantime, one way to reliably release such a lock would be to use a timeout so when a subsequent check happens to see if the lock is in use, if enough time has elapsed, it'll automatically release. Here's an example of implementing one adapted from something I was working that also reflects the lessons learned from this thread about proper use of try/catch. In this example, a refund is being processed that requires both a balance and transfer call to a token-ledger canister (it has not actually been tested, but something very close was, some methods/fields omitted): 
+
+```
+  let isAlreadyRefundingLookup = HashMap.HashMap<Principal, Time.Time>(32, Principal.equal, Principal.hash);
+  let isAlreadyRefundingTimeout : Nat = 600000000000; // "10 minutes ns"
+
+  func isAlreadyRefunding(caller : Principal) : Bool {
+    switch (isAlreadyRefundingLookup.get(caller)) {
+      case null return false;
+      case (?atTime) {
+        if ((Time.now() - atTime) >= isAlreadyRefundingTimeout) {
+          isAlreadyRefundingLookup.delete(caller);
+          return false;
+        } else {
+          true;
+        };
+      };
+    };
+  };
+
+ public type RefundResult = Result.Result<RefundResultSuccess, RefundResultErr>;
+
+  public type RefundResultSuccess = {
+    txIndex : Nat;
+    refundedAmount : Nat;
+  };
+
+  public type RefundResultErr = {
+    kind : {
+      #InProgress;
+      #InsufficientTransferAmount : Nat;
+      #InvalidDestination;
+      #NotAuthorized;
+      #NoBalance;
+      #ICRC1TransferErr;
+      #CaughtException : Text;
+    };
+  };
+
+  public shared ({ caller }) func refund(to : Account) : async Result.Result<RefundResultSuccess, RefundResultErr> {
+    if (isAlreadyRefunding(caller)) {
+      return #err({ kind = #InProgress });
+    };
+    // Note if getting the address involved computation for subaccount,
+    // or otherwise caused a trap (division by zero for instance) this
+    // would not be caught in this method. Not as important here, but below
+    // when transferring, notice check to see balance > fee before the
+    // try wrapping the transfer call.
+    let account = getAddress(caller);
+    isAlreadyRefundingLookup.put(caller, Time.now());
+    let balanceCallResponse : Result.Result<Nat, Text> = try {
+      #ok(await Ledger_ICRC1_Example.icrc1_balance_of(account));
+    } catch e {
+      // Might also want to include the error code or reformulate error as valid return type.
+      #err("Caught during balance query: " #Error.message(e));
+    };
+    switch balanceCallResponse {
+      case (#err err) {
+        // Unlock and return the caught & trapped intercanister call.
+        isAlreadyRefundingLookup.delete(caller);
+        return #err({ kind = #CaughtException(err) });
+      };
+      case (#ok currentBalance) {
+        // Prevent trapping from underflow
+        if (currentBalance < ICRC1_FEE) {
+          if (currentBalance == 0) {
+            isAlreadyRefundingLookup.delete(caller);
+            return #err({ kind = #NoBalance });
+          } else {
+            isAlreadyRefundingLookup.delete(caller);
+            return #err({ kind = #InsufficientTransferAmount(currentBalance) });
+          };
+        } else {
+          let transferAmount : Nat = currentBalance - ICRC1_FEE;
+          switch (getTransferArgsIfValidDestination(caller, transferAmount, to)) {
+            case (#err invalidToAccount) {
+              // Validation of the given to account failed, eg subaccount was an empty array.
+              // Important to confirm to prevent trapping when calling ICRC1 ledger.
+              isAlreadyRefundingLookup.delete(caller);
+              #err({ kind = #InvalidDestination });
+            };
+            case (#ok transferArgs) {
+              let transferCallResponse : Result.Result<Result<Tokens, TransferError>, Text> = try {
+                #ok(await Ledger_ICRC1_Example.icrc1_transfer(transferArgs));
+              } catch e {
+                // Might also want to include the error code or reformulate error as valid return type.
+                isAlreadyRefundingLookup.delete(caller);
+                #err("Caught during transfer:" # Error.message(e));
+              };
+              switch (transferCallResponse) {
+                case (#err errMsg) {
+                  isAlreadyRefundingLookup.delete(caller);
+                  #err({ kind = #CaughtException(errMsg) });
+                };
+                case (#ok transferResult) {
+                  switch transferResult {
+                    case (#Err _) {
+                      // Or each specific TransferError could be parsed with its own case in this switch
+                      isAlreadyRefundingLookup.delete(caller);
+                      #err({ kind = #ICRC1TransferErr });
+                    };
+                    case (#Ok txIndex) {
+                      isAlreadyRefundingLookup.delete(caller);
+                      #ok({ txIndex; refundedAmount = transferAmount });
+                    };
+                  };
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+  };
+```
+
+-------------------------
+
+claudio | 2023-02-12 10:38:02 UTC | #8
+
+Nice post!
+
+That looks plausible to me though I think you could simplify and use a single try catch (or at least fewer) together with your timeout mechanism. Won't attempt that here on mobile.
+
+I'm not 100% certain the timeout mechanism can't bite you and will defer to others opinion on that, though it seems reasonable to me. For example, what happens if the network is slow and a valid transaction is just taking very long to complete without failing. Its lock might get stolen under its feet.
+
+@robin-kunzler what do you think?
+
+-------------------------
+
+icaten | 2023-02-12 13:52:49 UTC | #9
+
+Interesting point--does a canister not have a set timeout expiration for intercanister calls it makes? 
+
+The thought was if a canister is taking more than 10 minutes to finish replying, then it's likely something is wrong and the original caller will have to call the method again anyways (the particular use case I've been developing for is more constrained; for instance a refund is only called for a "one off" amount as opposed to an address that contains a significant balance that could be drained). 
+
+Thanks for the review!
+
+-------------------------
+
+skilesare | 2023-02-12 14:13:40 UTC | #10
+
+As opposed to locks I've just been making the change and then rolling it back on failure.
+
+For example, here we deduct the escrow so that it can't be spent again before our ledger transactions complete...if the various failure cases we put it back.
+
+https://github.com/ORIGYN-SA/origyn_nft/blob/ffe256bcf5e6c8cfc617765f0a3743b93129e0bd/src/origyn_nft_reference/market.mo#L1222
+
+Note: this likely only works for simple pessimistic ledger like transactions. If you have richer state transitions, you may need different kinds of locks.
+
+-------------------------
+
+icaten | 2023-02-14 21:02:07 UTC | #11
+
+Thanks for pulling that up. On a sidenote, where can I see how to use 'with'? I thought I had seen it at one point, but then found someone using it in a ~pseudocode example as a feature request, but it seems it does exist as part of Motoko. 
+
+Originally this issue came up while working on the invoice canister, [SEC-F05 TOCTOU in verify_invoice #21](https://github.com/dfinity/invoice-canister/issues/21), and is likely more an edge case than a real issue; but also seems like something that will ultimately require a robust solution (such as a built-in cleanup function) if locks are used. In any case, I did want resolve it as well as it could be.
+
+-------------------------
+
+skilesare | 2023-02-14 21:07:53 UTC | #12
+
+It was added in moc 0.7.0. It is pretty slick and make your code a lot shorter:
+
+https://github.com/dfinity/motoko/blob/master/Changelog.md#070-2022-08-25
+
+-------------------------
+
+timo | 2023-02-19 16:41:02 UTC | #13
+
+[quote="icaten, post:7, topic:18422"]
+Each try/catch (at least currently and for the foreseeable future) should **only** be used “exclusively” for its own piece of logic that might trap. In other words, when wrapping an intercanister call, it should only wrap that and nothing else since anything else won’t be caught (such as a division of zero done locally after the await has returned) and multiple separate intercanisters calls made within the same function should each have their own try/catch.
+[/quote]
+
+I would like to challenge this statement. Say we have this code:
+```
+// code 1
+let result = try {
+  let response  = await canister.method(args);
+  // code 2
+} catch e {
+  // code 3
+};
+// code 4
+```
+Your statement says that we should move as much as possible from code 2 to code 4.
+But there is no difference if an accidental trap happens in code 2 or code 4. The result will be the same. If code 4 traps then everything done in code 2 + code 4 up until the trap (or in code 3 + code 4 if the catch branch ran) will be rolled back. So it seems that writing the code like this will be equivalent and cleaner:
+```
+// code 1
+try {
+  let response  = await canister.method(args);
+  // code 2
+} catch e {
+  // code 3
+};
+// code 4
+```
+where now code 4 is made as small as possible or even empty. (Code 4 is only used when there is code duplication in code 3 and code 4).
+
+In other words, releasing a lock can't be made more reliable by moving code around between code 2 and code 4.
+
+As for multiple canister calls made within the same function I think it entirely depends on what you want to achieve and how the calls relate to each other.
+```
+try {
+  let r1 = await canister1.method(args);
+  // code
+  let r2 = await canister2.method(args);
+  // code
+  let r3 = await canister3.method(args);
+  // code
+} catch e {
+  // code
+};
+```
+assumes that you have sequential calls to make and if one fails then you don't want to make the remaining ones anymore. If that's the scenario then this code is very natural. For example in Defi the three steps: deposit, swap, withdraw where each is a call to another canister. 
+
+On the other hand:
+```
+try {
+  let r = await canister1.method(args);
+  // code
+} catch e {
+  // code
+};
+// code
+try {
+  let r = await canister2.method(args);
+  // code
+} catch e {
+  // code
+};
+// code
+...
+```
+assumes that the calls are independent and you want to make the second call even if the first one failed. For example, notify multiple other canister about an event.
+
+However, if you are in the first scenario then using separate try catch statements seems unnecessarily verbose for no gain in safety or robustness.
+
+-------------------------
+

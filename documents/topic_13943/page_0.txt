@@ -1,0 +1,177 @@
+manubodhi | 2022-06-21 08:07:44 UTC | #1
+
+Is there any way to do this?
+I am having a type 
+```
+public type DishType = { 
+        name : Text;
+        dishTypeId : Nat;
+        parentDishTypeId : Nat;
+        description: Text;
+    };
+```
+and my data is 
+```
+record {3; record {parentDishTypeId=0; name="Main Course"; description=""; dishTypeId=3}};
+```
+Now if I want to update the `name = "Main Course"` field, what is the best way? How can i send only name to the backend? how can i make parameters optional? and how can i spread the name field to replace inside my api? 
+
+This is API my main.mo code
+```
+public func updateDishtype (dishType : Types.DishType) : async Result.Result<Types.DishType, Types.Error> {
+        
+        let existingDishType = dishTypeRepository.getDishType(dishType.dishTypeId);
+      
+        switch(existingDishType) {
+            case null {
+                #err(#NotFound);
+            };
+
+            case (? v) {
+                dishTypeRepository.upsertDishtype(dishType.dishTypeId, dishType);
+                #ok(dishType);
+            };
+        };
+
+    };
+```
+
+This is the DishTypeRepository code
+
+```
+public class DishTypeRepository() {
+    
+    let dishTypesHashMap = HashMap.HashMap<Types.DishTypeId, Types.DishType>(0, isDishTypeIdEq, Hash.hash);
+
+    public func upsertDishtype (dishTypeId : Types.DishTypeId, dishType : Types.DishType) {
+      dishTypesHashMap.put(dishTypeId, dishType);
+    };
+
+    public func getDishType(dishTypeId : Types.DishTypeId): ?Types.DishType {
+      return dishTypesHashMap.get(dishTypeId);
+    };
+}
+```
+
+-------------------------
+
+inviscidpixels | 2022-06-21 23:42:21 UTC | #2
+
+Since you're using an opt returning collection, you could first make it real by using a predefined "invalid" record type with Option.get. Then do similarly for reach field of the record itself, ie for each optional parameter, use Option.get<ofType>(newValue, existingValue) and then update the record in your collection with the "upserted" record. For instance,
+```
+private func persistUserProfileChanges(
+   forUserId: Text,
+   updatedEmailAddress: ?Text,
+   updatedDisplayName: ?Text,
+   updatedBioDescription: ?Text,
+       ): Result.Result<Text, Text> {
+   let exists = Option.get<UserProfile>.get(
+      userId2UserMap.get(forUserId), 
+      INVALID_USER_PROFILE
+   );
+   if (not (exists == INVALID_USER_PROFILE)) {
+      let updatedUserProfile: UserProfile = {
+         userId = forUserId;
+         emailAddress = Option.get<Text>(
+            updatedEmailAddress, 
+            exists.emailAddress
+         );
+         preferredDisplayName = Option.get<Text>(
+            updatedDisplayName, 
+            exists.preferredDisplayName
+         );
+         bioDescription = Option.get<Text>(
+            updatedBioDescription, 
+            exists.bioDescription
+         );
+      };        
+      userId2UserMap.put(forUserId, updatedUserProfile);
+      return #ok("Success: updated profile details for user id " # forUserId); 
+   } else {
+      // assert(true);
+      #err("Could not update values of record that doesn't exist in id map for id " # forUserId);
+   };
+   return #err("Error: unrecoverable intractable error while getting userProfile lose all hope ye who called upon this!");
+};
+```
+However I feel like there's a cleaner way to do this that does not need a predefined invalid type to be declared, but this is what has worked for me. Also an assertion at the beginning verifying the id maps to a given profile is probably "best practice".
+
+Note if you are using an iterable type, you could also use map, doing something similar to the above as far as the optional parameters "upserts" as a function of Option.get if the id of the record matches.
+
+-------------------------
+
+inviscidpixels | 2022-06-28 11:22:46 UTC | #3
+
+Just for the sake of consistency, here's the cleaner way (no arbitrary "invalid" declarations, uses opts as I believe they are intended to be implemented) to do this:
+
+```
+// note type UniqueId = Text;
+// note idToProfilesMap is HashMap<UniqueId, UserProfile>
+// where UserProfile 
+//   = { epochCreationTimestamp, epochLastUpdateTimestamp, preferredDisplayName, emailAddress }
+
+public func persistNewUserProfileDetails(
+      forUniqueUserId: UniqueId,
+      preferredDisplayNameIn: ?Text,
+      emailAddressIn: ?Text,
+      ): () {
+      assert(profileExistsForId(forUniqueUserId));
+      let exists = idToProfilesMap.get(forUniqueUserId);
+      switch exists {
+        case (null) { Prelude.unreachable(); };
+        case (?exists) {
+          idToProfilesMap.put(forUniqueUserId, {
+            epochCreationTimestamp = exists.epochCreationTimestamp;
+            epochLastUpdateTimestamp = Time.now();
+            preferredDisplayName = Option.get<Text>(preferredDisplayNameIn, exists.preferredDisplayName);
+            emailAddress =  Option.get<Text>(emailAddressIn, exists.emailAddress);
+          });
+        };
+      };
+    };
+```
+
+-------------------------
+
+manubodhi | 2022-06-28 12:01:30 UTC | #4
+
+Do UserProfile's candid definition need any changes? I can use the same model class like this?
+
+```
+public type DishType = { 
+        name : Text;
+        dishTypeId : Nat;
+        parentDishTypeId : Nat;
+        description: Text;
+    };
+```
+
+-------------------------
+
+manubodhi | 2022-06-30 06:04:52 UTC | #5
+
+This looks like the solution for now, I wanted to actually not define every parameters again that's why i was curious about an operator like spread operator in Javascript, but this seems the best option we got, In my case I'm having a very big candid structure or model class and most of the things I just don't want to change at all, I just need 2,3 parameters to change that too optional and just need to add rest of the parameters as it is, so here I have to assign it with exists.existingParameter for everything. Thank you for the help mate @ [inviscidpixels](https://forum.dfinity.org/u/inviscidpixels)
+
+-------------------------
+
+inviscidpixels | 2022-07-03 10:13:34 UTC | #6
+
+It's not the spread operator, but in addition to the above you can use destructuring for your function's arguments so that the function call looks like:
+
+
+```
+public func someInboundCall({
+  arg1: ?Text;
+  arg2: ?Principal;
+  arg3: ?Nat;
+  arg4: ?CustomType
+}) : async () { ... }
+```
+ 
+
+And then you don't have to worry about the ordering or include each parameter when you make the call, (can even safely use the spread/rest operator from Javascript without having to enumerate each field as an argument), as null values will be handled (by the code of the language in the previous posts) fine.
+
+Spread operator would be nice! One of these days... how long did take for Javscript to mature? Many of the ECMA standards are still fairly recent!
+
+-------------------------
+

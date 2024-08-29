@@ -1,0 +1,149 @@
+icme | 2022-02-20 01:31:07 UTC | #1
+
+Quick question, just didn't find "tail recursion" or "tail call optimization" mentioned on the docsite when searching for it. 
+
+Just wondering if I should opt into looping vs. having fun with recursion when writing code :slight_smile:
+
+-------------------------
+
+rossberg | 2022-02-20 08:24:31 UTC | #2
+
+Unfortunately, WebAssembly cannot currently express tail calls. The [proposal](https://github.com/WebAssembly/tail-call) to add them has been completed years ago, but is stalled from becoming standard because no other browser vendor besides Google thinks it necessary to implement yet. If you'd like to see progress, feel free to speak up on [this issue](https://github.com/WebAssembly/tail-call/issues/15), or perhaps directly lobby with the browser vendor of your choice to implement it. ;)
+
+That being said, the Motoko compiler might be doing some optimisation for limited cases of tail self recursion. @claudio would be more knowledgeable about that.
+
+-------------------------
+
+icme | 2022-02-20 09:01:50 UTC | #3
+
+@rossberg Bummer that issue has been held up for so long! :disappointed: 
+
+That being the case, there's a few great functional data structures in the base library (List, Trie) that would benefit a bunch from this optimization. If I were currently using a linked list and the it necessary that the library I'm building be optimized in terms of performance and space, would it make sense then at this time to use a more object oriented list data structure? Something like:
+```
+type List<T> = ?{
+  value: T;
+  next: List<T>
+};
+```
+instead of the current
+```
+type List<T> = ?(T, List<T>);
+```
+
+-------------------------
+
+claudio | 2022-02-20 21:01:48 UTC | #4
+
+Motoko only optimizes  tail calls to the nearest enclosing function (a.k.a. self tail calls), which see compiled to simple loops. 
+
+We don't optimize tail calls to first-class functions or mutually recursive functions and are still waiting for wasm support for that. 
+
+So 'List.iter', for example, is compiled to a loop. 
+
+But code written in continuation passing style will not use tail calls to call a continuation. In an ideal world, it would.
+
+-------------------------
+
+claudio | 2022-02-20 21:18:03 UTC | #5
+
+Using a record rather than a tuple won't make any difference to the need for tail calls, will actually use 1 word more space per list node and make field access less efficient than plain indexing into a tuple.
+
+-------------------------
+
+icme | 2022-02-20 21:36:07 UTC | #6
+
+I'm assuming you're referring to [`List.iterate()`](https://github.com/dfinity/motoko-base/blob/master/src/List.mo#L86)?
+
+@claudio I'm still slightly confused, as I'm rusty on my terminology in this area as I haven't touched it in a few years - maybe if I present an example?
+
+```
+/// A function that adds an element in comparison order to a linked list that keeps track of its size, replacing it if that already exists
+/// The AddOrReplace type variant is used to signal if an addition or replacement occured (and to adjust the size accordingly)
+/// The inner helper function, addInOrderWithReplacement(), is meant to be tail recursive
+public func addWithReplacement<T>(x: T, sizeLL: SizeLL<T>, compare: (T, T) -> Order.Order): SizeLL<T> {
+    type AddOrReplace<Add, Replace> = {
+      #add: Add;
+      #replace: Replace;
+    };
+
+    // Add the element to the list in its proper order.
+    func addInOrderWithReplacement(x: T, l: List.List<T>): AddOrReplace<List.List<T>, List.List<T>> {
+      switch(l) {
+        case null { #add(?(x, null)) };
+        case (?(h, t)) {
+          switch(compare(x, h)) {
+            case (#less) { #add(?(x, l)) };
+            case (#greater) { 
+              switch(addInOrderWithReplacement(x, t)) {
+                case (#add(nt)) { #add(?(h, nt)) };
+                case (#replace(nt)) { #replace(?(h, nt)) };
+              }
+            };
+            case (#equal) { #replace(?(x, t)) };
+          };
+        };
+      }
+    };
+
+    // match on the add/replace variant, returning the updated list size and list accordingly
+    switch(addInOrderWithReplacement(x, sizeLL.ll)) {
+      case (#add(ll)) {{
+        size = sizeLL.size + 1;
+        ll = ll;
+      }};
+      case (#replace(ll)) {{
+        size = sizeLL.size;
+        ll = ll;
+      }}
+    }
+  }
+```
+
+-------------------------
+
+icme | 2022-02-20 21:35:29 UTC | #7
+
+I guess another solution that would eliminate the variant and inner function need would be to keep track of the remaining list size downstream of the element in each element and recurse up that way - I just **would rather not** hold and extra count element at each element of the list, since that would take up unnecessary space.
+
+-------------------------
+
+claudio | 2022-02-20 22:12:46 UTC | #8
+
+Yes, I meant 'List.iterate'.
+
+None of the calls in your example are tailcalls because there is more work to do after each call before returning.
+
+Are you trying to rewrite this to be tail recursive?
+
+-------------------------
+
+icme | 2022-02-20 23:39:32 UTC | #9
+
+@claudio To clarify, I'm trying to make the `addInOrderWithReplacement` helper function tail recursive, (not the main `addWithReplacement` function, which doesn't include tail calls).
+
+I'm primarily trying to write this in a way that would be most performant on the IC. 
+
+But yes, I'd prefer if this was tail recursive and used self tail calls so that it would receive the optimization you mentioned down to simple loops.
+
+I'm assuming that within the `addInOrderWithReplacement` function, the extra match inside the `#greater` case of the nested switch at `switch(addInOrderWithReplacement(x, t))` performs that extra computation that negates it receiving that optimization.
+
+Would love some advice or a modification of this example then that I could use to apply in the future when trying to hit the self tail call optimization.
+
+-------------------------
+
+icme | 2022-02-20 22:33:38 UTC | #10
+
+If you think I should just opt for pointer variables and simple loops in cases like this, I'm open to that option - although I find that mutation-style looping code to be a bit more fickle and hard to maintain.
+
+-------------------------
+
+claudio | 2022-02-21 23:42:02 UTC | #11
+
+On reflection, I think your example requires a bit more that just tail recursion and would benefit from 'tail recursion modulo cons' optimization 
+(see the section on this in
+https://en.wikipedia.org/wiki/Tail_call) 
+
+Motoko doesn't do that optimization yet and it would be difficult, or at least awkward, to express in  Motoko itself.
+
+-------------------------
+

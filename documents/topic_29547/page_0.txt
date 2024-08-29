@@ -1,0 +1,132 @@
+icme | 2024-04-10 16:39:44 UTC | #1
+
+Recently, one out of every 3-5 times one of our integration tests runs that communicates with the ICP ledger, a specific test returns this error.
+
+```
+Invalid certificate: Signature verification failed
+```
+
+```
+(node:4446) V8: /home/runner/work/CycleOps/CycleOps/node_modules/borc/src/decoder.asm.js:3 Linking failure in asm.js: Unexpected stdlib member
+```
+
+We're having trouble pinpointing exactly where this got introduced, since it happens intermittently and we're sure it doesn't impact actual backend functionality (I think the first time we noticed it was after changing the readme).
+
+-------------------------
+
+jennifertran | 2024-04-18 04:55:02 UTC | #2
+
+Do you still need help with this?
+
+-------------------------
+
+jamesbeadle | 2024-04-24 18:55:24 UTC | #3
+
+Hi Jennifer,
+
+Do you know what causes the certification verifiation failed errors on a local dfx setup when raising an SNS proposal?
+
+![image|690x367](upload://ntVwaC9aHGzssg2HLy55IYnsOM6.png)
+
+
+Thanks, James
+
+-------------------------
+
+jennifertran | 2024-04-24 20:08:47 UTC | #4
+
+Let me check for you
+
+-------------------------
+
+icme | 2024-04-24 21:46:50 UTC | #5
+
+Hi @jennifertran thanks for following up.
+
+We haven't received this issue in awhile, but then again it's an intermittent issue that shows up in CI (local dfx) from time to time. I'll post here again once we hit it again.
+
+-------------------------
+
+jamesbeadle | 2024-04-25 13:25:12 UTC | #6
+
+This was solved here by passing insecure dev mode flag
+
+https://forum.dfinity.org/t/sns-testing-add-hot-key-error/29967/14
+
+-------------------------
+
+icme | 2024-05-09 00:46:27 UTC | #7
+
+We just received this error again a few times throughout today in CI, then reran the test and it passed. It happens when we're using agent-js to make a call to a query method on our canister. Curiously, it always happens on the same test?
+
+AgentJS version `^1.2.0`
+
+The call is made to this query endpoint on a canister that has some relatively simple logic.
+
+```
+/// Returns the local account of the caller.
+  public query ({ caller }) func customerLocalAccount() : async Ledger.AccountIdentifier {
+    _localAccount(caller);
+  };
+
+  private func _localAccount(customerId : Principal) : Ledger.AccountIdentifier = Ledger.accountIdentifierFrom(
+    Principal.fromActor(this),
+    customerId,
+  );
+```
+
+We end up getting an error that looks like this every time:
+```
+Invalid certificate: Signature verification failed
+
+      63 | // Deposit ICP from NNS ledger to account
+      64 | export async function depositICP(user: User, amount: number) {
+    > 65 |   const customerLocalAccount = await user.call.accounts.customerLocalAccount(); // see the endpoint I listed above
+         |                                ^
+      66 |   await user.call.ledger.transfer({
+      67 |     amount: { e8s: BigInt(amount * 1e8 - 10_000) },
+      68 |     to: [...customerLocalAccount],
+```
+
+Here is the test
+
+```
+// Some setup
+  test("User deposits ICP into their cycleops account", async () => {
+    await grantICP(principalToAddressBytes(user.key.getPrincipal()), 10);
+    // User transfers funds to their cycleops account
+    await depositICP(user, 10);
+    expect((await user.call.accounts.customerBalance()).e8s).toEqual(
+      BigInt(10 * 1e8 - 10_000)
+    );
+  });
+```
+
+Where the depositICP function is:
+```
+export async function depositICP(user: User, amount: number) {
+  const customerLocalAccount = await user.call.accounts.customerLocalAccount();
+  await user.call.ledger.transfer({
+    amount: { e8s: BigInt(amount * 1e8 - 10_000) },
+    to: [...customerLocalAccount],
+    from_subaccount: [],
+    memo: BigInt(0),
+    fee: { e8s: BigInt(10_000) },
+    created_at_time: [],
+  });
+}
+```
+
+and the `User` type looks like this
+```
+export interface User {
+  key: Ed25519KeyIdentity;
+  call: {
+    accounts: ActorSubclass<Accounts>; // the canister we're making the call to
+    //...similar pattern for other canisters
+  };
+}
+```
+
+-------------------------
+

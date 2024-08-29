@@ -1,0 +1,78 @@
+qwertytrewq | 2023-07-20 09:30:59 UTC | #1
+
+I am trying to start N "threads" (each an asynchronous execution).
+
+Unfortunately the following program produces a not understandable error:
+
+```
+expression of type
+  Nat -> async ()
+cannot produce expected type
+  Nat -> async<$main> ()Motoko(M0096)
+```
+
+What is this `<$main>` and how to correct the error?
+
+```
+import Iter "mo:base/Iter";
+import Debug "mo:base/Debug";
+
+actor StressTest {
+    public func main() {
+        let nThreads = 3;
+        let x = Iter.range(0, nThreads);
+        let threads = Iter.toArray<async ()>(Iter.map<Nat, async()>(x, func(_: Nat) : async () {runThread()}));
+        // Iter.iterate(threads, func(t) { await t; });
+    };
+
+    func runThread() : async () {
+        Debug.print("XXX");
+    }
+}
+```
+
+-------------------------
+
+claudio | 2023-07-21 16:37:45 UTC | #2
+
+Ok, this is a little hard to explain.
+
+In Motoko, every async type actually has a hidden type parameter (<$main>) used to restrict the context in which it can be awaited. This is to enforce restrictions dictated by platform.
+
+The general rule of thumb is that you can only wait an async value that was created within the same enclosing async expression, and the hidden type parameters enforce that. 
+
+In addition, async types belonging to different scopes are not compatible.
+
+The lambda that calls `runThread()` produces a fresh async (of type async<$other>), say, that isn't compatible with the async<$main> type in the scope of main, which leads to the error.
+
+You can rewrite the example to get what you are aiming for by not using higher-order functions (unfortunate, but true).
+
+```
+actor StressTest {
+  
+    public func main() {
+        let nThreads = 3;
+        let threads : [var ?(async())] = Array.init(nThreads, null);
+        for (i in threads.keys()) {
+          threads[i] := ?runThread();
+        };     
+        for (topt in threads.vals()) {
+           let ?t = topt;
+           await t;
+        }
+    };
+
+    func runThread() : async () {
+        Debug.print("XXX");
+    }
+}
+```
+
+https://play.motoko.org/?tag=445987449
+
+The documentation is currently silent on this aspect of the type system, because we wanted to leave room to improve it later. Few people have noticed. You may even be the first.
+
+The use of these hidden type parameters is closely related to Rust's use of (typically, but not always, implicit) lifetime parameters to control variable lifetimes.
+
+-------------------------
+

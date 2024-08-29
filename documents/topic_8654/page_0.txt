@@ -1,0 +1,269 @@
+diegop | 2021-11-29 23:18:09 UTC | #1
+
+# Summary
+
+Upgrading a canister can be a dangerous task. It can break clients due to a Candid interface change. It can also discard Motoko stable state due to a change in stable declarations. There are already several reports from the forum about people losing data after an upgrade (https://github.com/dfinity/motoko/issues/2692).
+
+This proposal promise to check these properties statically before attempting the canister upgrade, so that 1) existing clients depending on it and not (yet) being aware of the upgrade will continue to function; 2) the new canister should be able to read the contents of existing stable variables, and not to accidentally lose data after an upgrade.
+
+To support this feature in dfx, we also need a way to expose canister metadata, such as the Candid interface from the Wasm module. We are exposing the metadata in the state tree to allow users to download this metadata in a certified manner.
+
+
+# People involved
+
+Yan Chen (@chenyan ), Claudio Russo (@claudio)
+
+# Timeline
+- [ ] 1-pager posted on the forum for review: Thursday, November 18, 2021
+- [ ] NNS Motion Proposal (to approve design + project) submission:  Tuesday, November 23, 2021. 15:00 UTC.
+- [ ] NNS Motion Proposal (to approve design + project) expiration: Thursday, November 25, 2021. 15:00 UTC.
+- [ ] If NNS Motion Proposal passes, ETA on implementation + deploy: TBD
+
+-------------------------
+
+diegop | 2021-11-18 03:40:39 UTC | #2
+
+The person leading this will be @chenyan and @claudio so I will let them answer questions. Currently working on a 1-pager we intend to post tomorrow thursday.
+
+-------------------------
+
+chenyan | 2021-11-19 16:58:58 UTC | #3
+
+# Objective
+
+To ensure canister upgrade safety, dfx needs to verify that an upgrade can proceed without:
+
+* breaking clients (due to a Candid interface change). We specifically designed Candid to define, in a checkable manner, what a safe upgrade is. This is expressed in terms of [subtyping](https://github.com/dfinity/candid/blob/master/spec/Candid.md#upgrading-and-subtyping) rules on Candid interfaces. Joachim recently explained these in a [blog series](https://www.joachim-breitner.de/blog/782-A_Candid_explainer__The_rough_idea). We are actually able to formally prove, as a form of machine-verified soundness statement, that these rules correctly prevent clients from breaking.
+* discarding Motoko stable state (due to a change in stable declarations). While stable variables are not part of the public interface of a canister, they are a sort of private interface between two versions of a canister, and generally need checking in an analogous way. Concretely, the new canister should still be able to read the contents of existing stable variables, which requires restricting changes to their type across an upgrade, otherwise a canister might accidentally lose data.
+
+# Compiler support
+
+PR [#2887](https://github.com/dfinity/motoko/pull/2887) adds support for manually checking compatibility of Candid and stable signatures using moc.
+
+Roughly,
+
+moc --idl foo.mo will write the Candid interface of an actor(class) to file foo.did.
+
+You can use tool didc to check that the dids are compatible
+
+didc --check new.did old.did
+
+The Candid interfaces can evolve to a Candid subtype (note the inversion of the relation), so that old clients can use the new interface without breaking.
+
+moc --stable-types foo.mo will write the stable signature of an actor(class) to file foo.most.
+
+moc --stable-compatible old.most new.most will check that the stable interface can evolve from old.most to new.most in a type safe way without unintentional data loss.
+
+PR [#2897](https://github.com/dfinity/motoko/pull/2897) has some examples to explain what is a compatible signature change and what isn’t.
+
+The basic rules for stable-compatible are that you can evolve
+
+* a stable variable to a super-type with the same mutability (so that the upgrade can consume the old value)
+* add a new stable variable with different name and any type (it takes its value from the initializer when first introduced)
+
+In practice, with the current implementation, one can safely change the mutability of a stable variable in an upgrade and drop an existing stable variable, but we have decided to error on those cases for now (but might only warn in future).
+
+Besides writing the Candid interface and stable signature as files, the Motoko compiler also compiles these interfaces into the Wasm module as [custom sections](https://webassembly.github.io/spec/core/appendix/custom.html).
+
+* Custom section “candid:service” stores the interface for the running (initialized) canister, which removes the initialization arguments.
+* Custom section “candid:args” stores the initialization arguments. The argument types can refer to types defined in the candid:service custom section.
+* Custom section “motoko:stable-types” stores the signatures for stable variables.
+
+The compiler flag --public-metadata decides if the custom section can be retrieved publicly, or only by the controllers of the canister.
+
+# Interface spec change
+
+For dfx to perform the compatibility check, we need to be able to download the Candid interface and the stable signatures from the running canister. This requires a general solution to expose canister metadata from the replica, preferably in a certified manner.
+
+We add a new path in the state tree to expose canister metadata. Specifically, `/canister/<canister_id>/metadata/<name>` contains the content of the Wasm custom section named “icp:public <name>” or “icp:private <name>”.
+
+The prefix “icp:public ” means the metadata can be accessed publicly, and the prefix “icp:private ” means the metadata is only accessible by the controllers of the canister.
+
+As the specification repo of the Internet Computer is not open source yet, please see the proposed diff [here](https://gist.github.com/chenyan-dfinity/3523b62167f87b7a4f56ce42ec85b167).
+
+The benefit of exposing metadata from the state tree is that it can be accessed from the HTTP endpoint, and the result is certified for free. The downside is that there is no programmatic way of accessing the state tree within the canister. So it is currently not possible to check for compatibility of a canister, if all of the controllers are canisters, not user principals. There is an ongoing [RFC](https://forum.dfinity.org/t/rfc-standardising-how-smart-contracts-expose-state/8544) to consolidate the metadata interface, so that both canisters and users can access the metadata in a uniform way.
+
+# dfx integration
+
+PR [#1926](https://github.com/dfinity/sdk/pull/1926) checks for upgrade compatibility in `dfx canister install`, and allows users to override the warning if they understand the consequence.
+
+-------------------------
+
+jzxchiang | 2021-11-20 00:00:25 UTC | #4
+
+Thanks for the one-pager. While not the "sexiest" feature, this is by far one of the most important for any production-ready system.
+
+Just to double check: after this change the new version of `dfx` will call the new version of `moc` to check that both a canister's external Candid interface and internal stable variable interface are "safe" (i.e. the new interfaces are subtypes of the old interfaces).
+
+If it's safe, the upgrade will automatically proceed. If it's unsafe, then `dfx` will print the warning outputted by `moc`, and the developer can choose whether to force proceed?
+
+And either way, if the upgrade proceeds but errors out due to a lack of cycles, then the entire upgrade is atomically aborted and no data is lost, including BOTH stable and non-stable variables?
+
+-------------------------
+
+chenyan | 2021-11-20 01:39:26 UTC | #5
+
+[quote="jzxchiang, post:4, topic:8654"]
+If it’s safe, the upgrade will automatically proceed. If it’s unsafe, then `dfx` will print the warning outputted by `moc` , and the developer can choose whether to force proceed?
+
+And either way, if the upgrade proceeds but errors out due to a lack of cycles, then the entire upgrade is atomically aborted and no data is lost, including BOTH stable and non-stable variables?
+[/quote]
+
+Exactly. If the canister is out of cycles, it's atomically aborted.
+
+-------------------------
+
+diegop | 2021-11-23 21:48:56 UTC | #6
+
+Update:
+
+NNS Motion proposal created: [https://dashboard.internetcomputer.org/proposal/31168](https://dashboard.internetcomputer.org/proposal/31168)
+
+-------------------------
+
+jzxchiang | 2021-11-24 06:02:35 UTC | #7
+
+If you have an update on the timeline of implementation (right now, it's TBD on the post), that would be great. I know it's difficult to estimate these things, but I think this proposal would make a huge difference for developers.
+
+Also, will any of the suggestions @akhilesh.singhania made [here](https://forum.dfinity.org/t/watch-out-for-foot-guns-with-canister-upgrades/8954) be part of this? For example, I'd really like a way to easily download / upload canister state, in case I accidentally screw things up with an upgrade.
+
+-------------------------
+
+diegop | 2021-11-24 06:34:19 UTC | #8
+
+Good question. The ETA is at the end of December 2021.
+
+This date is listed in the markdown file in the proposal: https://github.com/ic-association/nns-proposals/blob/main/proposals/governance/20211123T2300Z.md 
+
+But it was not updated in the summary at the top of the thread because Discourse is not letting me edit the original comment.
+
+-------------------------
+
+jzxchiang | 2021-11-24 06:36:58 UTC | #9
+
+Thanks. These bugs with Discourse edits are really annoying haha, for example I can't edit a post if  I put code in there.
+
+-------------------------
+
+diegop | 2021-11-24 07:53:40 UTC | #10
+
+they drive me crazy, tbh
+
+-------------------------
+
+akhilesh.singhania | 2021-11-24 08:50:58 UTC | #11
+
+[quote="jzxchiang, post:7, topic:8654"]
+Also, will any of the suggestions @akhilesh.singhania made [here](https://forum.dfinity.org/t/watch-out-for-foot-guns-with-canister-upgrades/8954) be part of this? For example, I’d really like a way to easily download / upload canister state, in case I accidentally screw things up with an upgrade.
+[/quote]
+
+Hey @jzxchiang .  No I do not believe this work will address the issues I brought up in the post.  My understanding is that this work addresses some of the issues with safely upgrading canisters written in Motoko but not all of them.  So most of the issues raised in my post above are not addressed here.
+
+-------------------------
+
+claudio | 2021-11-24 11:48:52 UTC | #12
+
+This proposal really just addresses checking the external and internal type safety of an upgrade, not the dynamic points of failure identified [here](https://forum.dfinity.org/t/watch-out-for-foot-guns-with-canister-upgrades/8954)
+
+Performing the check will not guarantee that an upgrade will succeed, just that if it succeeds, the existing clients won't experience Candid serialization error because of an incompatible change of the Candid interface, and that Motoko code won't inadvertently lose data by dropping a stable variable or changing its type in compatible ways.
+
+The candid interface check is applicable to  Rust, Motoko and any other canister that uses Candid.
+The stable variable check is Motoko specific.
+
+-------------------------
+
+claudio | 2021-11-24 11:49:49 UTC | #13
+
+Perhaps a better title for this post and the NNS proposal would be "Static Checking of Canister Upgrade Compatibility"
+
+-------------------------
+
+diegop | 2021-11-29 23:17:50 UTC | #14
+
+It passed!
+
+https://dashboard.internetcomputer.org/proposal/31168
+
+-------------------------
+
+diegop | 2021-11-29 23:18:34 UTC | #15
+
+Please note i changed the title of the forum post: 
+
+*Static Checking of Canister Upgrade Compatibility (formerly "Canister Safe Upgrades")*
+
+-------------------------
+
+Motokoder | 2021-12-17 00:24:30 UTC | #16
+
+Should I be worried?
+https://github.com/dfinity/motoko/blob/7a069e67aa867edceb3ae06322efef9af91f161b/test/run-drun/bad-upgrades/upgrade1.mo#L4
+
+-------------------------
+
+nomeata | 2021-12-17 08:21:42 UTC | #17
+
+Maybe, given corona, climate change and people believing conspiracy theories. But not due to that code… :-)
+
+-------------------------
+
+isakkiblaze | 2022-07-25 10:58:11 UTC | #18
+
+WARNING!
+Candid interface compatibility check failed for canister 'jobs'.
+You are making a BREAKING change. Other canisters or frontend clients relying on your canister may stop working.
+Method create: func (Job) -> (bool) is not a subtype of func (Job/1) -> (bool)
+Do you want to proceed? yes/No
+
+
+How can I fix this issue ?
+
+-------------------------
+
+ggreif | 2022-07-28 17:55:51 UTC | #19
+
+It is a warning, so you're free to ignore it. That said, I'd have a thorough look into all the changes (if at all) to the `Job` type  (and the types it contains). Also make sure that you have the newest `dfx` installed.
+
+If you can give us the definition of `type Job` (the former and current versions) that we might drop a few eyeballs on it, too.
+
+-------------------------
+
+claudio | 2022-07-29 07:41:37 UTC | #20
+
+I expect what happened here is that the new version of type `Job` is not a Candid subtype if the previous version `Job/1`. If `Job`s are records, perhaps you added a field of non optional type. If  they are variants (enums), perhaps you removed a case from the variant.
+
+In either case an old client using the previous interface could wind up sending the incompatible data to the new version of the canister, leading to failure.
+
+If there are no existing clients of the canister, or you don't mind breaking things, it's fine to ignore the warning.
+
+-------------------------
+
+isakkiblaze | 2022-07-29 08:11:33 UTC | #21
+
+Hi,
+
+Thanks for the reply. Here I shared a video link for your reference. Hope it will be useful to you to understand the issue.
+
+https://www.vidline.com/share/V0766HJWDL/b8058b3570cff1583a356639880b5078
+
+Please check and share your thoughts. Thanks again for the support.
+
+-------------------------
+
+ggreif | 2022-07-29 12:47:04 UTC | #22
+
+It also appears that you change the data type for your `stable var` records. First question, does this canister carry production data? If so, you should think about a migration strategy that will be able to upgrade past stable data. If not, you better come up with a sound versioned strategy that will spare you from losing data in the future. E.g. a variant type that carries the version and a distinct type for each: `{ #v1 : [Job_v1]; #v2 : [Job] }` or similar.
+
+-------------------------
+
+claudio | 2022-07-29 13:26:56 UTC | #23
+
+
+I'm on vacation and don't have my laptop handy, but these links might help explain what is going on. 
+
+https://internetcomputer.org/docs/current/developer-docs/build/languages/motoko/upgrades/
+
+https://internetcomputer.org/docs/current/developer-docs/build/languages/motoko/compatibility/
+
+-------------------------
+

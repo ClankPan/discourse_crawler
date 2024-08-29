@@ -1,0 +1,61 @@
+sat | 2024-04-19 15:21:47 UTC | #1
+
+## Summary
+
+On March 27, 2024, between 11:42 UTC and 13:36 UTC, a critical incident occurred in the upgrade process, affecting two IC Mainnet subnets cv73p and 4ecnw, which resulted in a temporary interruption of services. This downtime impacted various user applications, including a few high-profile services.
+
+The root cause of the incident was traced to changes in error code mappings in the newly deployed replica version. Specifically, certain error codes that were used in the previous replica version were removed in [e6913a356c581f34ef3b5c281859ab9e90c37262](https://github.com/dfinity/ic/commit/e6913a356c581f34ef3b5c281859ab9e90c37262) and [4495e2b5e60dadb1f1145bd2b53e3237881758fd](https://github.com/dfinity/ic/commit/4495e2b5e60dadb1f1145bd2b53e3237881758fd), and replaced with new ones. When the system attempted to resume operations post-upgrade, it could not recognize some of the old error codes in the ingress history persisted by the old replica version, leading to a failure in the restart process of the affected subnets.
+
+## Actions Taken
+
+Immediate actions included rolling back the affected subnets to their previous stable versions to restore service. This rollback process involved:
+
+* Identifying and addressing the issue with the error codes.
+* Submitting network proposals to downgrade the affected subnets.
+* Recovery operations to resume the subnets.
+
+## Timeline of Events
+
+* 11:38 UTC - Upgrade process initiated for the affected subnets.
+* 11:40 UTC - Both subnets encountered issues and entered a crash loop.
+* 11:43 UTC - The problem was detected by the monitoring stack, and the incident response team was alerted.
+* 12:00 UTC - Decision made to roll back the upgrades.
+* 12:56 UTC - Subnet rollback proposals were submitted and executed.
+* 13:19 UTC - Recovery of the first affected subnet was completed.
+* 13:34 UTC - Recovery of the second affected subnet was completed.
+* 13:36 UTC - Incident mitigated.
+
+## What went right
+
+* Alerts were in place and quickly notified us of the issue. Escalation to the appropriate teams happened also quickly within the first few minutes of the incident.
+* Subnets were recovered relatively quickly (within ~1.5h) using our established process
+
+## Lessons Learned
+
+* The incident highlighted the need for careful handling of system upgrades, particularly with changes in enums persisted in the checkpoints. In those cases, it is important to maintain both backward and forward compatibility between replica releases when making changes to such enums..
+* Rolling back to the previous replica version took a long time.
+
+# Technical details
+
+Error codes follow an HTTP error code-like approach: three-digit numbers, with error codes in the same class (determined by the [reject code](https://internetcomputer.org/docs/current/references/ic-interface-spec#reject-codes), e.g. DESTINATION_INVALID or CANISTER_ERROR) all starting with the same digit (e.g. DESTINATION_INVALID is 3, so all transient error codes are of the form 2xx). It was recently noticed that a number of errors were classified in the wrong class (e.g. CanisterMethodNotFound was classified as a DESTINATION_INVALID error code – 302 – but should have been a CANISTER_ERROR class error – error code 5xx.
+
+So 9 error codes were remapped (e.g. CanisterMethodNotFound from 302 to 536), with the ErrorCode enum now recognizing only the newly assigned error codes as valid.
+
+Error codes are persisted in checkpoints (as part of the ingress history, under IngressState::Failed entries). Most subnets did not have Failed ingress history entries at the time of the upgrade, or at least not ones with one of the 9 remapped error codes. These upgrades went through without issue.
+
+But 4ecnw and cv73p both had some of the old error codes in their checkpoints; and they were both upgraded at the same time. So when the upgraded replicas started, they failed to deserialize the checkpoint (e.g. 4ecnw replicas could not understand a 302 error code) and went into a crash loop. On the plus side, this meant that the upgraded subnets made no progress whatsoever, so it was possible to “just” roll back to the previous replica version, with no danger of failure.
+
+The actual rollback was performed by submitting two proposals to downgrade the affected subnets to their previous versions. To restart the subnets two additional recover-subnet proposals were submitted. This required extracting the latest checkpoint hash for each of the subnets. The hash was determined by logging into the DFINITY controlled admin node on each subnet and running the state-tool.
+
+A [fix](https://github.com/dfinity/ic/commit/7184d168d44f3ba27f750285a0fba43a0c56190a) was merged to master and later to the release branch. The fix was to restore the old ErrorCode variants (e.g. DeprecatedCanisterMethodNotFound = 302) alongside the new variants. The replica will now be able to deserialize the old error codes after an upgrade. But it will only produce the new error codes. Meaning that after the 5 minute TTL has expired, all Deprecated<Xyz> variants will have been garbage collected. At that point, it will be safe to actually drop the Deprecated<Xyz> variants in the next replica release.
+
+## Action Items
+
+To prevent similar incidents, we are taking several actions:
+
+* Ensure all enums persisted in checkpoints are backed by a proto enum to make the requirements on backward and forward compatibility more clear.
+* Add compatibility tests to capture changes to enums that might lead to similar issues.
+* Developing automated tools to facilitate quicker rollback processes.
+
+-------------------------
+

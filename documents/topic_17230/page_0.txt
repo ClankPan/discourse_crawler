@@ -1,0 +1,263 @@
+lara | 2022-12-08 22:15:35 UTC | #1
+
+Hi everyone,
+
+The last two weeks have been exciting - the first SNS DAO is launched and in the control of the community!
+As mentioned in prior public global R&Ds, SNS-1 was a dress-rehearsal for future SNSs. Its main purpose was to **experiment** with launching and running an SNS in production, inviting the community to participate in this experiment, and to educate all users on how an SNS is launched.
+We are excited about the enthusiasm that we saw and that so many people were participating.
+The detailed questions and the engagement with SNS-1 proposals suggest that users are learning how SNSs work.
+
+SNS-1 was a successful experiment as it revealed many limitations and shortcomings of the current system. There is some fair criticism from the community that we could have anticipated and tested more prior to launching SNS-1. Indeed, in retrospect the launch was somewhat rushed. At the same time, we considered it an experiment and didn’t anticipate such active community participation. This active engagement was a blessing because it stressed the system significantly and exposed real limitations. We spent the last days understanding and collecting what went well and what must be improved for future SNSs. In this forum post, we would like to share important lessons learned and how we plan to address them in the future.
+
+### Degraded performance NNS subnet
+
+During the SNS sale, the performance of the NNS subnet was degraded. We already shared a detailed post mortem about this separate issue [here](https://forum.dfinity.org/t/degraded-performance-during-sns-1-decentralization-sale-incident-retrospective-tuesday-november-29-2022/17005), and thus we do not cover it in more detail in this post.
+
+### SNS subnet got stuck
+
+*What happened*
+
+* **Bug**: There was a recently discovered bug related to state serialization where the subnet would stall if the ingress history exceeded a certain bound. The fix was being rolled out as a regular release, but the SNS subnet was unfortunately scheduled to be upgraded a few days later.
+* **SNS-1 launch revealed the bug**: To check if a user can still participate in the sale, the NNS frontend calls a function to obtain the full state of the sale. This function has a big response and multiple concurrent invocations triggered the crash condition.
+
+*Our response*
+
+* (Done) Meanwhile, the NNS updated all subnets to the patched version.
+* We plan to modify the API so that only required information is returned to reduce the size of responses.
+
+### Repeated ICP transfers
+
+*What happened*
+* Sale participation is realized by two successive method calls
+1. A call to the ICP ledger to transfer ICP from the user’s to a subaccount of the sale
+2. A call to the sale canister to notify it about the transfer and register the participation
+The frontend issues both these calls and retries the second one if it didn’t go through.
+* Refunds can happen in two ways:
+  * If the sale canister was notified about a transfer but the participation was not valid, the sale canister will automatically send back the ICP to the sale participant when it finalizes the sale.
+  * If the sale canister was not notified about a transfer (i.e., the above step 2 did not happen while the sale was open), then the sale does not know that it has to refund tokens. In this case, an additional call has to be made to instruct the sale “please check if this given principal has tokens to be refunded”. The sale was designed so that this call can be made by anyone and refund tokens to a principal if the sale is over and the sale still holds tokens that have been sent by this principal.
+* In the SNS-1 sale we had a lot of the second type of refunds. This second type of refund was not automatic and so took a day or so to be executed.
+* We stress that this was not a case of “double-spending”. In double-spending attacks one token can be used twice (e.g., to buy something). Rather there were more ledger transfers than needed. The sale canister was written to take into account this behavior and to be able to refund the tokens.
+
+*Our response*
+
+* (Done) To make it easier for SNS-1 participants to get the refunds, we triggered the above mentioned method that was already built into the sale canister. Anyone else could have triggered this method safely, as the sale canister will only execute the request if it is valid.
+* We are working on improving the payment protocol that is used between the frontend, the ledger canister, and the sale canister, so that users who use the frontend are less likely to make repeated withdrawals and get into this situation, even if they refresh the page.
+
+### Neurons with randomized dissolve delays
+
+*What happened*
+
+* In the sale proposal, it was communicated that sale participants will get one neuron with zero dissolve delay and one neuron with 1 month dissolve delay.
+* Instead, sale participants received one neuron with zero dissolve delay and one neuron with 1-2 months dissolve delay. The reason for this was that the code was written to randomize the non-zero dissolve delays of neurons so that not all neurons would dissolve at the same point in time. The team had been debating whether to remove the randomization or not to lower complexity.
+* The mismatch was a timing and communication issue on our part.
+
+*Our response*
+
+* Look into removing this randomness in the dissolve delays (due to the fact that users need to select “start dissolving” it is unlikely that all neurons liquidate at exactly the same time).
+
+### Incorrect dissolve delays for neurons of sale and airdrop participants
+
+*What happened*
+
+* Users who participated both in the sale and in the airdrop should have received three neurons: one airdrop neuron and two sale neurons.
+* Instead, users received just two neurons. The first contained the stake of both the airdrop neuron and the stake intended to go into a sale neuron with zero dissolve delay. The second (sale) neuron, as intended, was locked with a dissolve delay of 30-60 days. The reason for this was that the neuron ID for the airdrop neuron and one of the sale neurons was computed in the same way. Therefore, when the sale wanted to create the neuron, instead of creating a new neuron it just topped up the existing (airdrop) neuron.
+
+*Our response*
+
+* We plan to fix this bug by computing the neuron IDs for sale and airdrops in distinct ways.
+
+### Delay in neuron creation when sale was finished
+
+*What happened*
+
+* Once an SNS sale is over, it can be finalized. This means that the sale canister will, for all registered participants, trigger the creation of neurons. For this the sale canister also transfers SNS tokens to the respective neurons’ accounts.
+* When the sale finished, the SNS-1 neurons were not created immediately. When the sale canister tried to transfer the SNS1 tokens needed to create the neurons, the SNS-1 ledger canister returned an error. This was because the ledger canister tried to spawn an archive canister that is supposed to keep the history of all ledger blocks forever, but did not have sufficient cycles to do so.
+
+* The finalization method of the sale canister was written in a way that it can continuously be called again and will just pick up with the finalization where it left (i.e., it remembers which calls were already made and just continues with the ones still to do). Therefore, once we topped up the ledger canister with cycles, we could just trigger the finalization again and neurons were created successfully.
+
+*Our response*
+
+* Improve cycles monitoring and potentially automatic cycles management in SNSs.
+
+### General challenges developing on the IC
+
+*What happened*
+
+* While working on the SNS launch, including debugging when something did not go as expected, we ran into some problems that are faced by many IC developers. This included dealing with canisters that run out of cycles and hitting message limits. This also included the fact that it was hard to get logs of what is happening and experiencing the usability difficulties of the tools to install SNSs.
+
+*Our response*
+
+* We plan to address these findings not only by solving them for us, but by also thinking about which of these challenges can be improved with more general features for all IC developers
+
+### Sale started when the NNS proposal was executed
+
+*What happened*
+
+* For starting an SNS sale, there is an NNS proposal that has to be adopted. When the proposal is adopted, it will be executed which means that a call is made to the sale that starts it immediately. This made it challenging for users who wanted to participate in the sale to know when the sale would start exactly as a yes-majority in the NNS could have triggered this before the voting period was over. This also made it hard for known neurons to know when they should vote.
+* The sale’s starting time’s starting time was particularly bad for the Asian IC community.
+
+*Our response*
+
+* We plan to implement a means to define a pause between the proposal being adopted and the sale starting.
+
+### Bots participating in the SNS decentralization sale
+
+*What happened*
+
+* The sale allowed participation not only via the frontend but also using command line tools. This was used by some to set up bots for the sale participation.
+* As described above in “Repeated withdrawals”, sale participation consists of a ledger transfer and a notification. Some ledger transfers were done before the sale started, the notify messages were sent later whilst the sale was open.
+
+*Our response*
+
+* These bots have led to controversial discussions. What happened is not against the design and we knew that this could happen. For that reason, airdrops were included in the decentralization process. However, some community members feel that this was an unfair behavior. We are still discussing to what extent this should be prevented. For example, sale participation could be limited to one frontend, but this would be against the spirit of allowing everyone to integrate with the SNS sale and it would also exclude command line tools that are used for good reasons, such as security.
+* Proof of personhood is a challenging problem in a permissionless environment. We will continue to look for possible solutions.
+
+### Use of airdrops
+
+*What happened*
+
+* We decided to conduct airdrops, mostly to ensure that bots (as mentioned above) are not able to gain centralized control over the DAO.
+* The airdrop process did not run as smoothly as we would have liked. Copying and pasting NNS principals and the non uniform process used to collect principals across the dapps used was confusing for many users. We would have also liked to have been more inclusive.
+* SNS-1 showed that airdrops are an effective way to engage the community and were well perceived. It also revealed that the current setup was not designed with flexible airdrop solutions in mind.
+
+*Our response*
+
+* As we foresee that more projects will want to use airdrops, we plan to work on and present a feature that adds more flexible airdrops to the SNS.
+
+### Frontend does not (yet) have all the functionality
+
+*What happened*
+
+* As users noticed, the NNS frontend dapp did not support the full neuron and voting functionality when SNS-1 was launched.
+* It was a conscious decision to go ahead with this experimental launch and get this feedback for the further development rather than waiting for the full frontend to be ready.
+
+*Our response*
+
+* We should have better communicated this decision and aim to do so going forward
+* We are working on the missing features in the frontend. Two new features were already released this week (increasing the dissolve delay and following) and others are implemented but still being tested and security reviewed including staking and creating neurons).
+
+### Closing
+
+Whilst not everything went as smoothly as we would have liked, it is worth remembering that congested launches on other chains can result in $10,000s lost in gas fees, something we avoided on the ICP. We also now have a functioning SNS DAO with which the community can continue to experiment with. The journey continues.
+
+-------------------------
+
+Maxfinity | 2022-12-09 04:47:23 UTC | #2
+
+[quote="lara, post:1, topic:17230"]
+* Proof of personhood is a challenging problem in a permissionless environment. We will continue to look for possible solutions.
+[/quote]
+
+The Ethereum community has researched different modes of decentralised sale. Have any of these models been researched by the SNS team? 
+
+Auctions or LBPs have traditionally been used to conduct decentralised sales. Why? Because the amount of tokens you get is proportional to the amount of cash you put in relative to others, which means that botting is not really feasible, you get what you put in and no surplus is possible. It's also should in theory lead to issuers raising capital more efficiently. This should obviate the need for People Parties in this case. 
+
+As it stands, InfinitySwap is working on a Liquidity Bootstrap Pool so would prefer the Foundation to collaborate or work on an auction mechanism to resolve the issue.
+
+-------------------------
+
+Denis | 2022-12-09 08:06:00 UTC | #3
+
+[quote="lara, post:1, topic:17230"]
+As mentioned in prior public global R&Ds, SNS-1 was a dress-rehearsal for future SNSs. Its main purpose was to **experiment** with launching and running an SNS in production, inviting the community to participate in this experiment, and to educate all users on how an SNS is launched.
+[/quote]
+
+If it was a model for SNS launches, some consideration should have been given to pricing? Something like a million dollar market cap is reasonable for the first SNS DAO, even if it has no predecided purpose. But it can be valued at 250000 USD at the very least. Why not sell 50000 tokens or 200000 tokens at 1 ICP each? Perhaps that would have been a better test model because supply and demand would have been matched in a way that one might expect in SNS sales, and it would have left fewer people frustrated and angry. Not including decisions on pricing in the post-mortem is understandable given what Dfinity considers technically relevant with its engineering mindset, but the lack of attention to market dynamics is what led to the catastrophe at mainnet launch as well, which led to reputational damage, which led to many talented developers shunning the IC and therefore slower technical progress. 
+A remark about the 'crypto mindset' in a different and very important thread is relevant here, too. A real crypto mindset always considers the market alongside technology; that is what separates it from an academic mindset.
+
+-------------------------
+
+tdammy64 | 2022-12-09 09:13:14 UTC | #4
+
+What timeline should we expect??
+
+
+[quote="lara, post:1, topic:17230"]
+*Our response*
+
+* We plan to fix this bug by computing the neuron IDs for sale and airdrops in distinct ways.
+[/quote]
+
+-------------------------
+
+CODESIMPLEX | 2022-12-09 12:15:34 UTC | #5
+
+The team has done well, congratulations on the successful launch of SNS-1. Yes their were issues but the refund of icp back to those who did not get sns-1for me was mind blowing and improved my trust for ICP 100%. Not just this alot of good happened too. All the best to the team. Lessons Learned❤️
+
+-------------------------
+
+lara | 2022-12-09 12:21:20 UTC | #6
+
+Hi @Maxfinity ,
+we have looked into a few other options, including auctions at the beginning of the design. 
+I think the nice thing about the more swap-like sale is that it is easier to understand. But we will certainly consider different options again now. 
+If you have concrete systems / link to what you think worked well, please feel free to send them our way!
+
+> As it stands, InfinitySwap is working on a Liquidity Bootstrap Pool so would prefer the Foundation to collaborate or work on an auction mechanism to resolve the issue.
+
+I am not sure what you mean here wrt "prefer" what option over the other option? Do you mean you would prefer if we didn't try to solve the proof of personhood problem before launching more SNSs?
+If so, I don't think we wanted to imply that we necessarily need to find a perfect solution for one to unblock the other. I agree that we might find other means to make SNSs a bit more resilient even before we solved proof of personhood completely.
+
+-------------------------
+
+lara | 2022-12-09 12:27:23 UTC | #7
+
+I think it is a great point that tokenomics and the choice of parameters pays a huge role in SNSs!
+While we wanted to share the most important learning here, we also noted down that we should write down the tokenomics learnings and we plan to include them in documentation for future SNS launches to consider.
+
+-------------------------
+
+lara | 2022-12-09 12:29:31 UTC | #8
+
+It is hard to give a timeline right now as we are still prioritising all these lessons learned, so for this (smaller) fix it really depends on when we will get to it.
+
+To clarify: Please note however that this will not change the neuron IDs for SNS-1 anymore.
+
+-------------------------
+
+tdammy64 | 2022-12-09 14:12:20 UTC | #9
+
+Thanks. This might look like the former question, but can it be done before the year runs out??
+
+
+[quote="lara, post:8, topic:17230, full:true"]
+It is hard to give a timeline right now as we are still prioritising all these lessons learned, so for this (smaller) fix it really depends on when we will get to it.
+
+To clarify: Please note however that this will not change the neuron IDs for SNS-1 anymore.
+[/quote]
+
+-------------------------
+
+lara | 2022-12-09 14:28:26 UTC | #10
+
+I think it could, but it has not been decided if it will be prioritised over other things that have to be done basically by the time the next SNS can launch. I personally think that there are other things that are even more urgent than this, such as thinking about how we can handle and test with more load etc.
+
+May I ask if there is a particular reason why you think this deserves more attention or is more urgent than other things?
+
+-------------------------
+
+Maxfinity | 2022-12-09 14:42:32 UTC | #11
+
+Have a look at Gnosis style auctions: https://gnosis-auction.eth.link/ Dutch auctions  or sealed bid auctions have often be used. There may also be some references in the better ICOs section of the Ethereum forums, here: https://ethresear.ch/t/kicking-off-the-better-icos-category/298/2.
+
+-------------------------
+
+lara | 2022-12-09 14:47:54 UTC | #12
+
+Thanks Max! I have looked at some of it, but this is certainly helpful!
+
+-------------------------
+
+tdammy64 | 2022-12-09 14:50:44 UTC | #13
+
+According to the tokenomics, half of the public sale would be liquid, while the other half will be locked, but for a lot of people it was locked for both. Which shouldn't be so.
+
+
+[quote="lara, post:10, topic:17230, full:true"]
+I think it could, but it has not been decided if it will be prioritised over other things that have to be done basically by the time the next SNS can launch. I personally think that there are other things that are even more urgent than this, such as thinking about how we can handle and test with more load etc.
+
+May I ask if there is a particular reason why you think this deserves more attention or is more urgent than other things?
+[/quote]
+
+-------------------------
+

@@ -1,0 +1,138 @@
+timo | 2023-08-02 11:04:22 UTC | #1
+
+When a frontend makes an update request it could crash after sending the request and while polling for the response, i.e. before it receives the response. It could even crash during sending the request, during the first http connection to the boundary node. When the frontend comes back up after the crash, even if it knows which requests were planned and if it can reproduce them, it has no way to find out which ones were made before the crash and which ones weren't. So what is the right way to do journaling here? If we write the request id to log _before_ sending the request then we can at least resume polling. That would let the frontend recover all information assuming it comes back up within the 5 minute window.
+
+I was wondering how to do all this with agent-js. Does it make sense to modify agent-js and split the request functionality into two steps? Like so: 1) a "prepare" step which forms the request, stores it internally and returns the request id, 2) a "commit" step which sends the stored request to a boundary node.
+
+-------------------------
+
+kpeacock | 2023-08-02 17:18:40 UTC | #2
+
+We can split the logic up, and that may also create some new opportunities for developers to hook into the workflow. This could be helpful for integrating with wallet extensions, as I know @domwoe has already explored.
+
+For the issue of picking up after a crash, it's a little more complicated. We could persist the request id / request contents in IndexedDB to survive an application crash, but that is browser specific logic, and would introduce some new security considerations and edge cases that we would need to thoroughly design and test for. 
+
+One aspect of the current design that I appreciate is that agent calls can be executed from within a closure currently, which has some desirable security qualities for frontend best practices
+
+-------------------------
+
+sea-snake | 2023-08-02 17:41:46 UTC | #3
+
+One question I was always uncertain about. Is a signed http request to e.g. send some ICP. Something that can be sent twice?
+
+Last time I tried to send the http request twice, it was only processed once. I also tried without the nonce, and it still only processed once.
+
+From a wallet perspective I was planning to send the body to be signed in a custom sign identity to the wallet and then return it in the same promise.
+
+-------------------------
+
+timo | 2023-08-02 21:55:19 UTC | #4
+
+[quote="kpeacock, post:2, topic:21888"]
+We could persist the request id / request contents in IndexedDB to survive an application crash, but that is browser specific logic
+[/quote]
+
+Maybe there are two separate things conflated here. When you say "we could" I understand you mean agent-js could, not the application code that uses agent-js. In my understanding agent-js needs to store the request contents between the first call to agent-js (prepare) and the second call (commit). I did not think of agent-js as having to persist anything to disk or requiring anything to survive a crash. For example the first call (prepare) can return a callback plus the request id and the second call (commit) can be calling the callback. In a crash agent-js loses the callback and the request contents.
+
+Writing anything to disk, hence any browser specific logic, can be left to the application code. I was assuming that the application code can reproduce the calls that is planning to make. How they do that, whether by writing them to disk or whether they were deterministic to begin with, doesn't matter to agent-js. The application code just cannot reproduce the request ids, hence agent-js should expose them. The application code then persists the request ids. It uses them after a crash to determine which requests made it.
+
+[quote="kpeacock, post:2, topic:21888"]
+agent calls can be executed from within a closure currently
+[/quote]
+
+Would that property be preserved if you consider the "commit callback" as the "call". Is it ok if that one can be executed from within a closure?
+
+-------------------------
+
+timo | 2023-08-02 21:57:22 UTC | #5
+
+[quote="sea-snake, post:3, topic:21888"]
+Is a signed http request to e.g. send some ICP. Something that can be sent twice?
+[/quote]
+
+Do you mean a signed update request (=canister call)? No, that can't be sent twice. The IC deduplicates it.
+
+-------------------------
+
+kpeacock | 2023-08-02 22:16:09 UTC | #6
+
+Yes, I think I was caught up by the "store" verb.
+
+Agent-JS could provide a way for an application to receive the initial response of a `call`, and then trigger the `readState` flow separately. In fact, the `readState` method is already available in the HttpAgent today, but not particularly useful without being able to access the request id.
+
+The more complicated task would be bubbling this functionality up to an `Actor`, where the `call` and `query` are already pre-configured using the candid IDL we generate. I have some design ideas for how this could work though.
+
+Here is my breakdown of what we could do
+- Offer a new method on HttpAgent
+  - `agent.prepareCall(x: CallOptions)`
+- Add a callback hook to HttpAgent
+  - `onCallPrepare` or something
+
+Prepare doesn't feel like quite the right concept to me though, because this initial step can actually modify state on the canister, even if the Request ID isn't inspected after the fact
+
+-------------------------
+
+timo | 2023-08-03 07:46:45 UTC | #7
+
+What if we do the second but not the first. That is, add the callback `onCallPrepare` to HttpAgent as you propose but making a call is exactly as it was before, via the `Actor` interface generated from candid (we don't introduce a method `prepareCall`). When the application code calls that `Actor` interface then the agent prepares a call, calls the callback `onCallPrepare` and _waits_ for it to return, then sends the call to the boundary node.
+
+The only problem remaining is how does the application link a particular execution of `onCallPrepare` to a call it was trying to make. If it makes sequential calls then it's clear but if it makes concurrent calls then there's something missing.
+
+-------------------------
+
+neeboo | 2023-08-03 09:07:12 UTC | #8
+
+Can we just add an event emitter do workaround?
+
+-------------------------
+
+timo | 2023-08-03 13:48:38 UTC | #9
+
+[quote="neeboo, post:8, topic:21888, full:true"]
+Can we just add an event emitter do workaround?
+[/quote]
+
+That alone is not enough because the logic has to pause between call preparation and sending the request to the boundary node, to give the application code time to persist it, and the application code has to have control over when the logic resumes.
+
+-------------------------
+
+peterparker | 2023-08-03 13:50:15 UTC | #10
+
+Is a recovery mechanism the responsibility of the agent-js library? When using the `fetch` or `XMLHttpRequest` APIs, it's up to to me, if I desire it, to implement such a recovery mechanism using a custom queue, for example. Therefore, I'm not sure if it's the library's core job to handle that. Just thinking out loud, no strong opinion either way.
+
+Just mentioning this because the more features we add to the agent-js core, the more complex and heavy it becomes with additional code.
+
+-------------------------
+
+timo | 2023-08-03 13:55:43 UTC | #11
+
+[quote="peterparker, post:10, topic:21888"]
+Is a recovery mechanism the responsibility of the agent-js library?
+[/quote]
+
+Yes, it’s not. But it should be designed such that the calling code/application code can implement a recovery mechanism. And currently it cannot because the request id isn’t exposed and the application level doesn’t have enough control.
+
+-------------------------
+
+peterparker | 2023-08-03 14:03:25 UTC | #12
+
+I mean, the `fetch` API for example does not expose any IDs either. If I want to implement a recovery mechanism with it, it's up to me to take care of generating IDs, keeping track of them, and dequeuing those on my side or not. However, I might be missing something in regards to what you mean with "the application level doesn’t have enough control."
+
+Anyway, as I mentioned before, I don't have a strong opinion on this matter, except that I would love agent-js to become way lighter rather than heavier. 😉
+
+-------------------------
+
+timo | 2023-08-03 14:22:21 UTC | #13
+
+Another way could be if we let the caller pass in the expiration time, instead of letting agent-js choose the expiration time. Then the caller has full control over all the inputs that influence the request id. The caller can then repeat the call with the exact same request id.
+
+Then agent-js should the have a „dry-run“ feature so that the application code can make a „dry“ call without actually making the call, with the sole purpose of getting the request id.
+
+-------------------------
+
+kpeacock | 2023-08-03 16:16:38 UTC | #14
+
+At a certain point, it may be worth considering shipping a separate Agent implementation that meets the criteria you need. I don't know how necessary this dry run mechanic is for typical use cases
+
+-------------------------
+

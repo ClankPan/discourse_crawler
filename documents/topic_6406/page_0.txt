@@ -1,0 +1,168 @@
+ehsan6sha | 2021-08-10 20:12:17 UTC | #1
+
+Hi
+I want to know if this is normal that when multiple calls or queries are sent simultaniousely to a canister, eventhough they are executed, the resonse is never sent as if it is blocked. And after that the canister does not respond(Even executes) any new command. Is there any watchdog capability in place?
+
+-------------------------
+
+CarstenJ | 2021-08-11 16:05:03 UTC | #2
+
+Hey @ehsan6sha,
+
+How are you making calls/queries to the canister?
+
+-------------------------
+
+ehsan6sha | 2021-08-11 17:54:58 UTC | #3
+
+the same code of CanCan:
+
+```
+const putChunkPromises: Promise<[] | [null]>[] = [];
+for (
+    let byteStart = 0;
+    byteStart < file.size;
+    byteStart += MAX_CHUNK_SIZE, chunk++
+  ) {
+    putChunkPromises.push(
+      processAndUploadChunk(videoBuffer, byteStart, file.size, videoId, chunk)
+    );
+  }
+await Promise.all(putChunkPromises);
+//It never reaches here
+```
+
+and processAndUploadChunk is basically calling this actor which is from CanCan:
+```
+export async function putVideoChunk(
+  videoId: string,
+  chunkNum: number,
+  chunkData: number[]
+) {
+  return (await CanCan.actor).putVideoChunk(videoId, chunkNum, chunkData);
+}
+```
+
+If I just send one request at a time instead of simultanious ones, the front-end receives the response, however, if I do it the above way, although the canister recieves them and processes them(I verified with loggin on canister), no response is ever received from canister, and if I send another command to canister, it dose not process it as if it is busy.
+
+And I tried this in browser too using CanCan and same result, so not sure if there is a seting somewhere for canister to be bale to pool multiple calls?
+
+-------------------------
+
+CarstenJ | 2021-08-12 18:00:27 UTC | #4
+
+This is not normal behavior. 
+
+Can you provide a description of how we can reproduce this, step-by-step?
+
+Also, have you noticed at how many simultaneously requests the canister starts to become non-responsive?
+
+-------------------------
+
+PaulLiu | 2021-08-12 19:29:39 UTC | #5
+
+Is this on local dfx or publicly deployed to the Internet Computer?
+
+If it is local dfx, are you on Linux or Mac or Windows?
+
+-------------------------
+
+ehsan6sha | 2021-08-12 20:04:00 UTC | #6
+
+@PaulLiu @CarstenJ 
+
+I am trying to replicate a small part of the code that is not working.
+
+here are the other responses:
+1- I am using Ubuntu64
+2- it becomes unresponsive when a batch of first Promises is received and processed and it does not repond to anymore calls(even when called directly from terminal) and does not repond back to front end
+3- I am tsting locally/Linux
+
+-------------------------
+
+PaulLiu | 2021-08-12 20:10:37 UTC | #7
+
+[quote="ehsan6sha, post:6, topic:6406"]
+3- I am tsting locally/Linux
+[/quote]
+
+Thanks for the info. I think it is a bug with the proxy server run by `dfx start` because I ran into it before. The problem doesn't seem to affect Mac users, or when you deploy your canister to the real network.
+
+I actually had a fix, but the fix was unsatisfying (it made the proxy process single threaded). Let me see if there is any other workaround in the meantime.
+
+-------------------------
+
+PaulLiu | 2021-08-12 23:28:50 UTC | #8
+
+Here is a workaround, let me know if it works for you.
+
+1. Start replica by itself.
+
+Just run `dfx replica`. There will then be a file `.dfx/replica-configuration/replica-1.port`. The content of this file is the localhost port that replica listens to.
+
+`dfx replica` command optionally can take a port number as argument, but if there already exists a configuration file `.dfx/state/replicated_state/ic.json5`, it will actually ignore the command line argument.
+
+2. Build a binary of `icx-proxy` from https://github.com/dfinity/agent-rs/. You may also download a pre-built binary from https://github.com/ninegua/agent-rs/releases.
+
+3. Run `icx-proxy` to connect to the replica.
+
+`icx-proxy --address 0.0.0.0:8080 --replica http://localhost:$(cat .dfx/replica-configuration/replica-1.port)`
+
+This will serve at HTTP port 8080. You should change it to match what your local dfx.json uses.
+
+Then everything else should work the same.
+
+The additional benefit of serving through `icx-proxy` is that you can resolve canisters in the domain name if you setup your DNS correctly. For example I can visit my local canister at `http://qaa6y-5yaaa-aaaaa-aaafa-cai.tower.server:8080/` where tower.server is a local domain I setup through `dnsmasq`.
+
+-------------------------
+
+ehsan6sha | 2021-08-12 23:30:03 UTC | #9
+
+Wow! Thank you it works. just a question, how then do you run front-end ?
+normally it is npm run start, but now that dfx is not started through the normal process it complains
+
+-------------------------
+
+kpeacock | 2021-08-12 23:40:39 UTC | #10
+
+You can remove the `copy:types` setup from `package.json`, and then `npm start` should stop complaining. You'll need to manually handle the declarations for now though, and my blog post might be a good reference for that https://kyle-peacock.com/blog/dfinity/working-with-candid
+
+-------------------------
+
+PaulLiu | 2021-08-12 23:49:42 UTC | #11
+
+As for access frontend through a browser, I think icx-proxy only resolves canister through the domain name. This is a bit hard to setup. So it is not for everyone.. but if you want to try, you can configure dnsmasq on your host, and point /etc/resolv.conf to this dnsmasq server.
+
+In the dnsmasq configure something like:
+
+```
+address=/local.server/127.0.0.1
+```
+This would allow domain names like `<canister-id>.local.server` to resolve to your localhost.  Then you can point browser to URL like `http://<canister_id>.local.server:8080`.
+
+You can also configure your LAN to use a custom DNS with the above setting. This is how I test my app on cell phones at home. 
+
+I understand this is quite involved, and not for everyone. Hopefully next dfx release will have the bug fix for the hang problem on Linux.
+
+-------------------------
+
+PaulLiu | 2021-08-12 23:54:11 UTC | #12
+
+I just noticed that there is a shortcut if you only want to use frontend to visit one specific canister.
+
+There is a `--dns-alias domain.name:canisterId` option to `icx-proxy`. You can try specifying `--dns-alias localhost:<canister_id>`. Then `http://localhost:8080` might just work. I've not tried myself yet though.
+
+-------------------------
+
+jzxchiang | 2021-08-15 18:11:29 UTC | #13
+
+[quote="PaulLiu, post:8, topic:6406"]
+cat .dfx/replica-configuration/replica-1.port
+[/quote]
+
+Amazing, this worked for me too.
+
+FYI, I hit the same issue on a Mac (not M1). I was trying to pre-populate my canister "database" using a bunch of concurrent updates from a local Node.js script, and hit the same problem as OP. Now it's solved. But I'm pretty sure other people using `dfx start` will hit this same roadblock very soon, if they haven't already.
+
+-------------------------
+

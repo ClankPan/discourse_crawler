@@ -1,0 +1,193 @@
+harshbaz | 2022-11-24 11:06:57 UTC | #1
+
+I'm trying to call my APIs with NodeJS.
+
+Here's my code:
+```
+import { idlFactory } from '../../declarations/user_index/user_index.did.js';
+import { Actor, HttpAgent } from '@dfinity/agent';
+import canisterIds from '../../../../.dfx/local/canister_ids.json' assert { type: 'json' };
+const canisterId = canisterIds.user_index.local;
+
+const host = 'http://127.0.0.1:4943';
+
+const agent = new HttpAgent({ fetch, host });
+await agent.fetchRootKey();
+const userIndexActor = Actor.createActor(idlFactory, {
+	canisterId,
+	agent: new HttpAgent({ host, fetch })
+});
+const anonPrincipalId = await userIndexActor.get_my_id();
+
+console.log(anonPrincipalId.toText());
+```
+
+On running this `node test.js`, I get the following error:"
+```
+/xxx/node_modules/@dfinity/agent/lib/cjs/certificate.js:142
+            throw new CertificateVerificationError('Signature verification failed');
+                  ^
+
+AgentError: Invalid certificate: Signature verification failed
+    at Certificate.verify (/xxx/node_modules/@dfinity/agent/lib/cjs/certificate.js:142:19)
+    at async Certificate.create (/xxx/node_modules/@dfinity/agent/lib/cjs/certificate.js:122:9)
+    at async pollForResponse (/xxx/node_modules/@dfinity/agent/lib/cjs/polling/index.js:51:18)
+    at async caller (/xxx/node_modules/@dfinity/agent/lib/cjs/actor.js:190:35)
+```
+
+I have gone through all the posts for calling canisters with NodeJS and nothing is yet working for me.
+
+I'm using NodeJs 18.12.1 and dfx sdk version 0.12.1
+
+-------------------------
+
+coin_master | 2022-11-24 13:35:29 UTC | #2
+
+[quote="harshbaz, post:1, topic:16836"]
+`agent: new HttpAgent({ host, fetch })`
+[/quote]
+
+I believe you need to use the agent you initialised instead of creating a new agent.
+
+-------------------------
+
+GLdev | 2022-11-24 13:38:36 UTC | #3
+
+Have you tried fetching the root cert for ```userIndexActor```?
+
+-------------------------
+
+harshbaz | 2022-11-24 14:23:51 UTC | #4
+
+My bad, 
+
+I updated the code to following:
+
+```
+import { idlFactory } from '../../declarations/user_index/user_index.did.js';
+import { Actor, HttpAgent } from '@dfinity/agent';
+import canisterIds from '../../../../.dfx/local/canister_ids.json' assert { type: 'json' };
+const canisterId = canisterIds.user_index.local;
+
+const host = 'http://127.0.0.1:4943';
+const identity = Ed25519KeyIdentity.generate();
+const agent = new HttpAgent({ host, identity });
+await agent.fetchRootKey();
+
+const userIndexActor = Actor.createActor(idlFactory, {
+	canisterId,
+	agent
+});
+const anonPrincipalId = await userIndexActor.get_my_id();
+
+console.log(anonPrincipalId.toText());
+```
+
+I'm getting another error now:
+
+```
+(node:37087) ExperimentalWarning: The Node.js specifier resolution flag is experimental. It could change or be removed at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:37087) ExperimentalWarning: Importing JSON modules is an experimental feature. This feature could change at any time
+/client/node_modules/@dfinity/agent/lib/cjs/agent/http/index.js:141
+                throw new Error('Must specify a host to connect to.');
+                      ^
+
+Error: Must specify a host to connect to.
+    at new HttpAgent (/client/node_modules/@dfinity/agent/lib/cjs/agent/http/index.js:141:23)
+    at createActor (file:///client/declarations/user_index/index.js:11:33)
+    at file:///client/declarations/user_index/index.js:36:27
+    at ModuleJob.run (node:internal/modules/esm/module_job:193:25)
+    at async Promise.all (index 0)
+    at async ESMLoader.import (node:internal/modules/esm/loader:530:24)
+    at async loadESM (node:internal/process/esm_loader:91:5)
+    at async handleMainPromise (node:internal/modules/run_main:65:12)
+
+Node.js v18.12.1
+```
+
+-------------------------
+
+coin_master | 2022-11-25 11:21:59 UTC | #5
+
+This error could be an agent instance somewhere that's trying to load before you pass it the host, you can check the imports where you have agents and try to debug it there.
+
+-------------------------
+
+harshbaz | 2022-11-25 12:05:18 UTC | #6
+
+Let me create a minimal reproduction for this.
+
+-------------------------
+
+icme | 2023-01-06 09:54:35 UTC | #7
+
+I just ran into this issue, and was trying to figure out what the heck was going on for at least an hour.
+
+It turns out in my case the issue was in the generated declarations file. At the end of the file, it exports an actor - https://github.com/dfinity/sdk/blob/c9de1385ee150611a5dfc1ad7465b613569b9633/src/dfx/assets/language_bindings/index.js.hbs#L30.
+
+Since it doesn't pass a host, I get this exact error.
+
+The solution in my case was to comment out the last line of this generated declarations file.
+
+
+@kpeacock Node has been at war with this generated declarations file for some time now :sweat_smile: 
+
+Even with setting my dfx.json to have `node_declarations: true` I still end up with this issue.
+
+Time for round 2 of [Node-js compatibility](https://github.com/dfinity/sdk/pull/2426) ? :facepunch:  :bell:
+
+-------------------------
+
+icme | 2023-01-06 10:17:23 UTC | #8
+
+~~Aha, @kpeacock it looks like [this is potentially the pr](https://github.com/dfinity/sdk/commit/8e67974a9f979e9cab4f705febc358da61837031) that broke the node compatibility?~~
+
+Edit: nvm, not sure that's it :thinking:  - can't seem to figure out why it's not picking up the `node_compatibility` flag.
+
+-------------------------
+
+icme | 2024-05-24 17:52:44 UTC | #9
+
+Bringing the conversation over from [this thread](https://forum.dfinity.org/t/intermittent-signature-verification-failed-errors-from-agentjs/29547/7)
+
+We use this setup pattern for our tests. @kpeacock Is there anything you see that might look off or result in Invalid Certificate errors?
+
+```
+  // Returns a factory function for interacting with a canister for a specific identity.
+  function factory<T>(
+    idlFactory: IDL.InterfaceFactory,
+    canisterName: string
+  ): (identity?: Identity, network?: Network) => ActorSubclass<T> {
+    return (
+      /** The identity to use. Defaults to anonymous. */
+      identity: Identity = new AnonymousIdentity(),
+      /** The network to use. Defaults to local. (ic | local) */
+      network: Network = "local"
+    ) => {
+      const agent = new HttpAgent({ host: host[network], identity });
+      const ids = Canisters.IDs[canisterName as keyof typeof Canisters.IDs];
+      const canisterId = ids[network as keyof typeof ids];
+      if (network === "local") {
+        agent.fetchRootKey();
+      }
+      return Actor.createActor<T>(idlFactory, { canisterId, agent });
+    };
+  }
+
+  export const myActor = factory<MyActorType>(MyActorIDL, "myActor");
+
+  export function randomUser(): User {
+    const key = Ed25519KeyIdentity.generate();
+    return {
+      key,
+      call: {
+        myActor: Actors.myActor(key),
+      
+      },
+    };
+  }
+```
+
+-------------------------
+

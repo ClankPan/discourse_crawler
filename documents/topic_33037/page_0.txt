@@ -1,0 +1,140 @@
+gip | 2024-07-10 23:31:28 UTC | #1
+
+Hey folks,
+
+My interest in decentralizing data (and bringing a new model of data ownership) and distributing compute dates back years and I had wanted to build a non-trivial app on the ICP for a while now.
+
+I took a few days during the summer to learn a new language and experiment with the implementation of a real world LLM in a distributed way on the ICP. Llama 3 8b inference is now running live on the ICP, including the tokenizer, which I think makes it the first fully on-chain 8b LLM. Consensus runs on the inference algorithm as well, bringing a new level of guarantees with regard to the results.
+
+The current implementation is live on mainnet, but is not public given the amount of cycles being burned and the latency.
+
+As a product it’s not usable yet though!
+* The current implementation burns 0.168 TC per token predicted, which translates to $260K / 1M tokens. Compare with $15 / 1M output tokens for gpt-4o.
+* Result above is achieved without much optimization and without SIMD for instance. During a matmul (which is where transformers spend most of their execution time), we currently have 22 cycles per multiply/accumulate. We could hope to improve that to 2 cycles per multiply/accumulate but that would still translate into $26K / 1M tokens. To achieve something usable and competitive, we will very likely need GPUs and price the amount of cycles they use close to zero.
+* Loading the weights into the blocks is very expensive and cost a total of 33 TC (F16-quantized tensors were used, computation on-chain is using float32). I think we will need to think a little bit more about how we want to leverage data on the ICP and probably develop the notion of ‘data nodes’ if we want ICP to be competitive in the data-centric markets (that includes AI).
+* Last but not least the latency is 200 seconds! I’m actively looking at why that is and will improve that soon.
+
+Regarding the implementation, I’ve developed a set of generic ‘yblock’ that can do different operations and connect to each other using inter-canister calls. The current model is distributed over 34 canisters. Feel free to check it out: https://github.com/gip/yllama.oc and https://github.com/gip/yllama.rs.
+
+Learning and next steps
+
+* Manually handcrafting models was fun the first time but it is not a very effective approach and optimizing compilers / tooling will have to be developed if we want the ICP to become an execution target for AI models
+* I’d love to open the implementation for more people to use but for that I would need a lot more cycles - if someone is willing to pitch in and help with cycles please let me know
+* The canister programming model is simple to reason about and the tools / libraries (like ic_cdk) easy enough to use
+* The memory management inside a canister is a little hard to understand I wasn't able to use the stable memory solutions - crash and not access to the right abstraction
+* Cool to see inference being run through consensus, I think that could have real-world applications soon
+* My next focus should be on the tooling and on the data ownership piece, where crypto can really shine
+
+Any questions, let me know.
+
+-------------------------
+
+diegop | 2024-07-11 01:15:08 UTC | #2
+
+One question to help me understand:
+
+How fast/slow is it for a standard, simple prompt/response? Very curious.
+
+Measured in seconds? Tens of seconds? More?
+
+-------------------------
+
+gip | 2024-07-11 16:36:44 UTC | #3
+
+[quote="diegop, post:2, topic:33037"]
+Very curious.
+[/quote]
+
+On a CPU with enough RAM (64GB), Llama 3 8b inference will be able to do 1 token / second at best. 
+
+On ICP, we can go up to 2GB per canister and partitioning the model was what I wanted to explore. The added overhead from the communication between canisters (canisters only exchange ~16KB of data, so it's reasonable), from consensus and the fact that wasm isn't optimized for this workload bring the latency to ~100s.  So as I said it's not usable as such as, except for batch stuff, waiting 100s for an answer is a no go (even 10s is too much). Optimizing the implementation is definitely possible.
+
+-------------------------
+
+jennifertran | 2024-07-13 02:05:35 UTC | #4
+
+Thank you so much for this and for presenting at the DeAI Technical Group. 
+
+A few questions: 
+
+1. How would you reduce 2 cycles per multiply/accumulate?
+2. How are you spreading the model between 34 canisters? Can you pinpoint the different canisters? I noticed that each canister has the same .did file. I assume that they different though.
+3. Would optimization or SIMD significantly improve performance?
+
+-------------------------
+
+gip | 2024-07-16 22:21:54 UTC | #5
+
+Hi Jennifer
+
+[quote="jennifertran, post:4, topic:33037"]
+* How would you reduce 2 cycles per multiply/accumulate?
+[/quote]
+I'm not sure how fast we can get to 2 cycles per mulacc, but basically that would involve performance engineering to understand what wasm does and possibly re-writing the inner loop.
+
+[quote="jennifertran, post:4, topic:33037"]
+* How are you spreading the model between 34 canisters? Can you pinpoint the different canisters? I noticed that each canister has the same .did file. I assume that they different though.
+[/quote]
+
+To reduce deploy complexity, I made the design decision to have one type of canister called yblock that can be configured to do different things (tokenizer, main forward, block forward, logits). 
+
+All canisters are below. If you click on the first link and click 'tensor_list' you will need see what tensors are on that block. You won't be able to run the model since you would need to hit update calls for that and they are not public.
+
+yblock_0: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=fvil7-gaaaa-aaaap-ahnoq-cai
+    yblock_1: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=f4lad-qiaaa-aaaap-ahnpa-cai
+    yblock_10: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=f3kgx-5qaaa-aaaap-ahnpq-cai
+    yblock_11: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=ahr4s-wyaaa-aaaap-ahnqa-cai
+    yblock_12: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=aaq2g-3aaaa-aaaap-ahnqq-cai
+    yblock_13: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=ajtr2-niaaa-aaaap-ahnra-cai
+    yblock_14: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=aosxo-aqaaa-aaaap-ahnrq-cai
+    yblock_15: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=a3vgd-byaaa-aaaap-ahnsa-cai
+    yblock_16: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=a4uax-maaaa-aaaap-ahnsq-cai
+    yblock_17: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=avxll-2iaaa-aaaap-ahnta-cai
+    yblock_18: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=aswn7-xqaaa-aaaap-ahntq-cai
+    yblock_19: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=b7yjr-yyaaa-aaaap-ahnua-cai
+    yblock_2: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=byzpf-vaaaa-aaaap-ahnuq-cai
+    yblock_20: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=br2ez-diaaa-aaaap-ahnva-cai
+    yblock_21: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=bw3cn-oqaaa-aaaap-ahnvq-cai
+    yblock_22: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=bd4ta-pyaaa-aaaap-ahnwa-cai
+    yblock_23: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=be5vu-caaaa-aaaap-ahnwq-cai
+    yblock_24: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=bn66i-uiaaa-aaaap-ahnxa-cai
+    yblock_25: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=bk7y4-zqaaa-aaaap-ahnxq-cai
+    yblock_26: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dxcwu-kyaaa-aaaap-ahnya-cai
+    yblock_27: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dqdqa-haaaa-aaaap-ahnyq-cai
+    yblock_28: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dza34-riaaa-aaaap-ahnza-cai
+    yblock_29: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=d6b5i-4qaaa-aaaap-ahnzq-cai
+    yblock_3: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dlgmf-5yaaa-aaaap-ahn2a-cai
+    yblock_30: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dmhkr-qaaaa-aaaap-ahn2q-cai
+    yblock_31: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dfebn-giaaa-aaaap-ahn3a-cai
+    yblock_4: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=dcfhz-lqaaa-aaaap-ahn3q-cai
+    yblock_5: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=cpldx-eyaaa-aaaap-ahn4a-cai
+    yblock_6: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=cikfd-jaaaa-aaaap-ahn4q-cai
+    yblock_7: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=cbjo7-7iaaa-aaaap-ahn5a-cai
+    yblock_8: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=cgiil-sqaaa-aaaap-ahn5q-cai
+    yblock_9: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=ctpzg-tyaaa-aaaap-ahn6a-cai
+    yllama: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=fho4g-kqaaa-aaaap-ahnnq-cai
+    yllama_logits: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=cuo7s-6aaaa-aaaap-ahn6q-cai
+
+
+[quote="jennifertran, post:4, topic:33037"]
+* Would optimization or SIMD significantly improve performance?
+[/quote]
+
+SIMD has improved things quite a bit already and my sense the main limiting factor is now due to the protocol / wasm overhead. I'm not sure though and I think performance engineering on a real ICP node is required to figure it out.
+
+-------------------------
+
+tcrst | 2024-07-16 00:48:37 UTC | #6
+
+@gip how can we help with the cycles ?
+
+-------------------------
+
+gip | 2024-07-16 21:51:35 UTC | #7
+
+Good question.. I've submitted a grant proposal and if accepted I will be able to continue the work and maintain LLama 3 on-chain. If it's not accepted I may ask the community to pitch in some TC to make access public and keep the canister going.. until it runs out of cycles. 
+
+Project is open-source so anyone should be able to run its own canister also (set up may not be straightforward though, I'll update the docs).
+
+-------------------------
+

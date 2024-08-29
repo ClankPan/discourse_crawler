@@ -1,0 +1,106 @@
+yotam | 2023-12-18 12:54:49 UTC | #1
+
+Hi,
+
+A few months ago, the IC community voted for the replacement of the [P2P layer for the state sync protocol](https://medium.com/dfinity/new-p2p-layer-of-the-internet-computer-introduces-quic-for-state-sync-984764fe9976). The new P2P layer for state sync uses QUIC as the transport protocol. It improves the performance and the security of the IC stack, and reduces the code complexity. It has been since deployed to all subnets, and is operating flawlessly.
+
+We would now like to propose a new P2P layer used by the consensus protocol, and other consensus-related protocols such as the DKG, Ingress, HTTPS-outcalls, etc.
+
+The new P2P layer we propose for these clients has several major improvements over the existing P2P layer:
+1. It improves latency for artifact delivery when artifacts are small enough (instead of using adverts, small artifacts are pushed).
+2. It uses highly concurrent code, integrated with the new QUIC transport that was introduced with the P2P layer for state sync. This enables faster and more efficient processing of messages, and eliminates risks of queuing delays and head-of-line blocking that existed in the existing P2P layer.
+
+The new P2P layer uses a novel data structure we call a *slot table*, that is used to track active artifacts for each client, and to synchronize the content of the artifact pool of each node with its peers. On the send-side, it maintains this slot table where each artifact is assigned a slot number, out of a bounded pool of slots. The consensus protocol guarantees that it will not need more than a constant number of such slots. Then, for each peer, a set of async tasks are spawned to push the content of the slot table, and any subsequent updates, to that peer. If a peer is slow, it will receive these updates slower. But it will not slow down the sender or other peers.
+
+Each update is sent as a new QUIC stream, and is handled asynchronously by the receiving peer. On the receive-side, peers resolve any conflicting updates using a versioning field and a connection tracking field that are included with each update (`commit_id` and `connection_id`, respectively). Since the receive side is handled asynchronously, there is no risk of head-of-line blocking in processing incoming updates and artifacts.
+
+The new design of the P2P layer makes it easy to push small artifacts and skip the advert-request-artifact paradigm for such small artifacts. The sender decides whether to push an artifact if it is lower than a certain threshold (currently, 1KB). This is expected to improve the latency of many clients, where most artifacts are small.
+
+We propose to start the rollout of this new P2P layer by enabling it only for HTTPS outcalls, which is a relatively separate client. While we have tested it thoroughly, we believe that starting from a client that is not part of the core consensus protocol, is safer but still useful to be able to monitor it on mainnet and make sure the transition is smooth.
+
+In the coming months, we will propose to migrate more and more clients to the new P2P protocol, until eventually we will deprecate the old P2P protocol and have all clients using the new P2P and Transport layer (thus, the entire P2P layer will no longer use TCP).
+
+As always, let me know if anything is unclear or if you have any further questions.
+
+Thanks,
+Yotam
+
+-------------------------
+
+cymqqqq | 2023-12-18 13:42:03 UTC | #2
+
+[quote="yotam, post:1, topic:25680"]
+It improves the performance and the security of the IC stack,
+[/quote]
+
+Hi @yotam , about "It improves the security of the IC stack", how does it work for the security(for an account or other things)? Any description of this?
+
+-------------------------
+
+yotam | 2023-12-18 13:59:42 UTC | #3
+
+There was a certain vulnerability in the old P2P layer specifically when used for state sync.
+I'd rather not provide full details here, but it was not something that could easily be exploited in any way.
+In any case, this has been resolved with the deployment of the new P2P layer for state sync.
+
+-------------------------
+
+massimoalbarello | 2023-12-19 14:56:05 UTC | #4
+
+Hello @yotam, happy that this is happening!
+
+[quote="yotam, post:1, topic:25680"]
+The consensus protocol guarantees that it will not need more than a constant number of such slots
+[/quote]
+How does this work? Isn't the consensus layer only using the artifacts in the validated section of the pool? What does it need the slot table for?
+
+[quote="yotam, post:1, topic:25680"]
+The new design of the P2P layer makes it easy to push small artifacts and skip the advert-request-artifact paradigm for such small artifacts. The sender decides whether to push an artifact if it is lower than a certain threshold (currently, 1KB).
+[/quote]
+This sounds great! Do you already know if this significantly impacts the finalization latency of the ICC?
+
+-------------------------
+
+yotam | 2023-12-19 15:16:23 UTC | #5
+
+Hi @massimoalbarello
+
+> How does this work? Isn’t the consensus layer only using the artifacts in the validated section of the pool? What does it need the slot table for?
+
+The slot table is kind of a reference table for artifacts in the pool, maintained by the P2P layer. The P2P layer does not access the validated artifact pool directly. It receives "events" of additions and deletions from consensus. So the slot table is used to locally track the content of the pool, so that P2P knows what it needs to broadcast to the peers. I am in progress in writing a detailed writeup on this. But if you have further questions I am happy to clarify here as well.
+
+> This sounds great! Do you already know if this significantly impacts the finalization latency of the ICC?
+
+We are testing it these days. It seems to have a positive effect (along with other performance improvements that are thanks to the switch to the async QUIC model).
+
+-------------------------
+
+massimoalbarello | 2023-12-19 16:02:48 UTC | #6
+
+[quote="yotam, post:5, topic:25680"]
+It receives “events” of additions and deletions from consensus. So the slot table is used to locally track the content of the pool, so that P2P knows what it needs to broadcast to the peers.
+[/quote]
+
+So the slot tble is used only for outgoing artifacts while the incoming artifacts from other peers still end up first in the unvalidated section of the corresponding peer and then in the validated artifact pool?
+
+Looking forward to the writeup. Thanks a lot :)
+
+-------------------------
+
+yotam | 2023-12-19 16:15:15 UTC | #7
+
+[quote="massimoalbarello, post:6, topic:25680"]
+So the slot tble is used only for outgoing artifacts while the incoming artifacts from other peers still end up first in the unvalidated section of the corresponding peer and then in the validated artifact pool?
+[/quote]
+
+Yes, the slot table is used to track the distribution of validated artifacts, and it is built in such a way that the receiver can "synchronize" the content of its peers' slot tables, making sure they haven't missed anything, etc. Eventually, all downloaded artifacts end up in the unvalidated pool and then after being validated by the consensus layer, moved to the validated pool, just like before.
+
+-------------------------
+
+yotam | 2024-01-22 14:34:31 UTC | #8
+
+A new blog post on the proposed new P2P layer for Consensus is available here:
+https://medium.com/dfinity/a-new-p2p-layer-is-coming-to-the-internet-computer-772ac2a29484
+
+-------------------------
+

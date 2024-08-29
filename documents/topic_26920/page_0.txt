@@ -1,0 +1,1095 @@
+free | 2024-01-23 14:24:36 UTC | #1
+
+## Background
+
+The IC’s messaging model (as of January 2024) is conceptually an attractive proposition: remote procedure calls (RPCs) with reliable replies and automatic call bookkeeping through call contexts. Unpacking it a bit:
+
+* Canisters interact via RPCs
+  * A ⇾ B *request* (message); followed by B ⇾ A *response* (message).
+  * Every call being handled (Motoko *shared function*; or Rust *update function*) is backed by a *call context*.
+* Best-effort requests
+  * With *ordering guarantees*: if canister A makes two calls, **c1** and **c2** (in that order) to canister B, then **c2** will not be delivered before **c1**.
+* Guaranteed responses
+  * There is *globally exactly one response* (reply or reject) for every request.
+  * This response is *eventually delivered* to the caller.
+* Backpressure mechanism
+  * Canister A may only have a limited number of outstanding calls to canister B.
+
+## Problem Statement
+
+The long term goal of messaging on the IC is to ensure that **canisters can rely on canister-to-canister messaging, irrespective of subnet load and with reasonable operational costs**.
+
+This goal is impossible to achieve with the current messaging model; to the extent that [there were already discussions](https://forum.dfinity.org/t/fixing-incorrect-message-memory-fee/21987) about increasing prices for messaging on the IC. These discussions were paused to take a step back and see whether there are any other variables that could be tweaked to achieve the goal. This post presents the results of these discussions.
+
+The reasons for why messaging on the IC doesn’t satisfy the long term goal are the following:
+
+* Guaranteed response delivery implies unbounded response times. Concrete examples where this is a problem include calling into untrusted canisters, safe canister upgrades, and responsive applications in general. It also makes (true) fire-and-forget type of messages impossible. Later – once the IC supports more diverse subnet topologies – calling into dishonest subnets will also become a problem because of these guarantees.
+* Relatively large upper bound on the size of requests/replies (2MB while the mean message size observed on mainnet is 1kB). In combination with guaranteed replies, this requires reserving orders of magnitude more memory than necessary in most practical cases, increasing costs both to the canister and to the system.
+
+## Proposal
+
+We propose to extend the current messaging model in two directions: *small messages with guaranteed responses*, and *best-effort messages*. The extensions will require explicit opt-in from canister developers so that backwards compatibility is maintained. Canisters that do not take any action will simply keep sending messages with the current semantics and guarantees.
+
+### Small Messages with Guaranteed Responses
+
+Small messages with guaranteed replies have the same semantics as existing canister-to-canister messages, except for being limited to 1 kB payloads. Besides being significantly less resource-intensive, the size restriction opens the possibility of ensuring every canister a quota of messages and thus a much more predictable environment. The current thinking is that it should be possible to give every canister guaranteed quotas of 50kB for incoming and 50kB for outgoing small messages that can be in flight at the same time, plus use of an optimistically shared pool of 5GB*. (Note that the guarantee to be able to produce an outgoing request does not change anything to the fact that delivery of requests is best-effort.) Initially small messages’ payloads will be limited to 1kB (50 incoming, 50 outgoing, 5M shared optimistically), but given demand this can be made more flexible later.
+
+Small guaranteed-response messages still have the issue of potentially unbounded response times, but this may be an acceptable tradeoff in certain situations.
+
+*\* We assume an upper bound of 100k canisters per subnet. More would only be reasonable if they are part of one or more canister groups. At that point, per-canister quotas are no longer so important.*
+
+### Best-Effort Messages
+
+For best-effort messages, both request and response delivery would be best-effort, which opens up the possibility for the system to ensure fairness even in high load scenarios via fair load shedding. Because the system may drop requests or responses under heavy load, memory reservations for responses are unnecessary. From a canister’s perspective every request still gets exactly one response. But the system does not guarantee that it is a globally unique response (e.g. the callee may produce a reply while the caller sees a timeout reject).
+
+This means that canister developers who choose to rely on best-effort messages may have to handle the case where they can not infer from the reply whether the callee changed its state or not. In other words, best-effort messages allow developers to make a choice between bounded response times and the (potential) requirement to handle this additional case.
+
+Additionally, every call has a deadline, set explicitly by the caller; or implicitly by the system. And when a response does not materialize before the deadline (whether because the callee did not produce one; or because the response got dropped) the subnet always generates and delivers a timeout reject response.
+
+Similarly to small guaranteed-response messages, canisters would be guaranteed a quota of 50 concurrent best-effort calls, complemented by an optimistically shared pool of 5M calls.
+
+### How to use the new message types
+
+Canisters will continue using the async-await programming model, with no structural changes required. Switching between “guaranteed response messages ”, “small guaranteed-response messages” and “best-effort messages” could be as simple as e.g. defaulting to “guaranteed response messages” (for backwards compatibility) and calling `with_size_limit(1024)` or `with_timeout(duration)`, respectively, when building a request; or setting a global flag for all of a canister’s outgoing calls (details TBD).
+
+There will likely also be a need for global flags or per-canister-method annotations to signal which message types a canister is willing to accept (details TBD).
+
+## What’s in It for Me?
+
+A predictable environment in terms of messaging, responsiveness, scalability, fairness, upgradeable canisters, safe interactions with untrusted canisters and malicious subnets. Eventually, sensible retries.
+
+In a bit more detail:
+
+* For both new message types, per-canister quotas ensure that canisters can *operate in a predictable environment* in terms of how many messages they can reliably send and receive.
+* For best-effort messages we additionally have that:
+  * Subnet-generated timeout rejects ensure *bounded response times*; make it safe to interact with *untrusted canisters* and *malicious subnets*; and allow *canister upgrades* at all times.
+  * The lack of response reservations allows applications to handle *orders of magnitude more concurrent calls*; reduces *storage use*; and reduces the overhead of simulating *one-way messages*.
+  * The possibility of dropping messages allows for *graceful degradation* under heavy load and provides the opportunity for *fair load shedding* (e.g. when a canister uses more than its fair share of XNet bandwidth).
+  * Callers’ ability to enforce deadlines means that (within the context of best-effort calls) it would be acceptable for the system to provide a `sleep` primitive. Providing sensible *retries with back-off*.
+
+## Conclusion & Next Steps
+
+The new extensions to the messaging model will provide an environment canisters are able to rely on, and, hence, make it easier to implement reliable and/or consistent cross-canister applications.
+
+We will keep working on the interface details and follow up as soon as they are worked out. With that in place, the goal is to start working on a first iteration towards an MVP in the replica; and expose it in Motoko and the Rust CDK.
+
+Further work can be prioritized based on real-world needs: besides completing the vision outlined in this post, we believe that there will be demand for fair load shedding; a `sleep` API; rejecting pending calls on stop; dropping the payloads of expired messages from blocks; bidding for message priority; etc.
+
+-------------------------
+
+hpeebles | 2024-01-24 09:11:07 UTC | #2
+
+This is a really good improvement! Having to reserve 2MB for every single call is definitely not feasible long term.
+
+Also, this is how all web2 services work so developers will already be used to having to retry failed requests in an idempotent way.
+
+In OpenChat we will switch to using "best effort" messages for almost everything.
+
+I guess we may use "small guaranteed-response messages" for calls to the ledgers, but even then it may be better to use "best effort" because we have integrated with many tokens whose ledgers could potentially become malicious and prevent us from upgrading.
+
+-------------------------
+
+domwoe | 2024-01-24 09:45:42 UTC | #3
+
+@icme @lastmjs @levi @skilesare @saikatdas0790 Please have a look at this proposal.
+
+Note that this is considered also an alternative to named callbacks to ensure safe canister upgrades.
+
+-------------------------
+
+free | 2024-01-24 10:26:56 UTC | #4
+
+Note that best-effort calls would not make named callbacks entirely superfluous, but they would cover quite a few use cases.
+
+More specifically, they would only guarantee safe upgrades for canisters that rely exclusively on best-effort calls (or only make guaranteed calls to "fast" endpoints of trusted canisters, however one would define that). This is because best-effort calls come with a hard upper bound on response latency, so once a canister is `Stopping`, all its outstanding calls would be guaranteed to have a response within this (TBD) time bound.
+
+The other important point is that a canister can still shoot itself in the foot if it simply retries failed calls forever: a canister in the `Stopping` state can no longer receive calls, but is still allowed to make downstream calls; so if the canister simply follows up every timeout response with a new call, then it will never stop. A reasonably implemented canister would not have this issue, but it might still retry failed requests for some limited time (or some limited number of times), which would correspondingly extend how long the canister takes to stop. So as long as there exists a limit on retries, there' also exists an upper bound on canister stopping time.
+
+Finally, a more speculative idea might be to allow canisters that can deal with this to opt into an "instant stop" mode, where all their outstanding best-effort calls are immediately aborted (i.e. they receive something akin to an early timeout reject) when the canister transitions into the `Stopping` state; and the canister is prevented from making any more downstream calls. Such a canister would only require a couple of rounds to handle all those abort responses, after which it would stop.
+
+Named callbacks OTOH would implicitly allow for instant upgrades; and would also apply to guaranteed response calls. Which would clearly make them the superior option. But they would also require rewriting canisters to use explicit callback functions, as opposed to the nice (and potentially misleading) async-await structure that is most widely used.
+
+-------------------------
+
+saikatdas0790 | 2024-01-24 11:14:47 UTC | #5
+
+[quote="free, post:1, topic:26920"]
+Subnet-generated timeout rejects ensure *bounded response times*
+[/quote]
+
+👏🏽👏🏽👏🏽
+
+Looking forward to be able to utilize this
+
+-------------------------
+
+skilesare | 2024-01-24 17:00:51 UTC | #6
+
+There is a bunch in this post across a wide range of topics...sorry for the length...let me know if anything isn't clear.
+
+[quote="free, post:1, topic:26920"]
+Small messages with guaranteed replies have the same semantics as existing canister-to-canister messages, except for being limited to 1 kB payloads.
+[/quote]
+
+For some context, we've been working on a bunch of 'batch by default' and batch standards for Fungible and NFTs.  Once these are out, I'd expect that the average message size may significantly increase as wallets, marketplaces, etc begin batching their requests. (An NFT market can now pull the whole list of NFTs for a collection and then make a request with all those IDs to a metadata endpoint and expect to get back, depending on the collection, a large response.  So fewer requests, but bigger payloads.)
+
+It is probably just a variable to stick into our calculus, but hopefully, we are developing some patterns that will extend to much more complicated standards than just Tokens.
+
+Also, Question: Is the 1kb limit for both incoming payload and outgoing payload?  
+
+We have metadata variables that we give out on the token canisters like ICRC4:max_balance_batch that are there to specifically restrict users under the current 2MB limit.  Will there be complications where the client doesn't know what kind of response the server has implemented? Will the candid(did) expose it?  What if one ICRC4 canister uses Small Message with Guaranteed response, but another uses Best effort and supports up to 2MB sized incoming batch...I guess phrased another way, how will canister clients know which method to use and/or are we going to have to go back and add stuff to existing ICRCs to handle this.
+
+[quote="free, post:1, topic:26920"]
+
+But the system does not guarantee that it is a globally unique response (e.g. the callee may produce a reply while the caller sees a timeout reject).
+
+[/quote]
+
+Oh man...this makes my head ache a bit trying to think of all the ways this could go sideways for folks that don't know what they are doing, but I'd imagine some well-developed patterns would help here.  We are already handling some deduplication on the ICRC canisters and I guess this pushes us to move to some kind of request-id generated client side(or deterministic key as is the case with ICRC1/2/4/7/37 transactions.  It feels like getting back to a failed response might be a tough one.  If the output was written to an ICRC3 log and dedup works, then hopefully you get a nice duplicate-of response. Still, you're really going to need to make sure all relevant data is in that log in order to serialize it back to an expected object and inject it back into your processing pipeline.
+
+Much of that feels like it leads to some 'code smells', but I guess you get to select this option intentionally. My concern is for the old pathway...will it get more expensive as we move forward if we don't opt into these new modes?
+
+[quote="free, post:1, topic:26920"]
+
+calling `with_size_limit(1024)` or `with_timeout(duration)`, respectively, when building a request; or setting a global flag for all of a canister’s outgoing calls (details TBD).
+
+...
+
+There will likely also be a need for global flags or per-canister-method annotations to signal which message types a canister is willing to accept (details TBD).
+
+[/quote]
+
+I'd be interested in @dfx-json, @claudio, @luc-blaeser, +rest of motoko teams, though on how this would actually look in motoko.
+
+```
+    //calling
+    let foo = await.with_size_limit(1024) myactor.transfer(...);
+
+   //declaring
+   public guranteed(msg) transfer(...) : async Bool{
+   };
+
+   or
+
+   public shared(msg) transfer(...) : async.best_effort Bool{
+   };
+
+   or something else(we don't really have decorators yet).
+
+```
+
+We have been solving for these issues at the application level and have an alpha of a system that isn't really 'best effort', but that assumes an event-based programming including archiving, replay, etc. It is specifically designed let canister 'publish' events to a trusted canister and not have to worry about any of the 'untrusted' stuff.  The Broadcasters do everything via one-shots to subscribers and don't wait for responses. If a subscriber is off-line it can catch up later by checking the nonce of the event stream.
+
+The one thing it isn't super good at for now is subnet awareness and/or optimizations, so it is possible to do something expensive like send an event to 100 subscribers on a different subnet instead of relaying to a broadcaster on the subnet and having it distribute to the 100 subscribers.  I was hoping to get to that after the alpha.
+
+It lays the foundations of some other cool features like cycle-neutral messaging, tokenization of data streams, etc.  Given all of that and some grand designs that I may never actually have time to build...I would have actually loved something like this at the protocol layer.
+
+Ethereum has events, but your contracts can't respond to them. This event system fixes that glitch and lets you write programs in an event messaging style.  When you do that you don't have to stress about 'what happens if I miss a message' or 'did the canister get it and do an update that I don't have access to' because you just assume that architecture from the beginning.
+
+```
+module {
+
+   let handleEvent = EventHandlerHelper([
+        ("icrc1.transfer", onTransfer),
+        ("icrc2.transfer", onApprove),
+        ...
+   ]);
+
+   var lastTransfer = 0;
+   var lastApprove = 0;
+
+    public shared(msg) handleEvent(eventId: Nat, publisherId: Principal, eventName: Text, payload: Candy.CandyValue){ //oneshot
+    handleEvent(eventID, publisherID, eventName, payload);
+};
+
+   private func onTransfer(eventId: Nat, publisherId: Principal, eventName: Text, payload: Candy.CandyValue){
+     if(eventID != lastEvent+1){ //this won't work if you use a filter at the event system level
+        let missedEvents = eventSystem.catchUp(eventName, lastTransfer+1, eventID);
+        for(thisItem in missedEvents){
+          onTransfer(thisItem..);
+        }
+     };
+     //transfer logic
+ };
+
+///etc
+
+};
+```
+
+It certainly adds some state requirements and probably isn't conducive to implementation in the replica, but I'd much rather be able to do the following then to have to write a bunch of retry code inline with the classic async/await approach:
+
+```
+   public event({caller, msg}) some_namespace_schema{
+     //handle the event
+   }; //and even better if the replica/motoko took care of making sure I didn't miss messages somehow.
+```
+
+-------------------------
+
+sea-snake | 2024-01-24 17:34:45 UTC | #7
+
+With "best effort" and batch methods in icrc4 and 7, I suppose the transfer request deduplication will become more crucial to handle cases where there's a timeout.
+
+Should we consider supporting both batch and non batch methods in icrc7 where the first uses guaranteed response and latter uses best effort? Similar could be done with icrc1 and 4 canisters.
+
+-------------------------
+
+free | 2024-01-24 18:37:14 UTC | #8
+
+[quote="skilesare, post:6, topic:26920"]
+Is the 1kb limit for both incoming payload and outgoing payload?
+[/quote]
+
+The 1 kB limit would apply to both the request and the response payloads, yes. Just as the existing 2 MB limit does.
+
+We have discussed the possibility of having arbitrary small message limits (hence the 50 kB quota as opposed to a 50 small message quota); as well as allowing canisters to reserve larger quotas (so e.g. with a 1 MB quota you could handle 20 concurrent 50 kB messages). But this is all very speculative and will likely require significant time and effort to achieve. And, depending on popular demand and whatever bottlenecks subnets run into in the future, they may well end up being implemented after other features that we currently labeled as "future work" (i.e. low priority), e.g. dropping expired payloads from streams; fair load shedding, ingress history size limits, etc.
+
+[quote="skilesare, post:6, topic:26920"]
+Will there be complications where the client doesn’t know what kind of response the server has implemented? Will the candid(did) expose it? What if one ICRC4 canister uses Small Message with Guaranteed response, but another uses Best effort and supports up to 2MB sized incoming batch…I guess phrased another way, how will canister clients know which method to use and/or are we going to have to go back and add stuff to existing ICRCs to handle this.
+[/quote]
+
+All very good questions that I do not have a definite answer to. SDK / Motoko people and the community should get to decide how to best address them.
+
+My very evasive answer is that in general callers would be expected to know what canister they are calling into and what its limitations are (i.e. does it support small responses? best effort?). Standards should explicitly define what's supported and what isn't. And for standards completed before the new message types are released, I would say that the only reasonable expectation should be that they can handle the old 2 MB guaranteed response calls.
+
+Another perspective may be that if a canister's API (or implemented standard) is idempotent, then it should be safe (within limits, such as the ICP ledger's 24 hour deduplication window) to use best-effort calls. If there's no idempotent API, then one must assume that retrying a timeout response could result in a double spend; with the implication that the respective canister only supports (small or large) guaranteed calls.
+
+[quote="skilesare, post:6, topic:26920"]
+Oh man…this makes my head ache a bit trying to think of all the ways this could go sideways for folks that don’t know what they are doing,
+[/quote]
+
+The truth is that guaranteed response calls cannot be made to work reliably. Even with small guaranteed response messages, if the subnet is badly backlogged your canister may end up with an output queue full of responses (whatever the quota) and, as a result, be prevented from receiving more calls. In a very real sense (both in terms of "can I make / receive a call now" and "will I ever receive a response to my call") guaranteed response calls are best-effort: you are guaranteed to get a response, but it may not be what you want and it may "never" materialize.
+
+OTOH traditional systems have been relying on best-effort messaging (TCP, UDP, HTTP) forever and people have built reliable, available, consistent distributed applications on top of them. These were not "folks that [didn’t] know what they are doing", but it is entirely possible. You just have to start from the right set of assumptions.
+
+[quote="skilesare, post:6, topic:26920"]
+My concern is for the old pathway…will it get more expensive as we move forward if we don’t opt into these new modes?
+[/quote]
+
+It may well do so. As mentioned at the top of the thread, we already suggested increasing message memory fees by ~1000x and were about to do so, before we took a step back to reconsider our options. In reality, this 1000x increase would have been experienced as a much less than 2x increase as long as calls completed in reasonable time. But message memory is a much more limited resource than storage in general (messages are always loaded in-memory, routed, checked and inducted), so a price increase once an alternative exists cannot be excluded. Which is where a "small guaranteed response message" may come in handy, even in cases where the call takes a lot longer than what e.g. a reasonable HTTP request may take.
+
+[quote="skilesare, post:6, topic:26920"]
+Ethereum has events, but your contracts can’t respond to them. This event system fixes that glitch and lets you write programs in an event messaging style. When you do that you don’t have to stress about ‘what happens if I miss a message’ or ‘did the canister get it and do an update that I don’t have access to’ because you just assume that architecture from the beginning.
+
+[...]
+
+I’d much rather be able to do the following then to have to write a bunch of retry code inline with the classic async/await approach
+[/quote]
+
+Ethereum has a lot of features (such as atomic transactions) that a sharded network could never provide outside of very narrow use cases (e.g. atomic single message execution). This is because Ethereum is a single (and single threaded?) virtual machine, so most of these things are trivial to achieve. But it also means that Ethereum is very, very tightly limited in terms of scalability. We had someone on the team look at messaging models across Ethereum rollups and a bunch of sharded blockchains as part of coming up with a proposal and the findings were (to put it mildly) not encouraging.
+
+You may be able to implement reliable event notifications in a very, very tightly controlled environment, but a general solution is IMHO impossible, since it would be equivalent to guaranteed request delivery. Regardless of volume, load, number of participants, number of virtual machines.
+
+So while I fully agree with the sentiment (it would be very nice to have guaranteed message delivery, atomic transactions and high throughput all at once), I don't think that is even vaguely realistic.
+
+-------------------------
+
+free | 2024-01-24 18:45:13 UTC | #9
+
+[quote="sea-snake, post:7, topic:26920"]
+Should we consider supporting both batch and non batch methods in icrc7 where the first uses guaranteed response and latter uses best effort?
+[/quote]
+
+Quite possible. Although, as said, it may take a while for all of the above to materialize and it may do so out of order. In the meantime it is entirely reasonable to stick with the existing 2 MB guaranteed response calls. And maybe consider making allowances for future support of those messaging models that make sense for the standard.
+
+-------------------------
+
+Zane | 2024-01-25 05:00:37 UTC | #10
+
+[quote="free, post:8, topic:26920"]
+We had someone on the team look at messaging models across Ethereum rollups and a bunch of sharded blockchains as part of coming up with a proposal and the findings were (to put it mildly) not encouraging.
+[/quote]
+
+Out of curiosity has the team looked into Radix? They claim to have a come up with an approach which allows to scale the network's throughput linearly by adding more shards while still preserving atomicity and composability even across different shards. Their whitepaper is quite technical and has been supposedly peer reviewed, I'm not an expert on the matter so most of it is beyond my understanding, but I'd be curious to know if you already took it into consideration and whether there is any merit to it.
+
+[quote="free, post:4, topic:26920"]
+But they would also require rewriting canisters to use explicit callback functions, as opposed to the nice (and potentially misleading) async-await structure that is most widely used
+[/quote]
+
+This is the first time I've seen this limitation mentioned in relation to named callbacks. Aren't there any alternatives that would allow us to continue using the async/await pattern? Perhaps the CDK could perform some compile time magic to abstract this process? 
+Regardless, I still believe that named callbacks are an essential part of the puzzle. Being able to safely interact with third party services, irrespective of the messaging type, is crucial for composability. 
+Even if the limitation can't be avoided, it'd still better than not having them at all, we could even view this positively, as explicit callbacks might make some potential reentrancy issues more noticeable.
+
+-------------------------
+
+free | 2024-01-24 21:49:51 UTC | #11
+
+[quote="Zane, post:10, topic:26920"]
+Out of curiosity has the team looked into Radix?
+[/quote]
+
+Not that I know of. But I did take a quick look at their quite useful [infographic series](https://www.radixdlt.com/blog/cerberus-infographic-series-chapter-i). At first look, it does seem as if their approach scales linearly. They have something like UTXOs to hold everything from tokens to smart contracts with their data. And every such UTXO ends up in its own separate shard. There is always a transaction to create the UTXO and one to consume it (and potentially replace it with a slightly different UTXO that ends up in a different shard).
+
+On paper it looks quite reasonable, as they can pull together any number of UTXOs into one atomic transaction. However, I can imagine that if we're talking a UTXO cintaining even a few GB of state (say the equivalent of an IC canister and its state), any mutation will result in a new, slightly altered copy of said UTXO / canister being created in a new shard. And the old shard is never deleted. I.e. such a transaction would be agonizingly slow; and would result in another few GB of state that must be persisted forever.
+
+My personal conclusion (that may well be flawed) is that while their protocol does scale linearly with the number of nodes, it is only realistically usable for maintaining a ledger (or other small chunks of data) and it actually requires linear (or likely higher) growth only to manage the infinitely growing set of UTXOs. Without continuous growth, it all just falls over.
+
+[quote="Zane, post:10, topic:26920"]
+Regardless, I still believe that named callbacks are an essential part of the puzzle.
+[/quote]
+
+No disagreement from me there. (o:
+
+[quote="Zane, post:10, topic:26920"]
+Even if the limitation can’t be avoided, it’d still better than not having them at all, we could even view this positively, as explicit callbacks might make some potential reentrancy issues more noticeable.
+[/quote]
+
+Also agreed. The async-await model is too misleadingly simple for its own good. But to be honest, explicitly carrying over state from callback to callback is not trivial. Even though I was already a solid software engineer at the time, I remember the confusion and annoyance of dealing with explicit callbacks in my first Big Tech job. So I can see how they could be exceedingly difficult for someone just getting started with coding.
+
+-------------------------
+
+Zane | 2024-01-25 00:04:45 UTC | #12
+
+[quote="free, post:11, topic:26920"]
+My personal conclusion (that may well be flawed) is that while their protocol does scale linearly with the number of nodes, it is only realistically usable for maintaining a ledger
+[/quote]
+
+Yes their protocol is mainly focused on providing a scalable layer for DeFi, rather than serving as a general purpose crypto cloud like ICP. 
+Could something similar be considered in the future by introducing the concept of DeFi canisters/subnets with a different set of tradeoffs from regular ones?
+
+-------------------------
+
+free | 2024-01-25 09:40:58 UTC | #13
+
+[quote="Zane, post:12, topic:26920"]
+Could something similar be considered in the future by introducing the concept of DeFi canisters/subnets with a different set of tradeoffs from regular ones?
+[/quote]
+
+Hard to say. If you were to implement something like this with canisters instead of physical nodes, my knee jerk reaction would be that latency would increase by at least one order of magnitude (hundreds of milliseconds roundtrip for geographically distributed nodes; multiple seconds roundtrip for canisters across multiple subnets). So if their claim of 5 second finality is accurate, you could expect something like 1 minute finality if you were to implement it with canisters. Not great.
+
+You could also (presumably) have a subnet that essentially runs Radix underneath but somehow exposes the same interface as an IC subnet. But at that point, why not simply have canisters on the IC interact directly with the real Radix? (Similar to how ckBTC interacts directly with Bitcoin.)
+
+-------------------------
+
+infu | 2024-01-25 11:24:32 UTC | #14
+
+Sounds good. DeFi  & ledgers are probably the ones that rely on guaranteed responses the most and generate most of the calls right now. 
+
+[quote="free, post:1, topic:26920"]
+Similarly to small guaranteed-response messages, canisters would be guaranteed a quota of 50 concurrent best-effort calls, complemented by an optimistically shared pool of 5M calls.
+[/quote]
+
+How about - if a canister utilizes 300 simultaneous calls over a period of time (weeks) its quota raises to 300. Then someone who tries to exploit this by flooding the network to cause others canister calls to fail, will not be able to do that easily. 
+
+Perhaps CDKs should put some kind of test mode where 30% of the calls artificially fail throwing all possible errors to simulate work under heavy load. Otherwise, we will only find out how good our ecosystem and our code are, when under attack.
+
+-------------------------
+
+infu | 2024-01-25 11:41:49 UTC | #15
+
+Heartbeat and Timer callbacks are not considered messages correct? These limitations wont apply to them and they are still guaranteed? Also calls to the management canister aaaaa-aa are not messages?
+
+-------------------------
+
+free | 2024-01-25 12:25:54 UTC | #16
+
+[quote="infu, post:14, topic:26920"]
+How about - if a canister utilizes 300 simultaneous calls over a period of time (weeks) its quota raises to 300. Then someone who tries to exploit this by flooding the network to cause others canister calls to fail, will not be able to do that easily.
+[/quote]
+
+As currently envisioned, you would get a guaranteed quota of 50 concurrent calls; plus access to an optimistically shared pool of 5 M concurrent calls. So you would be far from limited to 50.
+
+One possible future extension might be to allow reserving chunks of that 5 M concurrent calls pool, similar to how you currently reserve storage. Or introducing some form of canister groups, within which the 50 call quota of each of N canisters in the group would turn into a N*50 calls quota to be shared by the group (which would presumably consist of canisters designed to collaboratively share resources). A dynamic quota based on historical usage may also work, but it could e.g. prevent you from handling a spike in traffic.
+
+[quote="infu, post:14, topic:26920"]
+Perhaps CDKs should put some kind of test mode where 30% of the calls artificially fail throwing all possible errors to simulate work under heavy load. Otherwise, we will only find out how good our ecosystem and our code are, when under attack.
+[/quote]
+
+That is a wonderful idea. We should definitely consider something like that. You can bring it up as a separate forum topic; or I can do it internally.
+
+[quote="infu, post:15, topic:26920"]
+Heartbeat and Timer callbacks are not considered messages correct? These limitations wont apply to them and they are still guaranteed?
+[/quote]
+
+Heartbeats and timers are indeed system tasks, not messages. The only resource they would use (in terms of what we considered as resources in our proposed messaging model) is one call context. But there can be at most one call context per canister without callbacks, the one currently executing (whether it is triggered by a message or a system task). And only while the canister is executing something. Which means that we can safely ignore it in the big scheme of things. So yeah, no limitations on timers and heartbeats,
+
+[quote="infu, post:15, topic:26920"]
+Also calls to the management canister aaaaa-aa are not messages?
+[/quote]
+
+Management canister calls are in fact messages. We have a separate set of input and output queues for the management canister, just as with regular canisters. The management canister itself is not really a canister, it's just functionality provided by the system, but in order to support asynchronous operations (e.g. canister installs) it looks for all intents and purposes the same as a canister.
+
+-------------------------
+
+infu | 2024-01-25 12:37:14 UTC | #17
+
+[quote="free, post:16, topic:26920"]
+That is a wonderful idea. We should definitely consider something like that. You can bring it up as a separate forum topic; or I can do it internally.
+[/quote]
+
+Not sure it needs a separate forum topic. I would just add - The test mode has to be placed inside the wasm so it can be put on IC mainnet. Placing it in local replica won't work for us. Most of our canisters are calling basically hundreds of different canisters on the IC. It's nearly impossible to replicate everything locally to test things out.
+
+-------------------------
+
+Severin | 2024-01-25 12:37:48 UTC | #18
+
+[quote="free, post:16, topic:26920"]
+[quote="infu, post:14, topic:26920"]
+Perhaps CDKs should put some kind of test mode where 30% of the calls artificially fail throwing all possible errors to simulate work under heavy load. Otherwise, we will only find out how good our ecosystem and our code are, when under attack.
+[/quote]
+
+That is a wonderful idea. We should definitely consider something like that. You can bring it up as a separate forum topic; or I can do it internally.
+[/quote]
+
+I made it a feature request [over here](https://dx.internetcomputer.org/topic/218) on the feedback board. I suspect such a capability would be put in PocketIC and not into the CDK so it is not limited to one specific CDK
+
+-------------------------
+
+infu | 2024-01-25 12:43:46 UTC | #19
+
+That's great to have, but I think we need it in the CDK as well. Trying to replicate some NNS canisters, XRC, a few SNSes, some ledgers of different types, and DEXes and DeFi canisters and populate them with realistic data while all of them constantly change, some are closed source and the whole process can't be automated - not sure that's possible.
+
+-------------------------
+
+skilesare | 2024-01-25 15:33:50 UTC | #20
+
+[quote="free, post:8, topic:26920"]
+
+OTOH traditional systems have been relying on best-effort messaging (TCP, UDP, HTTP) forever and people have built reliable, available, consistent distributed applications on top of them. These were not “folks that [didn’t] know what they are doing”, but it is entirely possible. You just have to start from the right set of assumptions.
+
+[/quote]
+
+I agree! And I’m not saying that it shouldn’t be done, but like the above mentioned protocols, significant attention will be needed to make it easier for users to consume the new protocols…good examples…good libraries…all of that. Totally do able…mostly thinking out lout and seeking consensus on the implications.
+
+[quote="free, post:8, topic:26920"]
+
+Ethereum has a lot of features (such as atomic transactions) that a sharded network could never provide outside of very narrow use cases (e.g. atomic single message execution). This is because Ethereum is a single (and single threaded?) virtual machine, so most of these things are trivial to achieve. But it also means that Ethereum is very, very tightly limited in terms of scalability. We had someone on the team look at messaging models across Ethereum rollups and a bunch of sharded blockchains as part of coming up with a proposal and the findings were (to put it mildly) not encouraging.
+
+You may be able to implement reliable event notifications in a very, very tightly controlled environment, but a general solution is IMHO impossible, since it would be equivalent to guaranteed request delivery. Regardless of volume, load, number of participants, number of virtual machines.
+
+So while I fully agree with the sentiment (it would be very nice to have guaranteed message delivery, atomic transactions and high throughput all at once), I don’t think that is even vaguely realistic.
+
+[/quote]
+
+I may have done a bad job of conveying my point. It wasn’t that ethereum was better or that the IC should copy it, but more that I liked that in ethereum I could write an event that others could consume later without me having to know who they were….and beyond that it was a bummer that your contract couldn’t just ‘subscribe’ to that event(and of course you can’t because too many subscribers would blow out your gas limit).
+
+What I meant to convey is that, perhaps, instead of trying to shove three modes of execution into supporting one paradigm, perhaps two different paradigms would be better.(And at the same time I acknowledge that the current one doesn’t scale so maybe it shouldn’t be one of the two, which complicates things since it is already live).
+
+Mode 1: Async Await
+
+Mode 2: Event Base Pub-Sub - not ‘best effort’, not ‘guaranteed’, but ‘no possible guarantee’ so that developers begin with that simple paradigm in mind.
+
+Postulate: A guaranteed message with unbounded return time converges on the preparation and handling of a publication with guaranteed delivery to a known single subscribing verified smart contract that MUST respond unless it is turned off.
+
+So if you got the above plus one to many pub-sub on the replica it would be cool and likely very powerful. (The issues that I came up with were that you might have to keep a bunch of data laying around, but the event system could off load those and have the come back later if a witness were provided…basically a data availability problem that the IC is super good at solving).
+
+So the problem would change from ‘How do we scale guaranteed message delivery’ to “if you need scale, use pub-sub.”
+
+Obviously, very different paradigms, and I guess event-based programming can be more difficult, but as someone up above implied, it may make you more disciplined at handling the way a multi-actor asynchronous multi-verse "actually" works.
+
+-------------------------
+
+free | 2024-01-25 16:30:53 UTC | #21
+
+I'm not sure I fully understand your proposal. Are you suggesting a combination of requests with guaranteed delivery and best-effort pub-sub? Or is it something else?
+
+-------------------------
+
+timo | 2024-01-25 16:53:11 UTC | #22
+
+[quote="free, post:1, topic:26920"]
+small messages with guaranteed responses
+[/quote]
+
+means the outgoing message is small or the response is small? Your post sounds like the outgoing message is small as well (i.e. both are). But doesn't the problem of wasted allocations only require the response to be small? Why does the outgoing message have to be small as well? I mean scheduling the call can already fail synchronously if there isn't enough space in the out-queue.
+
+I do experience that in practice frequently that I make canister calls and already know that the response is going to be small, often just an ACK. So any excessive allocations for the response would indeed be wasted.
+
+-------------------------
+
+skilesare | 2024-01-25 16:55:17 UTC | #23
+
+Well, I guess a better first question would be: "Have you all ever considered replica-level Pub-Sub? And if so, why was it ruled out or de-prioritized?"
+
+If the answer is "Oh yeah...that's in the pipeline" then I'd ask if the target is increasing scalability, why not go down that avenue first as it would likely converge on all implementation scenarios needed for a developer by Guaranteed Messages with a set size that would get a system time out or Guaranteed Messages with a programmer specified timeout. (In the Guranteed case you can handle the time out in-line and in the pub sub, you have to do some application-level bookkeeping to clean up and throw out responses that have timed out).
+
+My guess is that there are plenty of answers to the first question that make the second not worth asking. Sorry for the confusion. I'm a total amateur at the replica level here so I'm sure there are some dumb assumptions and/or impossible/ridiculously hard things that I don't know are impossible/ridiculously hard.
+
+-------------------------
+
+skilesare | 2024-01-25 16:57:30 UTC | #24
+
+[quote="timo, post:22, topic:26920"]
+I do experience that in practice frequently that I make canister calls and already know that the response is going to be small, often just an ACK. So any excessive allocations for the response would indeed be wasted.
+[/quote]
+
+:point_up_2: Yeah...in most cases I know I'm returning WAY less than 1kb and could easily tell you that before hand(although it might rule out using batch).  But if I want to ship a file from one canister to another I'm going to be sending a bunch of 2MB chunks and just getting back the OKs.
+
+-------------------------
+
+oggy | 2024-01-25 17:34:05 UTC | #25
+
+[quote="skilesare, post:20, topic:26920"]
+Mode 2: Event Base Pub-Sub - not ‘best effort’, not ‘guaranteed’, but ‘no possible guarantee’ so that developers begin with that simple paradigm in mind.
+[/quote]
+
+What do you mean by "no possible guarantee"? Also, I'm not sure how either topic-based or content-based pub/sub would work, given the ICs sharded nature; it's not clear how a single subnet would learn of all the recipients interested in a particular message.
+
+We have discussed something a la message queues, namely one-way messages, but this was discarded primarily since it'd be a large change to the current programming model, including the external user interaction (right now both are request/response based). Guaranteed (i.e., exactly-once) delivery of such messages would also likely require a large refactoring of our streams, which would need to become per-canister-pair to be able to implement backpressure. An additional concerns are cycles; first, it can happen that the receiver is frozen or out of cycles, which could violate the delivery guarantees. Furthermore, the receiver might itself implement some kind of rate limiting (for example, the ICP ledger does that, where it will start rejecting transactions if there are too many in some time window) to protect itself from DoS attacks, which could also violate delivery guarantees.
+
+-------------------------
+
+free | 2024-01-25 18:20:14 UTC | #26
+
+[quote="timo, post:22, topic:26920"]
+Why does the outgoing message have to be small as well? I mean scheduling the call can already fail synchronously if there isn’t enough space in the out-queue.
+[/quote]
+
+The reason why we proposed a small request-small response approach is that it allows providing canisters with guaranteed incoming and outgoing quotas (whether in terms of messages or bytes). But that only works because we can guarantee each of 100k canisters something up to 100 kB (we settled on 50 kB, with the remaining memory in a shared pool, but it doesn't have to be 50-50).
+
+If the model allowed arbitrary size requests, we could no longer guarantee a quota, incoming or outgoing. All you'd get out of it would be a small reservation.and fractionally lower costs (in the average case; if the response takes hours or days to materialize, it would be more significant).
+
+And providing some sort of guaranteed messaging resources to canisters (in the same way that they can e.g. rely on reserved storage) was the whole point of the proposal. If your calls fail synchronously, you will pretty much be forced to terminate the call context. Which makes it impossible to provide a reliable synchronous API (make call, receive response) and would force callers to poll for the status of their requests; and callees to use an event loop driven by timers/heartbeats. Some canisters may require the latter, but we believe it should not be the default approach to canister programming.
+
+-------------------------
+
+free | 2024-01-25 18:30:16 UTC | #27
+
+[quote="skilesare, post:23, topic:26920"]
+“Have you all ever considered replica-level Pub-Sub? And if so, why was it ruled out or de-prioritized?”
+[/quote]
+
+I don't think we have. As @oggy said, how would one make pub-sub work across subnets? Sure, there may be some way of broadcasting a message to all canisters on the subnet (which is what I understand by "at the replica level"), but doing it at the protocol level would either require subnets to broadcast messages to all other subnets (imagine what that means when/if we get to hundreds of thousands of subnets or more); or maintain potentially huge lists of subscribers and still end up broadcasting to pretty much every other subnet.
+
+[quote="skilesare, post:24, topic:26920"]
+But if I want to ship a file from one canister to another I’m going to be sending a bunch of 2MB chunks and just getting back the OKs.
+[/quote]
+
+Maybe you should consider using best-effort calls for those, since there is no request delivery guarantee anyway. With best-effort calls, no reservation is needed (and a tiny response should be delivered with very high probability).
+
+-------------------------
+
+skilesare | 2024-01-25 18:57:21 UTC | #28
+
+[quote="free, post:27, topic:26920"]
+I don’t think we have. As @oggy said, how would one make pub-sub work across subnets? Sure, there may be some way of broadcasting a message to all canisters on the subnet (which is what I understand by “at the replica level”), but doing it at the protocol level would either require subnets to broadcast messages to all other subnets (imagine what that means when/if we get to hundreds of thousands of subnets or more); or maintain potentially huge lists of subscribers and still end up broadcasting to pretty much every other subnet.
+[/quote]
+
+Yep...that makes sense. It becomes an exponential problem if the publishers/subscribers don't have to register themselves(and perhaps even if they do).  In our application-level version, we are requiring publishers and subscribers to register themselves and thus each publisher is assigned a broadcast canister that manages where all the message needs to go.  Making this canister subnet aware so it can route to avoid multi-cast across subnets is part of the problem we are facing in keeping cycle costs down.
+
+Makes sense! Thanks to you and @oggy for humoring me. :)
+
+-------------------------
+
+free | 2024-01-26 07:00:24 UTC | #29
+
+No worries. That's why we posted this, to get feedback. And we very much appreciate it.
+
+For a bit more context why we haven't seriously considered pub-sub, you already know that the IC is (for the time being) significantly bandwidth constrained. Every piece of data used in a replicated computation by a subnet must either already be present in the subnet's storage; or be inducted through a block, limited to 4 MB in size and a of ~1 block/second rate.
+
+We have ideas for how to work around that (basically have a side-channel for the actual data and only include hashes into blocks, although it's quite a bit more elaborate than that). But until we make some progress in that area, anything that requires large amounts of bandwidth (such as broadcasting) is a bit out of reach.
+
+This is also one of the reasons why we chose to go with "small messages" as one solution and "best-effort" as another: given limited bandwidth, one can either try to reduce the amount of data being passed around; or, under the assumption of low traffic in the average case, allow for arbitrarily-sized payloads backed up by fair load shedding when necessary.
+
+-------------------------
+
+levi | 2024-01-26 08:54:42 UTC | #30
+
+The proposal looks great, most calls that need guaranteed responses are smaller than 1-kb so this is a great way to balance the response guarantees with the subnets' memory reservations. I like how this lets each canister have a guaranteed quota of concurrent incoming and outgoing calls.
+
+[quote="free, post:1, topic:26920"]
+There will likely also be a need for global flags or per-canister-method annotations to signal which message types a canister is willing to accept (details TBD).
+[/quote]
+If a caller makes an outgoing call using the small guaranteed message type and the callee sends back a response bigger than 1-kb, then the callee would change it's state but the caller will not be able to receive the response and would not be able to know that the callee changed it's state - breaking the response guarantee. So as far as I can tell the method annotations are a requirement, and if a caller sends a request type different from the callee's method type, the call must not reach the callee (so the callee can't change it's state) and the caller gets an error response. This of course only applies to the small-message-gauranteed-response type. Is this a correct conclusion or are there possible better ways to handle this scenario?
+
+-------------------------
+
+free | 2024-01-26 10:00:38 UTC | #31
+
+[quote="levi, post:30, topic:26920"]
+If a caller makes an outgoing call using the small guaranteed message type and the callee sends back a response bigger than 1-kb, then the callee would change it’s state but the caller will not be able to receive the response and would not be able to know that the callee changed it’s state - breaking the response guarantee.
+[/quote]
+
+We have discussed a number of options here.
+
+The obvious one was to cause the callee to trap when producing a response larger than the reservation. In theory, this would both roll back the callee's state changes and inform the caller of the failure. Unfortunately, this only works reliably if the callee does not make any downstream calls; if it does, and it persists any state before doing so, then those changes to the state would not be rolled back. At the extreme, this could be used as an attack, causing canisters that do not expect to trap while responding to remain in inconsistent states. Even if that is not so and the callee takes care to roll back all changes (or rather to only apply them when producing the response), it still consumes cycles for zero work done.
+
+The other option was, as you described, to use annotations and/or requiring callees to invoke a system API with the semantic of "I promise to produce a response smaller than X bytes" as the first thing the request handler does. If the annotation or the system API call specify a maximum response size larger than what the caller requested, the call traps. The callee still burns some cycles (if we go with the API approach); or the system must be aware of the maximum response size of every endpoint of every canister before inducting a request; but there is no possibility of a partial transaction being applied by the callee. However, this does require all callees that want to support small guaranteed messages to actively do something about it (i,e, it is opt-in). Which, in the best case, means that it will take a long time before small messages become a significant fraction of the IC traffic.
+
+The final option we came up with so far is to make it the caller's responsibility to know whether the endpoint they are calling is capable of producing small responses only; or else to deal with the eventuality of a large response. Which would succeed on the callee side (i.e. no trapping, no errors), but a response that was larger than the reservation may (potentially, not necessarily always) be replaced with a specific reject response saying "response too large". This might be seen as acceptable behavior, since it's a bad idea to make guaranteed response calls to untrusted/unknown canisters anyway: said canister may "never" produce a response, meaning that your canister is non-upgradeable and has likely locked some resources that now cannot be unlocked. Also, if the endpoint you're calling is idempotent and you get a "response too large" error, you can retry it as a "large guaranteed response" call; or, if you don't actually care about the response, a "response too large" reject implies that the call succeeded and that's all you may want to know. Still, this does mean that we no longer have the clear cut between a response meaning the call succeeded and a reject meaning the call failed (although there already is a lot of nuance there: a response may simply be an error produced by the canister; and a reject could mean that the callee trapped while trying to produce the response, but changes had already been applied).
+
+So yeah, that's something else that we would appreciate feedback on. Do any of the above approaches seem reasonable? Do you have other suggested approaches that we haven't considered?
+
+-------------------------
+
+timo | 2024-01-26 12:57:31 UTC | #32
+
+[quote="free, post:26, topic:26920"]
+The reason why we proposed a small request-small response approach is that it allows providing canisters with guaranteed incoming and outgoing quotas (whether in terms of messages or bytes).
+[/quote]
+
+Could you elaborate a little more on the the differences between sending under the small request-small response approach vs the current approach? In my understanding when I schedule a call it first goes into a out-queue which belongs to my canister and which lives in my canister's memory. In both approaches I am the sole controller of that space and if there isn't any space then the call fails synchronously. So far there is no difference between the approaches.
+
+Then from there it goes to the subnet and I can be confronted with noisy neighbours on my subnet. What exactly is the difference now assuming noisy neighbours? I believe in the current approach my message will remain in my canister's own queue indefinitely. And in the small request-small response approach a certain quota of my messages will make it through "fast". Is that right?
+
+Then at the destination side I believe I have no guarantees because the quotas that we are talking about are not "point to point". So I could have other canister on my subnet or on a different subnet overloading my target canister and then even the small requests will be delayed indefinitely, right?
+
+But when there is a response then I will get it fast again because of the quota. Or not? I find it hard to imagine any guarantees of quotas when it goes cross-subnet. I can imagine a guarantee relative to the other 100k canisters on the same subnet. But my target subnet could be hammered by traffic from arbitrarily many other subnets.
+
+-------------------------
+
+free | 2024-01-26 16:24:23 UTC | #33
+
+[quote="timo, post:32, topic:26920"]
+In my understanding when I schedule a call it first goes into a out-queue which belongs to my canister and which lives in my canister’s memory. In both approaches I am the sole controller of that space and if there isn’t any space then the call fails synchronously. So far there is no difference between the approaches.
+[/quote]
+
+Not exactly. Because messages are always resident in memory (whether they are in canister queues or in subnet streams) we keep track of all message memory utilization across the subnet. So that message's memory utilization counts against your canister's memory utilization; but it also counts against the subnet's memory utilization from the moment you make the call. Actually, if it's a request, we make a 2 MB reservation for the expected response and that is what we account for as the memory utilization of the request, regardless of how small it is. As soon as some memory limit is hit, your request will fail synchronously
+
+[quote="timo, post:32, topic:26920"]
+I believe in the current approach my message will remain in my canister’s own queue indefinitely.
+[/quote]
+
+Again, not exactly. If a request makes it into your canister's output queue, it will eventually be routed into the appropriate stream (unless it times out before that, which happens after 5 minutes). The destination subnet will then attempt to induct it and, unless there isn't enough memory for it, likely succeed.
+
+[quote="timo, post:32, topic:26920"]
+And in the small request-small response approach a certain quota of my messages will make it through “fast”. Is that right?
+[/quote]
+
+Unfortunately, no (I'm running out of ways to start my answers disappointingly (o: ). The subnet cannot guarantee that your messages will make it through "fast". Even if it did, at 50 kB per canister and 100k canisters, that would be 5 GB worth of messages. If the other subnet had no other messages to induct (no ingress, no calls from other subnets) that would be at least 20 minutes. But since the other subnet may have arbitrarily many other messages to handle, it will take arbitrarily long to deliver even your 50 small message quota.
+
+What this quota guarantees is that you can make the 50 calls without failing synchronously. Not that they will be delivered. Fast or ever.
+
+We are considering introducing bidding for message prioritization (which would actually make it very likely that your message is delivered "fast", whatever that means), but right now we're doing round-robin across canisters when routing into streams and some sort of round-robin over streams (with a new randomly picked starting point every time) when including them into blocks.
+
+So basically we have no quota of any kind now and no deadline for delivery. When you make a call, it may fail synchronously, it may time out after 5 minutes if the stream is backlogged; or it may be rejected when inducting it at the receiver end. You are guaranteed to get a response (whether from the local timeout; from the failure to induct it on the other side; execution trapping; or the callee producing a response), but again there cannot be any kind of guarantee regarding how long it takes to deliver it back to you.
+
+With both of the newly proposed models (best effort and small guaranteed response) you would have a quota limited to how many calls you can make before they may start failing synchronously; and how many concurrent calls you can handle before they start being rejected by the system. But you still have no guarantee regarding "fast" delivery, because that is impossible to provide. Bidding on call priority (which would likely apply to both the request and the response) might change that. But even if we implement it, it will be a long way off.
+
+-------------------------
+
+levi | 2024-01-26 20:55:12 UTC | #34
+
+In my current thinking (not final), Option #1 that you mentioned would make the callee dependent on the caller and that sounds like a bad tanglement and like you mentioned, would require all methods to account for a possible (uncontrollable by the callee) trap in the final response message. 
+
+Option #3 sounds better than #1 but would remove the guarantee that there will be one globally unique response for this message type, and would remove the guarantee that once the call reaches the callee, the caller will always receive the response produced by the callee. 
+
+Option #2 sounds best in my current view. I think the system-level guarantee of the globally unique response for the small-guaranteed-message type where once the call reaches the callee, the caller will always receive the response produced by the callee, is a great help for the canister-writer and a good tool to help make sure the state of both canisters can never be out-of-sync. I think of it in the same way that the system makes sure to reserve the caller's cycles for a response when an outgoing call is made, to make sure the caller will be able to handle the response.
+
+[quote="free, post:31, topic:26920"]
+Do you have other suggested approaches that we haven’t considered?
+[/quote]
+
+None that I can think of at the moment, I'll post if I do.
+
+[quote="free, post:31, topic:26920"]
+However, this does require all callees that want to support small guaranteed messages to actively do something about it (i,e, it is opt-in). Which, in the best case, means that it will take a long time before small messages become a significant fraction of the IC traffic.
+[/quote]
+
+At least for me, knowing that the "old" (current as of the time of this post) message type will cost up to 1000x more puts a big pressure to opt-in to the new message types. I for one will do so as soon as possible.
+
+-------------------------
+
+free | 2024-01-26 21:21:19 UTC | #35
+
+[quote="levi, post:34, topic:26920"]
+I think the system-level guarantee of the globally unique response for the small-guaranteed-message type where once the call reaches the callee, the caller will always receive the response produced by the callee, is a great help for the canister-writer and a good tool to help make sure the state of both canisters can never be out-of-sync.
+[/quote]
+
+A great help, yes. A guarantee, no. If the caller traps while handling the response (which may happen through no fault of its own, e.g. if the subnet storage fills up) it will be as if it never received that response. Another way of looking at it is that response delivery is only guaranteed if you can ensure you never trap (which is not under your control). It's a minute possibility, but it is not zero. Which means it's not a guarantee, just very likely.
+
+[quote="levi, post:34, topic:26920"]
+At least for me, knowing that the “old” (current as of the time of this post) message type will cost up to 1000x more puts a big pressure to opt-in to the new message types.
+[/quote]
+
+Only the message memory will become more expensive. Initiating the call will continue to be the majority of the cost, as long as your call doesn't take hours to complete.
+
+-------------------------
+
+levi | 2024-01-26 22:16:17 UTC | #36
+
+[quote="free, post:35, topic:26920"]
+If the caller traps while handling the response (which may happen through no fault of its own, e.g. if the subnet storage fills up) it will be as if it never received that response. Another way of looking at it is that response delivery is only guaranteed if you can ensure you never trap (which is not under your control).
+[/quote]
+
+The canister can reserve the memory it needs in the canister-settings. The stable_grow api returns a result that the canister can handle without trapping. This is within the canister's control. Are there specific examples where the canister can trap from something outside the canister's control? If so I want to know about them.
+
+-------------------------
+
+free | 2024-01-27 12:22:39 UTC | #37
+
+[quote="levi, post:36, topic:26920"]
+Are there specific examples where the canister can trap from something outside the canister’s control? If so I want to know about them.
+[/quote]
+
+It may well be possible to cover all these edge cases (I might not even know all of them). But the fact that you can reserve the memory you think you need is not exactly a mathematical certainty that you will never run out of memory. E.g. every request in your input queue currently makes a 2 MB reservation in your output queue. So if someone floods you with requests, your canister memory usage could easily (temporarily) jump by tens of GB. Considering that a subnet only provides a total of something like 600 GB of storage (I don't remember the exact number), this means that only a few dozen canisters per subnet could even reserve sufficient memory to prevent this eventuality, But subnets support up to 100k canisters.
+
+Similarly, you can always run out of cycles. Yes, you can go to great lengths to avoid it, but it's not precisely a guarantee. Not in the same sense that e.g. atomic message execution; or Ethereum's atomic transactions are.
+
+To put it differently, I would think twice about trusting my life savings to a blackholed DeFi app (i.e. one that could not be upgraded and did not support any form of manual intervention) that relied exclusively on guaranteed responses for correctness / consistency.
+
+-------------------------
+
+timo | 2024-01-28 10:14:28 UTC | #38
+
+[quote="free, post:33, topic:26920"]
+Unfortunately, no (I’m running out of ways to start my answers disappointingly (o: ).
+[/quote]
+
+Not disappointing at all. I knew my understanding was wrong and I am grateful to have my misunderstandings corrected.
+
+So in summary, the difference the current behaviour and small request-small response approach lies in less synchronous sending failures, respectively even guaranteed no synchronous failures up to the quota.
+
+In my thinking I was just mislead by taking the viewpoint of a single canister. When you take 2MB each for 500 messages you get 1GB and that appears small relative to heap memory limit (4GB) and stable storage limit. But of course if 100k canisters do the same thing then the story is different. 100k canisters cannot all allocate 2MB for a message at the same time. But they also cannot all have a few MB of wasm memory. The limit in both cases is subnet memory.
+
+So is it fair to say that if a subnet runs into synchronous message sending failures due to subnet memory limits then its canisters will likely also run into memory grow errors? Because they are both caused by the same limit?
+
+-------------------------
+
+timo | 2024-01-28 10:29:51 UTC | #39
+
+[quote="free, post:26, topic:26920"]
+If your calls fail synchronously, you will pretty much be forced to terminate the call context. Which makes it impossible to provide a reliable synchronous API (make call, receive response) and would force callers to poll for the status of their requests; and callees to use an event loop driven by timers/heartbeats.
+[/quote]
+
+One more question here. I am not arguing against the proposed new approaches, just trying to understand the rationale in detail.
+
+Here, I think you mean the situation in which a canister receives a call and wants to make a downstream call which fails synchronously. Now the canister has to terminate the call context (respond) because there is nothing else it can do. A retry does not make sense if making the call just failed synchronously. Now the caller has to retry later. But with the small request-small response approach I can still have asynchronous failures. So what exactly is gained by it? The situation seems to be the same. Or is the difference that after an asynchronous failure it makes sense to retry so the canister does not have to terminate the call context right away?
+
+I have the feeling I did not understand your scenario or who the caller/callee are and what the call context is. Can you elaborate please?
+
+-------------------------
+
+free | 2024-01-28 11:00:56 UTC | #40
+
+[quote="timo, post:39, topic:26920"]
+A retry does not make sense if making the call just failed synchronously. Now the caller has to retry later. But with the small request-small response approach I can still have asynchronous failures. So what exactly is gained by it?
+[/quote]
+
+This is all fine in the trivial case where your canister acts as more or less of a proxy to a single downstream canister (maybe also doing something on the side, such as recording the payment, if that's what it is). But if you e.g. consider the case of a DEX or any canister that makes multiple downstream calls in a multipart transaction; and the first call succeeded; and now the second call fails synchronously, you will be forced to essentially commit half a transaction. (Or fall back on timers and asynchronous APIs.) Whereas if the second call fails asynchronously, you have the option of retrying until it eventually succeeds. And still provide a straightforward synchronous API.
+
+[quote="timo, post:38, topic:26920"]
+So is it fair to say that if a subnet runs into synchronous message sending failures due to subnet memory limits then its canisters will likely also run into memory grow errors? Because they are both caused by the same limit?
+[/quote]
+
+Yes, if the subnet runs into one of its resource limits and your canister does not have an allocation for said resource (e.g. you can allocate storage but, for now, you cannot allocate message memory), then whatever it was you were doing will either return an error (if it's some explicit API) or trap (if you're allocating memory on the heap).
+
+-------------------------
+
+levi | 2024-01-29 00:58:57 UTC | #41
+
+[quote="free, post:37, topic:26920"]
+It may well be possible to cover all these edge cases (I might not even know all of them). But the fact that you can reserve the memory you think you need is not exactly a mathematical certainty that you will never run out of memory. E.g. every request in your input queue currently makes a 2 MB reservation in your output queue. So if someone floods you with requests, your canister memory usage could easily (temporarily) jump by tens of GB.
+[/quote]
+
+A subnet running out of memory due to input/output queues filling up will not cause a canister to trap mid-execution. It would only cause synchronous outgoing call error results which the canister can handle without trapping and it would cause a canister to not be able to receive incoming calls at the method entry points but again would not cause a canister to trap mid-execution by something outside the canister's control. 
+
+[quote="free, post:37, topic:26920"]
+Similarly, you can always run out of cycles. Yes, you can go to great lengths to avoid it, but it’s not precisely a guarantee.
+[/quote]
+
+A canister (or a canister author/maintainer) is able to make sure that there is always enough cycles and also can check with the canister_balance api in case of trying to send cycles or create a canister with cycles. This is still within the canister's control.
+
+I think I know what is going on here. Even though there are no specific cases where a canister could trap mid-execution by something outside the canister's control, you would still hold the assumption that it could happen. It looks to me like this is because there is no claim on the contrary anywhere in the protocol spec, so as the good engineer that you are, you assume the worst case. In this case however, that assumption is not held by DFINITY as a whole as the evidence by the ckBTC minter canister's code shows (as spoken about in [the last thread](https://forum.dfinity.org/t/question-about-message-guarantees/21367/14?u=levi)) where the ckBTC minter does rely on the guarantee that a canister cannot trap mid-execution by something outside the canister's control and thereby does rely on the response guarantee of the ckbtc-ledger's-response to make sure it mints 1:1 btc for ckbtc.
+
+If you are now thinking about designing the scalable message model around the assumption that a canister could trap mid-execution by something outside the canister's control, and therefore, the assumption that current responses are not guaranteed because if a canister can trap mid-execution by something outside the canister's control, then that means that the trap can happen while handling a response, making it as if the response never reached the canister, then this would worsen the fragmentation even more. It is good that now this underlying question is being brought to the surface so we can settle this matter and create harmony between the canister implementors (ckBTC canister implementers) and the replica implementers (the execution team). The one location that is the authority of the contract between the canister implementors and the replica implementors is the ic interface-specification.
+
+Hi @bjoern, and @mraszyk, Does the protocol guarantee that a canister will not trap mid-execution by something outside the canister's or canister-maintainer's control? Or does the protocol allow for the possibility of a canister to trap mid-exection by something outside the canister's control? 
+
+There is a big difference between these two statements with far reaching consequences in different directions depending on which statement is correct.
+
+Once the correct statement is chosen, it fits into the interface-spec as the single and final authoritative source of the contract between the replica implementers and the canister implementers.
+
+-------------------------
+
+mraszyk | 2024-01-29 07:38:39 UTC | #42
+
+[quote="levi, post:41, topic:26920"]
+Does the protocol guarantee that a canister will not trap mid-execution by something outside the canister’s or canister-maintainer’s control? Or does the protocol allow for the possibility of a canister to trap mid-exection by something outside the canister’s control?
+[/quote]
+
+A canister can trap in the middle of its message execution at least in the following cases:
+
+- the canister runs out of WASM heap memory (4GB): then the canister traps whenever the WASM tries to allocate more WASM heap memory
+- the subnet runs out of memory available for canisters: then the canister traps whenever the WASM tries to allocate more WASM heap memory (although here one can argue that using an explicit memory allocation this can be mitigated)
+- it runs out of instructions (although here one can argue that using the performance counter system API, the canister can detect that this is approaching)
+
+-------------------------
+
+timo | 2024-01-29 08:16:38 UTC | #43
+
+[quote="levi, post:41, topic:26920"]
+[quote="free, post:37, topic:26920"]
+Similarly, you can always run out of cycles. Yes, you can go to great lengths to avoid it, but it’s not precisely a guarantee.
+[/quote]
+
+A canister (or a canister author/maintainer) is able to make sure that there is always enough cycles and also can check with the canister_balance api in case of trying to send cycles or create a canister with cycles. This is still within the canister’s control.
+[/quote]
+
+Since the conversation was specifically about responses: When a message is sent out there are cycles reserved for the processing of the response, so that even if the canister is stopping or frozen then the response will still get processed.
+
+I am also very interested in how a response could fail because I have been designing all my protocols around the assumption that they won't. It seems to me what remains, outside the developer's control, is this one:
+
+[quote="mraszyk, post:42, topic:26920"]
+the subnet runs out of memory available for canisters: then the canister traps whenever the WASM tries to allocate more WASM heap memory (although here one can argue that using an explicit memory allocation this can be mitigated)
+[/quote]
+
+It might be hard to exclude the possibility that memory has to grow during the response. Even the tiniest temporary heap allocation can cause it. Most likely, the runtime will already make an allocation when parsing the value carried by the response. For practical purposes at least this is outside the developer's control. Hence, an explicit memory allocation with a large enough margin seems to be the only way to mitigate it.
+
+-------------------------
+
+timo | 2024-01-29 08:45:27 UTC | #44
+
+[quote="free, post:40, topic:26920"]
+But if you e.g. consider the case of a DEX or any canister that makes multiple downstream calls in a multipart transaction; and the first call succeeded; and now the second call fails synchronously, you will be forced to essentially commit half a transaction. (Or fall back on timers and asynchronous APIs.) Whereas if the second call fails asynchronously, you have the option of retrying until it eventually succeeds. And still provide a straightforward synchronous API.
+[/quote]
+
+OK, I understand the scenario and problem now but am not convinced about the argument. I agree that if the failure is asynchronous then I have more options. The advantage comes the fact that an asynchronous failure takes time so it functions like a "timer" to reschedule a subsequent attempt at a later time that can also keep the call context open (something a real timer cannot). By retrying multiple times spaced apart in time I increase the chances of success, so I increase the chance that my synchronous API can report success. But I cannot retry indefinitely, i.e my synchronous API cannot guarantee success. It still has to account for a failure possibility. I can reduce the frequency of failure and thus can improve the average user experience. But from an API design standpoint I still have to account for the possibility of the failure that you describe, where I get stuck with a half committed transaction and have to exit the call context in that state. I end up having to provide a solution just like I have to with synchronous failures, for example putting unfinished tasks in a backlog and having a way to trigger processing the backlog in a different call context. In summary I understand that I may be able to improve average user experience but don't see a difference in terms of implementation complexity. I don't follow the argument that this new approach let's me "provide a straightforward synchronous API" where the old approach doesn't.
+
+-------------------------
+
+bjoern | 2024-01-29 09:10:54 UTC | #45
+
+[quote="levi, post:41, topic:26920"]
+Does the protocol guarantee that a canister will not trap mid-execution by something outside the canister’s or canister-maintainer’s control? Or does the protocol allow for the possibility of a canister to trap mid-exection by something outside the canister’s control?
+[/quote]
+
+Following up to what Timo and Martin have already said: If you consider the "wasm-level execution," a canister does not "just trap" in the middle of an execution due to random external influences. So it is technically possible to build a canister that does not trap. But it's still hard due to the reasons Alin, Martin, and Timo have already stated; the canister has to be very precise in managing its resources (memory, cycles per execution, cycles balance) as well as consider carefully which APIs are safe to call. Practically, hardly any canister would meet these criteria and thus building the canister defensively so it does not rely on this strong consistency seems a commendable approach.
+
+-------------------------
+
+oggy | 2024-01-29 11:37:05 UTC | #46
+
+[quote="levi, post:34, topic:26920"]
+Option #3 sounds better than #1 but would remove the guarantee that there will be one globally unique response for this message type, and would remove the guarantee that once the call reaches the callee, the caller will always receive the response produced by the callee.
+[/quote]
+
+I like this option best because I think it's quite a nice practical compromise. In many cases, just looking at the callee's interface (e.g., its `.did` file), the caller can already know that the callee will produce small responses in the success case. For example, the ICRC-1 and the ICP ledger return just a number in the case the call succeeds. In theory they may return a larger response in case of a failure, as they can return strings, but at this point the caller likely doesn't care so much why the request failed. This way the caller doesn't have to wait on the callee to upgrade before they can start using small guaranteed responses. And note that this doesn't preclude further user-level aids where the callee could explictly indicate maximum response sizes in its Candid defs, and where Motoko and the CDKs could do some compile-time safety checks based on that.
+
+[quote="levi, post:34, topic:26920"]
+Option #2 sounds best in my current view. I think the system-level guarantee of the globally unique response for the small-guaranteed-message type where once the call reaches the callee, the caller will always receive the response produced by the callee, is a great help for the canister-writer and a good tool to help make sure the state of both canisters can never be out-of-sync.
+[/quote]
+
+If the callee tries to produce a larger response despite its promise, the system would still generate a synthetic reject response, so in a way it wouldn't be globally unique. And assuming that we let the callee trap, it's a more draconian failure mode than a soft failure of converting the response. But granted, it's a violation of a promise.
+
+-------------------------
+
+free | 2024-01-29 11:55:40 UTC | #47
+
+[quote="timo, post:44, topic:26920"]
+I end up having to provide a solution just like I have to with synchronous failures, for example putting unfinished tasks in a backlog and having a way to trigger processing the backlog in a different call context.
+[/quote]
+
+Thing is, if you take that approach (and IMHO anything dealing with non-trivial amounts of tokens/cycles should), the API provided by your canister is now by definition asynchronous: on the happy path it is "make a call, get a response"; but if there's a non-zero chance that it can return an "oops, transaction still in progress" response, then for the caller it is not materially different from the possibility of getting a timeout response (maybe with a bit more context, such as a transaction ID).
+
+I guess my point is that the existing messaging model and the newly proposed additions all live in a gray area and (IMHO, not speaking for anyone else) it is wrong to expand any guarantee actually provided by the spec/system (such as the existing response delivery guarantee; or the proposed call quotas) beyond their very narrow, very specific definitions. Specifically, I wouldn't expand the response delivery guarantee into a "consistency across canisters" guarantee; just as I wouldn't interpret the call quotas as guaranteeing correct and consistent fully synchronous APIs.
+
+-------------------------
+
+free | 2024-01-31 10:42:11 UTC | #48
+
+Since there appears to be general agreement that the additions we suggested to the messaging model are likely to be useful; and the discussion mostly consisted of questions and the pros and cons of specific design alternatives; we will be submitting an NNS motion proposal soon (aiming for this Friday). The text of the proposal will be based on the post at the top of this thread. And will link back to this thread for further discussion.
+
+We very much appreciate all the feedback we got so far and look forward for continued community input.
+
+-------------------------
+
+levi | 2024-01-31 10:54:41 UTC | #49
+
+Thanks guys for your responses and clarifications, knowing for a fact the protocol specifics is a great help.
+
+[quote="bjoern, post:45, topic:26920"]
+If you consider the “wasm-level execution,” a canister does not “just trap” in the middle of an execution due to random external influences. So it is technically possible to build a canister that does not trap. But it’s still hard due to the reasons Alin, Martin, and Timo have already stated; the canister has to be very precise in managing its resources (memory, cycles per execution, cycles balance) as well as consider carefully which APIs are safe to call.
+[/quote]
+
+I think a big point here is that this fact puts both the control and the responsibility at the same time into the hands of the canister to make sure the canister handles it's messages without a trap. 
+
+[quote="free, post:47, topic:26920"]
+it is wrong to expand any guarantee actually provided by the spec/system (such as the existing response delivery guarantee; or the proposed call quotas) beyond their very narrow, very specific definitions.
+[/quote]
+
+I for sure do not want to expand/assume on the guarantees. Is it correct to say for a fact (for the current messaging guarantees that exist at the time of this post) that it is the canister's responsibility and it is within the canister's control to make sure it does not trap while handling a response, and it is the protocols responsibility to make sure to deliver (and only deliver) the correct globally-unique response?
+
+-------------------------
+
+timo | 2024-01-31 11:47:19 UTC | #50
+
+I have a question related to the proposal for best effort messages. They a) introduce a timeout response and b) do not guarantee uniqueness (callee may respond but caller sees timeout). I haven't thought through examples to see the usefulness. But my question is what about an approach with timeouts but uniqueness? So that the caller can always tell if the callee has processed the message or not. If there is congestion and a timeout happens, no matter where, then at least the responses are very small because they only contain the timeout error. So hopefully it would be easy to deliver them. 
+
+Has this been considered? Or is it too close to the current model? In the current model can time out in the  caller's output queue but not later. So their return time is unbounded which can be a problem for applications.
+
+-------------------------
+
+free | 2024-01-31 13:03:28 UTC | #51
+
+[quote="levi, post:49, topic:26920"]
+Is it correct to say for a fact (for the current messaging guarantees that exist at the time of this post) that it is the canister’s responsibility and it is within the canister’s control to make sure it does not trap while handling a response, and it is the protocols responsibility to make sure to deliver (and only deliver) the correct globally-unique response?
+[/quote]
+
+The protocol provides a hard guarantee regarding response delivery. And it provides a hard guarantee regarding atomically persisting changes resulting from executing said response **if the canister does not trap** while executing it.
+
+But there is no explicit guarantee to the effect of "it is within the canister’s control to make sure it does not trap while handling a response". I suppose that it is a design goal to avoid to the extent possible trapping while handling responses (it is e.g. why cycles are set aside for executing the response as part of making a call). But the spec is just not detailed enough to be able to guarantee it. (Nor should it, IMHO, as that level of detail would inevitably prevent meaningful and necessary protocol development.)
+
+So while I'm not 100% sure about this, it may even be possible to ensure that your canister never traps **if it executes on the current replica version**. But it is just as possible that a replica change that is entirely within spec and otherwise harmless (e.g. increasing the instruction cost of something or other) will push your carefully managed and tuned canister over the limit and cause it to trap. With new replica versions released once a week.
+
+To put it differently, **this is an assumption** you are free to make when designing your dapp (just as, to pick a random example, payment providers implement a transaction deduplication window of N days, under the assumption that all transactions will complete within less than N days). But **it is not a guarantee** in the same way that response delivery is a guarantee.
+
+-------------------------
+
+free | 2024-01-31 13:21:11 UTC | #52
+
+[quote="timo, post:50, topic:26920"]
+But my question is what about an approach with timeouts but uniqueness? So that the caller can always tell if the callee has processed the message or not.
+[/quote]
+
+We have considered something similar, namely, within the context of guaranteed response delivery, allowing callers to set a deadline on the whole call tree resulting from a call; and when that deadline was exceeded, to synchronously fail any downstream calls and force the call tree to unroll from the bottom up. On paper it sounded like a really nice idea, but it would basically guarantee that multipart transactions would end up in an inconsistent state (same first part committed, second part failed scenario as above, but with a hard guarantee that you could neither roll back nor forward). And it still wouldn't provide a meaningful time bound, since an arbitrarily deep tree would have to be rolled up completely, and a message scheduled and executed for every call in said tree)
+
+Now thinking of your suggestion, the time bound guarantee would be even weaker: as long as the request was not yet delivered, you would get a timeout response guaranteeing non-delivery within however long it would take to deliver that response cross-subnet. But as soon as the request was delivered and started execution, all bets are off. Which might still be useful within the context of a scenario where you control both caller and callee (or at least trust the callee and know its worst-case behavior). But not very useful outside of that very specific use case.
+
+Thinking about it some more, if you control both caller and callee, you may even design a protocol of your own with deadlines attached to calls; and if the timeout was the same for all calls targeting a given callee, you would get behavior that was very similar to the system timing out your request while still in-flight.
+
+-------------------------
+
+levi | 2024-01-31 13:44:50 UTC | #53
+
+[quote="levi, post:41, topic:26920"]
+Hi @bjoern, and @mraszyk, Does the protocol guarantee that a canister will not trap mid-execution by something outside the canister’s or canister-maintainer’s control? Or does the protocol allow for the possibility of a canister to trap mid-exection by something outside the canister’s control?
+[/quote]
+
+[quote="bjoern, post:45, topic:26920"]
+If you consider the “wasm-level execution,” a canister does not “just trap” in the middle of an execution due to random external influences. So it is technically possible to build a canister that does not trap. 
+[/quote]
+
+[quote="free, post:51, topic:26920"]
+But there is no explicit guarantee to the effect of “it is within the canister’s control to make sure it does not trap while handling a response”.
+[/quote]
+
+[quote="free, post:51, topic:26920"]
+the spec is just not detailed enough to be able to guarantee it.
+[/quote]
+
+@bjoern is your above statement a guarantee of the spec? Can you write down in the spec whether it is or isn't within the canister’s control to make sure it does not trap while handling a response?
+
+-------------------------
+
+levi | 2024-01-31 14:00:58 UTC | #54
+
+[quote="free, post:51, topic:26920"]
+But there is no explicit guarantee to the effect of “it is within the canister’s control to make sure it does not trap while handling a response”.
+[/quote]
+
+[quote="free, post:51, topic:26920"]
+To put it differently, **this is an assumption** you are free to make when designing your dapp
+[/quote]
+
+I do not want to make any assumptions. I want to build on the facts of the protocol specification. If there is no explicit guarantee, then can there be an explicit non-guarantee written down in the spec?
+
+-------------------------
+
+infu | 2024-01-31 14:27:40 UTC | #55
+
+Can we get a table like this (for one canister):
+
+Values are in messages/sec.
+Limits measured by calling a simple function at (B) that returns something right away.
+
+|   | Before  | Jan 2024 | with proposed changes  |
+|---|---|---|---|
+|  one way A -> B |  ? |  ? | ?  |
+|  one way A -> B (diff subnet) |  27 m/s |  ? | ?  |
+|  A -> B | ?  |  ?  | ?  |
+| A -> B (composite query) | ? | ? | ? |
+|  A -> B (diff subnet) | ?   | ?  | ?  |
+| A -> any | ? | ? |  ? |
+| A -> any (diff subnet) | ? | ? |  ? |
+| ..add more... | ? | ? | ? |
+
+We conveyed a test ~ 40 days ago and it showed something like 27 m/s for "one way A -> B (diff subnet) ". It was throwing errors when new calls were made - "one way call limit reached"
+
+-------------------------
+
+free | 2024-01-31 17:02:37 UTC | #56
+
+The changes to the messaging model are not about increasing throughput. Taking this to the extreme, if we consider that introducing new message types will require adding one or two more fields (guaranteed/best-effort flag; deadline) to message headers, one could actually argue that there will be a minute reduction in raw throughput.
+
+The point of best-effort messages is (to allow for) improvements in fairness and latency. While guaranteeing time bounds for responses and per-canister quotas; and reducing costs (or at least keeping them flat). Small guaranteed response messages only address the latter two issues (guaranteed quota and low cost).
+
+E.g. assume a large user-facing application consisting of multiple canisters (e.g. a sharded ledger or document storage) under very high load. With guaranteed responses your canisters' queues may be clogged with responses going back and forth long after everyone has given up refreshing their browsers. Whereas if your canisters were using best effort messages, much of that backlog would disappear within tens of seconds or minutes; and part of the user traffic would still make it through. Or simply consider calling out to untrusted canisters. Ot ensuring timely upgrades. And so on and so forth.
+
+Looking at your specific test, even though it's not entirely clear from your description, I believe that you ran into the backpressure limit: we allow up to 500 in-flight calls between a pair of canisters, beyond which any new calls will fail synchronously. Otherwise you may end up in the situation where canister A produces a request to canister B every second (e.g. from a heartbeat); and canister B needs 2 seconds to produce a response (or, equivalently, the system requires 2 rounds to deliver one response because they are huge); the resulting backlog will grow indefinitely. Especially when using guaranteed response calls We have no plans of increasing that 500 in-flight calls limit.
+
+Edit: We do have ideas about how to increase XNet throughput (by using a side-channel to transfer data between subnets; and only including payload hashes into blocks), but that is not part of this proposal. And it is unfortunately not a trivial addition.
+
+-------------------------
+
+bjoern | 2024-02-01 10:09:03 UTC | #57
+
+[quote="levi, post:53, topic:26920"]
+@bjoern is your above statement a guarantee of the spec? Can you write down in the spec whether it is or isn’t within the canister’s control to make sure it does not trap while handling a response?
+[/quote]
+
+The spec describes when and why a wasm module can trap. So yes, it is a guarantee of the spec that, on the wasm level, canisters do not "just trap." Note that depending on things like the CDK used, it may not be trivial to translate the same guarantees to the higher levels.
+
+-------------------------
+
+levi | 2024-02-01 10:25:18 UTC | #58
+
+Awesome, thank you for that clarification :pray:.
+
+-------------------------
+
+levi | 2024-02-01 10:52:47 UTC | #59
+
+So now that we know it is guaranteed in the spec that it is within the canister's control to make sure it does not trap while handling a response, and we know that with the current messaging guarantees, the replica makes sure to deliver the one single globally-unique response, therefore my current feedback is that I will not be switching to any new message types that removes or changes these facts.
+
+-------------------------
+
+derlerd-dfinity1 | 2024-02-01 13:08:40 UTC | #60
+
+Note that the proposed changes are completely independent of whether or not it is possible to write a canister that avoids trapping while handling a message. If anything the new message types make it slightly easier to ensure that a canister doesn't trap in certain situations.
+
+Also putting it explicitly here, just in case people are worried: there is no intention to change anything with respect to the spec'ed behavior of canisters in terms of (not) "just trapping" randomly. I think the above discussion is very interesting because it points out a couple cases where it is far from trivial to actually ensure not trapping in practice (and despite having a spec conformant replica implementation), but I'd suggest to keep the two discussions separate from each other.
+
+-------------------------
+
+free | 2024-02-02 10:51:04 UTC | #61
+
+The NNS motion proposal [is live](https://nns.ic0.app/proposal/?u=qoctq-giaaa-aaaaa-aaaea-cai&proposal=127668), voting is open for the next 4 days.
+
+-------------------------
+
+tiago89 | 2024-02-02 11:55:56 UTC | #62
+
+I agree with this change and endorse it.
+
+I come from a Web2 experience doing a lot of integrations, and a lot of the "pain" came from handling all the possible errors, edge cases. We could never "prepare well enough", it was crucial to have proper alert / logging systems.
+
+For the "best effort" system to be a success, we definitely need the "canister logging on traps" and proper handling of these fails (sleep + retry nr as mentioned).
+
+Please kindly prioritise these before the release of wide changes in networking. :pray:
+
+-------------------------
+
+free | 2024-02-02 12:24:18 UTC | #63
+
+[quote="tiago89, post:62, topic:26920"]
+For the “best effort” system to be a success, we definitely need the “canister logging on traps” and proper handling of these fails (sleep + retry nr as mentioned).
+[/quote]
+
+There is already [work in progress](https://forum.dfinity.org/t/canister-logging-support-community-consideration/25571) to preserve and expose logs, with explicit coverage for traps.
+
+For alerting, you can expose standard Prometheus metrics via an HTTP endpoint (e.g. [here](https://rrkah-fqaaa-aaaaa-aaaaq-cai.raw.ic0.app/metrics) are the NNS governance canister metrics). The only thing you should be careful about is to explicitly attach timestamps to every sample, so if you hit a replica that is significantly behind the rest of the subnet you get a gap instead of an out-of-order sample.
+
+-------------------------
+
+abk | 2024-02-13 09:39:46 UTC | #64
+
+@here - if you're interested in this topic, we'll have a [presentation and discussion](https://forum.dfinity.org/t/technical-working-group-scalability-performance/14265/86?u=abk) about it this Thursday.
+
+-------------------------
+
+derlerd-dfinity1 | 2024-05-23 07:20:09 UTC | #65
+
+Hello everybody,
+
+it has been quite a while since we shared the last update on the new messaging model so we thought we’d provide a quick update on the progress of the currently ongoing implementation of messages with best effort responses.
+
+1. The system API changes required to expose the new message type to canisters are done and hidden behind a feature flag.
+2. On top of this, we plan to expose the feature in CDKs behind a similar feature flag for early developer feedback already before the feature will be available on mainnet.
+3. The core changes to support best effort responses are also progressing well. This includes (quite fundamental) changes to canister queues and other related data structures to support the new message types. The strategy here is to develop data structures that are functionally equivalent to the current canister queues but also support the new message types. They exist in parallel to the current ones but remain unused until everything is sufficiently tested. Then there will be a switch from the old to the new ones. This way things can gradually go to master. So watch out for queue related changes in case you’re interested to follow the progress.
+
+Finally note that 2 is not blocked by 3, so if everything goes according to plan canister devs will be able to prepare their canisters and provide feedback even before the feature implementation is fully done.
+
+-------------------------
+

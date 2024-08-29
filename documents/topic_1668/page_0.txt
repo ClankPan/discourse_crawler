@@ -1,0 +1,241 @@
+d2k | 2020-12-18 10:48:33 UTC | #1
+
+Hi, 
+I need some real random bytes generated.
+I read https://sdk.dfinity.org/docs/base-libraries/random but I am not sure that I 100% understand some of the mentioned constrains.
+
+Can someone share and example / explain how I get a list of N random bytes in the correct way?
+Thanks in advance
+
+-------------------------
+
+Fulco | 2020-12-23 23:21:17 UTC | #2
+
+I think it is not really about how you obtain the random bytes but how you use them. If you want a list of random bytes you could call let `blob : shared () -> async Blob` first then use that blob to create a Finite object and call byte() on the finite object until the entropy is depleted (32 times). If you need more you can repeat the process. 
+
+However if you would want to run an online casino for example. You would first need to let everyone place there bets and only afterwards generate these random bytes to decide the outcomes.
+
+-------------------------
+
+d2k | 2021-01-08 10:58:08 UTC | #3
+
+I don't get it working :-(.
+
+Could someone share the code for a function to get an array of 32 random bytes?
+
+-------------------------
+
+enzo | 2021-01-09 02:13:03 UTC | #4
+
+    actor {
+
+      let SubnetManager : actor {
+        raw_rand() : async Blob;
+      } = actor "aaaaa-aa";
+
+      public func get_bytes() : async Blob {
+        let bytes = await SubnetManager.raw_rand();
+        return bytes;
+      };
+    };
+
+-------------------------
+
+d2k | 2021-01-09 09:56:36 UTC | #5
+
+works :slight_smile:  - thanks!
+
+Did I had a chance to figure this out from the current documentation? 
+If yes, can you point me to it please.
+
+-------------------------
+
+enzo | 2021-01-09 12:20:10 UTC | #6
+
+It is well documented in "The IC Public Specification", but despite the name this spec is not yet public. :(( According to [this](https://medium.com/dfinity/announcing-internet-computer-mainnet-and-a-20-year-roadmap-790e56cbe04a) blog post it should be released very soon though, and probably even this month!
+
+-------------------------
+
+d2k | 2021-01-09 15:48:37 UTC | #7
+
+Thanks for the info - good that it is published soon. 
+You feel sometimes quite stupid if you can't figure out things ;-)
+
+-------------------------
+
+d2k | 2021-01-10 09:57:44 UTC | #8
+
+So finally I came up with:
+
+    import Word8 "mo:base/Word8";
+    import Array "mo:base/Array";
+    import Iter "mo:base/Iter";
+
+    actor RandomBytpes {
+
+        let SubnetManager : actor {
+            raw_rand() : async Blob;
+        } = actor "aaaaa-aa";
+
+        func blobToArray(blob : Blob) : [Word8] {
+            return Iter.toArray(blob.bytes());
+        };
+
+        public func get_bytes(n : Nat) : async [Word8] {
+
+            var r : [Word8] = [];
+            var ct : Nat = 0;
+
+            while (ct < n) {
+                let bytes : Blob = await SubnetManager.raw_rand();
+                let bytes_array : [Word8] = blobToArray(bytes);
+                var ba_ct : Nat = bytes_array.size();
+                while (ct < n and ba_ct > 0) {
+                    r := Array.append(r, Array.make(bytes_array[ba_ct-1]));
+                    ct += 1;
+                    ba_ct -= 1;
+                };
+            };
+            return r;  
+        };
+
+    };
+
+there might be more elegant ways but it is working for now.
+What can be observed is that due to the 32 limit for random the generation longer byte arrays take reasonable time as each iteration will take some sec.
+just compare the runtime of
+`dfx canister call random get_bytes 190`
+and 
+`dfx canister call random get_bytes 32`
+
+-------------------------
+
+enzo | 2021-01-11 02:20:47 UTC | #9
+
+Dunno that this is much better... 
+
+    import Array "mo:base/Array";
+    import Iter "mo:base/Iter";
+    import Option "mo:base/Option";
+    import Random "mo:base/Random";
+
+    actor {
+      public func getBytes(n : Nat) : async [Word8] {
+        let m = (n + 31) / 32;
+        var chunk = Iter.fromArray<Word8>([]);
+        let beacons = Array.init(m, chunk);
+        for (i in Iter.range(0, m - 1)) {
+          beacons[i] := (await Random.blob()).bytes();
+        };
+        let source = Iter.fromArrayMut(beacons);
+        Array.tabulate<Word8>(n, func _ {
+          switch (chunk.next()) {
+            case (?x) x;
+            case (null) {
+              chunk := Option.unwrap(source.next());
+              Option.unwrap(chunk.next())
+            }
+          }
+        })
+      };
+    };
+
+-------------------------
+
+d2k | 2021-01-11 07:20:02 UTC | #10
+
+Thanks for that but overall the patter of runtime seems to be the same - where I can only run this locally so far. Hope to get access to the network soon - as it was announced to me in Dec.
+
+$ ./run_getBytes.sh 
+Mon Jan 11 08:05:21 CET 2021
+32 bytes start
+(
+  blob "\37\28\e1\ea\3d\ad\b1\5c\38\4e\e5\4a\66\d0\e0\c6\ba\ab\f0\5f\5c\cf\c3\83\b3\77\53\ea\46\2f\75\7c",
+)
+Mon Jan 11 08:05:28 CET 2021
+64 bytes start
+(
+  blob "\da\41\67\a0\8b\7c\c6\97\3a\53\a9\fd\ec\61\b9\cd\a0\db\a5\40\86\73\2b\e4\5f\b9\f7\2e\b1\47\5b\8a\74\b6\87\1a\7b\76\51\b0\4e\9e\52\2d\f0\73\ee\b2\bf\5a\22\0c\8d\8c\17\c6\63\4b\7a\47\7a\0b\de\69",
+)
+Mon Jan 11 08:05:38 CET 2021
+128 bytes start
+(
+  blob "\b2\c5\2b\e3\35\18\02\f3\60\ad\4f\64\40\a3\95\9e\45\ff\c7\f5\c1\09\cb\a7\6e\ca\1e\fd\6b\b8\01\b7\7c\6d\6d\24\74\6f\bb\d5\0f\8f\74\f8\42\1b\de\45\4a\06\e0\43\2d\6b\1f\b3\8e\d2\73\67\90\9e\2b\7d\71\54\81\d6\13\8e\4f\7b\c8\52\12\f6\bf\7f\ee\dc\4f\a5\84\15\56\ff\65\2c\ad\49\9c\71\d5\55\2b\3f\2a\3a\ed\c2\73\24\95\42\24\0f\cd\48\60\e1\5e\b6\e0\81\41\d2\94\9d\75\a3\69\b0\a4\81\79\93\68\d6",
+)
+Mon Jan 11 08:05:54 CET 2021
+256 bytes start
+(
+  blob "\06\5a\a2\13\96\f3\2e\d2\3d\4e\a1\fb\32\fe\c6\67\95\dc\74\11\77\f6\2e\25\73\50\73\f6\d7\76\fd\43\6e\49\26\71\7e\00\b0\da\8b\fa\65\ba\63\53\15\97\80\66\a0\e7\c3\42\cd\a9\c2\f0\58\8b\37\50\7f\79\54\4e\0e\f2\4f\63\f4\e2\56\42\53\e7\d7\6d\4c\99\7a\81\f5\76\99\fe\5d\49\f7\21\45\58\ea\b5\06\16\43\96\95\23\09\05\c1\d8\fa\d6\34\b8\67\66\bc\ca\10\72\64\c5\77\59\58\3f\6a\17\9e\03\48\82\95\75\63\4a\57\a4\b2\8b\95\c1\7a\04\99\4c\91\3b\68\85\c4\1b\10\b6\43\c8\64\13\95\84\50\64\9a\4f\e7\03\52\9c\32\fb\4d\9c\a1\9e\fa\dc\5d\48\d2\f4\2c\c1\65\a9\e9\04\5b\1c\c4\b1\a9\43\f1\ed\e0\4c\a5\d5\da\e5\2a\eb\84\1b\9b\31\c8\a5\91\c6\39\76\cf\ab\a2\d9\64\4c\ee\59\63\23\2f\b7\21\4e\51\a4\d1\36\4f\54\4a\bf\3b\b2\3b\34\96\2b\61\4c\9f\d7\95\c6\ca\cc\1a\ca\28\c3\ba\ff\35\8d\f2\56\9b\25\dc\25",
+)
+Mon Jan 11 08:06:22 CET 2021
+
+-------------------------
+
+alexa.smith | 2021-01-11 16:54:24 UTC | #11
+
+@d2k you can follow the instructions [here](https://sdk.dfinity.org/docs/quickstart/network-quickstart.html) to deploy to the Sodium network today. We will be providing more details in the coming weeks for mainnet onboarding, so stay tuned!
+
+-------------------------
+
+d2k | 2021-01-12 07:35:27 UTC | #12
+
+doesn't work for me 
+```
+dfx ping ic
+```
+returns 
+   ` "ic_api_version": "0.14.0"  "impl_hash": "40d5e890ae5c3558fbb4281ec04a5c0d0c1c0104012a33dfc8ecb0445057f405"  "impl_version": "0.1.0"`  
+but
+`dfx deploy --network=ic`
+raises an error
+`The replica returned an HTTP Error: Http Error: status 400 Bad Request, content type "", content: [66, 97, 100, 32, 82, 101, 113, 117, 101, 115, 116]`
+
+I got an email in December which states:
+" * For developers who use DFX_VERSION to access new versions of dfx that have not yet been promoted to “latest,” please refrain from doing so for V0.6.16 or V0.6.17. If you install either of these versions, you will not be able to deploy to the Internet Computer network. Both versions can be used for local development, but you will need to rebuild your canisters.
+* With this change, you will lose access to the wallet canisters that were created for your old principal ID on the ic network. Because wallets are not currently required to make calls or deploy canisters to the ic network, this change should not affect your ability to continue developing, deploying, and testing canisters locally or on the ic network."
+And didn't got any update afterwards - so I guess this is still true as I am on 0.6.16. Correct?
+
+-------------------------
+
+enzo | 2021-01-12 13:19:53 UTC | #13
+
+Might be good to move this conversation to a separate topic.
+
+-------------------------
+
+Fulco | 2021-01-26 17:25:37 UTC | #14
+
+What are you using the bytes for? perhaps you could create more random bytes by continually hashing the original random bytes with `func hash(i : Nat) : Hash`   and   `let toNat : Word32 -> Nat`?
+
+-------------------------
+
+d2k | 2021-01-26 18:29:01 UTC | #15
+
+I still would prefer to get some cryptographic good enough random bytes. Therefore I came up with a sha256 based iteration of an initial set of random bytes. This might be good enough for the time being. 
+But it also comes with some costs - it works well for 10000 bytes. But I run out of token for 20000 ;-).
+So costs infos gets more interesting :upside_down_face:
+
+public func randomWord8sFromInitViaSHA256(n: Int, start : [Word8]) : [Word8] {
+        var r : [Word8] = [];
+        var ct : Int = 0;
+        var bh : [Word8] = start;
+        while (ct < n) {
+            var a: [Word8] = Array.append(bh, start);
+            bh :=  Sha256.sha256(a);
+            var bh_ct : Nat = bh.size();
+            while (ct < n and bh_ct > 0) {
+                r := Array.append(r, Array.make(bh[bh_ct-1]));
+                ct += 1;
+                bh_ct -= 1;
+            };
+        };
+        return r;
+    };
+
+public func getBytesViaSHA256(n : Nat) : async [Word8] {
+    let start : [Word8] = Iter.toArray((await Random.blob()).bytes());
+    return RL.randomWord8sFromInitViaSHA256(n, start);
+ };
+
+-------------------------
+

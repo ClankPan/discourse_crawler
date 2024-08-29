@@ -1,0 +1,93 @@
+peterparker | 2023-12-16 08:39:53 UTC | #1
+
+Following my [thread](https://forum.dfinity.org/t/getting-heap-and-stable-size/25533) about how to get the size of the heap and stable memory of a canister, I developed such an endpoint:
+
+```
+#[query]
+fn memory_size() -> MemorySize {
+    MemorySize {
+        heap: wasm_memory_size(0) * WASM_PAGE_SIZE_IN_BYTES,
+        stable: stable_size() as usize * WASM_PAGE_SIZE_IN_BYTES,
+    }
+}
+```
+
+For test purposes, I deployed it to an existing canister (`fqotu-wqaaa-aaaal-acp3a-cai`) on mainnet. To my surprise, I got the following usage as a result:
+
+```
+{
+stable:117506048
+heap:141426688
+}
+```
+
+Both numbers seem to be correct, given that `canister_status` returns 259 MB.
+
+While I can understand the heap size, as there are a few data on the heap including the dapp assets, I'm really surprised to notice that the stable memory consumes 117 MB when I do not use stable memory at all for this canister.
+
+Sure, I declare a few `StableBTreeMap`, but those are empty. Moreover, to proof that those are empty, I exposed a debug endpoint that returns the length (`map.len()`) of the three stable tree map used in the canister and those are indeed empty.
+
+```
+{
+db:0
+assets:0
+content_chunks:0
+}
+```
+
+Any idea why stable memory is consumed? Is some memory page reserved in advance?
+
+-------------------------
+
+peterparker | 2023-12-16 09:04:39 UTC | #2
+
+I'm not sure why 117 MB is being consumed, but I did find a reason for 89 MB of that memory usage. The canister writes and reads to stable memory in the pre/post_upgrade hook when the canister code is upgraded. Since the memory used for this purpose is never freed, it remains consumed.
+
+My implementation doesn't have anything unusual and follows the [example](https://github.com/dfinity/stable-structures/blob/main/examples/src/quick_start/src/lib.rs) of the stable structure crate.
+
+@ielashi, similar to the [answer](https://forum.dfinity.org/t/free-memory-of-hashmap/25568/2?u=peterparker) you gave me the yesterday, I assume there's no way to free the memory of a `VirtualMemory<DefaultMemoryImpl>`, right?
+
+And btw., do you have an idea what is the reason for the 28 MB remaining consumed given that none of the other memory holds data?
+
+```
+// in WASM pages
+{
+db:1
+assets:1
+upgrade:1371
+content_chunks:1
+}
+```
+
+-------------------------
+
+ielashi | 2023-12-17 12:45:09 UTC | #3
+
+Hey @peterparker, virtual memories (i.e. `VirtualMemory<..>`) grow in 8MiB increments by default. So, even if you just declare a `StableBTreeMap`, that would be sufficient to to grow its virtual memory by 8MiB.
+
+Keep in mind that stable memory never shrinks (at least for now), so even if there's a way to free a virtual memory, that won't actually reduce memory usage.
+
+Would these two points help explain your canister's memory usage?
+
+-------------------------
+
+peterparker | 2023-12-17 12:56:52 UTC | #4
+
+It definitely explains it. There are four `StableBTreeMap`, given the 8 MB default, it explains the 28-isch MB difference I was looking for, thanks!
+
+Regarding "memory never shrinks", do you know if this will ever be an option or do you think that will never be possible?
+
+-------------------------
+
+ielashi | 2023-12-17 15:29:52 UTC | #5
+
+It is in theory possible of course, and I think we've seen some cases where it's really needed.
+
+-------------------------
+
+peterparker | 2023-12-17 17:06:22 UTC | #6
+
+If you discover a way to do this, or if it ever becomes feasible, please inform me, especially for Juno's heap size; that would be useful.
+
+-------------------------
+

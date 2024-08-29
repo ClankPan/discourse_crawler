@@ -1,0 +1,85 @@
+senior.joinu | 2022-10-21 12:03:51 UTC | #1
+
+Hey there. There is this relatively new thing in Rust that is called [MaybeUninit](https://doc.rust-lang.org/nightly/std/mem/union.MaybeUninit.html). 
+
+Basically it could help saving a couple of bucks reading data from stable memory. Can we get that in `ic-cdk-rs`? I can't find a way to use it currently, since `stable_read` only accepts `&mut [u8]` as an argument.
+
+-------------------------
+
+lwshang | 2022-10-21 16:10:37 UTC | #2
+
+Could you elaborate about what you want to achieve?
+
+IIUC, `MaybeUninit` is used in unsafe code. While the stable memory module is a safe abstract over system API which implemented standard `Read`/`Write` traits. So it's unlikely to incorporate `MaybeUninit` with stable memory.
+
+-------------------------
+
+senior.joinu | 2022-10-21 21:31:48 UTC | #3
+
+When you read from stable memory, you do something like this:
+```rust
+let mut buf = vec![0u8; size];
+stable_read(offset, &mut buf);
+```
+You create a buffer (maybe a big one), __you initialize it with zeros__ (sequentially setting every byte to 0) and then you read. This initialization step is a waste of performance, since you are going to rewrite those zeros with the content of stable memory anyway.
+
+This is a known pattern in Rust and MaybeUninit is the tool to solve this problem.
+Basically it allows your program to work with uninitialized memory in a type-safe way. 
+
+I'm thinking of something like this:
+```rust
+let mut vec = MaybeUninit::new(Vec::<u8>::with_capacity(size));
+stable_read_uninit(vec.as_mut_ptr());
+```
+
+_______________
+P.S.
+
+It is possible to fix this performance inperfection without MaybeUninit, like this
+```rust
+let mut buf = Vec::<u8>::with_capacity(size);
+unsafe { buf.set_len(size) };
+ 
+stable_read(offset, &mut buf);
+```
+
+But this is the real unsafe code here.
+
+-------------------------
+
+AdamS | 2022-10-21 22:36:53 UTC | #4
+
+Are you seeing the zeroing step performed in bitcode? That's nearly always optimized out.
+
+-------------------------
+
+lwshang | 2022-10-21 22:39:39 UTC | #5
+
+There is a nightly-only feature for this purpose: https://doc.rust-lang.org/std/io/trait.Read.html#method.read_buf
+
+You should be able to use `read_buf` with a nightly rust toolchain.
+
+-------------------------
+
+senior.joinu | 2022-10-22 11:19:52 UTC | #6
+
+[quote="AdamS, post:4, topic:16041, full:true"]
+Are you seeing the zeroing step performed in bitcode? That’s nearly always optimized out.
+[/quote]
+
+Doubt. Why would the compiler optimize it in such a way? Everything it sees is that someone creates a buffer and gives a mutable pointer to that buffer to some FFI. 
+
+What if this FFI does nothing with the buffer and returns it back? The user would end up with an uninitialized buffer, that they were explicitly trying to initialize? 
+
+I'm not entirely sure, since I didn't perform any bitcode inspect, but coming from a simple logic it seems like there should definitely be an initialization step in it.
+
+[quote="lwshang, post:5, topic:16041, full:true"]
+There is a nightly-only feature for this purpose: [Read in std::io - Rust](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_buf)
+
+You should be able to use `read_buf` with a nightly rust toolchain.
+[/quote]
+
+Thanks! Gonna try it out.
+
+-------------------------
+

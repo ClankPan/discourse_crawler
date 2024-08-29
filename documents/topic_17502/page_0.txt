@@ -1,0 +1,105 @@
+icme | 2022-12-17 01:05:01 UTC | #1
+
+## Proposal
+
+The errors thrown by canisters on the IC should include **the specific error code** dictating why the error was thrown in addition to the reject code.
+
+Many of us wanting to build robust systems know there are different reasons why an inter-canister call might fail, and some of our workflows (integrations between canisters) might expect these errors. However, there are some types of errors that canister may expect, and others that canisters will never expect, which should be caught and alerted to the developing team ASAP.
+
+The IC reject codes are too broad and categorical (only 1-6) for canisters to know exactly why a message or process failed, and needing to programmatically parse through the reject text of an error to figure out what happened is not only burdensome, it's a fragile solution - any updates to the text error message could be considered a breaking change.
+
+## Background
+
+On the IC, when canisters make inter-canister calls there's a chance of these calls failing for one of many reasons.
+
+These reasons, or `ErrorCode`s can be found here
+https://github.com/dfinity/ic/blob/7919a756d3b2925a9bc5068f1cf50256c57bfbf9/rs/types/error_types/src/lib.rs#L115
+
+
+When an inter-canister call throws an error on the IC, canisters are currently only explicitly exposed to reject codes
+
+https://github.com/dfinity/ic/blob/7919a756d3b2925a9bc5068f1cf50256c57bfbf9/rs/types/error_types/src/lib.rs#L19
+
+You also receive different error messages if calling a canister from outside the IC vs. from a canister (on the IC). For example, let's take the following case calling a canister from outside the IC.
+
+
+These come with accompanying "reject text" error messages that one has to parse through in order to extract the error code. For example, in the case below parsing the reject text you'll find a 501.
+
+```
+Error: Call was rejected:
+Request ID: 6c6d2f761b741…9866dcd61e900cb
+Reject code: 4
+Reject text: IC0501: Canister jjmme-aqaaa-aaaai-ab5ya-cai is out of cycles: requested 893853709998 cycles but the available balance is 893857809998 cycles and the freezing threshold 2057103111 cycles
+```
+
+However, if I'm communicating from a canister in Motoko and I catch an `Error` object, I can call `Error.code` to get the reject code or call `Error.message(error)` to get the reject text. That reject text for the same error looks like this:
+
+```
+Canister jjmme-aqaaa-aaaai-ab5ya-cai is out of cycles: requested 893853709998 cycles but the available balance is 893857809998 cycles and the freezing threshold 2057103111 cycles
+```
+
+
+Another example of the error messages not providing an error code with the reject text. For example, in the case what should be a 512 (CanisterInvalidController) a canister parsing the `Error` with `Error.message(error)` will get
+```
+Only the controllers of the canister r7inp-6aaaa-aaaaa-aaabq-cai can control it.
+Canister's controllers: rwlgt-iiaaa-aaaaa-aaaaa-cai 7ynmh-argba-5k6vi-75frw-kfqpa-3xtca-nmzk3-hrmvb-fydxk-w4a4k-2ae
+Sender's ID: rkp4c-7iaaa-aaaaa-aaaca-cai
+```
+
+-------------------------
+
+icme | 2023-01-06 17:47:16 UTC | #2
+
+Tagging @derlerd-dfinity1 @roman-kashitsyn for visibility :)
+
+-------------------------
+
+roman-kashitsyn | 2023-01-07 06:56:33 UTC | #3
+
+Thanks for the proposal, @icme!
+
+I added error codes to the certified tree some time ago (that’s why dfx calls can display them). We also discussed giving canisters access to these codes with @bjoern at the time, but didn’t get to implementing this feature.
+
+My idea was to add new system API that returns the error code as a string if you access it from a reject callback. Something like that:
+```
+ic0.msg_reject_error_code_size : () -> i32;
+ic0.msg_reject_error_code_copy : (dst: i32) -> ();
+```
+In fact, my idea was a bit bolder: I would allow canisters attaching custom error codes to reject responses:
+```
+ic0.msg_reject_error_code : (src : i32, len : i32) -> ();
+```
+
+The receiver can distinguish canister error codes from system error codes by looking at the reject code: if it’s CANISTER_REJECT, then the error code can be custom. Otherwise, it’s a system error code.
+
+-------------------------
+
+icme | 2023-01-16 03:21:28 UTC | #4
+
+[quote="roman-kashitsyn, post:3, topic:17502"]
+`ic0.msg_reject_error_code : (src : i32, len : i32) -> ();`
+[/quote]
+
+Awesome, just to clarify -  in this case I'm assuming that `src` represents the `RejectCode` and `len` represents the `ErrorCode` - is that correct? As you said, this would then allow the developer to differentiate error codes thrown by `CanisterReject` vs. `CanisterError`.
+
+I personally haven't seen any of reject codes 1-3 yet, so I can't speak on the error codes that may accompany those classifications of errors.
+```
+    SysFatal = 1,
+    SysTransient = 2,
+    DestinationInvalid = 3,
+```
+
+Roping in @claudio to coordinate this work and the API so that it can easily extend the existing Motoko [`Error` API](https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/base/Error) to include these error codes.
+
+-------------------------
+
+roman-kashitsyn | 2023-01-17 20:40:10 UTC | #5
+
+[quote="icme, post:4, topic:17502"]
+Awesome, just to clarify - in this case I’m assuming that `src` represents the `RejectCode` and `len` represents the `ErrorCode` - is that correct?
+[/quote]
+
+`src` represents the memory address from which the replica should copy your error code, and `len` is the length of this error code. The idea is that a canister should be able to set custom error codes in rejects. For example, the Governance canister could send you "GOV123" and the reject code would still be `CanisterReject`.
+
+-------------------------
+

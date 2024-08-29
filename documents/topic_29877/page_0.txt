@@ -1,0 +1,113 @@
+icme | 2024-04-21 04:32:55 UTC | #1
+
+I for the past ~35 minutes I noticed a few IC applications returning the following error through a frontend browser client:
+
+```
+  Code: 429 (Too Many Requests)
+  Body: load_shed: Overloaded
+```
+
+Additionally, one of our health check processes received the a similar error when attempting to call health check endpoints.
+
+It seems like the issue has been resolved now (not receiving this error currently), but figured I'd bring it up.
+
+Edit: nvm still receiving this error when using certain apps.
+
+-------------------------
+
+rbirkner | 2024-04-21 06:51:38 UTC | #2
+
+Hey @icme 
+
+I just checked and there was the one boundary node in Seattle, which was returning an increased number of 429s from around 3AM UTC to 5:30AM UTC. When looking at the observed latencies, it looks like during that time the routing changed and the latencies doubled, which lead to 429s (around 20 per seconds, while the nodes was receiving about 150 requests per second).
+
+I guess you observed it on some dapps and not on others due to the DNS loadbalancer. Sometimes you would pick the node in Seattle and sometimes you would pick the other 4 nodes in that pool.
+
+-------------------------
+
+icme | 2024-04-21 22:26:05 UTC | #3
+
+[quote="rbirkner, post:2, topic:29877"]
+it looks like during that time the routing changed and the latencies doubled, which lead to 429s (around 20 per seconds, while the nodes was receiving about 150 requests per second)
+[/quote]
+
+Can you elaborate on the part about the routing changing? Is that something that is regularly scheduled, and when it happens will the latency always increase immediately afterwards?
+
+Is there anything that can be done to mitigate the latency/429 rejections from happening?
+
+-------------------------
+
+rbirkner | 2024-04-22 07:52:23 UTC | #4
+
+Hey @icme 
+
+The increased latency can have many reasons:
+
+* *Routing*: The boundary nodes sit in a DC connected to the rest of the Internet through an ISP. The ISP is again connected to other (usually) larger ISPs, etc. The routes between the ISPs can always change (e.g., switching to a cheaper upstream ISP or some outage) and a change in route will lead to a different latency -- if the data packets take a longer path, it takes longer for them to arrive.
+* *Congestion*: If there is a lot of traffic along the route, the buffers start to fill up and that increases the latency.
+* *Endhost configuration* (unlikely since we didn't change anything on our during that time): The configuration of the networking stack can also impact the performance.
+* *Overload* (the node was not even close to capacity in this instance): When there are more requests coming in than a boundary node can handle, the requests are being queued and wait until the node gets around to process them. 
+
+What can be  done about it:
+
+* *At the boundary nodes*: The boundary nodes monitor the latency and have a target latency. If the latency is consistently exceeding the target latency, they start to shed load as it can be a sign of being overloaded. This event showed that the defined target latency is maybe to strict and starts load shedding to quickly.
+* *At the client*: You **could** direct your requests to one specific boundary node that is not returning 429s. This can be done by identifying the IP addresses of the boundary nodes and fixing DNS resolution to that node (e.g., by specifying it in `/etc/hosts` for UNIX-based systems). I want to emphasize that this is really a **could**/a hack and is not the solution: the boundary nodes have to work in a way such that the client does not have to do anything.
+
+I hope this answers your questions. If not, let me know :)
+
+-------------------------
+
+rbirkner | 2024-04-22 08:05:34 UTC | #5
+
+And just as a follow-up:
+Our networking guys just forwarded me [this status from Cogent (Tier 1 ISP)](https://ecogent.cogentco.com/network-status) indicating that it was indeed a problem with an upstream ISP:
+> Cogent customers located in or routing traffic through the Pacific Northwest region may have experienced severe latency or observed service outages due to a backbone issue on the Cogent network between 4/20 11:20PM EDT and 4/21 1:45AM EDT (21 April 0320 - 0545 UTC). The issue has been resolved by our NOC.
+
+-------------------------
+
+icme | 2024-04-23 05:00:23 UTC | #6
+
+[quote="rbirkner, post:4, topic:29877"]
+*Routing*: The boundary nodes sit in a DC connected to the rest of the Internet through an ISP. The ISP is again connected to other (usually) larger ISPs, etc.
+[/quote]
+
+For someone not as familiar with the boundary node stack (such as myself), what purpose & functionalities does the domain controller (DC) provide in terms of serving requests to the boundary node?
+
+[quote="rbirkner, post:5, topic:29877"]
+[this status from Cogent (Tier 1 ISP)](https://ecogent.cogentco.com/network-status)
+[/quote]
+
+It seems the status page doesn't keep a history (status has been overridden, and is now pointing at a different issue due to a tree falling).
+
+![Screenshot 2024-04-22 at 21.51.25|690x298](upload://wWYny9VDMtlTwJFOoqcrqb6Zess.png)
+
+
+What's the SLA with the current ISP that the boundary nodes use? From browsing a few forums, it seems that ISP outage/latency incidents are infrequent, but definitely still happen from time to time.
+
+Does each boundary node use a different ISP, or is all the same global ISP? If so, is it possible for the Internet Computer to build in ISP redundancy?
+
+-------------------------
+
+rbirkner | 2024-04-23 07:50:54 UTC | #7
+
+> For someone not as familiar with the boundary node stack (such as myself), what purpose & functionalities does the domain controller (DC) provide in terms of serving requests to the boundary node?
+
+With DC I meant data center :) Sorry for using abbreviations. The data center is just the facility where the machine is hosted and connected to the Internet.
+
+> It seems the status page doesn’t keep a history (status has been overridden, and is now pointing at a different issue due to a tree falling).
+
+Sorry about that: The text they had, was the following:
+Cogent customers located in or routing traffic through the Pacific Northwest region may have experienced severe latency or observed service outages due to a backbone issue on the Cogent network between 4/20 11:20PM EDT and 4/21 1:45AM EDT (21 April 0320 - 0545 UTC). The issue has been resolved by our NOC.
+
+> What’s the SLA with the current ISP that the boundary nodes use?
+
+I am not sure about the SLAs. This is not my part of responsibility, but I would assume that the boundary nodes have pretty standard SLAs. Some of the boundary nodes are hosted as bare metal machines with Equinix. You could check what they provide.
+
+> Does each boundary node use a different ISP, or is all the same global ISP? If so, is it possible for the Internet Computer to build in ISP redundancy?
+
+Today's boundary nodes are hosted in different data centers across the globe and therefore also connecting through different ISPs to the Internet. For example, in this case only a single boundary node was affected by the outage of Cogent.
+
+In the future, API boundary nodes will be running on node machines operated by different node providers. Then,the boundary nodes are similarly decentralized as the replicas within a subnet today.
+
+-------------------------
+

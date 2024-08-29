@@ -1,0 +1,355 @@
+levi | 2021-09-22 12:57:06 UTC | #1
+
+Continuing the discussion from [Big Map (for scaling canisters across subnets)](https://forum.dfinity.org/t/big-map-for-scaling-canisters-across-subnets/6155/9):
+
+[quote="akhilesh.singhania, post:9, topic:6155"]
+beyond scaling a canister’s storage capacity, one may also want to scale a canister’s update throughput capacity
+[/quote]
+
+@akhilesh.singhania 
+Can you share some more specifics on the new challenges that having multiple threads brings? How is it different than having deterministic cross canister await calls? For this is something that if we solve, will let us build things like a serious browser or operating-system as a smart-contract and will let a single canister have the bility to take the full-computing-power (& full storage capacity) of the whole subnet.
+
+-------------------------
+
+free | 2021-09-25 21:52:57 UTC | #2
+
+Each update is deterministic. The outcome of multiple concurrent updates is not deterministic.
+
+E.g. assume an application that hands out tokens; and assume that a single token is left. If 2 clients try to acquire that token, there is no way to tell which of them will get it. Whether it's canister calls or concurrently issued ingress messages.
+
+If you look at the very limited case of 2 updates in a block, then yes, they are already ordered and the outcome is deterministic. But that's precisely because execution is serial. If it was parallel, either request may end up getting the token, so it would no longer be deterministic.
+
+There may be limited situations in which concurrency may work (e.g. drawing lottery tickets from a jar can be done concurrently with drawing cards from a stack). I.e. one could optimistically try to execute multiple updates concurrently as long as they don't try to write to the same memory location or read each other's writes. And if they do, then deterministically (e.g. based on their initial order) decide which one gets to proceed and which gets canceled. But it may be expensive (most updates may end up getting canceled) and it would require a lot of work to implement,
+
+-------------------------
+
+akhilesh.singhania | 2021-09-27 07:55:54 UTC | #3
+
+As @free replied above, the general problem is that there are multiple nodes on a subnet that are all executing the same wasm code.  At the end of executing a message, they all need to arrive at the same state.  This is important so that the nodes can all agree on what the state of the canisters and the subnet is.
+
+If all canisters are single threaded, then it is easy to guarantee this property.  As a given canister will only be executing a sequence of instructions in order.  However, if a canister can execute multiple threads concurrently, the exact sequence of instructions can be arbitrarily interleaved.  So determinism is not guaranteed out-of-the-box.  We would have to come up with some clever strategy to make the execution deterministic.  Happy to hear if you have any thoughts on it.
+
+-------------------------
+
+levi | 2021-09-28 16:18:36 UTC | #4
+
+@akhilesh.singhania @free Here is what I am thinking.
+
+There are two kinds of multi-threads that are possible and we can have both of them with the same solution.
+ 
+Multi-thread-type-~1: 
+ - New in-coming calls can spawn a new thread on a different core in the stead of waiting for the current-calls to finish. 
+
+Multi-thread-type-~2: 
+ - within a single in-coming call, a canister can spawn multiple threads to get its work done.
+
+For both of these scenarios, the thing we need to solve is: how to make sure that the canister's-state is in the synchronization a cross the threads. And we need a way for each node to come up with the same block-sequence so the subnet can consensus on the blocks. 
+
+Now let's clarify what is a canister's-state. A canister's-state consists of the two-parts:
+    ~1: a wasm heap
+    ~2: a stable-memory
+
+I will start with the stable-memory. For the cross-thread-synchronization & for the block-sequence(ordering) of the stable-memory: each live thread will have the bility to quest for a stable-memory-write. We will create a queue of the stable-memory-write-quests with a base on which **thread** quests for it first (not which call starts first). In the same way that the nodes concur bout the sequence of the in-coming-calls they will concur bout the sequence of the in-coming(from the threads)-stable-memory-write-quests. Threads quest for a stable-memory-write must contain an index range of the stable-memory that they want to write on. Threads can put themselves into the queue for a stable-memory-write with these 3 ways:
+~1. A thread can put a stable-memory-write onto the queue and wait for it to complete or error(if it tries to write too many bytes or in case the stable-memory couldn’t write for some other reason). 
+~2. A Thread can put itself into the stable-memory-write-queue and wait for a cross-thread-write-lock on an index range of the stable-memory that will give them a guarantee that it is the single current thread with the canister’s-stable-memory-write-permission (on that range), that the stable memory (of that range) will stay the same while they are holding the lock. Then they can read and write, do their commits, and then unlock it for the next thread in the queue. (It can have an automatic-unlock when the thread closes) 
+~3. A Thread can put a function into the queue with a possible-callback that will perform on the stable-memory when it’s run at it’s time in the queue. This function can have within it locks and unlocks and writes. This way a thread doesn’t have to wait for its turn. 
+
+Stable-memory-writes will have a sequence(the ordering) by this queue. Stable-memory-writes are atomic (in a case where a canister tries to write too many bytes or something like that). We will tweak the node-consensus-“Reputations”-scores to show the performance of the cores of the nodes. 
+
+This will give the canisters the clear-controll of the committ-point of the contract. A write to the stable-memory is a commit. 
+
+For the wasm-heap: the system will wipe the wasm-heap at the finish of each call and each call will start with a fresh-wasm-heap. 
+
+For the Languages like motoko that want to give a simpler contract writing usage, in the same-way that it handles stable-vars behind the scenes and does garbage-collection, it can lock and unlock the stable-memory when it sees that the contract needs to commit or it can lock the stable-memory the whole time of each call to give the same functionality as it has now. It can copy some part or the whole of the wasm-heap from the stable-memory at the begining or at some custom times in the middle of each call and then save some parts or the whole of the wasm-heap to the stable-memory at each call's-finish or at some custom times in the middle if it wants. A library in a language like rust (or any language) can give a simpler functionality (like lock the stable-memory during the whole time of each call and copy data-structures to and from the stable-memory at the beginning & finish of each call) or for someone who wants, to lock and unlock and quest for a stable-memory-write and commit the contract cross the threads with the manual-calls.
+
+-------------------------
+
+free | 2021-09-28 16:37:22 UTC | #5
+
+[quote="levi, post:4, topic:7471"]
+For the cross-thread-synchronization & for the block-sequence(ordering) of the stable-memory: each live thread will have the bility to quest for a stable-memory-write. We will create a queue of the stable-memory-write-quests with a base on which **thread** quests for it first (not which call starts first).
+[/quote]
+
+Consider the following situation: you have 2 incoming requests; you execute each on a separate thread.
+
+Replica 1 has no other threads/processes doing work at the time, so it actually executes both requests in parallel. Request A is a lightweight request so it enqueues a write to memory location M early on. Request B has a bunch of work to do and is the second to enqueue a write to memory location M. At the end of the round M contains the value written by B.
+
+Replica 2 also has no other threads/processed doing any work, so it starts executing A and B in parallel. But then a read-only query comes in via HTTP. The thread running A is preempted and the query runs on that core for a while. Request B completes the work it had to do and enqueues a write to memory location M. The query finishes, the thread running request A is resumed. Request A enqueues a write to memory location M. At the end of the round M contains the value written by A.
+
+Replicas 1 and 2 (let's consider they're the only ones on the subner) can't agree what the subnet state looks like at the end of the round, as each of them has a different state. The subnet stalls.
+
+Unfortunately you can't assume that 2 threads started concurrently will both run to completion in perfect parallel fashion and the one that's doing less work will always finish before the one doing more work. There are lots of things going on in a modern OS (or process) and the same sequence of inputs with just a millisecond of delay here and there may result in wildly different outputs.
+
+-------------------------
+
+levi | 2021-09-28 17:08:08 UTC | #6
+
+[quote="free, post:5, topic:7471"]
+Unfortunately you can’t assume that 2 threads started concurrently will both run to completion in perfect parallel fashion and the one that’s doing less work will always finish before the one doing more work. There are lots of things going on in a modern OS (or process) and the same sequence of inputs with just a millisecond of delay here and there may result in wildly different outputs.
+[/quote]
+
+
+Yes this
+
+[quote="levi, post:4, topic:7471"]
+We will create a queue of the stable-memory-write-quests with a base on which **thread** quests for it first (not which call starts first)
+[/quote]
+
+ should say: 
+
+Yes each node will give a different sequence of write quests (replica 1 will do A then B , replica 2 will do B then A) but the hashes of the write-quests will be the same, both nodes will give A and B as write quests. The subnet can then take those write quests and create a uniform-block-sequence of the writes that will then be passed back for each node to perform of the same sequence. A thread should not correlate it’s position in the write sequence with other threads. A thread can only guarantee the current-state when it holds the write-lock.
+
+This is what I mean when I say:
+[quote="levi, post:4, topic:7471"]
+In the same way that the nodes concur bout the sequence of the in-coming-calls they will concur bout the sequence of the in-coming(from the threads)-stable-memory-write-quests.
+[/quote]
+
+-------------------------
+
+free | 2021-09-28 20:49:50 UTC | #7
+
+What happens if thread A reads a memory address that is written to by thread B? Probably the simplest example is 2 threads incrementing a counter. By your approach, they would both read the current value, say `3`, and both would enqueue writes with a value of `4`. Whichever way those writes are ordered, the result will end up being `4` instead of `5`, which is what you'd expect.
+
+What about a canister that maintains a binary tree? Would nodes have to reach consensus after every change to the tree? Every time they descend into the tree? Executing a message that way may take tens of seconds.
+
+What happens if I have this tree:
+```
+  3
+ / \
+1   5
+```
+And two requests: one that removes the node `3` (replacing it with `5`) and one that inserts a node `4` as the left child of `5`. What happens if the second write is enqueued before the first?
+
+-------------------------
+
+levi | 2021-09-28 22:18:27 UTC | #8
+
+[quote="free, post:7, topic:7471"]
+What happens if I have this tree:
+
+```
+  3
+ / \
+1   5
+```
+
+And two requests: one that removes the node `3` (replacing it with `5` ) and one that inserts a node `4` as the left child of `5` . What happens if the second write is enqueued before the first?
+[/quote]
+
+ : 
+
+[quote="levi, post:4, topic:7471"]
+~2. A Thread can put itself into the stable-memory-write-queue and wait for a cross-thread-write-lock on an index range of the stable-memory that will give them a guarantee that it is the single current thread with the canister’s-stable-memory-write-permission (on that range), that the stable memory (of that range) will stay the same while they are holding the lock. Then they can read and write, do their commits, and then unlock it for the next thread in the queue. (It can have an automatic-unlock when the thread closes)
+[/quote]
+
+
+Both threads can get into the stable-memory-write-queue. Their position In the queue will be the same for each node in the subnet. The first thread will first hold a cross-thread-write-lock on the stable-memory, then read the tree, then write their write, then unlock the stable-memory-write for the next thread in the queue. While the first thread is holding the lock, the second thread is waiting for it. When the first thread unlocks the stable-memory-write, the second thread then holds the lock, then reads, then writes, then unlocks the stable-memory for the next thread in the queue. Threads can do minimal work while the lock is on (or send a function , see ~3 ) and do the rest of the work in the wasm-heap. The queue for the write-lock-hold and for the stable-memory-writes is the same single-file-queue with two kinds of items. The subnet will create blocks out if this single-file-queue. 
+
+[quote="free, post:7, topic:7471"]
+Would nodes have to reach consensus after every change to the tree? Every time they descend into the tree? Executing a message that way may take tens of seconds.
+[/quote]
+
+At each commit-point or block of the commit-points yes. Can you break down what takes how many seconds?
+
+-------------------------
+
+free | 2021-09-28 22:24:26 UTC | #9
+
+Consensus takes 1 second.
+
+Would you care to explain how you see the following working: a canister holds a linked list containing values 1 million items. Two transactions start executing in parallel: one increments every third value, one removes every second value.
+
+And in case your strategy is "one canister locks the whole memory, completes its work, then unlocks it", then how is it better (or different, really) than running the two transactions one after the other?
+
+-------------------------
+
+levi | 2021-09-29 01:15:04 UTC | #10
+
+[quote="free, post:9, topic:7471"]
+in case your strategy is “one canister locks the whole memory, completes its work, then unlocks it”, then how is it better (or different, really) than running the two transactions one after the other?
+[/quote]
+(I assume you mean “one thread locks the whole memory, …”)
+
+ it wouldn’t be better if you had to do a call like this but this setup lets canisters if they want make a call like this or if they want they can create stable memory lists and structures that don’t overlap on their writes or at least as little as possible so that they can each lock their own index ranges and those writes and write-locks can run in the parallel. We only need a single-file-queue for the writes and write-locks for the threads that want the same index-range of the stable-memory. It is better(and different) because both of those transactions would only need to get in a line for the linked-list(part of the stable memory), other transactions could write and write-lock other parts of the stable memory without waiting for either of these two calls. Of course if the linked list is the only data structure that every call needs then it is a simple contract and it will work the same as it does now [but faster(and different) because the way it is now , the whole transaction has to wait for the current one to finish, this way only the stable-memory-writes and locks of the same-stable-memory-location of the transaction have to get in a line] but if the canister is something like a browser or an operating-system or a stock-market, it can run its many parts in the parallel.
+
+-------------------------
+
+free | 2021-09-29 07:45:04 UTC | #11
+
+I don't see this working, honestly.
+
+First, what are we locking, whole memory ranges or individual addresses? If the former, then a linked list might well be spread across the whole heap (some entries got allocated early, when very little heap was in use, some only recently, towards the end of the 4 GB heap). If the latter, then we would need a lock for every byte (or maybe word) of memory. You've just doubled memory usage and forced every single write to go though a consensus round (i.e. every memory write takes 1 second).
+
+Second, you would also need to order memory reads, not just writes. And taking the "increment a counter" example, you don't want to order all reads, then order all writes. If I repeatedly increment the counter, I need at the very least to put every "read + write" cycle behind a lock. But maybe I don't want to increment the counter twice, read it back and find that its value has grown by 3. So then I have to hold on to the lock throughout the execution of my request. At this point I'm executing requests in sequence, with a lot of overhead (locking and unlocking every memory location I'm accessing) while keeping many cores idle, waiting to grab a lock, instead of executing transactions on other canisters.
+
+Third, I don't even know how I would write Rust (let alone Motoko) code that locks access to a given memory range. How do I figure out the memory range of a linked list or tree? How do I force the coder to lock every memory address it reads from? Some of those memory accesses may not even be obvious, because they're done by library functions.
+
+Fourth, with so many locks I'm virtually bound to deadlock the first time I run 2 transactions in parallel (because one thread will lock A then B, while the other will lock B then A and each will end up waiting for the other).
+
+Fifth, every lock that a request fails to acquire would need to create a "call context" (similar to what we have now when making a canister call; stack and other data, probably locks held), so it can be resumed from that state whenever the lock can be acquired or the memory write is applied. That call context needs to be persisted, hashed, certified every single round. That is huge overhead.
+
+AFAICT whatever this mechanism that allows multithreaded canisters is, it cannot include canister-controlled locking or it will be both inefficient and brittle. It would either need to be something fully automated, relying on orthogonal persistence (start the transactions in parallel and if they both touch the same memory address abort one of them (the "second", whatever that means). Or involve different heaps (which is how heap vs. stable memory is currently implemented) and only allow transactions that touch different sets of heaps to run in parallel. But the former will likely always result in starting 2 transactions and aborting one. And the latter would require specialized language features as e.g. Rust doesn't have a concept of multiple memory heaps.
+
+-------------------------
+
+free | 2021-09-29 10:12:35 UTC | #12
+
+Simply sharding your application into multiple canisters (say multiple "business logic" canisters backed by one "data" canister) and "co-locating" them onto the same subnet will give you most of the features of a multithreaded canister: you can execute transactions in parallel on the "business logic" canisters; then serialize reads from/writes to the data canister (because it's a single canister, so it's single-threaded); then get back your data and continue executing the rest of those transactions in parallel.
+
+Execution already has a feature whereby if it hasn't already executed 2B instructions in a round, it will circle back, route all outgoing messages to canisters on the same subnet into those canisters' input queues, and start another execution round (within the same consensus round). This way, assuming your canisters are not backlogged, you can execute the whole start transaction - read/write data - complete transaction (or something more complex) in a single consensus round, i.e. as fast as any straightforward transaction.
+
+-------------------------
+
+skilesare | 2021-09-29 10:49:13 UTC | #13
+
+[quote="free, post:12, topic:7471"]
+you can execute transactions in parallel on the “business logic” canisters; then serialize reads from/writes to the data canister (because it’s a single canister, so it’s single-threaded);
+[/quote]
+
+I love this answer in theory. One thing that would make this much easier is if it were possible to have sibling actors that always live together and don't have a high cycle fee for x-canister transactions. I don't know if this is possible or not, but in Motoko, it would be nice if I could declare two actors in the same file that act as different actors, but always live together and are really one canister.  Or the registry could be responsible for keeping spawns of the business logic canister right next to the one instance of the data canister.  This is really an important feature for all kinds of IC applications.
+
+-------------------------
+
+levi | 2021-09-29 15:57:26 UTC | #14
+
+[quote="free, post:11, topic:7471"]
+First, what are we locking, whole memory ranges or individual addresses?
+[/quote]
+I am thinking, at the start, the stable-memory-api is a simple vector of the bytes. And it has a certain size and it can grow and has an index of bytes like a list. The stable-memory-api has a method that a thread(or a call because a new call is a new thread) can use to first wait and then set a lock on an index range ( could be the current whole size of the canister’s-stable-memory-vector or could be a single byte or the thread can call for multiple locks or writes on a couple of different ranges and if it is waiting for all of them, it would only need to wait for the longest of the write-and-lock-queues if the ranges dont overlap because the stable-memory-vector write-and-lock queues and can run in parallel on different cores of the node for different ranges) of the stable-memory-bytes-vector. Later on we can make it so that the heap-data and its pointers and stable-memory-byte-vector can connect somehow but for the now we make it a simple byte vector. 
+
+[quote="free, post:11, topic:7471"]
+then we would need a lock for every byte (or maybe word) of memory.
+[/quote]
+At first I thought this but the system can keep track of the current(active) locks on the specific-index-ranges and make sure that a thread can’t set a lock if the lock-quest’s-index-range cludes one that is already in a lock by another thread. Without keeping a lock on every byte. Now that we make it so that one thread can write to the same stable-memory-index-range at a time, and that those writes and locks are put in a one-single-file-per-thread-sequence (for the same or overlapping ranges of the stable-memory) and that this sequence is consistent on each node of the subnet (see earlier post), the write-commits and the lock-holds(records of the lock holds of which thread held it in which sequence of which ranges) together (from the same single-file-sequence-queue of the same or overlapping ranges of the stable-memory) go into new blocks that the system makes and commits and gets consensus on. Once we have the single-file-line of the stable-memory-write-commits-and-lock-holds(-records) then the blocks and the consensus part stays the same. The cool part bout this is that these blockchains of the stable-memory-single-file-write-commits-and-locks can run(make blocks and get consensus) in the parallel on the different cores of the nodes as long as there is writes and locks being done on separate (non-overlapping) index-ranges of the stable-memory-byte-vector. 
+This will create a setup where simple canisters will run the same as they do now (but faster if they do some work on the call-parameter-data before they lock the stable-memory or after, then that work will have multithreaded throughput. Also if the thread doesn’t need to lock[write without lock] then most of the thread will run in the parallel.). 
+
+
+
+:Chains of the blocks running on the subnet:
+~1.  for the in-coming calls with their parameters and data (this one I think we don’t have to change how it works now), 
+~2. stable-memory-writes-and-locks (possible many parallel ones if different calls are writing/locking separate stable-memory-ranges), 
+~3. the subnet-sequencing of the threads’-quests for the stable-memory-writes-and-locks (see earlier post) (also possible many parallel ones if different calls are writing/locking separate stable-memory/ranges), 
+~4. Outgoing sponses back to the callers will go through the another round of the consensus. 
+
+This can be 4 seconds for a transaction. ?
+
+[quote="free, post:11, topic:7471"]
+while keeping many cores idle, waiting to grab a lock, instead of executing transactions on other canisters.
+[/quote]
+We can make cores do other transactions while a thread waits for either a lock or a write confirmation if we see that it will be waiting for enough time, and if it won’t then no time lost waiting anyway. And as soon as a thread unlocks, the next thread can continue.
+
+-------------------------
+
+levi | 2021-09-29 17:48:41 UTC | #15
+
+[quote="free, post:11, topic:7471"]
+Third, I don’t even know how I would write Rust (let alone Motoko) code that locks access to a given memory range.
+[/quote]
+
+Motoko should use the stable-memory-api in its compiler in the background to lock and unlock and read and write. Rust can use a library or the stable-memory-api. If you are talking about how to build the cross-thread-locks, rust is perfect for this task it has the tools to build this.
+
+
+[quote="free, post:11, topic:7471"]
+How do I figure out the memory range of a linked list or tree?
+[/quote]
+We can leave that up to the canister writer how to store things and get them back Into the stable-memory like how it is now, Motoko stores data-structures in the stable memory I am sure it keeps track of the index range of its data structures in the stable-memory.
+
+[quote="free, post:11, topic:7471"]
+How do I force the coder to lock every memory address it reads from?
+[/quote]
+Why? Let it read without a holding a write-lock if it wants. Let Motoko and cdks do it in the background.
+
+-------------------------
+
+levi | 2021-09-29 15:53:04 UTC | #16
+
+[quote="free, post:11, topic:7471"]
+Fourth, with so many locks I’m virtually bound to deadlock the first time I run 2 transactions in parallel (because one thread will lock A then B, while the other will lock B then A and each will end up waiting for the other).
+[/quote]
+
+Can you explain this one more?
+
+-------------------------
+
+levi | 2021-09-29 17:47:10 UTC | #17
+
+[quote="free, post:11, topic:7471"]
+Fifth, every lock that a request fails to acquire would need to create a “call context” (similar to what we have now when making a canister call; stack and other data, probably locks held), so it can be resumed from that state whenever the lock can be acquired or the memory write is applied. That call context needs to be persisted, hashed, certified every single round. That is huge overhead.
+[/quote]
+
+Can you say more specific how the overhead with this model would be any different than how it is now with the cross-canister and cross-subnet-calls?
+
+-------------------------
+
+free | 2021-09-29 18:04:49 UTC | #18
+
+I don't mean to be impolite or anything, but I don't have the time to continue this and (as I see it) it has lots of problems that won't be solved by making it even more complicated.
+
+To answer your last couple of questions: if you and I both need to hold locks A and B to do something and I grab A while you grab B, what next? The overhead wouldn't be conceptually different (except in having to keep track of possibly thousands of locks) but you'd have to create (and persist. and hash) a call context for every single memory access as opposed to every canister call.
+
+And finally, the reason why you need to hold locks (or keep track) on memory locations you've read from is my counter example: what happens if you and I both increment a counter by 1 concurrently? What is its final value?
+
+-------------------------
+
+levi | 2021-09-29 18:54:08 UTC | #19
+
+Thank you for your time thus far. 🙏 I will put my final words. 
+
+
+[quote="free, post:18, topic:7471"]
+And finally, the reason why you need to hold locks (or keep track) on memory locations you’ve read from is my counter example: what happens if you and I both increment a counter by 1 concurrently? What is its final value?
+[/quote]
+
+In these cases each of us will hold the lock but sometimes a thread might just want a read without a lock, like the latest market price. 
+
+[quote="free, post:18, topic:7471"]
+if you and I both need to hold locks A and B to do something and I grab A while you grab B, what next?
+[/quote]
+
+This is a good point. For a solution: 
+
+We can make it impossible for threads to deadlock by only letting threads hold one lock at a time, and each lock can have multiple-possible-stable-memory-index-ranges. A thread can put itself into the queue for **more than one index-range** (with a single-api-call) and when the write-and-lock-quests get put into a single-file-queue, it will make sure that the thread will get the locks for the Index range**s** that it needs at the same-time. That way there can never be a deadlock because if a thread wants to lock A and B it will have to ask for them at the same time , and this way the queue can give it A and B at the same-time.
+
+-------------------------
+
+akup | 2021-11-11 13:09:47 UTC | #20
+
+I would like to make a proposal of POSSIBLE multithreaded operation.
+
+A special canister function that is a pure function. it can be marked as pure_update or something like this at candid description.
+Purity of this function means that it can not read from stable memory (or even heap?) but can write to special Hash maps or Btree maps stored at stable memory, lists (unordered), and increment counters.
+
+The purity of the function will remove the side effects and need for thread synchronization. Moreover as it can write to maps, we can describe by candid what function parameter is a key and make it impossible to be called in parallel if kay parameter is the same.
+
+Example:
+I would like to log some action canister A do. Canister B has a defined pure function. Canister A can call async B pure_func and continue to run not waiting for its completion.
+
+What do you think?
+
+-------------------------
+
+free | 2021-11-12 07:29:10 UTC | #21
+
+Sounds like a reasonable proposal, I guess. (o:
+
+Simple enough to both prove its correctness and implement a clear API around. Thank you.
+
+I'll bring it up internally, see what other people think. It's not going to be high priority regardless (there are a bunch of things that need to be addressed yesterday, such as canister migration / subnet splitting, canisters holding ICP, etc.) but we can definitely think about it.
+
+-------------------------
+
+senior.joinu | 2021-11-15 11:58:42 UTC | #22
+
+Seems related
+https://forum.dfinity.org/t/the-complexities-of-supporting-multithreaded-canister-execution/7634
+
+-------------------------
+
+free | 2021-11-15 17:50:03 UTC | #23
+
+For the record, I did bring this up internally and, as expected, the agreement was that it is a good idea, but it's going to be a while before multithreading as a feature makes it anywhere near the top of the priority list.
+
+Thanks again.
+
+-------------------------
+

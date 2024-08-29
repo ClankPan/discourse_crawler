@@ -1,0 +1,68 @@
+lastmjs | 2024-04-01 16:37:34 UTC | #1
+
+I would like to initiate discussion of adding a synchronous `raw_rand` function call to the [System API](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api).
+
+Currently `raw_rand` can only be called asynchronously, and as far as I know it is the only way for a canister to retrieve "secure" (secure meaning it has the properties of randomness that the IC's VRF provides) randomness directly from the IC. Unfortunately because `raw_rand` is asynchronous, it cannot be called in `canister_init` or `canister_post_upgrade`, and I assume it also couldn't be called in `(start)`.
+
+This is problematic as a canister may have need for randomness synchronously during canister initialization. For example, Azle and Kybra both execute their respective source code entrypoints during canister initialization, and both must call `ic_wasi_polyfill::init` (which accepts a random seed) during initialization. Secure randomness is not accessible to this initialization code.
+
+Workarounds have been discussed, and Azle/Kybra have used them to some extent. One of them is to create a timer of 0 that sets a global randomness seed as quickly as possible after initialization. The drawback is that this doesn't happen inside of the same call as the initialization.
+
+Another workaround would be to set the randomness as an initialization parameter to `canister_init` or `canister_post_upgrade`, but of course this would call into question the security of the original randomness.
+
+Let's discuss the merits of a synchronous `raw_rand` and move it forward if possible.
+
+## Prior Discussion
+
+1. https://forum.dfinity.org/t/introducing-wasi-for-ic/18583/28
+
+2. https://forum.dfinity.org/t/introducing-wasi-for-ic/18583/30
+
+3. https://forum.dfinity.org/t/generating-custom-principals-uuids-in-rust/2294/13
+
+4. https://forum.dfinity.org/t/issue-about-generate-random-string-panicked-at-could-not-initialize-thread-rng-getrandom-this-target-is-not-supported/15198/4
+
+-------------------------
+
+Manu | 2024-05-02 10:01:58 UTC | #2
+
+I worked on the randomness design way back in the day so i can try to give some context. The goal of ICP's randomness is that it would be super secure, meaning that it's resistant even to bias from block makers. So concretely, if a canister uses randomness to select a random lottery winner or so, then even if some of the nodes (but < 1/3rd of course) are dishonest, they cannot increase their probability to win. A consequence of that goal is that the randomness must not be decided yet at the time of block creation, because otherwise, block makers can already see if they are going to win the lottery if they were to include a lottery-participation message in their block, and only then decide if they participate or not. So the randomness that will be used for a certain message has to be determined after it is finalized that message m will be executed.The first idea to achieve this was to simply do the following:
+* after block m is finalized, create a random tape for block m
+* once the random tape is ready, execute the content of block m with that random tape, offering synchronous & secure randomness
+
+The obvious downside is that now every block has higher latency, because you always need to wait for the random tape to be created. To avoid that, we changed the design to what we have now, where all blocks are not delayed and can execute immediately, but if you want randomness, you need to briefly wait so you get randomness that was chosen after your message was finalized.
+
+So a fully synchronous raw_rand would either be less secure or we would need to go with the old approach that increases latency for all messages, either of which is undesirable. Some of your suggested workarounds could perhaps be possible though.
+
+-------------------------
+
+lastmjs | 2024-05-02 11:33:37 UTC | #3
+
+Hi thanks for the context.
+
+We are already using one of the workarounds, and both have material drawbacks to them. So they are not solutions to this problem.
+
+Another possible solution at a high level would be to allow init and post upgrade to perform asynchronous cross canister calls. What are the problems with that?
+
+Canisters cannot currently get access to secure randomness during initialization.
+
+-------------------------
+
+kpeacock | 2024-05-02 16:12:46 UTC | #4
+
+Would async `canister_init` solve your problem as well?
+
+-------------------------
+
+lastmjs | 2024-05-02 17:31:42 UTC | #5
+
+Yes I think this would solve it
+
+-------------------------
+
+lastmjs | 2024-05-15 12:55:32 UTC | #6
+
+I have opened up an item on the feedback board to make the initialization canister methods async, if you would like to see this prioritized please upvote it here: https://dx.internetcomputer.org/topic/233
+
+-------------------------
+

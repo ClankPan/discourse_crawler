@@ -1,0 +1,101 @@
+frederico02 | 2024-06-20 11:55:28 UTC | #1
+
+Hi,
+
+I'm developing a rust backend canister that queries a sns governance canister for neurons and distributes rewards to our users depending primarily on the maturity of said neurons. This distribution happens on a weekly cycle.
+
+a Distribution is encapsulated into a `PaymentRound` and importantly 
+- payment records are stored in the payment round as `payments`
+- the payment round itself is stored in stable memory once all payments are completed. 
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct PaymentProcessor {
+    /// Holds only PaymentRounds that are FULLY completed.
+    #[serde(skip, default = "init_map")]
+    round_history: StableBTreeMap<(TokenSymbol, u16), PaymentRound, VM>,
+    /// Holds active PaymentRounds that are being processed
+    active_rounds: BTreeMap<TokenSymbol, PaymentRound>,
+}
+
+#[derive(Serialize, Deserialize, CandidType, Debug, Clone)]
+pub struct PaymentRound {
+    pub id: u16, 
+    pub round_funds_total: Nat,
+    pub tokens_to_distribute: Nat,
+    pub fees: Nat, 
+    pub ledger_id: Principal,
+    pub token: TokenSymbol, 
+    pub date_initialized: TimestampMillis, 
+    pub total_neuron_maturity: u64, 
+    pub payments: BTreeMap<NeuronId, Payment>, 
+    pub retries: u8,
+}
+```
+
+I've been using pocket-ic ( v3 ) to automate the testing of this feature but I've noticed that there seems to be an inconsistent increase in the stable memory increase and when this memory increase actually occurs.
+
+```
+//// distribution 1 - heap used : 5308416
+//// distribution 1 - stable used : 16842752
+
+//// distribution 2 - heap used : 5570560
+//// distribution 2 - stable used : 16842752
+
+//// distribution 3 - heap used : 5832704
+//// distribution 3 - stable used : 16842752
+
+//// distribution 4 - heap used : 6029312
+//// distribution 4 - stable used : 33619968
+
+//// distribution 5 - heap used : 6160384
+//// distribution 5 - stable used : 33619968
+
+//// distribution 6 - heap used : 6422528
+//// distribution 6 - stable used : 33619968
+
+//// distribution 7 - heap used : 6684672
+//// distribution 7 - stable used : 42008576
+
+//// distribution 8 - heap used : 6815744
+//// distribution 8 - stable used : 42008576
+
+//// distribution 9 - heap used : 7077888
+//// distribution 9 - stable used : 42008576
+```
+## Important observations : 
+from distribution 3 -> 4 - delta of 16MB ~
+from distribution 6 -> 7 - delta of 9MB ~
+
+Questions:
+1) What I would expect is that the stable memory increases each distribution. However as you can see from above, it stays the same for approximately 3 weeks and then it bumps up. What would cause this? Is this pocketIc related?
+2) I would also expect that the increase is always the same given the test data is always the same and so the number of transactions that occur are always the same, however, you can see the first increase is 16MB but the second increase is only 9MB. Why would this be lower even though the data used is the same? Is this related to BTreeMap?
+
+Is it that pocket ic isn't best suited for calculating the memory increases? Would appreciate any insights people may have into how stable memory is stored.
+
+-------------------------
+
+ielashi | 2024-06-20 13:08:43 UTC | #2
+
+[quote="frederico02, post:1, topic:32199"]
+What I would expect is that the stable memory increases each distribution. However as you can see from above, it stays the same for approximately 3 weeks and then it bumps up. What would cause this? Is this pocketIc related?
+[/quote]
+
+Stable structures are stored in virtual memories that are provided by the `MemoryManager`. For performance and technical reasons, virtual memories grow in "buckets". The default bucket size is 8MiB. Therefore, as soon as a virtual memory requires > 8MiB, an additional bucket of 8MiB is allocated.
+
+[quote="frederico02, post:1, topic:32199"]
+I would also expect that the increase is always the same given the test data is always the same and so the number of transactions that occur are always the same, however, you can see the first increase is 16MB but the second increase is only 9MB. Why would this be lower even though the data used is the same? Is this related to BTreeMap?
+[/quote]
+
+That question is harder to answer. Do you have any other state/stable structures? Note that using a stable structure ends up allocating a bucket (8MiB) the first time, since it needs some memory to be initialized.
+
+-------------------------
+
+frederico02 | 2024-06-20 13:23:34 UTC | #3
+
+Hi ielashi,
+
+Thanks so much for this update. Yes there are other parts of the state that grow in stable memory. The arguments you make marry up with what we see on the live canister as well. ( we see bumps of either 8~ or 16~ )
+
+-------------------------
+

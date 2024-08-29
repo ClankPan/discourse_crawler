@@ -1,0 +1,167 @@
+apufvqsp | 2022-07-18 09:53:29 UTC | #1
+
+![1|690x278](upload://otsUTZPeutWjQZDvTxGjdi3ML15.png)
+
+**Hey there, is there an example on how to set the expire time for a transaction?**
+
+**the first one**
+
+```
+"metadata":{
+	"ingress_start":1658108506613893125,
+	"ingress_end":1658110306613893125
+}
+```
+The ingress_end is 30 minutes later than the ingress_start. When I call the `/construction/payloads` method, there are 30 payload in the returned result, But the expectation should be 2 payloads, I don't understand why this endpoint returns a result with 30 payloads
+![2|690x439](upload://1c30hiVHgCl46OQ5qRlrnjt6p03.png)
+
+
+**the second**
+
+```
+"metadata":{
+	"created_at_time":1658108506613893125
+}
+```
+The result does not have a 24-hour validity period as stated in the documentation, and the signed transaction will soon expire.
+
+**I would like to know what is the correct way to set the expire time of a transaction, or an example would be better**
+
+**Any help is greatly appreciated！！！**
+
+-------------------------
+
+roman-kashitsyn | 2022-07-18 10:35:52 UTC | #2
+
+Hi @apufvqsp,
+
+TL;DR your code with `ingress_start` and `ingress_end` is correct, there is nothing wrong with 30 messages.
+
+All ingress messages you send to the IC have an `ingress_expiry` field to prevent replay attacks:
+
+> * `ingress_expiry` (`nat`, required): An upper limit on the validity of the request, expressed in nanoseconds since 1970-01-01 (like [ic0.time()](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-time)). This avoids replay attacks: The IC will not accept requests, or transition requests from status `received` to status `processing`, if their expiry date is in the past. **The IC may refuse to accept requests with an ingress expiry date too far in the future.** This applies to synchronous and asynchronous requests alike (and could have been called `request_expiry`).
+-- https://internetcomputer.org/docs/current/references/ic-interface-spec/#authentication
+
+In practice, the IC accepts messages within ~[5 min](https://sourcegraph.com/github.com/dfinity/ic@d561add285c2138637ede888886264f683f063d5/-/blob/rs/constants/src/lib.rs?L11) window. There is no way for the client to extend this interval (that would open a DoS attack vector).
+
+The trick that the rosetta node employs is signing *multiple* messages with the same payload but different expiry windows, each message in the batch is valid for ~2 min.
+When you specify 30 min range, the rosetta node generates 15 `call` requests and 15 corresponding `read_state` requests:
+
+```
+10:00–10:02 transfer  1, read_state  1
+10:02–10:04 transfer  2, read_state  2
+...
+10:28–10:30 transfer 15, read_state 15
+```
+That's why you need to sign 30 payloads.
+
+When you submit the signed bundle to an online rosetta node, the node picks the message pair applicable to the current time.
+
+It might happen that the rosetta node will send transfer 1, lose the network connection for a couple of minutes, and then retry with transfer 2. This scenario cannot result in a double spend because the ICP ledger deduplicate transactions; it will consider all transfers from the same bundle duplicates and apply only the first one.
+
+-------------------------
+
+apufvqsp | 2022-07-19 11:02:00 UTC | #3
+
+@roman-kashitsyn  thanks for your reply
+
+I signed all the 30 payloads, and then immediately submitted the transaction with the 30 signatures to the rosetta node, but the following error was returned
+
+
+```
+{
+    "code":770,
+    "message":"Operation failed",
+    "retriable":false,
+    "details":{
+        "operations":[
+            {
+                "account":{
+                    "address":"e10f102ade825951 572dbac6d1fa5b5b98ed3ae2b7dd8786a346e497fec1b033"
+                },
+                "amount":{
+                    "currency":{
+                        "decimals":8,
+                        "symbol":"ICP"
+                    },
+                    "value":"-30000"
+                },
+                "metadata":{
+                    "response":{
+                        "code":760,
+                        "details":{
+
+                        },
+                        "message":"Transaction expired",
+                        "retriable":false
+                    }
+                },
+                "operation_identifier":{
+                    "index":0
+                },
+                "status":"FAILED",
+                "type":"TRANSACTION"
+            },
+            {
+                "account":{
+                    "address":"4a31d8a7bf0189cd2ff31e6de67b630675ec143ecf6b26ca9b776878ec51a173"
+                },
+                "amount":{
+                    "currency":{
+                        "decimals":8,
+                        "symbol":"ICP"
+                    },
+                    "value":"30000"
+                },
+                "metadata":{
+                    "response":{
+                        "code":760,
+                        "details":{
+
+                        },
+                        "message":"Transaction expired",
+                        "retriable":false
+                    }
+                },
+                "operation_identifier":{
+                    "index":1
+                },
+                "status":"FAILED",
+                "type":"TRANSACTION"
+            },
+            {
+                "account":{
+                    "address":"572dbac6d1fa5b5e10f102ade825951b98ed3ae2b7dd8786a346e497fec1b033"
+                },
+                "amount":{
+                    "currency":{
+                        "decimals":8,
+                        "symbol":"ICP"
+                    },
+                    "value":"-10000"
+                },
+                "metadata":{
+                    "response":{
+                        "code":760,
+                        "details":{
+
+                        },
+                        "message":"Transaction expired",
+                        "retriable":false
+                    }
+                },
+                "operation_identifier":{
+                    "index":2
+                },
+                "status":"FAILED",
+                "type":"FEE"
+            }
+        ]
+    }
+}
+```
+
+**If ingress_start and ingress_end are not added to the transaction, the transaction can be submitted successfully when the default expiration time is used**
+
+-------------------------
+

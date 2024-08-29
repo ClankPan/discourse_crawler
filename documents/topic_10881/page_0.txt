@@ -1,0 +1,278 @@
+peterparker | 2022-02-14 19:51:15 UTC | #1
+
+I get two different principals when I use dfx or use the pem file I actually thought was supposed to store my local certificate.
+
+Anyone knows where the actual dfx idendity pem file is stored on Mac?
+
+****
+
+Context:
+
+a. with dfx command I get
+
+> $ dfx identity get-principal
+> w2bwq-cyv.....
+
+That's the principal I added as controller in nns.
+
+b. however when I load in a JS script with the supposed pem file I get another value
+
+```
+const initIdentity = () => {
+  const buffer = readFileSync('/Users/daviddalbusco/.config/dfx/identity/default/identity.pem');
+  const key = buffer.toString('utf-8');
+
+  const privateKey = crypto.createHash('sha256').update(key).digest('base64');
+
+  const identity = Secp256k1KeyIdentity.fromSecretKey(Buffer.from(privateKey, 'base64'));
+  console.log(identity.getPrincipal().toText())
+
+  // output: cd5mb-c6i5a...
+};
+```
+
+That's why I am assuming I use the wrong location.
+
+-------------------------
+
+jzxchiang | 2022-02-15 07:40:45 UTC | #2
+
+Yeah, that location looks [right](https://smartcontracts.org/docs/developers-guide/cli-reference/dfx-identity.html#_creating_a_default_identity).
+
+Can you double check that you're using the default identity with `dfx identity list` or `dfx identity whoami`?
+
+-------------------------
+
+peterparker | 2022-02-15 08:10:33 UTC | #3
+
+I get default. Not big with cmd lines, therefore never played much with.
+
+> ❯ dfx identity whoami
+> default
+> ❯ dfx identity list
+> anonymous
+> default *
+
+Also double checked, just in case, I don't have any old folder `$HOME/.dfinity` on my machine.
+
+-------------------------
+
+GLdev | 2022-02-15 08:47:49 UTC | #4
+
+I think you have the right location, but I believe dfx uses Ed25519...
+
+If I remember correctly this code from agent-rs produced the same principal:
+
+```
+fn use_identity() -> impl Identity {
+    let pem_path = "../identity.pem".to_string();
+
+    BasicIdentity::from_pem_file(pem_path).expect("Could not read the key pair.")
+}
+
+[...]
+
+impl BasicIdentity {
+    /// Create a BasicIdentity from reading a PEM file at the path.
+    #[cfg(feature = "pem")]
+    pub fn from_pem_file<P: AsRef<std::path::Path>>(file_path: P) -> Result<Self, PemError> {
+        Self::from_pem(std::fs::File::open(file_path)?)
+    }
+
+    /// Create a BasicIdentity from reading a PEM File from a Reader.
+    #[cfg(feature = "pem")]
+    pub fn from_pem<R: std::io::Read>(pem_reader: R) -> Result<Self, PemError> {
+        let bytes: Vec<u8> = pem_reader
+            .bytes()
+            .collect::<Result<Vec<u8>, std::io::Error>>()?;
+
+        Ok(BasicIdentity::from_key_pair(Ed25519KeyPair::from_pkcs8(
+            pem::parse(&bytes)?.contents.as_slice(),
+        )?))
+    }
+
+    /// Create a BasicIdentity from a KeyPair from the ring crate.
+    pub fn from_key_pair(key_pair: Ed25519KeyPair) -> Self {
+        let der_encoded_public_key = der_encode_public_key(key_pair.public_key().as_ref().to_vec());
+
+        Self {
+            key_pair,
+            der_encoded_public_key,
+        }
+    }
+}
+```
+
+-------------------------
+
+GLdev | 2022-02-15 09:05:19 UTC | #5
+
+I just tested this, and it does return the same principal id.
+
+main.rs
+```
+use ic_agent::{identity::BasicIdentity, Identity};
+
+fn main() {
+    println!("Hello, world!");
+
+    let my_identity = use_identity();
+
+    let my_principal = my_identity.sender().unwrap();
+
+    println!("My identity is: {:?}", my_principal.to_text());
+}
+
+fn use_identity() -> impl Identity {
+    let pem_path = "../identity.pem".to_string();
+
+    BasicIdentity::from_pem_file(pem_path).expect("Could not read the key pair.")
+}
+
+```
+
+Cargo.toml
+```
+[package]
+name = "rust-test-pem"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ic-agent = "0.12.1"
+
+```
+
+-------------------------
+
+peterparker | 2022-02-15 16:54:43 UTC | #6
+
+[quote="GLdev, post:4, topic:10881"]
+I think you have the right location, but I believe dfx uses Ed25519…
+[/quote]
+
+When I try out `Ed25519KeyIdentity`with exact same code as above and the same `.pem` file I get an error:
+
+> Error: bad secret key size
+
+P.S.: Linked forum posts about the same subject [6169](https://forum.dfinity.org/t/using-dfinity-agent-in-node-js/6169/27) and [9456](https://forum.dfinity.org/t/how-to-use-my-local-private-keys-in-agent-js/9456)
+
+-------------------------
+
+kpeacock | 2022-02-15 17:23:22 UTC | #7
+
+The challenge is in parsing the `.pem` file - as far as I've been able to tell, there is no equivalent tool to parse the file, so we need to re-implement the Rust package in order to get reproducible identities.
+
+The DFX identities are secp256k1 though
+
+-------------------------
+
+GLdev | 2022-02-15 18:16:16 UTC | #8
+
+[quote="kpeacock, post:7, topic:10881"]
+The DFX identities are secp256k1 though
+[/quote]
+
+Weird. dfx 0.8.4 and ic-agent = "0.12.1" show identical principals when calling *BasicIdentity::from_pem_file*
+
+*Secp256k1Identity::from_pem_file* doesn't work for me, it erros out:
+
+> ErrorStack(ErrorStack([Error { code: 218529960, library: "asn1 encoding routines", function: "asn1_check_tlen", reason: "wrong tag", file: "../crypto/asn1/tasn_dec.c", line: 1149 }, Error { code: 218640442, library: "asn1 encoding routines", function: "asn1_template_noexp_d2i", reason: "nested asn1 error", file: "../crypto/asn1/tasn_dec.c", line: 572, data: "Field=attributes, Type=PKCS8_PRIV_KEY_INFO" }, Error { code: 151498765, library: "PEM routines", function: "PEM_read_bio_PrivateKey", reason: "ASN1 lib", file: "../crypto/pem/pem_pkey.c", line: 88 }]))', src/main.rs:29:10
+
+-------------------------
+
+peterparker | 2022-02-15 18:30:14 UTC | #9
+
+Not fluent with Rust nor sure I am looking at the right place but if I do, it depends on the type of private key.
+
+EC -> secp256k1
+else -> BasicIdentity -> Ed25519
+
+https://github.com/dfinity/sdk/blob/5254869ada16c7dbb5d1c587e53f304f6df4008f/src/dfx/src/lib/identity/identity_manager.rs#L419
+
+-------------------------
+
+peterparker | 2022-02-15 19:42:24 UTC | #10
+
+I manage to get ... another other principal, yolo 🤪
+
+Joke beside with `Ed25519KeyIdentity` I know understand it expects a `Uint8Array(64)` as parameter (doing so no error "bad secret key size"). Being said, did not manager to transform the pem file content to such format yet.
+
+```
+const initEd25519Identity = () => {
+  const buffer = readFileSync('/Users/david.../default/identity.pem');
+  const key = buffer.toString('utf-8');
+
+  // TODO - BEGIN: transform key to Uint8Array(64)
+  const privateKey = crypto.createHash('sha512').update(key).digest('base64');
+
+  const secretKey = new Uint8Array(Buffer.from(privateKey, 'base64'));
+  console.log(secretKey);
+  // END
+
+  return Ed25519KeyIdentity.fromSecretKey(secretKey);
+};
+```
+
+-------------------------
+
+GLdev | 2022-02-15 19:47:18 UTC | #11
+
+Have you tried removing the -----BEGIN PRIVATE KEY---- and _END..._ strings?
+
+-------------------------
+
+peterparker | 2022-02-15 19:49:33 UTC | #12
+
+Yeah, even hardcoded my private key. I get the error about the length because it encodes a `Uint8Array(85)` (85 vs 64 length).
+
+-------------------------
+
+GLdev | 2022-02-15 21:11:24 UTC | #13
+
+I think I understand what Kyle said above, about having to recreate the parsing...
+
+IIUC this is the core thing:
+
+> Ed25519KeyPair::**from_pkcs8**()
+
+Apparently, from [here](https://stackoverflow.com/questions/42638068/signing-decoding-with-base-64-pkcs-8-in-node-js) you could use [node-rsa](https://github.com/rzcoder/node-rsa) to decode the key like so:
+
+```
+// 1. Decode the private key with base64 then pkcs8
+const key = new NodeRSA();
+key.importKey(new Buffer(encodedPrivateKey, 'base64'), 'pkcs8-private-der');
+const privateKey = key.exportKey();
+```
+
+:crossed_fingers:
+
+-------------------------
+
+kpeacock | 2022-02-15 23:43:44 UTC | #14
+
+I'll try that pattern out and see if it reproduces the same principal as DFX. Appreciate you looking into it!
+
+-------------------------
+
+peterparker | 2022-02-16 16:21:24 UTC | #15
+
+That's an excellent hint but I wasn't successful. Like I tried all node-rsa formats (private, public, `der`, pem) with key as string, as buffer, hardcoded, all failed with various errors:
+
+> Unsupported key format
+> Invalid Public key format
+> [InvalidAsn1Error]: encoding too long
+
+Also tried to sublet nodejs native crypto lib ([node](https://nodejs.org/api/webcrypto.html#class-subtlecrypto) - [mdn](https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/importKey)) but there are even more options and therefore even more error msgs 🤣
+
+-------------------------
+
+peterparker | 2022-02-26 06:52:08 UTC | #16
+
+@kpeacock made some progress (🚀) regarding using the same identity between NodeJS and dfx.
+This is the post to follow 👉 https://forum.dfinity.org/t/using-dfinity-agent-in-node-js/6169/41?u=kpeacock
+
+-------------------------
+

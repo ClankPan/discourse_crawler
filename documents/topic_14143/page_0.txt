@@ -1,0 +1,141 @@
+cryptoschindler | 2022-07-04 12:52:46 UTC | #1
+
+i recently tried a different setup for canister imports. when i allow `checkJs : true` in my `tsconfig.json`, ts complains with the following error
+```
+Module '"./whitelist.did.js"' has no exported member 'idlFactory'.ts(2305)
+```
+can we add the `idlFactory` export to the `.d.ts` files? 
+@kpeacock
+
+-------------------------
+
+peterparker | 2022-07-04 18:19:15 UTC | #2
+
+Funny I had the same error while doing some refactoring in [nns-js](https://github.com/dfinity/ic-js/pull/127/) today too 😉. I end up adding the following code in a `.d.ts` file that has the same name as the factory js file
+
+```
+import type { IDL } from "@dfinity/candid";
+export const idlFactory: IDL.InterfaceFactory;
+```
+
+So maybe we don't even need to add the all the `idleFactory` but only above definition.
+
+-------------------------
+
+cryptoschindler | 2022-07-05 11:14:55 UTC | #3
+
+as long as `dfx` does it when generating the files and i don't have to do it manually and the typing is correct i'm more than fine :smiley:
+
+-------------------------
+
+kpeacock | 2022-07-05 17:04:03 UTC | #4
+
+It should be as simple as adding it to the `compile` method's `header` in this file and updating the test cases: https://github.com/dfinity/candid/blob/master/rust/candid/src/bindings/typescript.rs
+
+I'll get to this in a few days, but feel free to tag me for review if you get to it before me!
+
+-------------------------
+
+cryptoschindler | 2022-08-03 06:47:23 UTC | #5
+
+any news on this being integrated to dfx? :slight_smile:
+
+-------------------------
+
+cyberowl | 2023-04-17 12:12:17 UTC | #6
+
+So I followed the fix suggested here with adding `export const idlFactory: IDL.InterfaceFactory;` at the bottom of the ts file. https://github.com/cybrowl/agent-js-file-upload/blob/main/src/canisters/file_storage_idl.ts#L81. However, when using jest to test it exports 
+```
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.idlFactory = void 0;
+``` 
+and fails to export the function `const idlFactory = ({ IDL }) => {}`.
+Has anyone been able to get it to export correctly when testing with jest?
+
+-------------------------
+
+tommy-a | 2023-04-17 13:07:47 UTC | #7
+
+Don't know if this helps, but I ended up adding this to `evm.did.d.ts`:
+
+```
+export const idlFactory: ({ IDL }: { IDL: any }) => any;
+```
+
+And this to `evm.did.js`
+
+```
+module.exports = { idlFactory, init };
+```
+
+This was for ts-node/hardhat
+
+-------------------------
+
+kpeacock | 2023-04-17 14:04:01 UTC | #8
+
+Would a JSDoc comment suffice?
+
+-------------------------
+
+cyberowl | 2023-04-18 02:35:34 UTC | #10
+
+The comment `//@ts-ignore` helped for the error `Binding element 'IDL' implicitly has an 'any' type.`. 
+As for the error above with the canister `.did` files not having the `idlFactory` func properly exporting I added the following fields to tsconfig.json 
+```
+      "allowJs": true,
+      "checkJs": true,
+```
+If anyone in the future wants to see the changes they can go to: https://github.com/cybrowl/agent-js-file-upload
+
+-------------------------
+
+peterparker | 2023-04-20 07:21:58 UTC | #11
+
+I went for the `// @ts-ignore` way in a post build script as well.
+
+```
+/**
+ * We have to manipulate the factory otherwise the editor prompt for following TypeScript error:
+ *
+ * TS7031: Binding element 'IDL' implicitly has an 'any' type.
+ *
+ */
+const cleanFactory = async ({ dest = `./src/declarations` }) => {
+	const promises = readdirSync(dest).map(
+		(dir) =>
+			new Promise(async (resolve) => {
+				const factoryPath = join(dest, dir, `${dir}.did.js`);
+
+				if (!existsSync(factoryPath)) {
+					resolve();
+					return;
+				}
+
+				const content = await readFile(factoryPath, 'utf-8');
+				const cleanFactory = content.replace(
+					/export const idlFactory = \({ IDL }\) => {/g,
+					`// @ts-ignore
+export const idlFactory = ({ IDL }) => {`
+				);
+				const cleanInit = cleanFactory.replace(
+					/export const init = \({ IDL }\) => {/g,
+					`// @ts-ignore
+export const init = ({ IDL }) => {`
+				);
+
+				await writeFile(factoryPath, cleanInit, 'utf-8');
+
+				resolve();
+			})
+	);
+
+	await Promise.all(promises);
+};
+
+await cleanFactory({});
+```
+
+-------------------------
+

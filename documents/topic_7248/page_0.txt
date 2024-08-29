@@ -1,0 +1,156 @@
+nomeata | 2021-09-15 11:48:57 UTC | #1
+
+Is anyone here working with dfx on NixOS?
+
+Until dfx is open sourced we have to live with the binary that’s shipped in `https://sdk.dfinity.org/downloads/dfx/0.8.1/x86_64-linux/dfx-0.8.1.tar.gz`. The problem is that it’s not a static binary, and has `/lib64/ld-linux-x86-64.so.2` hard-coded as the ELF interpreter.
+
+I can create a nix derivation that fixes that for `dfx`, so I can run `dfx`. But `dfx` has this odd habit of unpacking further such binaries to `~/.cache/dfinity/versions/0.8.1/`, and that happens at runtime, so I cannot patch it.
+
+I created a nix derivation that, at build time, extracts these binaries, fixes their ELF interpreter, and then uses `DFX_CONFIG_ROOT` to make `dfx` use these, but that environment variable doesn’t just affect where `dfx` looks for the path, but also where it stores the identity, so letting that point to `/nix/store` doesn’t work well either. Too bad there is no way to set just the cache directory.
+
+I guess waiting for dfx to be open source will be easiest.
+
+@jwiegley, how do you do that?
+
+-------------------------
+
+nomeata | 2021-11-28 16:15:40 UTC | #2
+
+Now that the `sdk` repo is open source I had another look, but the whole way how dfx handles assets (tar-ballling them, then embedding the tarball in the code, and at runtime extracting the members) is quite ... opaque.
+
+Am I really the only on in the intersection of people who may want to use dfx and who may want to use nix?
+
+-------------------------
+
+nomeata | 2021-11-28 17:10:26 UTC | #3
+
+I created a repository with a rudimentary work-around, which could also be a place for a better solution:
+
+https://github.com/nomeata/dfx-in-nix
+
+-------------------------
+
+paulyoung | 2022-03-25 06:20:00 UTC | #4
+
+I’m pretty confused about the current state of things here.
+
+I thought @ericswanson fixed this in https://github.com/dfinity/sdk/pull/1868 (released in 0.8.3 according to the [release notes](https://github.com/dfinity/sdk/blob/master/CHANGELOG.adoc#083))
+
+However, I spent quite a while trying to get `dfx` working on Linux for CI via GitHub Actions and haven’t had much success.
+
+My attempts can be seen on this branch although the CI runs are in another repo. https://github.com/paulyoung/nixpkgs-dfinity-sdk/tree/patchelf
+
+What I can recollect is:
+* On 0.8.4, I was getting the “no such file or directory error” when trying to run `./dfx cache install`, which was supposedly already fixed.
+* Patching the `dfx` binary with `patchelf` in the same way that the SDK does it allowed me to get past that but I ran into the same error for the binaries installed in the cache directory.
+* Patching the other binaries in the same way that the SDK does it only got me so far; I kept getting the same error for `icx-proxy`
+* On 0.9.2 I ran into some similar symptoms but it seemed like some of the binaries were now statically linked and patching wouldn’t apply so I wasn’t sure what to do.
+
+I can probably do a better job of recreating all of this and investigating using `ldd` by getting a NixOS VM up and running again.
+
+I don’t understand why patching would be necessary when it’s apparently already been done.
+
+I also noticed the following, so maybe these are known issues?
+
+https://github.com/dfinity/sdk/blob/c8b8c9ac8801d6b5caa82d60756783deb48d87f9/e2e/utils/_.bash#L65-L67
+
+-------------------------
+
+paulyoung | 2022-03-25 06:14:17 UTC | #5
+
+[quote="paulyoung, post:4, topic:7248"]
+I spent quite a while trying to get `dfx` working on Linux for CI via GitHub Actions and haven’t had much success.
+[/quote]
+
+To clarify, the macOS build works fine and I can run tests against canisters and a replica with `ic-repl`.
+
+-------------------------
+
+nomeata | 2022-03-25 12:12:29 UTC | #6
+
+Dfinity patches the released binaries to replace the `/nix` path to the linker (which would not work elsewhere) with `/lib64/ld-linux-x86-64.so.2` (which works elsewhere, but not on NixOS). So to use them on NixOS, you have to patch that back.
+
+That's easy enough for `dfx` itself, using some nix hook (`patchElf` or so), but tricky for the binaries that are embedded into `dfx`.
+
+-------------------------
+
+paulyoung | 2022-03-25 15:51:03 UTC | #7
+
+I thought I was taking all of that into account.
+
+https://github.com/paulyoung/nixpkgs-dfinity-sdk/blob/d0fbef8c37979923cef954307fbea7cc34fde8fe/default.nix#L51-L78
+
+-------------------------
+
+nomeata | 2022-03-25 16:01:36 UTC | #8
+
+Hmm, ok, this extracts and patches these binaries, and puts them in the path. But wouldn't `dfx build` or `dfx start` _still_ extract and then call the unpatched binaries? What's telling `dfx` to use these?
+
+(I found no nice way of letting dfx use them, e.g. via an environment variable or such, and stopped short of patching dfx to allow that. Then it should work nicely, I believe.)
+
+-------------------------
+
+paulyoung | 2022-03-26 05:09:37 UTC | #9
+
+I’m pretty sure I know what to do. Will try and get things working this weekend.
+
+-------------------------
+
+paulyoung | 2022-03-26 07:33:55 UTC | #10
+
+@nomeata I believe I've fixed this with https://github.com/paulyoung/nixpkgs-dfinity-sdk/pull/3
+
+-------------------------
+
+paulyoung | 2022-03-26 07:48:11 UTC | #11
+
+Actually, no. If you try to do `dfx deploy` (for example) it fails because the config directory is now set to a path in the nix store.
+
+I think what we need is a separate environment variable for the cache directory, i.e. `DFX_CACHE_ROOT`.
+
+-------------------------
+
+paulyoung | 2022-03-26 07:49:03 UTC | #12
+
+I've created an issue to track this and plan to propose a change to `dfx` to address it, unless some enthusiastic Nix user beats me to it.
+
+https://github.com/paulyoung/nixpkgs-dfinity-sdk/issues/4
+
+-------------------------
+
+paulyoung | 2022-03-26 08:10:41 UTC | #13
+
+Blocked by `dfx` development depending on a private repo :frowning_face:
+
+I created an issue instead.
+
+https://github.com/dfinity/sdk/issues/2106
+
+-------------------------
+
+nomeata | 2022-03-26 13:06:00 UTC | #14
+
+[quote="paulyoung, post:11, topic:7248"]
+Actually, no. If you try to do `dfx deploy` (for example) it fails because the config directory is now set to a path in the nix store.
+[/quote]
+
+Beh, yes, that's also what I ran into. Patching dfx to be more friendly is probably the best way. Maybe even a envvar for each binary to override what to use? Might be useful to others as well.
+
+-------------------------
+
+ericswanson | 2022-03-30 16:09:44 UTC | #15
+
+Here's a github workflow that runs dfx both on linux and macos: https://github.com/dfinity/sdk/blob/master/.github/workflows/e2e.yml
+
+Starting with the next dfx release, we will start releasing dfx as built from a github workflow (https://github.com/dfinity/sdk/blob/master/.github/workflows/publish.yml), rather than built using nix.
+
+-------------------------
+
+paulyoung | 2022-04-01 01:21:59 UTC | #16
+
+This is looking promising!
+
+https://github.com/dfinity/sdk/pull/2112
+
+-------------------------
+

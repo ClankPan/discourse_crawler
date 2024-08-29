@@ -1,0 +1,204 @@
+miadey | 2023-07-01 19:19:41 UTC | #1
+
+Hi,
+have asked this question on Discord, Kyle redirected me to the [IC-Avatar  example](https://github.com/krpeacock/ic-avatar/blob/main/src/avatar/main.mo#L170) , but can get my head around how to communicate with the asset canister which contains index.html and all website files.
+
+I would like to get the content of an asset file into a variable in the backend canister.
+
+I have implemented this simple code but await returns Misplaced await...
+
+import Time "mo:base/Time";
+import T "mo:assets/Types";
+import AssetCanister "canister:app_frontend";
+
+shared actor class Main() {
+
+    type StructCanisterContent = {
+        content_type : Text;
+        encodings : [{
+        content_encoding : Text;
+        length : Nat;
+        modified : Time.Time;
+        sha256 : ?Blob;
+        }];
+        key : T.Key;
+    };
+
+
+    let fileList : async [StructCanisterContent] = await AssetCanister.list();
+
+    let myIndex : async StructCanisterContent =  await AssetCanister.get(["text/html"], "/index.html");
+
+}
+
+My backend canister has it dependency set to the asset canister in my dfx.json file
+"canisters": {
+    "app_frontend": {
+      "frontend": {
+        "entrypoint": "src/app_frontend/src/index.html"
+      },
+      "source": [
+        "src/app_frontend/assets",
+        "dist/app_frontend/"
+      ],
+      "type": "assets"
+    },
+    "app_server": {
+      "main": "src/app_server/main.mo",
+      "type": "motoko",
+      "dependencies": ["app_frontend"]
+    }
+  },
+
+Any help would be appreciate :slight_smile:
+
+-------------------------
+
+claudio | 2023-07-03 09:30:47 UTC | #2
+
+The problem here is that you can't await from the actor initialization code, only from its methods. This is actually a restriction of the internet computer, enforced at compile time in Motoko.
+
+Assuming the code is otherwise correct, putting it in a shared function body should help.
+
+Something like:
+
+```
+shared func init() : async () {
+   let fileList : async [StructCanisterContent] = await AssetCanister.list();
+   let myIndex : async StructCanisterContent =  await AssetCanister.get(["text/html"], "/index.html");
+   //....
+```
+Those `await`s will no longer be "misplaced".
+
+-------------------------
+
+miadey | 2023-07-04 19:37:24 UTC | #3
+
+Thank for your response
+Here is my new code, no more error but the code does't execute! Tried to call init() but still no result.
+
+```
+actor {
+    Debug.print("0-Main execute");
+
+    type StructCanisterContent = {
+        content_type : Text;
+        encodings : [{
+            content_encoding : Text;
+            length : Nat;
+            modified : Time.Time;
+            sha256 : ?Blob;
+        }];
+        key : T.Key;
+    };
+
+    var fileList : [StructCanisterContent] = [];
+
+    func init () : async () {
+      
+        fileList := await AssetCanister.list({fileList});
+   
+        let myIndex  =  await AssetCanister.get({ accept_encodings : [Text] = ["text/html"]; key : T.Key = "/index.html" });
+        Debug.print("1-Main() function was executed");
+    };
+
+    // let a = init;
+    Debug.print("2-show assets");
+    Debug.print(debug_show(fileList));
+}
+```
+ Any exemple exist of a complet asset canister with some docs and working code ?
+Thank you
+
+-------------------------
+
+claudio | 2023-07-06 10:43:23 UTC | #4
+
+Right, you never call `init()` from the body (and can't) so the fileList won't be set.
+
+I think you'd want every other shared method to call `init()` on demand, if `fileList` is still empty.
+
+-------------------------
+
+miadey | 2023-07-11 02:36:45 UTC | #5
+
+Hi! Thank you again for your response. 
+I have tried many things this week-end, without success. I have a hard time grasping the async/await concept :frowning: 
+
+Is init() a system function that is call when creating a class ?
+Any exemple exist of a complet asset canister with some docs and working code ?
+Thank you
+
+-------------------------
+
+claudio | 2023-07-12 18:50:13 UTC | #6
+
+I don't have an examples off hand but maybe this more gentle book might help you more than the official documentation:
+
+https://7po3j-syaaa-aaaal-qbqea-cai.ic0.app
+
+I think your code is reasonably close to working, but you can only await in certain contexts, and the main sequence of declaration in an actor isn't one of them.
+
+Some untested editing:
+
+```
+import AssetCanister "canister:app_frontend"; // was this missing?
+
+actor {
+    Debug.print("0-Main execute");
+
+    type StructCanisterContent = {
+        content_type : Text;
+        encodings : [{
+            content_encoding : Text;
+            length : Nat;
+            modified : Time.Time;
+            sha256 : ?Blob;
+        }];
+        key : T.Key;
+    };
+
+    var fileList : [StructCanisterContent] = [];
+
+    public func show() : async Text {
+        // initialize fileList if empty;
+        if (fileList == []) {
+           fileList := await AssetCanister.list({}); // pass an empty record.
+        };
+        debug_show fileList // convert fileList to a string for display
+    };
+}
+```
+Then call `show` using dfx or the playground (if deploying to that).
+
+-------------------------
+
+miadey | 2023-07-13 20:13:08 UTC | #7
+
+Hi!
+Work great from dfx, but I need to call show() from the actor, something like : 
+
+var fileList : [StructCanisterContent] = [];
+
+    public func show() : async Text {
+        // initialize fileList if empty;
+        if (fileList == []) {
+           fileList := await AssetCanister.list({}); // pass an empty record.
+        };
+        debug_show fileList // convert fileList to a string for display
+    };
+   let index = show(); // Aint working, if I add await, still dont get it.
+}
+
+I have tried to include the code in a module without success. 
+
+Dont know if it make sens, but I'm currently using HTMX with Motoko like an MVC,  so I don't need to call the candid files like in Javascript, the front end is HTML and the backend only Motoko.
+
+-------------------------
+
+miadey | 2023-07-22 15:52:02 UTC | #8
+
+Hi! Does the init() func supposed to be fired on instantiation of the class or when the actor is called or run like in the case of the main.mo when the actor is being executed ? Searched the documentation for Constructor or init() without success.
+
+-------------------------
+

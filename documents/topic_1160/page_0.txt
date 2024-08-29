@@ -1,0 +1,113 @@
+skilesare | 2020-08-28 19:36:17 UTC | #1
+
+I found this project https://mbbill.github.io/JSC.js/ that is a web assembly compilation of javascript core.  It only has a few functions that I think I can pull out of the c++(code at https://github.com/mbbill/JSC.js/tree/master/Source/JavaScriptCore) the main functions that I need.  So I think I have the wasm and the js that I'd need to run the thing(basically it pushes a js string into the engine, executes it, and reads out the results with a couple of memory allocation functions along the way.).  I think those are js_eval, stackAlloc, stackRestore, stackSave...maybe some others.  
+
+I understand that this is a terrible idea, and that running a js engine on top of wasm defeats the point of having a wasm engine....but I want to try it anyway just so that I can say that I can.  There is a lot of js code out there and it might be interesting to push out canisters that do needed things without having to do a rewrite.
+
+Anyway the function signatures look pretty simple...basically just char* and integers of various sizes, but I don't really have any clue where to start with the candid files and what is/isn't important to implement.  Any suggestions? Anyone want to help me with it?
+
+-------------------------
+
+chenyan | 2020-08-29 21:30:21 UTC | #2
+
+To interoperate on the Internet Computer, the canister needs to understand the system API and the Candid serialization format. It cannot run an arbitrary Wasm module. To get started, I would recommend checking out the reverse example in C: https://github.com/dfinity/examples/blob/master/c/reverse/reverse.c
+
+It contains the minimal bindings needed to reverse a string from a canister. Your Wasm module needs to somehow embed these APIs as well in order to run on the Internet Computer.
+
+-------------------------
+
+skilesare | 2020-09-30 21:28:28 UTC | #3
+
+I tried going down this road and ended up with this issue: https://github.com/dfinity/examples/issues/48
+
+Any help would be appreciated!
+
+-------------------------
+
+Ori | 2020-10-01 10:21:18 UTC | #4
+
+Make sure you’re using consistent versions across the toolchain. Eg
+
+`sudo apt-get install clang-11 lldb-11 lld-11`
+
+And the correct version of wasm-ld is being called. You could use update-alternatives:
+
+`sudo update-alternatives --install /usr/bin/wasm-ld wasm-ld /usr/bin/wasm-ld-11 100`
+
+(Also check your wcc alias is pointing at clang-11).
+
+-------------------------
+
+skilesare | 2020-10-01 15:29:49 UTC | #5
+
+clang-11 in the wcc was the issue. Thanks!
+
+-------------------------
+
+skilesare | 2020-10-02 04:13:13 UTC | #6
+
+So  made some progress on this and decided to try to go with the duktape project to try to get something to work. I'm using the basic reverse.c example but I moved over the duktape.h and duktape.c files into the directory and changed the function to try to call something out of this.  It turns out that the reason it can't compile is that it can't see the standard libraries for some reason.
+
+    root@ad0ec66809cb:/usr/src/examples/c/reverse# wcc reverse.c
+    In file included from reverse.c:1:
+    In file included from ./duktape.h:196:
+    ./duk_config.h:865:10: fatal error: 'time.h' file not found
+    #include <time.h>
+             ^~~~~~~~
+    1 error generated.
+
+time.h is in /usr/include. Do I need to do something to tell the compiler to look there?
+
+I'm currently running clang-11 --target=wasm32 -c -O reverse.c
+
+The code I'm trying to compile is at https://github.com/skilesare/examples/blob/master/c/reverse/reverse.c
+
+-------------------------
+
+skilesare | 2020-10-02 16:39:50 UTC | #7
+
+So a bit of progress! I got things to compile, but when trying to install the canister I get the following:
+
+Installing code for canister reverse, with canister_id 75hes-oqbaa-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-q
+Replica error (code 5): IC0504: Canister 75hes-oqbaa-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-q violated contract: Module imports function 'duk_create_heap' from 'env' that is not exported by the runtime.
+
+I'm guessing what I need is to better understand what all of these do:
+
+#define WASM_IMPORT(m,n) __attribute__((import_module(m))) __attribute__((import_name(n)));
+#define WASM_EXPORT(n) asm(n) __attribute__((visibility("default")))
+
+int dfn_ads(void) WASM_IMPORT("ic0", "msg_arg_data_size");
+void dfn_adc(void *, int, int) WASM_IMPORT("ic0", "msg_arg_data_copy");
+void dfn_reply_append(void *, int) WASM_IMPORT("ic0", "msg_reply_data_append");
+void dfn_reply(void) WASM_IMPORT("ic0", "msg_reply");
+void dfn_print(void *, int) WASM_IMPORT("ic0", "debug_print");
+
+I'm guessing I need to import the duk_create_heap function to some other different name and call it that way?  But I've tried this a couple different ways and received the compiler error:
+
+reverse.c:23:16: error: initializing 'duk_context *' (aka 'struct duk_hthread *') with an expression of incompatible type 'void'
+  duk_context *ctx = dfx_js_create_heap_default(); 
+
+for both
+
+void dfx_js_create_heap_default(void) WASM_IMPORT("ic0", "duk_create_heap");
+
+and 
+
+void dfx_js_create_heap_default() WASM_IMPORT("ic0", "duk_create_heap");
+
+-------------------------
+
+chenyan | 2020-10-02 20:00:39 UTC | #8
+
+This error means `duk_create_heap` is not linked in the Wasm module, so it expects the system to provide the imports, which doesn't exist.
+
+I don't know how duktape works, but the problem is probably that they are not compiled properly in Wasm. I suggest you first try to compile a wasm module that can be instantiated in browser or WASI, then try to port it to IC. The porting to IC would be similar to the `reverse.c` example, where it puts wasm_import and candid bindings.
+
+-------------------------
+
+skilesare | 2020-10-09 19:06:23 UTC | #9
+
+I've found a WASI implementation and I've created an issue over there to try to decipher the bindings: https://github.com/saghul/wasi-lab/issues/7
+
+-------------------------
+

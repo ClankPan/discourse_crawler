@@ -1,0 +1,582 @@
+Litzi | 2020-09-11 16:59:07 UTC | #1
+
+We're facing huge struggle with the fact, that we cannot easily retrieve multiple assets for the web frontend. What we need is a canister, which is able to resolve arbitrary files by calling `https://<canister_id>.ic0.app/path/to/asset.js` or something comparable. Are there any plans or ideas on this topic?
+
+I would consider this a fundamental requirement to build full fledged state of the art user interfaces on the IC within reasonable time frames. It looks like it's only doable by bundling everything into one `.js` file.
+
+I do not fully understand how the resolver currently works. In my understanding, the request to a specific canister should resolve somehow to its main function? Maybe someone can elaborate on this?
+
+-------------------------
+
+senior.joinu | 2020-09-11 17:12:02 UTC | #2
+
+I actually don't know the state of it, maybe we are not allowed to use it for now, but.
+
+`js-user-library/http_agent.js` contains the next function (warning! I only have 0.5.5 installed locally, maybe it was changed):
+ 
+    retrieveAsset(canisterId, path) {
+        const arg = IDL.encode([IDL.Text], [path]);
+        return this.query(canisterId, { methodName: '__dfx_asset_path', arg }).then(response => {
+            switch (response.status) {
+                case "rejected" /* Rejected */:
+                    throw new Error(`An error happened while retrieving asset "${path}":\n` +
+                        `  Status: ${response.status}\n` +
+                        `  Message: ${response.reject_message}\n`);
+                case "replied" /* Replied */:
+                    const [content] = IDL.decode([IDL.Text], response.reply.arg);
+                    return base64_js_1.toByteArray('' + content);
+            }
+        });
+    }
+
+Which could be accessed by a user via `<ActorObj>.__getAsset(path)`.
+
+I never used it (maybe it doesn't work), but at least it seems like the team is acknowledged about this requirement.
+
+-------------------------
+
+senior.joinu | 2020-09-11 17:18:17 UTC | #3
+
+This also means that you should be able to do this from any client (even from CLI) - just call the `__dfx_asset_path` of your canister.
+
+-------------------------
+
+senior.joinu | 2020-09-13 21:23:14 UTC | #4
+
+Oh. It looks like in 0.6.7 you need to create a separate canister for this.
+At least `dfx new`'s default hello-world canister does this. You should check it out.
+
+-------------------------
+
+Litzi | 2020-09-14 07:10:40 UTC | #5
+
+Thanks! Yes I'm on the latest version. But the same holds true. There is no easy way to request particular assets without `resolving` them via JavaScript by utilizing the canister API.
+
+-------------------------
+
+chenyan | 2020-09-15 00:51:51 UTC | #6
+
+You can retrieve files by importing the asset canister.
+
+```
+import asset from 'ic:canister/your_asset_canister';
+const content = await asset.retrieve('file to retrieve');
+const string = new TextDecoder().decode(new Uint8Array(content));
+```
+
+-------------------------
+
+Litzi | 2020-09-15 10:52:00 UTC | #7
+
+Yes, I'm aware of this. But this is not a solution in my eye. A modern web application will load the assets via `sub/path/to/asset/whatever.file`. Service worker for example cannot be register the proposed way. They need to be loaded via https.
+
+-------------------------
+
+lastmjs | 2020-10-01 00:49:16 UTC | #8
+
+I agree these are major problems. I've reached out to the team separately, hopefully we can get these capabilities added.
+
+I don't see why the static asset capabilities are being so narrowly defined right now. IMO webpack should have no part in the native functionality of the SDK. We need the ability to retrieve arbitrary static assets based on http paths, without the client having to know anything about ICP. This should all work with native simple http requests.
+
+A number of capabilities are currently missing as I see it:
+- ES/JS modules are impossible to use natively (only possible to use them with a bundler. Bundlers are not using ES modules under the hood, they compile them away)
+- Service worker issues like you mentioned (I'll take your word for it)
+- RSS feeds, won't be able to just do an http grab of files off of ICP
+- Building any type of frontend that isn't loaded from a JS file directly. What if I want to have an html file as my entrypoint? Or a txt file?
+- http2/3 multiplexing
+
+-------------------------
+
+Tbd | 2020-10-05 02:40:54 UTC | #9
+
++1000
+
+Agree with all the points. Especially the bit about having webpack in the sdk.
+
+Also can we have the sdk as an npm package please? Or at least a wrapper. Would make it easier to create something like NextJS but for dfinity 😉
+
+-------------------------
+
+mymikemiller | 2020-12-08 04:08:42 UTC | #10
+
+Any news on this? 
+
+I'm trying to write an RSS server for a podcast feed. I need to return xml generated from the data in my canister. I'm new to webpack, but afaik I'll never be able to return a simple xml file that can be parsed by a podcast app; it'll always be surrounded by that initial loading screen and whatever bootstrap scaffolding html there is.
+
+-------------------------
+
+max | 2020-12-09 02:20:31 UTC | #11
+
+I believe that the answer to this is that it is work in progress, about 80% complete.  I can't offer a release date and I'm not working on it myself so I cannot make a good projection for when it will be released but we do see this feature as highly desirable.
+
+-------------------------
+
+max | 2020-12-11 09:49:33 UTC | #12
+
+Dudes, you just caused a 100 message thread internally and a demo.  Hopefully the author of the demo can post some details.
+
+-------------------------
+
+nomeata | 2020-12-11 13:06:01 UTC | #13
+
+Guess now I have to…
+
+Yesterday I created a small proof of concept of how something like this *could* look like to developers. This is in no way official, so treat this as built by some rando in the community…
+
+The very small program at https://github.com/nomeata/ic-http-lambda/ implements an HTTP-to-IC bridge, encapsulating HTTP requests as Candid data, and sending it to the canister id mentioned in the hostname. This means you can go to https://jwksz-eqaaa-aaaab-aaaaq-cai.ic.nomeata.de/ and the full response (HTML, content-type, cookie headers) are under control of the canister.
+
+As a demo, I wrote a canister that implements a simple Telegram bot, you can play with it at http://t.me/InternetComputerBot and see the code at https://github.com/nomeata/ic-telegram-bot.
+
+Currently, I am hosting this service myself, outside of the IC infrastructure (actually on Amazon Lambda…), but it would be feasible (but not necessary, as I have just proven) that a service similar to this could eventually be provided as part of the Internet Computer platform, with a more official domain, maybe with a name registration service…
+
+I agree that this feature is great to onboard developers, but it also its its problems: E.g. you can initiate HTTP requests from the canister. And worse, you throw out more or less all the amazing security guarantees of the Internet Computer (e.g. responses are tamperproof, user identities are verified by the system). So yes, things are moving … but let’s get the platform properly live first!
+
+-------------------------
+
+mymikemiller | 2020-12-11 22:32:16 UTC | #14
+
+This is awesome, thank you nomeata!
+
+I was in the process of building something similar so I can [turn my canister's data into a parseable rss feed](https://forum.dfinity.org/t/can-a-canister-return-generated-xml/1636/5).
+
+Are we invited to use `https://<canister_id>.ic.nomeata.de/`? It would be handy as I build out and test my app, while we wait for a more formal/secure solution.
+
+-------------------------
+
+mymikemiller | 2020-12-11 23:08:30 UTC | #15
+
+@nomeata when I run [ic-http-lambda](https://github.com/nomeata/ic-http-lambda) locally, the response tells me `Use https://<cid>ic.nomeata.de/!`. That won't work for locally-running canisters, right? What's the url when running locally?
+
+I assume the address is supposed to be `https://<cid>.ic.nomeata.de/`, with a '.' between `<cid>` and `ic`, but of course neither work for me and my local canister.
+
+I've tried `<cid>.localhost:7878`, `<cid>.ic.localhost:7878` and `<cid>ic.localhost:7878` (7878 is the port spit out when I run `cargo run` from the ic-http-lambda folder). All of those tell me to use the `ic.nomeata.de` address.
+
+-------------------------
+
+nomeata | 2020-12-12 15:28:55 UTC | #16
+
+Sure, you can use that for experiments, but don’t complain if it breaks :slight_smile:
+
+For local use, you have to
+ * Cange `let url = "https://gw.dfinity.network";` (if you also want to use a local replica)
+ * Change the line `.and_then(|h| h.strip_suffix(".ic.nomeata.de").map(|x| x.to_owned()))` to your domain (which for local development p
+ * or, if you test just one caniser, just hardcode
+   ```
+   let cid = ic_types::Principal::from_text("your-canister-id".to_string()).unwrap()
+   ```
+
+PRs against https://github.com/nomeata/ic-http-lambda to make local use more convenient (e.g. a flag `--always-canister <cid>`, a flag `--endpoint <url>`…)  are welcome.
+
+-------------------------
+
+mymikemiller | 2020-12-22 21:09:57 UTC | #17
+
+I submitted a PR that [adds local replica support](https://github.com/nomeata/ic-http-lambda/pull/1). I've been using it and it's working for my needs.
+
+I also was able to convert your [ic-telegram-bot](https://github.com/nomeata/ic-telegram-bot/blob/main/telegram/src/lib.rs)'s requst/response code into motoko so I can write my server in motoko. Works great, but took some finagling as I tried to wrap my head around the Rust code. Maybe someone can save some time by checking out [my code](https://gist.github.com/mymikemiller/8992a4313a040aefcc3d3800dc272757), and maybe someone has some input as to how it can be improved. 
+
+Again, thanks @nomeata for your work on this! You've made it possible for me to begin work on my podcast host.
+
+-------------------------
+
+nomeata | 2020-12-23 10:09:15 UTC | #18
+
+Cool stuff!
+
+Instead of  `body: [Nat8];` you can use `body : Blob`; they have compatible types in Candid world, but `Blob` is more efficient in Motoko (but then, we still don't have all the operations on `Blob` that you might expect, so maybe array is better for now.)
+
+-------------------------
+
+mymikemiller | 2021-02-17 17:47:16 UTC | #19
+
+@nomeata I've been working with the ic-http-bridge locally and it's working great. I did have to increase the timeout in the waiter because update calls take longer than 5 seconds to complete. Unfortunately all my requests have to be upgraded to update requests even if they don't modify state (see [this thread](https://forum.dfinity.org/t/cant-call-an-imported-actors-query-functions/1732))
+
+Because I need to increase the timeout, I can't use your implementation at ic.nomeata.de. I just get timeouts if I try that, since 5s is not enough. So I'm trying to release the modified ic-http-lambda code as my own function on aws lambda. I've done a little with aws, but never a lambda function and am getting a little tripped up trying to deploy it.
+
+When setting up the lambda function, I don't see Rust as an option when choosing the runtime language. I do see "Provide your own bootstrap on Amazon Linux 2", which I assume is what you must have done to get this to run.
+
+I noticed [this runtime](https://github.com/awslabs/aws-lambda-rust-runtime). Is that what you used? If so, did you use the AWS CLI or the Serverless framework?
+
+I also noticed this in the ic-http-lambda readme: "To build for Amazon lambda, and hence musl, this is using a patched agent-rs without an openssl dependency for now."
+
+Will I need to make changes to (patch?) the runtime code (agent-rs?) to get it to work the way you did?
+
+Sorry if these questions seem vague, but that's that state I'm at right now in getting this to work. I would greatly appreciate your help in getting my own version of ic-http-lambda up and running!
+
+-------------------------
+
+studna | 2021-02-17 19:16:08 UTC | #20
+
+At Fleek we're trying to build a solution that allows you to surface frontend canisters like any other web app. You can have basic CRA, add these files: https://gist.github.com/studna/f2e496b7385500fadcbfb0f3ad78379a and simply `dfx deploy --network ic`. After it's deployed you can access website on URL like https://qajud-uiaaa-aaaab-aac6a-cai.ic.fleek.co. 
+
+Here's how it works behind: Initial request hits our server, that returns simple bootstrap script and installs a service worker to your browser. After service worker is ready, canister assets are fetched directly from IC gateway (thanks to SW there's no proxy between your browser and IC gateway). Also it's "bot-friendly" (when SW is not available, like search engines, link previews, ..), these kind of requests are proxied to IC.
+
+![image (14)|690x390](upload://j1lRgtfnHKBymmRDY0lmgk6JUdb.jpeg)
+
+-------------------------
+
+nomeata | 2021-02-18 10:53:20 UTC | #21
+
+> Because I need to increase the timeout, I can’t use your implementation at [ic.nomeata.de](http://ic.nomeata.de).
+
+Which timeout do you need? I can change my setup if you want. But maybe better to let you host your own :slight_smile: 
+
+> I do see “Provide your own bootstrap on Amazon Linux 2”, which I assume is what you must have done to get this to run.
+
+I think so, yes. It says “Custom runtime on Amazon Linux 2” here. (Not an AWS expert myself.)
+
+> Will I need to make changes to (patch?) the runtime code (agent-rs?) to get it to work the way you did?
+
+Nope, if you look at my `Cargo.toml` you’ll see that it pins the patched version of the agent:
+```
+[patch.crates-io]
+ic-agent = { git = "https://github.com/nomeata/agent-rs", branch = "joachim/musl-hacks" }
+ic-types = { git = "https://github.com/nomeata/agent-rs", branch = "joachim/musl-hacks" }
+```
+
+-------------------------
+
+mymikemiller | 2021-02-18 17:40:45 UTC | #22
+
+@nomeata I tried putting together a PR for the increased timeout, but I can't get ic-http-bridge to run locally anymore, even without the change. When I try to make a request to http://127.0.0.1:7878/, it causes the local dfx server to crash, which then restarts with a new port number, and ic-http-bridge respond with `Could not reach the server` presumably because it's looking on the old port. Relaunching ic-http-bridge with dfx's new port just repeats the cycle and I never get a response.
+
+This is the crash reported by the process started with `dfx start`: 
+`thread 'Http Handler' panicked at 'Opening old round db failed 493301', src/cow_state/slot_mgr.rs:469:37`
+
+-------------------------
+
+mymikemiller | 2021-02-18 17:41:07 UTC | #23
+
+In any case, when I was able to get this running, the timeout I needed to increase was on line 164:
+
+```
+let result = if result.upgrade {
+    // Re-do the request as an update call
+    agent.fetch_root_key().await?;
+    let waiter = delay::Delay::builder()
+        .throttle(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(90))    // <-- increased from 5 to 90
+        .build();
+```
+
+90 seconds is definitely more than I need; I was just using that for testing. I recall responses coming back in around 30-40 seconds.
+
+-------------------------
+
+cryptoschindler | 2021-02-18 20:11:11 UTC | #24
+
+EDIT: did you try using the `dfx start --clean` command yet?
+
+-------------------------
+
+mymikemiller | 2021-02-18 19:18:44 UTC | #25
+
+[quote="cryptoschindler, post:24, topic:1257"]
+using the `clean` flag
+[/quote]
+
+Which command? I'm not seeing `--clean` as a flag on any of the dfx commands. In the past, I've cleaned by deleting the .dfx folder, but doing that and then rebuilding results in the same cid for my canisters, so there must be something else that's not getting cleaned up.
+
+edit: Not sure how I missed `dfx start ~~clean` but things are working now
+edit edit: those tildes are supposed to be dashes, but editing a post on this forum causes a 403 error if it includes dashes...
+
+-------------------------
+
+Flanker | 2021-02-22 10:26:28 UTC | #26
+
+Can we implement Telegram bot all by canisters in the future?
+
+-------------------------
+
+nomeata | 2021-02-23 16:07:13 UTC | #27
+
+Sure, why not? (Assuming you use a HTTP bridge like the one I built, or eventually building on something similar that makes it into the offical offering.)
+
+-------------------------
+
+blacktyger | 2021-02-27 16:08:37 UTC | #28
+
+Hey, I'm new here (and newbie programmer overall), came from Python that I fell in love, now Dfinity is my new romance, but I need to make a big jump :D.
+
+I like writing telegram bots in python, so doing one on IC seems to be perfect example to start with.
+
+Questions:
+- Whole bot logic is pure rust, and I can change in without problems?
+- Bot is connected to ic-http-lambda running on AMAZON LAMBDA service? Is this like webhook and bridge between old rusty internet and new shiny IC?  : D
+- Live demo is pointing to your local environment? Or it's live on IC and cost cycles?
+- Can I write something to fetch data from outside http APIs and save it to IC, or forward to telegram chat?
+
+Sorry for stupid question if asked, but the whole thing is still shaping in my head :slight_smile: 
+Thanks for help, and great job!
+
+-------------------------
+
+nomeata | 2021-03-03 18:49:28 UTC | #29
+
+The `ic-http-lambda` is just a side proof of concept of mine, to show what’s possible with an HTTP interface. The fact that I run it on AWS is immaterial, once a feature _like_ that becomes official nobody will remember my little experiment :slight_smile: 
+
+> Can I write something to fetch data from outside http APIs and save it to IC, or forward to telegram chat?
+
+No, there is no good story for doing HTTP requests from a canister; it is somewhat at odds with replicated deterministic execution. So not for now.
+
+-------------------------
+
+nomeata | 2021-03-04 06:53:29 UTC | #30
+
+Judging from https://github.com/dfinity/agent-rs/pull/120 it seems that an “offical” version of this feature is in the making, so no need to worry about my little AWS experiment :-)
+(That one not yet with upgrade-to-update call, though).
+
+-------------------------
+
+shan | 2021-04-04 06:15:52 UTC | #31
+
+Interesting. If I'm interpreting this PR correctly, it looks like they are experimenting with sending HTTP requests via a set of Replica URLs by creating an intermediary canister that forwards the response back to a parent canister to circumvent wasm's lack of host knowledge. I'm still quite new to ICP, so might be missing something in that pipeline (or misinterpreting it, also pretty new to Rust!.. and wasm :stuck_out_tongue:)
+ 
+Wondering if we have any information on when (or if) this feature might be incorporated into the IC CDK? This will inform whether I wait for a bit so I can do it on the IC, orrrrrrr make a bridging 3rd party server to forward responses into my main backend canister.
+
+-------------------------
+
+nomeata | 2021-04-04 08:38:33 UTC | #32
+
+Close: it's not an intermediate canister, but rather a gateway service that is built into the “edge” of the internet computer - but as a developer, this is not something you need to worry about. The effect is simply that your canister is directly accessible from any HTTP client in the world: browsers of course, but also services invoking web hooks etc.
+
+Docs should be coming soon™
+
+-------------------------
+
+shan | 2021-04-04 19:21:47 UTC | #33
+
+Thanks for the info! I realise this behavior will be abstracted out eventually, but curious; is it possible for a developer to access a set of replica URLs from within a canister? I was under the impression that I could not, and looking at the PR it seems that they are being submitted via CLI rather than programmatically fetched in some way. Do you have any information about how that works in practice?
+
+-------------------------
+
+nomeata | 2021-04-05 08:49:26 UTC | #35
+
+I am not 100% sure I know what you mean, but let me try to answer anyways:
+
+Although not a really an intended use-case, it is indeed the case that a canister A can access the URLs exposed by canister B via the interface intended to be used by the HTTP Gateway, via an inter-canister call. Although my hope is that canisters will expose their features nicely via Candid-typed method calls, as there is no need to drop to the level of HTTP-encoded request between canisters.
+
+I am not sure what you mean by CLI vs. programmatically fetched, though: A canister exposes the `http_request` query method, and then the HTTP Gateway will turn HTTP requests into IC query calls. There is no CLI in the strict sense involved, but also nothing is really “programmatically fetched”; the request is merely translated between the two protocols.
+
+-------------------------
+
+levi | 2021-04-05 09:24:35 UTC | #36
+
+Is that how an asset canister knows to call its retrieve function when accessed by a url? by the creating of the http_request-method on the canister? 
+
+Does this mean we can fully customize our asset canisters as if they were regular canisters? Im curious how the asset canister compares to a regular canister at the protocall-level.
+
+-------------------------
+
+nomeata | 2021-04-05 11:01:55 UTC | #37
+
+“Asset canisters” are just normal canisters whose primary purpose happens to be to store your frontend assets, but there is no special treatment on the protocol level.
+
+-------------------------
+
+levi | 2021-04-05 19:44:56 UTC | #38
+
+Cool, thank you. 
+So where did the 2mb file limit on the asset canisters come from? (I know now there is no 2mb file limit with the new beta release) 
+
+My main question is will we have to use webpack for our frontend going forward? Or will we be able to just store the frontend-files-bytes on a canister and just serve the files to a browser with the http_request function?
+
+Also is there docs out yet bout the http_request canister function?
+
+-------------------------
+
+kpeacock | 2021-04-05 19:58:24 UTC | #39
+
+Hi there - I was refraining from answering this question until I had signoff to make this post: https://forum.dfinity.org/t/preview-improved-asset-canisters/2387. TLDR - we are supporting HTTP GET requests like a classic server now out-of-the-box!
+
+The 2mb file limit came from a restriction on message sizes that came from wasm, however we've worked around it by supporting chunking in DFX.
+
+Our improved canisters remove webpack as a dependency
+
+We have some new documentation about the architecture [here](https://medium.com/dfinity/a-technical-overview-of-the-internet-computer-f57c62abc20f), with more to come once we settle on and promote 0.7.0 stable
+
+-------------------------
+
+shan | 2021-04-06 00:00:24 UTC | #40
+
+Ah, sorry for the confusion. I was just referring to the CLI input from the `Clap` struct macro in the PR linked above, not for the actual release implementation. Just trying to understand the inner workings of ICP's architecture as best as I can.
+
+From what I can infer from what you said, a developer would, by design, not have direct access to the Replicas, only to the Canister that they are working within. The canister would simply forward the request to the replica, and funnel the response back into the canister.
+
+I was mainly just wondering if it's possible to interact with Replicas from the perspective of the developer in some theoretical case where you might need to run something on the "edge" of the network as Dfinity is doing here with the HTTP Gateway.
+
+-------------------------
+
+nomeata | 2021-04-06 07:41:44 UTC | #41
+
+> The 2mb file limit came from a restriction on message sizes that came from wasm, however we’ve worked around it by supporting chunking in DFX.
+
+This is not entirely accurate: The 2MB restriction on message sizes is in “the replica”, i.e. the Internet Computer implementation. WebAssembly itself has no such restriction.
+
+It seems that currently, the same limit applies to the size of update calls (user to canister, via consensus), query calls (user to canister, one node only) and  inter-canister calls (canister to canister), both for the call and the response. One could imagine different limits (e.g. larger query responses), but it would at least break the uniformity of the messaging abstraction. In any case, there ought to be some limit, so this chunking in the HTTP Gateway is a great way to avoid issues here.
+
+> From what I can infer from what you said, a developer would, by design, not have direct access to the Replicas, only to the Canister that they are working within. The canister would simply forward the request to the replica, and funnel the response back into the canister.
+
+Hmm, there might some terminology confusion here… are you confusing “canister” with “edge node/HTTP gateway”?
+
+Developers create canisters (i.e. services). These run on a subnet, which is the same thing as saying that these run on many nodes/replicas simulatenously. Users can interact with the canisters; this interaction goes through the edge nodes (which route the request to a suitable node/replica that’s part of the right subnet for this canister).
+
+> I was mainly just wondering if it’s possible to interact with Replicas from the perspective of the developer in some theoretical case where you might need to run something on the “edge” of the network as Dfinity is doing here with the HTTP Gateway.
+
+Ah, I see. Right now, user code (i.e. canisters) do not run on the edge nodes, but there is a vision that eventually, query calls (those that do not need to go through consensus and don’t change state) can be executed by the edge node directly, instead of by the node that takes part in a subnet. The Internet Computer is designed so that such an optimization can be introduced without the developers worrying about it, though.
+
+-------------------------
+
+levi | 2021-04-06 21:46:41 UTC | #42
+
+:Gratitude for the clarification. I comprehend the need for the system message size limit, so now my question is with your statement here:
+
+> so this chunking in the HTTP Gateway is a great way to avoid issues here.
+
+Where is the chunking happening in the specific? is it in the dfx tool? where the dfx tool uploads asset files in chunks to the asset canister? 
+
+Or is the chunking happening on the ic system level of some sort? if so can you laborate on where exactly the request is being chunked and how those chunks are sent? is it the "edge nodes" that are doing the chunking? 
+
+Does it work backwards too? if i need to respond to a http request with a large file will the system automatically chunk it for me? lets say the file is stored on my canister as bytes, if the whole file is 50mb, lets say a user requests the file with a public function update call, should the public function on the canister return with the whole mount of the bytes? or would i need to implement chunking on the canister? 
+
+Also if the chunking is on the edge nodes for the http_requests, does the chunking also work when communicating with the system through the standard ic api as is stated in the internet-computer-specification? or would the chunking only work when using the http edge node gateway?
+
+-------------------------
+
+kpeacock | 2021-04-06 22:57:42 UTC | #43
+
+The `dfx` SDK is able to chunk requests and send them to an asset canister. That canister is programmed to receive chunked files and to respond to http_request calls with chunked responses.
+
+You could implement the same functionality in your own canister, but it won't be present on all canisters, just the one that we build for you when you designate `"type": "asset"` for that canister in `dfx.json`.
+
+Even better news - this code is open source! The code to upload chunked assets lives in `ic-agent` and the `http_request` interface lives in `ic-utils/src/interfaces/http_request.rs`.
+
+https://github.com/dfinity/agent-rs
+
+-------------------------
+
+nomeata | 2021-04-07 08:10:11 UTC | #44
+
+[quote="levi, post:42, topic:1257"]
+lets say the file is stored on my canister as bytes, if the whole file is 50mb, lets say a user requests the file with a public function update call, should the public function on the canister return with the whole mount of the bytes? or would i need to implement chunking on the canister?
+[/quote]
+
+The canister would have to implement chunking, but hopefully and eventually your CDK will provide a convenient high-level interface for that.
+
+[quote="levi, post:42, topic:1257"]
+or would the chunking only work when using the http edge node gateway?
+[/quote]
+
+
+Yes, this chunking we are talking about is a feature of the upcoming HTTP gateway.
+
+-------------------------
+
+levi | 2021-04-09 19:59:39 UTC | #45
+
+[quote="kpeacock, post:43, topic:1257, full:true"]
+
+Even better news - this code is open source! The code to upload chunked assets lives in `ic-agent` and the `http_request` interface lives in `ic-utils/src/interfaces/http_request.rs`.
+
+https://github.com/dfinity/agent-rs
+[/quote]
+
+This is the best news thank you, good-portunity for the learn of the rust, i am looking for as close to metal as possible here thanks.
+
+-------------------------
+
+paulyoung | 2021-05-23 16:20:05 UTC | #46
+
+In `agent-rs`, all requests to canisters implementing the HTTP interface are converted to `query` calls:
+
+https://github.com/dfinity/agent-rs/blob/6804d29c2cb2e34c6d4116c74edd9cf5687ccce4/ic-utils/src/interfaces/http_request.rs#L81
+
+It seems like it should be trivial to inspect the request method and convert `POST`/`PUT`/`DELETE`/etc to an `update` call instead, but I’m assuming this code is only for development purposes and won’t affect the HTTP gateway on the network.
+
+I took a look at `dfn_http` but I haven’t been able to figure out how/where that’s used or intended to be used.
+
+https://github.com/dfinity/ic/tree/024de2fc73d7f6f5df5a92edf9675851f9ebbf59/rs/rust_canisters/dfn_http
+
+I would contact the author but everything appears as `dfinity-bot`. It would be helpful if the commits showed the author as well as the committer.
+
+@nomeata, do you know if `update` calls work with the HTTP interface for canisters?
+
+-------------------------
+
+paulyoung | 2021-05-23 22:24:28 UTC | #47
+
+Perhaps better for another thread, but I’d love some help understanding the process (in general) for proposing a change of this nature.
+
+Is the `ic` repo a read-only public mirror, or does it accept pull requests?
+
+How does the NNS fit in?
+
+Thanks
+
+-------------------------
+
+samjiks | 2021-05-24 06:16:43 UTC | #48
+
+I am facing a error when dfx deploy, do you know what cause the error.
+
+ERROR in ic:canisters/supplier
+Module build failed: UnhandledSchemeError: Reading from "ic:canisters/supplier" is not handled by plugins (Unhandled scheme).
+Webpack supports "data:" and "file:" URIs by default.
+You may need an additional plugin to handle "ic:" URIs.
+
+-------------------------
+
+chenyan | 2021-05-24 17:47:45 UTC | #49
+
+The `ic:` URI is replaced with `dfx-generated/`. See the doc here: https://sdk.dfinity.org/docs/developers-guide/webpack-config.html#_how_the_default_templates_are_used
+
+-------------------------
+
+chenyan | 2021-05-24 17:53:25 UTC | #50
+
+I think `http_request` only supports query method for now. We will need replica support to send update calls inside a query method.
+
+-------------------------
+
+paulyoung | 2021-05-25 00:02:09 UTC | #51
+
+@chenyan thanks Yan!
+
+I would also like to propose that `http_request` can determine the HTTP status code as part of its return value.
+
+I’ve already encountered a scenario where I need to return a `403` but am unable to do so.
+
+Is there a better place to discuss this and make these proposals?
+
+-------------------------
+
+chenyan | 2021-05-25 00:15:44 UTC | #52
+
+You can submit an issue at the [agent-rs](https://github.com/dfinity/agent-rs) repo.
+
+For update calls, @nomeata has a PoC here: https://github.com/nomeata/ic-http-lambda/
+
+-------------------------
+
+paulyoung | 2021-05-25 00:26:01 UTC | #53
+
+I think these are both feature requests for the replica  though.
+
+-------------------------
+
+ICVF | 2021-05-25 00:49:10 UTC | #54
+
+[quote="nomeata, post:29, topic:1257"]
+there is no good story for doing HTTP requests from a canister
+[/quote]
+
+Does this mean that an OTP service (provided by a vendor who is not on IC) cannot be deployed via a website served by a canister? Also, is an OTP-like service available on IC?
+
+-------------------------
+
+nomeata | 2021-05-25 07:27:23 UTC | #55
+
+(removed, moved to https://forum.dfinity.org/t/feature-request-map-appropriate-http-request-methods-to-update-calls/4303/2?u=nomeata)
+
+-------------------------
+

@@ -1,0 +1,190 @@
+vdve1997 | 2024-08-12 11:50:54 UTC | #1
+
+**Hi everyone!**
+I'm Valentina, CTO of [Cero Trade](https://www.cerotrade.cl), a climate asset marketplace on the blockchain. We're currently developing our MVP on the ICP blockchain using Motoko with the support of a **Developer Grant**, but we've hit a significant roadblock and could use some help from the community.
+
+**The problem:**
+We're dynamically generating canisters every time a new token is registered under the ICRC standard. While this approach allows us to maintain independence and scalability for each token, the cost of generating new canisters is quite high (around 2 ICP each time). This makes our current setup unsustainable in the long run.
+
+**How you can help:**
+I'm looking for developers with experience in ICP optimization and canister creation who can review our approach and suggest improvements. I can't share the repository directly here due to security and privacy concerns, but I'm happy to discuss details privately.
+
+Any help or suggestions would be greatly appreciated. If you're interested in collaborating, please reach out to me on Discord: **videvidts#5394**. Thank you in advance!
+
+-------------------------
+
+timo | 2024-08-12 12:19:47 UTC | #2
+
+Can you post the Motoko code lines that generate the canister? It should be much less to generate a canister, a few cents maybe.
+
+-------------------------
+
+vdve1997 | 2024-08-12 14:09:53 UTC | #3
+
+Sure:
+
+In this code, the `TokenIndex` canister is designed to dynamically create new canisters whenever a new token is registered. Below is an explanation of how this process works, focusing on the key parts of the code:
+
+### 1. **Wasm Module Registration**
+
+```
+shared({ caller }) func registerWasmArray(): async() {
+   // Fetch the Wasm module for the token canister
+   let wasmModule = await HttpService.get({
+      url = "https://raw.githubusercontent.com/Cero-Trade/mvp1.0/" # branch # "/wasm_modules/token.json";
+      // Further processing of the wasm module
+   });
+
+   // Register the wasm module
+   wasm_module := Blob.fromArray(nums8);
+
+   // Update the deployed canisters
+   for((tokenId, canister_id) in tokenDirectory.entries()) {
+      await IC_MANAGEMENT.ic.install_code({
+         arg = to_candid({ ... });
+         wasm_module;
+         mode = #upgrade;
+         canister_id;
+      });
+   };
+};
+```
+
+This function fetches and registers the WebAssembly (Wasm) module used to deploy the token canisters. This module defines the code that will run on each dynamically created canister.
+
+### 2. **Creating a New Canister**
+
+```
+private func registerToken<system>(assetMetadata: T.AssetInfo): async T.CanisterId {
+   let cid = switch (tokenDirectory.get(assetMetadata.tokenId)) {
+      case (?cid) cid;
+      case (null) {
+         // Add cycles for canister creation
+         Cycles.add<system>(T.cyclesCreateCanister);
+
+         // Create a new canister
+         let { canister_id } = await IC_MANAGEMENT.ic.create_canister({
+            settings = ?{
+               controllers = switch(controllers) {
+                  case(null) null;
+                  case(?value) {
+                     let currentControllers = Buffer.fromArray<Principal>(value);
+                     currentControllers.add(Principal.fromActor(this));
+                     ?Buffer.toArray<Principal>(currentControllers);
+                  };
+               };
+            }
+         });
+
+         // Install the Wasm module in the new canister
+         await IC_MANAGEMENT.ic.install_code({
+            arg = to_candid({
+               name = assetMetadata.deviceDetails.name;
+               symbol = buildSymbol(assetMetadata.deviceDetails.deviceType);
+               assetMetadata;
+               comission = Nat64.toNat(T.getCeroComission());
+               comissionHolder;
+            });
+            wasm_module;
+            mode = #install;
+            canister_id;
+         });
+
+         // Initialize the canister
+         await Token.canister(canister_id).admin_init();
+
+         // Register the canister in the directory
+         tokenDirectory.put(assetMetadata.tokenId, canister_id);
+         canister_id;
+      };
+   };
+   cid
+};
+```
+
+* **Cycle Allocation:** The function starts by adding the necessary cycles (ICP) to create the new canister.
+* **Creating the Canister:** `IC_MANAGEMENT.ic.create_canister` is called to create the new canister, which returns a `canister_id`.
+* **Installing the Wasm Module:** The `install_code` function is used to install the Wasm module into the newly created canister. This module contains the logic for the token's operation.
+* **Initialization:** After the canister is created and the code is installed, it is initialized with the token's metadata and commission information.
+* **Directory Registration:** The new canister ID is stored in the `tokenDirectory`, associating it with the token ID.
+
+### 3. **Canister Management**
+
+The `TokenIndex` canister includes various functions to manage these dynamically created canisters:
+
+* **Starting and Stopping Canisters:**
+
+```
+public shared({ caller }) func startDeployedCanister<system>(cid: ?T.CanisterId): async () {
+   ...
+};
+
+public shared({ caller }) func stopDeployedCanister<system>(cid: ?T.CanisterId): async () {
+   ...
+};
+```
+
+These functions allow the starting and stopping of individual or all deployed canisters.
+* **Canister Status:**
+
+```
+public shared({ caller }) func statusDeployedCanisterById<system>(tokenId: T.TokenId): async {
+   ...
+};
+```
+
+This function retrieves the status and other metadata of a specific canister.
+
+### 4. **Cycle Management**
+
+```
+Cycles.add<system>(T.cyclesCreateCanister);
+```
+
+The creation and management of canisters involve cycles, which are a form of computational resource in the Internet Computer. This function ensures that enough cycles are available to create and maintain the canisters.
+
+### Summary
+
+When a new token needs to be registered, this system:
+
+1. **Checks** if the token is already associated with an existing canister.
+2. **Creates** a new canister if one doesn’t exist, using the Wasm module and provided metadata.
+3. **Installs** the necessary code (Wasm) on the new canister.
+4. **Initializes** the canister with the appropriate token data.
+5. **Registers** the new canister in the `tokenDirectory` for future reference.
+
+-------------------------
+
+timo | 2024-08-12 14:22:11 UTC | #4
+
+What is your value for `T.cyclesCreateCanister`?
+
+-------------------------
+
+vdve1997 | 2024-08-12 15:09:58 UTC | #5
+
+* `public let cycles: Nat = 20_000_000;`
+This variable holds the amount of cycles allocated for general consumption or operations within the canister.
+* `public let cyclesCreateCanister: Nat = 100_000_000_000;`
+This variable holds the amount of cycles specifically reserved for the creation of new canisters.
+
+The first variable (`cycles`) is used for everyday operations, while the second one (`cyclesCreateCanister`) is dedicated to the more resource-intensive task of creating new canisters.
+
+-------------------------
+
+vdve1997 | 2024-08-12 17:46:58 UTC | #6
+
+Ok so I think I overestimated the cyclesCreateCanister and 300 000 000 is enough to create a new canister (roughly 0.13 USD), I will deploy, try it and get back to you.
+
+-------------------------
+
+moamir | 2024-08-14 01:52:33 UTC | #7
+
+Hello,
+
+sorry for out of topic. I am newbie in blockchain I just want to know from where should I start to learn to create a token wallet **for the Internet Computer Protocol (ICP) blockchain.**
+
+and please share some updated resources of icp.
+
+-------------------------
+

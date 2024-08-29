@@ -1,0 +1,108 @@
+jzxchiang | 2021-08-15 02:03:29 UTC | #1
+
+How is `RelShared` intended on being used in [CanCan](https://github.com/dfinity/cancan/blob/45e519f6252a182e1f90ffcdf4af69aca7cb5f2a/backend/Rel.mo#L51)? (It's not fully implemented so I can only guess what the intentions are.)
+
+The non-shared `Rel` type is defined as:
+```
+  public type Rel<X, Y> = {
+    forw : Trie.Trie2D<X, Y, ()> ;
+    back : Trie.Trie2D<Y, X, ()> ;
+    hash : HashPair<X, Y> ;
+    equal : EqualPair<X, Y> ;
+  };
+```
+Whereas `RelShared` is defined as:
+```
+  public type RelShared<X, Y> = {
+    forw : Trie.Trie2D<X, Y, ()> ;
+    //
+    // No HO functions, and no backward direction:
+    // In a serialized message form, the backward direction is redundant
+    // and can be recomputed in linear time from the forw field.
+    //
+    // back : Trie.Trie2D<Y, X, ()> ;
+  };
+```
+^ I'm not sure what HO means here—is it the hash and equal functions?
+
+Also, does `RelShared` omit the `back` field because `RelShared` is intended only to be used as persistent `stable` storage with all of the actual query logic instead going to a `Rel` data structure that's initialized from `RelShared` during canister creation? This way, the `back` field in `Rel` can be initialized from the `forw` field in `RelShared` in the same pass over `RelShared`.
+
+-----
+
+Related to this... I've heard that a canister's stable storage limit will be increased from 4 GB to something much larger in the near future. If this is the case, then how would a, say, 80 GB stable `RelShared` initialize a non-stable `Rel`, if a canister's non-stable, linear memory is still capped at 4 GB?
+
+Thanks!
+
+-------------------------
+
+diegop | 2021-08-15 03:38:30 UTC | #2
+
+I am not sure, tbh. Good question.
+
+@matthewhammer @chenyan would you guys have any context?
+
+-------------------------
+
+matthewhammer | 2021-08-17 18:27:40 UTC | #3
+
+[quote="jzxchiang, post:1, topic:6474"]
+How is `RelShared` intended on being used in [CanCan ](https://github.com/dfinity/cancan/blob/45e519f6252a182e1f90ffcdf4af69aca7cb5f2a/backend/Rel.mo#L51)? (It’s not fully implemented so I can only guess what the intentions are.)
+[/quote]
+
+Yeah, I'm responsible for sketching that code, but never using it.  Apologies for it being incomplete.
+
+That type definition was part of a thought process that was relevant when I was considering whether each OO-style object in type `State` had a corresponding non-OO representation that would be `stable`.  As you guessed, that's relevant for saving state across upgrades.  That feature is very important in practice, but since CanCan never ran in production, that backend feature was never prioritized or implemented.
+
+However, to see a variant of the same codebase that does use stable memory, you can check out Candid Spaces' "forever log", a stable sequence that is meant to grow across upgrades and never forget anything:
+https://github.com/matthewhammer/candid-spaces/blob/802d352ab8c661cadb60b0e63310c4c5473c339d/motoko/service/CandidSpaces.mo#L31
+
+That code illustrates how we need to use a non-OO structure, like `Sequence.Sequence` directly, and avoid any OO wrappers.  `RelShared` should probably have been named `RelStable` or something, but it had a similar goal, for all of the relations.
+
+>  Also, does `RelShared` omit the `back` field because `RelShared` is intended only to be used as persistent `stable` storage with all of the actual query logic instead going to a `Rel` data structure that’s initialized from `RelShared` during canister creation? This way, the `back` field in `Rel` can be initialized from the `forw` field in `RelShared` in the same pass over `RelShared` .
+
+Great question -- In short, yes, exactly that.
+
+The performance of stable vars in Motoko is not good at the moment during the upgrade step, when the entire content of that variable is written and read back from the canister's stable memory.  Since it's O(n) just to do an upgrade (where `n` is the size of all stable memory), trying to additionally store acceleration structures that can also be rebuilt in O(n) time/space makes little sense to me.  Exactly what you said.
+
+However, when stable memory becomes more incremental, storing more clever representations will pay off, I expect, and we'll want to do that.  However, CanCan never evolved to any version using stable memory, so the point never got pressed.
+
+-------------------------
+
+jzxchiang | 2021-08-19 07:01:22 UTC | #4
+
+Thanks for the response.
+
+Can you clarify what you mean by "when stable memory becomes more incremental"? I wasn't aware that something like this was on the roadmap. How would that work? It sounds pretty interesting, although to be honest maybe a O(n) upgrade step isn't that bad—could just do it when there aren't any users using the canister...
+
+-------------------------
+
+matthewhammer | 2021-08-19 19:17:24 UTC | #5
+
+[quote="jzxchiang, post:4, topic:6474"]
+Can you clarify what you mean by “when stable memory becomes more incremental”? I wasn’t aware that something like this was on the roadmap
+[/quote]
+
+Sure.
+
+But to be clear, this wouldn't be a roadmap-level feature, in the sense that it has nothing to do with the IC system itself, and just concerns what Wasm the Motoko compiler is producing to run there.
+
+So, the salient layers are the Motoko compiler's policy for representing and compiling `stable var`s in the main actor, and how it compiles that actor's upgrade hooks with respect to those representation choices.
+
+As I mentioned, the current policy is simple and not efficient, and not incremental.  For each upgrade, the compiler emits Wasm code that walks over all memory of each stable var.  That is not incremental, but it could be in the future.
+
+When the compiler does something more incremental, it would "merely" be a new use of the same (or similar) IC system API for the canister to read and write its stable memory region.
+
+Separately, that region may increase in size, but if that happens, it's a distinct feature, at a distinct layer.  FWIW, that increase is on the [roadmap](https://dfinity.org/roadmap/), and [also on this forum](https://forum.dfinity.org/t/increased-canister-storage/6148).  Apologies for the ambiguity.
+
+-------------------------
+
+matthewhammer | 2021-08-19 19:16:20 UTC | #6
+
+[quote="jzxchiang, post:4, topic:6474"]
+although to be honest maybe a O(n) upgrade step isn’t that bad—could just do it when there aren’t any users using the canister…
+[/quote]
+
+Yes, another good point.  I totally agree!
+
+-------------------------
+

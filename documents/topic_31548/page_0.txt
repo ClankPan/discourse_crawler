@@ -1,0 +1,101 @@
+qwertytrewq | 2024-06-04 15:10:10 UTC | #1
+
+It seems that when there are multiple same-named HTTP headers in a request:
+```
+    public shared func test(): async Text {
+        let headers = Http.headersNew();
+        headers.put("Host", ["local.vporton.name:8081"]); // overrides the default
+        // Add arbitrary headers for testing:
+        headers.put("Content-Type", ["text/plain"]);
+        headers.put("X-My", ["my", "my2"]);
+        let res = await Call.callHttp(
+            {
+                url = "https://local.vporton.name:8443";
+                headers = headers.share();
+                body = "";
+                method = #get;
+            },
+            null,
+            {
+                max_response_bytes = ?10_000;
+                cycles = 900_000_000_000; // TODO: much too much
+                timeout = 60_000_000_000; // 60 sec
+            },
+        );
+        let ?body = Text.decodeUtf8(Blob.fromArray(res.body)) else {
+            Debug.trap("No response body.")
+        };
+        body;
+    }
+```
+(a code from currently debugged https://github.com/vporton/joining-proxy-rust), then HTTP outcall preserves only one header. That's wrong. Multiple same-named headers is legit in HTTP and they should be preserved.
+
+However, this may be a fake alarm, I didn't thoroughly test it yet.
+
+-------------------------
+
+qwertytrewq | 2024-06-06 09:22:15 UTC | #2
+
+@kpeacock The bug was confirmed by a [minimal example](https://github.com/vporton/multiple-headers-bug).
+
+The outgoing in an outcall HTTP headers are erroneously crumbled (headers with duplicate names are removed, what should not).
+
+The incoming HTTP headers to IC are processed correctly.
+
+Where to report the bug in Replica?
+
+-------------------------
+
+christian | 2024-06-06 09:27:48 UTC | #3
+
+Hey, according to the HTTP spec, you can simply concatenate all values using a comma. E.g.:
+
+```
+Accept: text/html
+Accept: application/xml
+```
+
+is equivalent to
+
+```
+Accept: text/html, application/xml
+```
+
+I hope this helps.
+
+-------------------------
+
+qwertytrewq | 2024-06-06 09:41:22 UTC | #4
+
+@christian Current Replica removes a part of fields altogether rather than concatenating them. So, it's a bug.
+
+Second, [Field Lines and Combined Field Value](https://www.rfc-editor.org/rfc/rfc9110.html#name-field-lines-and-combined-fi) does not warrant that a client or a server will consider the meaning of a repeated field equal to its combined value.
+
+Particularly, AFAIK, it is an error to combine several `Set-Cookie` into one separated by comma.
+
+-------------------------
+
+christian | 2024-06-06 09:54:19 UTC | #5
+
+Right, this would not work for `Set-Cookie` as it uses a specific format to separate different attributes of a single cookie.
+
+Thanks a lot, we filed a bug and will look into it.
+
+-------------------------
+
+qwertytrewq | 2024-06-06 11:03:29 UTC | #6
+
+But note that "default" headers (Host, Content-Type, and (in some reason added by IC) Accept; maybe I forgot some) that are added by default, should be overwritten by user query rather than added to them.
+
+-------------------------
+
+tim1 | 2024-06-07 09:44:05 UTC | #7
+
+Thanks for the bug report. Indeed you are right that we remove some headers that have the same header name. 
+
+The fix has been [merged](https://github.com/dfinity/ic/commit/f22bc3f34eee21f53e26b995652c8d1c28db5991) and should be deployed on mainnet in ~1.5 weeks.
+
+Again thanks for reporting and providing a reproducible example!
+
+-------------------------
+

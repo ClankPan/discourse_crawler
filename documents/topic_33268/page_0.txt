@@ -1,0 +1,100 @@
+borovan | 2024-07-16 10:27:06 UTC | #1
+
+Hi, I've run into an issue because the complexity of inter-canister calls has exceeded what I was expecting, and need help.
+
+Our architecture is designed as a tree of canisters.  Root contains all the WASM for every other canister, and creates and upgrades every other canister on the subnet.  When a new canister is spawned it knows what the root_id is, and what it's parent_id is.  It will also keep track of all the child_ids in the future so it can function as part of the tree.
+
+If game canister #958 needs to query the world canister and find all the monsters that live at world co-ordinate 8,8,8, it sends the request to its parent, and then the parent is authenticated to query the world canister.
+
+I designed it this way because I didn't want to have to sync a BTreeMap with 100,000 rows representing all the subnet canisters between all the canisters as that's insane.  Authentication of every endpoint is super important to the game.
+
+What I was thinking was - could I just have a canister (perhaps root) that is the sole owner of that 100,000 row BTreeMap?  I'd have to route every endpoint into a composite query that hits this one canister.  What's the best way to do this?
+
+--------------
+
+Here are some screenshots that provide extra information.  Everything is automated via macros and "alien moon code"
+
+![image|669x341](upload://su1NomllsHTvMxUfa1uKG01gDYu.png)
+
+![image|690x434](upload://thYDfMWegA2fwYYvif5paSLwSOh.png)
+
+![image|500x500](upload://bh6W64J49oBRsQd47F3FwdlZAEq.png)
+
+-------------------------
+
+ielashi | 2024-07-16 11:26:42 UTC | #2
+
+[quote="borovan, post:1, topic:33268"]
+What I was thinking was - could I just have a canister (perhaps root) that is the sole owner of that 100,000 row BTreeMap? I’d have to route every endpoint into a composite query that hits this one canister. What’s the best way to do this?
+[/quote]
+
+IIUC, this canister would be the intermediary for fetching the monsters that live at a world coordinate for all the canisters, correct? Whether or not this approach is sufficient depends on the load you're expecting. AFAIK there are 4 threads for queries, and each canister is limited to 2 threads. @berestovskyy perhaps you know concrete benchmarks?
+
+-------------------------
+
+borovan | 2024-07-16 11:47:40 UTC | #3
+
+As for the load, we're going to probably end up with multiple subnets decicated to Dragginz, so yes as much load as the subnet can handle.
+
+We need to authenticate every call as we don't want the game secrets to leak.  Nobody other than the player that is standing at 8,8,8 should be able to access the data of that location.
+
+We could always replicate the canisters and have a  master "subnet index" crate and replicate it.  I need to know if that's something we'd need before starting to code it.
+
+-------------------------
+
+ielashi | 2024-07-16 11:53:00 UTC | #4
+
+[quote="borovan, post:3, topic:33268"]
+We could always replicate the canisters and have a master “subnet index” crate and replicate it. I need to know if that’s something we’d need before starting to code it.
+[/quote]
+
+Without knowing a concrete load to support, I'm not sure this question can be answered. If you want to have the maximum throughput possible, then yes having replicas of the index canister will lead to higher throughput, but I'd recommend starting with the simplest approach and only moving to the more complex one when/if the demand is there.
+
+-------------------------
+
+borovan | 2024-07-16 11:59:42 UTC | #5
+
+Are there any issues with just the fact another canister is involved with the call?  Does that involve any significant overhead.
+
+What I'm trying to avoid is a design that's focused on multiple canisters being called via a composite query only to find in the future that it's a bottleneck.
+
+I can't imagine there's too much because they're all in memory on the node right?
+
+Right now we've got max 2 canisters in any composite query call.  However, just like SQL queries on a webpage, following best practices in coding are followed (abstraction of storage layers, separation of concerns etc.), usage of the underlying resources can be harder to manage.
+
+-------------------------
+
+berestovskyy | 2024-07-16 13:19:35 UTC | #6
+
+The canister's state is on the disk, unless it was recently updated. There is a slight overhead of running a query across multiple canisters, as each canister runs in a separate sandbox. Also please keep in mind that the composite queries work only within the same subnet, i.e. they won't scale across subnets.
+
+By the way, we have a [Scalability and Performance](https://forum.dfinity.org/t/technical-working-group-scalability-performance/14265) Working Group. We could discuss your setup there, or you could find inspiration from [past presentations](https://docs.google.com/document/d/11L9_MvoW12JTWH71T6i3ULskjj9b3Gec0oBPVR83ZsE).
+
+-------------------------
+
+borovan | 2024-07-16 14:15:36 UTC | #7
+
+Yup thanks, I think we're going to arrange a call just so we can have the experts look at our architecture!
+
+Going to simplify things a lot with composite queries and will report back.
+
+-------------------------
+
+levi | 2024-07-17 03:00:48 UTC | #8
+
+Hey @borovan, There might be a better way. You can make it so that game canister #958 can call the world canister directly and still show authentication without syncing a map. First you can choose a constant public-key for the root-canister using a constant seed either through the threshold-ecdsa management-canister apis or through canister-signatures(like internet-identity), both work, threshold-ecdsa is simpler to set up. When the root canister creates a game canister (or any canister that it creates), the root canister can sign a message using the root's-public-key with the management-canister apis, where the message contains the child-canister's-id and it's authorization level/status, like: "this canister-id: abcde-fg... is a game-canister#958", and then the root puts that message and the signature on that message into the child canister using the child-canister's init-parameters or another method. Then when it comes time for the game canister #958 to call the world canister, the game-canister can show it's authorization in the call-request by sending the message and signature in the call-request. The world canister already knows the root's public key, so when the world canister receives the call from the game canister, the world canister verifies the signature on the message and checks the caller's authenticity.
+
+-------------------------
+
+borovan | 2024-07-17 13:07:58 UTC | #9
+
+Yup, we're attempting this right now, thanks so much!
+
+-------------------------
+
+levi | 2024-07-18 03:05:16 UTC | #10
+
+Awesome, you're welcome!
+
+-------------------------
+

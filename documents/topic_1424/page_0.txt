@@ -1,0 +1,208 @@
+pie-silo | 2020-10-15 18:37:19 UTC | #1
+
+Just splitting this out from this thread about scalability: https://forum.dfinity.org/t/scalability-of-update-calls-in-a-common-scenario/1422/2
+
+[quote="PaulLiu, post:2, topic:1422"]
+If 1000 calls are sent to different canisters (on the same or different subnets), then all of them will be processed in parallel. If 1000 calls are sent to the same canister on the same subnet, then all of them will be processed in order. It really depends on how many cycles each call will take. If each call take 1s, then the 1000th will only be completed after 1000s.
+[/quote]
+
+Could you explain a bit more how this interacts with blockchain blocks and cross-canister calls?
+
+My naive view is that incoming calls, whether from outside or inside the IC, wait in some kind of mempool, until they're processed and accepted into a block. Block consensus imposes some minimum latency of a few seconds on each block and on all the requests within it. 
+
+For argument's sake suppose the call takes negligible CPU time.
+
+It seems like you would still have some scaling limits to do with capturing the incoming requests and their results in the blockchain and coming to consensus on them? 
+
+In particular, what happens if the top-level request triggers some quasi-blocking messages to other canisters? 
+
+I'm not sure, but it sounds like Paul is saying that all the batch input is collected before processing begins? 
+
+That would seem to imply that the outgoing messages can't be processed until the next round, which means a multi-second delay per step of fan-out? But then, the top level call cannot produce any result in the block where it's originally enqueued: it's still awaiting a result. Does it get retried in a later block?
+
+On the other hand, if the subsidiary requests are processed in the same block, that seems to allow blocks to grow without bound in both space and time...?
+
+-------------------------
+
+PaulLiu | 2020-10-15 23:02:29 UTC | #2
+
+> In particular, what happens if the top-level request triggers some quasi-blocking messages to other canisters?
+
+Not sure what you mean by "quai-blocking", but all messages are asynchronous, i.e., sender of a message will not wait for the message reply to come back. So in other words, a canister is never blocked, when it finishes processing current message, it'll just pick up next one from its incoming message queue. Of course queue size is limited, in which case the sender will get a error back (in the form of a reply message). The space of replies (success or error) are pre-reserved, so the sender will know at sending point whether it will receive a reply.
+
+There is also a max cycle limit per message, so if a message takes too long to run, the execution will abort. So nothing should block a canister for long.
+
+> all the batch input is collected before processing begins 
+> ... seem to imply that the outgoing messages can’t be processed until the next round
+
+Not sure what you mean by "outgoing", but inter-canister calls to the same subnet can interleave with messages from the input batch. Inter-canister calls to a different subnet will be picked up for delivery periodically.
+
+Although input batches are picked up in order, there may still be residual messages in the system when the next batch is picked up for execution. It all depends on capacity. There is no strict guarantee on the order of messages that a canister processes. 
+
+So inter-canister messages for the same subnet are not considered part of the input batch (which includes those from user and from other subnets). There may be a worry that at some point there can be too many pending messages in the system, but if each canister has a max input queue size, the total capacity is bounded, at which point, messages are dropped and sender will receive an error in reply.
+
+-------------------------
+
+pie-silo | 2020-10-15 23:21:07 UTC | #3
+
+There's an 'await' keyword, which I thought could be used to wait for a response. Perhaps I misunderstood?
+
+-------------------------
+
+ohmi | 2020-10-15 23:40:52 UTC | #4
+
+If each canister has it's own private fixed-sized message queue, and each update takes a minimum time of 1 second (1000 times slower than a query), then the size of the queue update messages is the maximum rate of processing in seconds, because any additional messages are discarded. When that occurs (and it will, frequently, unless queue length can be enormous compared to normal message/packet buffers), what if any kind of error messages or responses are returned to anyone like the caller? If each update takes one second to process, then any traffic greater than 1/sec must be queued and if the queue length is n, the n+1 update received in a second will be discarded. The recovery solution that seems most obvious is to retry (particularly if the error code isn't specific); this will not help.
+
+Message queue depths in such protocol designs are rarely designed to hold more than few messages unless responsiveness isn't a direct requirement (like push notification). The IC could provision very large queues for each canister, so hundreds of items long perhaps. That it will take 100 update-times to get to that 100th update call seems unavoidable.
+
+-------------------------
+
+PaulLiu | 2020-10-16 00:05:17 UTC | #5
+
+[quote="ohmi, post:4, topic:1424"]
+each update takes a minimum time of 1 second (1000 times slower than a query)
+[/quote]
+
+That is the wrong idea. The difference between update and query is in latency, not efficiency. A function call runs in exactly the same way regardless of whether it is update or query, with some (but hopefully not too much) persistence overhead.
+
+Put in other words, if a user sends a update call, she will only receive a reply in a couple seconds.If a user sends 1000 update calls, she will likely also receive 1000 replies in a couple seconds, if the actual execution of the function takes 1ms to run.
+
+You may also think of it as pipelines. Users fill the input pipeline, which takes sometime to reach consensus before they are moved to execution pipeline. The execution pipeline periodically pumps out output, which are moved to output pipeline. In the ideal case, none of the pipelines sit idle. It may take a couple seconds for the output corresponding to an user input to appear in the output pipeline, but if you stuff a thousand input messages in there, they may all finish in a couple seconds.
+
+Real world performance of course depends on many variables. We may not be able to keep the pipelines filled, or some pipelines are over-filling and must spill. It is our goal to have input pipeline limited by network bandwidth, execution pipeline limited by hardware, and use multiple subnets for horizontal scaling.
+
+-------------------------
+
+PaulLiu | 2020-10-16 00:15:12 UTC | #6
+
+[quote="pie-silo, post:3, topic:1424, full:true"]
+There’s an ‘await’ keyword, which I thought could be used to wait for a response. Perhaps I misunderstood?
+[/quote]
+
+The `await` has the typical meaning in async programming, e.g. nodejs or rust. It means the execution will pick up from this point when the response comes back, but before that, there could be other inputs to the canister that got processed.
+
+-------------------------
+
+pie-silo | 2020-10-16 00:33:07 UTC | #7
+
+The interesting scenario for me is: user calls canister A, which calls (passes a message and awaits a reply from) canister B1 and B2 and B3, each of which in turn calls canister C1, C2, C3. Maybe layer B is structured storage and C is an underlying database. The pattern is not uncommon in internet apps and the 2 layers with 3x fanout in this example is small. 
+
+Assume they're all update calls so require consensus. The overall user-facing transaction is not complete until all these call-and-responses have completed.
+
+To make the math easy assume blocks complete in 3s. (Although that number seems optimistic to me, for subnet-wide consensus across multiple DCs, running arbitrary user code, with all the apparent sources of variability.)
+
+Now does this take:
+ - Also in 3s, because everything happens inside a single block? 
+ - In 9s, because the messages from A to B are processed inside the next block, so 3 rounds total?
+ - Actually in 18s because there are 6 layers of messages counting the replies? 
+ - Actually even more than 18s because some messages might miss out on being processed in the immediately next block and so have to wait longer, with compounding effects?
+
+Even at 3s I agree with ohmi that this is going to be unacceptable for many applications, and extremely uncompetitive with alternative infrastructure. And at 18s it's obviously ridiculous.
+
+[quote="PaulLiu, post:2, topic:1424"]
+inter-canister calls to the same subnet can interleave with messages from the input batch. Inter-canister calls to a different subnet will be picked up for delivery periodically.
+[/quote]
+
+I understand this to mean you're aiming to complete all of A, B123 and C123 within a single input batch, but it's not required. Any messages that you run out of time or space to process will wait for the next block. So it seems like in the best case, it will be 3s, but probably variability in the system will commonly cause end-to-end latency to be much higher. If the message to B2 is late, then you're at 6s. If in addition the message to C2 is late, 9s. If the reply from B2 to A is also delayed, 12s...
+
+Dominic has written elsewhere that people have already written high-performance scaled out systems on the IC, but all the examples/demos I see are pretty simple and almost-stateless. Are there any benchmarks or demonstrations showing low latency for multi-tier systems?
+
+-------------------------
+
+pie-silo | 2020-10-16 00:44:56 UTC | #8
+
+By "quasi-blocking" I meant the kind of thing shown in https://sdk.dfinity.org/docs/developers-guide/tutorials/intercanister-calls.html: 
+
+```
+  public shared(msg) func isConnected(userId: UserId): async Bool {
+    let userIds = await Connectd.getConnections(msg.caller);
+    Utils.includes(userId, userIds)
+  };
+```
+
+The code is calling another container and it can't complete until the server responds. Whether this is done by directly blocking the VM or by a continuation seems not really essential to assessing the latency of this single call - although of course async calls make it easier to overlap operations.
+
+[quote="PaulLiu, post:6, topic:1424"]
+The `await` has the typical meaning in async programming, e.g. nodejs or rust. It means the execution will pick up from this point when the response comes back, but before that, there could be other inputs to the canister that got processed.
+[/quote]
+
+So in nodejs or rust, when you await a condition, the process is still alive and perhaps listening for a notification from the OS.
+
+In the IC, I'm not clear whether 
+1. The wasm VM is still alive and will continue from that point when the completion occurs? If so, it seems like this blocks completion of the original block?
+2. Or, the continuation of the VM is somehow written onto the blockchain and picked up when a message is dequeued that matches the condition?
+
+-------------------------
+
+PaulLiu | 2020-10-16 01:29:08 UTC | #9
+
+[quote="pie-silo, post:7, topic:1424"]
+Now does this take:
+
+* Also in 3s, because everything happens inside a single block?
+[/quote]
+
+The answer is 3s. Execution is timed in cycles. As long as there are remaining cycles, pending messages (both from user and inter-canister as results of executing prior messages) will always be processed, doesn't matter how many are there.
+
+The idea is that we should not leave execution idle, which implies we aim to utilize hardware to its full capacity. Performance (i.e. execution throughput) should be comparable to similar hardware in a conventional cloud environment. Only difference is in latency for update calls.
+
+[quote]
+In the IC, I’m not clear whether
+
+1. The wasm VM is still alive and will continue from that point when the completion occurs? If so, it seems like this blocks completion of the original block?
+2. Or, the continuation of the VM is somehow written onto the blockchain and picked up when a message is dequeued that matches the condition?
+[/quote]
+
+Canister is always live as long as there are remaining messages to process. In case of `await`, it will resume from that execution point when its reply comes back. But before that happens, the canister continues to ingest next message in queue.
+
+-------------------------
+
+pie-silo | 2020-10-16 16:10:40 UTC | #10
+
+[quote="PaulLiu, post:9, topic:1424"]
+The answer is 3s. Execution is timed in cycles. As long as there are remaining cycles, pending messages (both from user and inter-canister as results of executing prior messages) will always be processed, doesn’t matter how many are there.
+[/quote]
+
+So the subnet processes as many messages as it can until it runs out of cycles, and then (and only then) freezes the memory state of all canisters and finalizes the block. Ok, makes sense. 
+
+And you need to ensure that all replicas agree on the exact same point to stop, I suppose, even if that means they are only part way through the batch...
+
+So the basic answer is 3s, but if any of the messages are "unlucky" and don't get completed inside that single batch, they need to wait another 3s, and that might happen repeatedly... 
+
+I suppose you could say this is a thrashing state and the canisters should be over-provisioned so that this never happens... But it's a helluva step from an already-slow 3s to 6s or more, if the subnet gets a bit busy.
+
+-------------------------
+
+pie-silo | 2020-10-16 16:31:25 UTC | #11
+
+One other question about the cycle limit: is this per-block, or per message, or (I guess) both?
+
+If the subnet runs out of cycles, does it abort current messages, or finish the current message and take no more?
+
+I guess if you don't kill them then one greedy actor can keep going indefinitely and the block won't finish, and so no more external messages will be accepted and every other CPU will be idle. So that's no good.
+
+This seems to mean that if someone wants to do CPU-intensive computation that lasts more than the cap, they need to manually refactor their code to, I guess, externalize its state and send itself messages to do the next stage. And this has to be done at perhaps a sub-CPU-second granularity? That sounds like a big pain in the butt. 
+
+And if you have slightly-CPU-intensive code that fits under the per-message cap, it might still sometimes be killed due to the whole block running out of cycles?
+
+-------------------------
+
+PaulLiu | 2020-10-27 07:21:14 UTC | #12
+
+[quote="pie-silo, post:11, topic:1424"]
+This seems to mean that if someone wants to do CPU-intensive computation that lasts more than the cap, they need to manually refactor their code to, I guess, externalize its state and send itself messages to do the next stage. And this has to be done at perhaps a sub-CPU-second granularity? That sounds like a big pain in the butt.
+[/quote]
+We are aware of this limitation, and hopefully the per message cycle limit will be large enough to accommodate most use cases. One solution to address this is to save the execution context much like in an operating system. But the (asynchronous) semantics of this change will have repercussions, because it may also surprise people when a single update call is implicitly broken into 2 or more calls simply because it took too long. So for now, having a cap and being explicit about this limitation is necessary, until a better solution surfaces.
+
+-------------------------
+
+ohmi | 2020-10-29 17:46:12 UTC | #13
+
+This scheme shares cpu cycles across all canisters getting messages in a subnet until some limit is reached based on total time to execute, then a persistence event occurs. How will a subnet behave when a flood of messages for a few/one canister come in to ensure other canister's messages are processed 'fairly' and prevent further perceived performance losses? Serialization and selection of messages into batches in this environment seems fraught with sharp edges. 
+
+Can we say the absolute number of messages processed by a subnet in a batch sets a hard bound on the amount of persistent state that can be changed and the number of canisters that can do work in that period? If the number of canisters that receive messages is even somewhat greater than that message processing capacity, then it seems like some canisters will be treated unfairly batch-over-batch over time and/or performance will suffer by many measures, although not overall throughput. 
+
+If CPU-intensive computation is problematic, what about updating a large amount of state just from inputs - an initialization case, for example? If a message itself has to contain the, say, 1 MB of new data to persist, how many such messages could a single subnet process on behalf of how many canisters per message cycle limit? Looping through lists inserting into other lists and arrays is fast as RAM and CPU allow, but still takes time to process and so there must be an upper limit.
+
+-------------------------
+

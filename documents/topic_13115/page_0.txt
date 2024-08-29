@@ -1,0 +1,77 @@
+rudy | 2022-05-19 04:47:53 UTC | #1
+
+I have not yet seen an example of this being done. Would the following code work in general, given `workers: Vec<Principal>`?
+
+```rust
+let responses: Vec<Result<(Nat,), _>> = futures::future::join_all(
+        workers
+            .into_iter()
+            .map(|principal| call::call(principal, "get_num", ())),
+    )
+    .await;
+```
+
+It seems to work fine on my local network. Would it depend on whether the worker canisters are on the same subnet?
+
+Here's my demo: https://github.com/rudyhb/async_actors
+
+-------------------------
+
+free | 2022-05-19 10:19:43 UTC | #2
+
+Should work just fine on the IC, canister calls are asynchronous.
+
+E.g. if you have one incoming ingress message that executes the code above, the sequence of events is the following:
+1. Ingress message is executed as transaction. It enqueues N outgoing canister requests into its output queues and finishes execution when it hits the `await` (persisting any local variables, call stack, etc. into a *call context*; and reserving a *callback* referring to this *call context* for each of the enqueued requests). (One transaction)
+2. Each of the requests is routed to whatever destination canister and executed, producing a response. (N transactions)
+3. Each response is routed to your original canister and each is executed as a separate message, updating the *call context* created at step (1) (e.g. by marking the respective future under `join_all()` as `Ready`) and dropping the corresponding callback. (N transactions)
+4. (Actually 3b) When the last response at step (3) is executed, all *callbacks* have been dropped, the `await` returns and execution of the code beyond it continues, eventually producing a reply to the ingress message and dropping the *call context*. (This the Nth transaction from step (3) above, not a separate transaction.)
+
+All in all, you have N+1 transactions executed on your canister (the ingress message plus N responses) and N transactions executed on downstream canisters (each request you've sent, assuming these complete immediately and don't result in further downstream messages). It's just a whole lot of messages being passed around and executed asynchronously (except that all messages executed on a given canister are executed sequentially -- since canisters are single threaded -- but in no particular order).
+
+-------------------------
+
+rudy | 2022-05-19 12:57:45 UTC | #3
+
+Thanks for the explanation! Quick follow-up:
+
+If I want to make my dApp more scalable (allow for more simultaneous users, more transactions per second), should I aim to have all my worker canisters in the *same* subnet, or in *random* subnets? Or does it not matter?
+
+-------------------------
+
+Zane | 2022-05-19 13:03:17 UTC | #4
+
+Afaik same subnet would be better, but there is no way currently to force canister creation on a specific subnet
+
+-------------------------
+
+Severin | 2022-05-19 15:00:41 UTC | #5
+
+Currently, when using a wallet to create them, canisters are always created on the same subnet as the wallet.
+
+-------------------------
+
+free | 2022-05-19 15:28:43 UTC | #6
+
+Depends on your requirements.
+
+Splitting a dapp (whose canisters communicate with one another) across multiple subnets means additional latency for cross-subnet (XNet) calls. On the order of 2x the latency of an ingress message (because essentially one subnet needs to induct the other's request, handle it and certify a response; and the originating subnet needs to induct the response and handle it; and it had to certify the request before the "server" subnet could induct it). On the plus side, if you can scale your dapp proportionally to the size of the IC (in terms of throughput and storage).
+
+Keeping all of a dapp's canisters on a single subnet gives you very fast inter-canister calls (multiple back-and-forth messages per round in the average case; so at least an order of magnitude faster) but you are limited by the latency, throughput and storage of that subnet (which, you must remember, will be shared with tens of thousands of other canisters).
+
+-------------------------
+
+Sormarler | 2022-05-19 19:21:37 UTC | #7
+
+What's the current max size for a subnet and can it be increase? If so what is the downside of making the subnet bigger?
+
+-------------------------
+
+free | 2022-05-19 19:34:00 UTC | #8
+
+In terms of state, it's 350 GB (of canister heap and stable memory). This is limited by node storage (we keep around the last 5 or so checkpoints, sometimes more. so we need 5x that amount of disk); and by checkpointing / state sync speed (you will notice dips in finalization rate every 10 minutes or so on busy application subnets, because the full state needs to be persisted and a hash of it computed every 500 blocks; this is checkpointing and certification).
+
+We could probably push the limit a bit higher, but not by more than e.g. 2x on the current hardware. And you'd notice various negative effects on performance (such as increased checkpointing and state sync times).
+
+-------------------------
+

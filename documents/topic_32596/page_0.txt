@@ -1,0 +1,118 @@
+boern | 2024-07-02 03:22:28 UTC | #1
+
+Currently, I have a State struct like this:
+```
+pub struct State {
+    #[serde(skip, default = "memory::init_ticket")]
+    pub ticket: StableBTreeMap<TicketId, Ticket, Memory>,
+    ...
+}
+```
+In the next version, we removed the ticket:
+```
+pub struct State {
+    ...
+}
+```
+After upgrading this canister, how does IC handle the stable memory previously used by the ticket? Does the developer need to manually handle the stable memory?
+
+-------------------------
+
+dsarlis | 2024-07-02 08:44:27 UTC | #2
+
+The memory used by ticket will still be there since the stable structures don't support freeing memory at the moment.
+
+-------------------------
+
+boern | 2024-07-02 09:08:00 UTC | #3
+
+So, the canister still have to pay cycles for these unused stable memories, right?
+
+-------------------------
+
+dsarlis | 2024-07-02 09:11:58 UTC | #4
+
+Yes, that's correct.
+
+-------------------------
+
+boern | 2024-07-02 09:13:43 UTC | #5
+
+@dsarlis Thx,  Got it
+
+-------------------------
+
+antinutrino | 2024-07-02 09:41:24 UTC | #6
+
+Are there any plans to allow freeing stable memory during an upgrade? Seems wasteful to not be able to change the internal state of a canister and keep having to pay cycles on it.
+
+-------------------------
+
+dsarlis | 2024-07-02 15:12:09 UTC | #7
+
+There was a [PR](https://github.com/dfinity/stable-structures/pull/95) that the team worked on a while ago but decided to close it at the time because there were some tricky parts that needed to be handled properly and we deferred given that no one had asked about it. If there's a lot of interest we can pick this work up again when we have some free cycles.
+
+-------------------------
+
+antinutrino | 2024-07-04 08:59:18 UTC | #8
+
+I can see why it might not be a high priority ticket and also tricky to implement, but at the same time it's something I think long term ICP should support. 
+
+Who want's to pay cycles for data that is no longer in use?
+
+I see 2 clear scenarios
+
+1. I have a type that has say a blob field. I decide I no longer need the blob field on the type or as part of the canisters stable memory. 
+
+2. I decide to reorganise my types and move the blob to another type, I still need the data in the blob but just associated with a different type.
+
+I think auto detecting this is very tricky. I'd expect that a migration must be written for the canister update that for 1) deletes the blob 2) migrates the blob to another type without losing any data.
+
+For either option I wouldn't expect to have to keep paying cycles for the stable memory where the blob was removed from. Perhaps I am missing something.
+
+-------------------------
+
+dsarlis | 2024-07-04 09:29:15 UTC | #9
+
+Fair points. I agree with you that auto detecting is very hard and you would likely do a migration as you said. And so, yes, I agree, you might have cases where you really want to delete the memory. And indeed, you shouldn't be paying for memory you don't use. So, either we give a way to "free" it or you can mark it as unused so you don't pay cycles for it.
+
+Thanks for the feedback, I'll relay this internally and we will try to schedule the work to fix this in the long term.
+
+-------------------------
+
+dsarlis | 2024-07-04 09:46:07 UTC | #10
+
+Also to clarify a bit on the use cases you presented @antinutrino:
+
+If you're removing a field from a data structure or moving it to another and you write a migration logic as you described, I'd expect that the memory loss would be minimal since you would still have a stable structure and at least for the StableBTreeMap we do try to reuse as much the existing buckets before allocating more. That's because we're still talking about the same memory.
+
+The problem is more on the case that was presented initially where you might want to drop an entire stable structure (and the underlying memory associated with it).
+
+-------------------------
+
+antinutrino | 2024-07-04 09:50:07 UTC | #11
+
+Thanks for that clarification @dsarlis, I had wondered if there would a be situation where eventually the memory would be overwritten by new data. Still trying to understand just how stable memory works exactly in that respect.
+
+-------------------------
+
+dsarlis | 2024-07-04 09:57:58 UTC | #12
+
+Very high level:
+
+The memory manager will chunk up the entire stable memory into buckets. Each stable structure is backed by a virtual memory (you request it from the memory manager). The stable structure is responsible for managing its own memory. When the data structure requires more memory, it'll allocate a new bucket and it will be assigned to it by the memory manager. The bucket can then be used internally by the data structure (but not by other memories/data structures).
+
+Let's look at some examples with a StableBTreeMap. If you perform an insertion in a StableBTreeMap and there's no more space, a new bucket of memory will be allocated. You can then continue inserting data and as long as there's space, no more buckets will be allocated.
+
+Buckets can be reused though by the stable structure. Imagine you remove data from the StableBTreeMap which would make a bucket be free (but still assigned to this data structure); if then you insert more data, before allocating new buckets, the stable structure will attempt to re-use existing buckets of memory.
+
+The idea of "free"-ing a a memory would be akin to un-assigning its buckets. Then other memories/stable structures can claim them when they need to grow.
+
+-------------------------
+
+antinutrino | 2024-07-04 10:07:33 UTC | #13
+
+makes sense, thanks for explaining this
+
+-------------------------
+

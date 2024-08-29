@@ -1,0 +1,397 @@
+ohmi | 2020-10-14 23:02:06 UTC | #1
+
+Say I have a canister that lots of people want to use. Callers use a update api first to register with the canister. Scenario: 1,000 (1K) such updates come in in one second. How many seconds pass before the 1000th update is resolved and that person receives the response? Will it not take 2K seconds to get each registration persisted? Does the wait time to process an update scale linearly to the number of identical update messages queued up? I note they are deterministically sequenced and each must completly update persistent memory. Does this answer change if the api itself interrogates the persistent data structure to make sure a username is unique or is just a simple insert?
+
+-------------------------
+
+PaulLiu | 2020-10-15 03:30:08 UTC | #2
+
+Good questions! There are a number of aspects regarding throughput:
+
+1. How many update calls can IC handle per second.
+
+Short answer: *unlimited*. This is because IC is able to throw in more resources and scale out by adding subnets.
+
+2. How many update calls can a subnet handle per second.
+
+Short answer: *it depends*. Because all machines participating the same subnet will be running identical computation, the theoretical limit is bounded by hardware (CPU, disk) and network. It also depends on what these update calls actually do, you can imagine some calls consumes more cycles than others.
+
+So really I'd ask a slightly different question: *"how many cycles can a subnet consume per second"*, if we use cycles as an approximation of unit computation. This will not be too different than traditional platforms offering VM or container solutions.
+
+Besides CPU and disk bound, there is also a network bound. Essentially all blockchains arrange inputs into batches (blocks), and process them one by one. So network bandwidth dictates how many messages can be included for processing per second. An ideal situation is to be able to saturate both available network bandwidth and available hardware capacity. But of course in reality there are always overheads that cannot be avoided.
+
+3. How many update calls can a canister handle per second.
+
+Because each canister handles each update calls one by one, this implies there is a limit to the throughput per canister. Again, each call is different, so the best way to think about it is still in terms of "cycles". A very rough estimation is how many cycles can a single execution thread (e.g. one CPU core) consume per second.
+
+Back to your original question. If 1000 calls are sent to different canisters (on the same or different subnets), then all of them will be processed in parallel. If 1000 calls are sent to the same canister on the same subnet, then all of them will be processed in order. It really depends on how many cycles each call will take. If each call take 1s, then the 1000th will only be completed after 1000s.
+
+You also asked about persistence. We only persist states periodically (say after each batch), so the overhead of disk I/O is not per message.
+
+-------------------------
+
+ohmi | 2020-10-15 22:12:10 UTC | #3
+
+Thank you for your interesting answers. Naturally, they raise more questions. I have been following Dfinity since the earliest days, read those papers, etc. Now rubber is finally meeting the road. 
+
+There is plenty to not like about the straw man analysis I do here, and I hope it's in the straw. I'd like very much for the most grandiose promises about the IC to the true. However, I see issues. 
+
+Thinking more narrowly about processing identical, minimal update messages by the same canister or subnet, let's define the scenario further still - the update call adds a string to a persistent memory associated with the caller's id. This string is supposed to be unique across all callers, so I'm interested in learning how the IC supports this kind of common constraint. In fact, support for this kind of logic requirement (code invariants) in a scalable way seems fundamentally more important to me as a developer than very nice things like scalable queries. 
+
+I presume the additional overall cost for the actual canister code here to save that string is utterly dwarfed by the overhead cost (in terms of instructions executed, electricity consumed, etc); clearly the overhead can't be less than the few hundred instructions the actor code compiles to, even with a search for uniqueness thrown in. I'm only speaking of code actually running on the same cpu as the canister - any network traffic increases the cost by orders of magnitude. 
+
+In the case where we have only one canister on one subnet these update messages are processed sequentially (in the network order received? any guarantees?). The uniqueness constraint is easily satisfied. However, the performance of the canister is worse than unacceptable; the implementation is clearly deficient, an anti-pattern at best, and cannot serve even as a starting point for inductive reasoning about the real thing.
+
+So, given a real IC with a subnet and plenty of cpus in a datacenter. The 1000 updates start coming in (although let's ignore any startup considerations for now, assuming all that's done) and start getting processed in parallel by some number of canisters in that subnet. 
+
+How can the uniqueness constraint be satisfied here? With regards to persistent memory, is it correct to say that all canister copies in a subnet have exactly the same memory content only after each batch is resolved? However, the messages are supposed to be processed in some kind of order? 
+
+I would like to understand how the uniqueness check could be managed here. To be clear - I'd like to reason about my data structure and today I'd write down an invariant: all strings are unique at all times. 
+
+If there are n update messages, they get queued into a batch and fanned out to some number of canisters. I understand you to say then that multiple updates can be executed in the same batch, presumably simultaneously as otherwise it's no better than the single canister case. Also, this implies every message assigned to a batch must complete before the batch can be processed. Also, a batch can have up to some max number of messages; if less, it will eventually be processed via a timeout, hence guaranteeing a minimum response time in the case of low traffic
+
+As each canister executes it decides whether to add a name or not to its persistent memory. If that memory isn't identical across canisters in the same subnet executing on different cpus, then any of searching that memory will fail to detect duplicates created by other messages executing simultaneously. If a canister's memory isn't updated between invocations/resolution of the same message, it will fail to detect duplicates created by another copy executing in the same batch, yes? It is interesting that one can say that no more than n duplicate names will ever by created max, based on message batch size. However, we wanted n to be 0 in this case.
+
+Uniqueness is not a unique problem here. The IC is a new paradigm to write code to solve problems. How does the IC help canister/actor writers can ensure their persistent resource: memory data structures, can support code that provide not just specific (arbitrary) business rules, but basic invariants like uniqueness, ordering, or relationships between objects if not captured by underlying datatypes but through composition, aggregation, etc? How does the IC help coders reason about these issues if the behavior of the lovely single thread of execution actor model actually isn't the behavior of a single-thread actor in the IC? 
+
+So, even if the uniqueness constraint cannot be met, how is the performance? It seems to me that the best that can happen is that somehow some number greater > 1 updates are persisted every 1 second - better than the single canister case. One can put an upper limit on this as the number of canisters on the subnet that execute the update, i.e., if we assume perfect independence of the updates then it's all just down to the overhead of processing a "batch". If the batch size is 1000, and there are a 1000 threads each processing the update call instantly then after 1 second all 1000 updates are persisted/resolved and all RAM in the subnet is updated, then the maximum upper limit on scalability is achieved and it's the batch size/second. For just that one canister of course, that's not the real IC design, unless I really misunderstood. Messages across canisters are persisted in the same batch, correct? There is no way to say, pay with cycles for your canister's messages to be updated before anyone else's in a subnet?
+
+So, my unwilling conclusion here is that a real subnet in a real datacenter will scale to handle perhaps a few dozen updates per canister per second in the simplest, easiest case!?! I doubt actual datacenters be able provision hundreds of identical canisters per subnet (worse, do it at speed, when spikes of identical messages come in), to even have a chance of 100 updates/sec? If so, for any practical system of real size, overall system performance like we see today is still order of magnitudes out of reach if implemented on top of IC.  On top of that, one can't code data structures that offer provable invariant behavior, performance guarantees, or arbitrary business logic because though that code may be identical in every respect to code performing well today, it is not executing in the environment it models and doesn't model the environment it is executing in.
+
+On the other side of performance is responsiveness. The IC doesn't seem to do well here either. If one must wait on the result of a update for whatever reason, worst case it could take hours, even worse than Bitcoin or Ethereum today, crucially depending not on overall blockchain update throughput (although limited by same), but instead on the provisioning of canisters and their state at any given time. Worst case performance really matters.  
+
+In a sense this is just the same as today - one must buy and provision all the networks resources one needs to satisfy performance requirements - if one has traffic then one can afford traffic.  However, today, typically what others do with their resources doesn't matter that much to you. This is not true for the IC, the number of updates per second is fixed across an entire subnet (at least) and that update bandwidth is shared across the canisters. If you have lots of updates and so does some other canister you'll both  get degraded performance because of the other and adding additional canisters or even subnets won't work because the fairness of (and overhead of) the message processing will put a hard upper limit on what one actor can update per second. This number should be known - in fact, a benchmark actor/tool should be included in the SDK that provides the exact answer in real time for a given canister/subnet, apologies if I have missed it.
+
+Canisters writers that wish to make update calls on other canisters cannot reason about the performance of their code because of this - the canisters they call into cannot themselves provide an adequate responsiveness guarantee because of the IC design. This would seem to make it very hard to design cooperating canisters/actors in a way that provides minimal guarantees and scales in any reasonable, practical way.  
+
+Human interaction is also presents several unappealing issues. The unbounded variability of the performance of a canister for updates is highly annoying but we are all familiar with spinning logos and the like. Since fast means sub-second times for humans, every UI form submission which calls an update api will be slow, often taking longer than the user took to fill in the data - this increases the chance for bad UX.  
+If an operation will take more than a few seconds one prepares the user in a particular way and presents an appropriate UI. The difference between subsecond delay and 10 seconds is almost nothing in the context of an IC - 10 updates/sec might do it. A ui choce for every single submit that says "Processing your request, estimated completion time is X seconds - ok/cancel" where is a real-time query to the subnet or NNS asking for might be needed in the future to help users decide if it's the right  time to update. 
+
+Note we are only taking about inserts here, updates seem even more problematic. In general, the ability of the canister coder to reason about their data structures depends entirely on how well the model presented to us is actually implemented. It's been known how to write provably correct code for single threaded execution for decades. I can write a insert with uniqueness check method in Python with a high degree of confidence. However, here, uniqueness seems difficult if not impossible to achieve here; there is no code the coder can add to that method to actually permit that invariant to hold given that memory isn't even shared in RAM but rather copied across physical networks. 
+
+This isn't great. I hope Dfinity hasn't failed out of the gate, failing to produce a system that can't handle this common scenario: Users want to register and sign in to a new canister because they saw a tweet with a link. The first ones to click on that link will get a reasonably normal UX. At some point (the 100th, 1000th, or 10,000th person) and every person after that, will fill out the form (if lucky enough to be served it) and will then rage quit/timeout. because those updates are, by design, split into n updates/sec where the n includes all canister messages just completed in a subnet. That batch size directly drives the response time and it seems today 2 orders of magnitude too slow to handle even a trivial 100 updates/sec over time. 
+
+That point of user rage quit failure is worse for container writers who want to make update calls on a canister - eventually enough identical update messages at the same time to the same canister or canister subnet will take too long to wait for a response for, given that they are also running in a canister - heaven help them if they need to made addtional updates based on previous responses. I also must point out the best case per update performance is still one batch-time - so even if those canisters you update aren't busy, each update on them takes the same time as <batch-size> updates. All these problems are completely out of the calling container's control and they can't even ask for more subnets/containers because they don't own them. Also, no matter how much someone may be willing to pay for it, one cannot buy or improve the fundamental update/sec limit imposed by the crypto tech? Since you cannot prevent someone from accessing your canister's methods you can't even control or provision for a ddos-style kind of attack?
+
+Real life IC performance for this simple update scenario and similar first-year cs questions should already be known and made public, forgive me if I have missed it. If hardware is already built for the production network than hard upper limits on update performance should be available, as should the models used to predict the performance of that hardware before it was built.
+
+Another questions, perhaps revealing what came first: is the IC/wasm memory persistence model implemented with/rely upon the crypto tech or is it clever low-level programming and understanding of wasm virtual memory blocks that is then used to support the crypto tech? I wonder how fast this update batching would take if the crypto stuff was simply left out? How well would the IC work with less/no crypto, say in the single cansister/subnet case? That should tell you exactly the upper limit of scaling for the IC - basically how fast you can copy RAM diffs in a gigabit subnet? Does a production subnet use an architecture like Microsoft's with custom hardware/packet processing to make this faster?  
+
+Thanks for your attention; I mean no criticism to be hurtful. I will go for funny, but that's it.
+
+-------------------------
+
+PaulLiu | 2020-10-15 23:50:38 UTC | #4
+
+Let me first clarify a couple things before I reply to other questions.
+
+[quote="ohmi, post:3, topic:1422"]
+is it correct to say that all canister copies in a subnet have exactly the same memory content only after each batch is resolved?
+[/quote]
+
+It is best to think of a subnet as a "single computer", and it runs multiple canisters, each one has its own persistent memory and does not share with others. Canisters only communicate through messages, not shared memory.
+
+Now, in reality we do run a network of machines in the same subnet, for redundancy and security purposes. Collectively they run a consensus protocol to make sure for each of them, canisters receive the same input and execute in exactly the same way.
+
+In terms of update call, it is best to think of the network machines collectively as a single computer. For query calls maybe we can think of them as some kind of CDN, where data can be served from edges.
+
+Back to your example. Suppose each message contains a string to append, and they are addressed to the same function of the same canister. Then they are processed sequentially one by one. After all is done, the canister will have a string in memory that is the concatenation of the 1000 input strings. However, IC will not guarantee message order. So if you repeat the same set of messages with the same initial canister state, you might have a different result. It is up to the application code to deal with message orders if it is required.
+
+IC will not guarantee message delivery either, because for whatever reason the target canister may reach its max capacity in input queue, or runs out of cycles. In this case, if it is an inter-canister message, the sender will receive an error in reply. If it is a user message, the user will receive an error code when querying message execution state.
+
+IC does guarantee that a message will not be executed more than once. Each user message must include an expiry timestamp, and if IC's clock has advanced beyond the timestamp, the user is guaranteed a reply -- either the result of successful execution or an error.
+
+So uniqueness is satisfied. I think there may be a confusion somewhere, but IC does not implicitly clone multiple copies of the same canister to process a batch of inputs in parallel. Inputs are only processed in parallel if they are addressed to different canisters.
+
+> Canisters writers that wish to make update calls on other canisters cannot reason about the performance because of this
+
+It is our intention to give bounds to both computations and communications. Inter-canister calls are guaranteed to receive a reply, but how timely really depends on a number of variables. The estimate is a couple seconds when network conditions are good.
+
+> a system that can’t handle this common scenario: Users want to register and sign in to a new canister because they saw a tweet with a link
+
+IC will provide basic QoS protection in terms of rate limiting and access control. Exact details are yet to be conveyed to developers, but we are working on it.
+
+That said, application developers can already start with some horizontal scaling techniques. For example, the tweet should lead to a query call, which serves a redirection to a randomly chosen canister id out of a dozen canisters, each on a different subnet.
+
+Scalability comes at multiple levels, there is no silver bullet I'm afraid. But hopefully IC can provide a sensible default that satisfy most developers starting out.
+
+-------------------------
+
+pie-silo | 2020-10-16 00:52:42 UTC | #5
+
+[quote="PaulLiu, post:4, topic:1422"]
+Suppose each message contains a string to append, and they are addressed to the same function of the same canister. Then they are processed sequentially one by one. After all is done, the canister will have a string in memory that is the concatenation of the 1000 input strings. However, IC will not guarantee message order. So if you repeat the same set of messages with the same initial canister state, you might have a different result. It is up to the application code to deal with message orders if it is required.
+[/quote]
+
+Dfinity has an idea of running the same computation redundantly in multiple DCs and checking they produce exactly-identical results. It seems that won't work unless you guarantee all DCs see the same messages, in the same order, within each batch?
+
+If you do try to ensure every DC sees the same messages in the same order in each batch, that seems to require reaching global consensus on the contents of the batch before starting to process it, and then a second global consensus on the results at the end?
+
+-------------------------
+
+pie-silo | 2020-10-16 01:08:01 UTC | #6
+
+Actually, there's a more interesting case: 
+
+Suppose A sends "ping" messages to B and C, and then updates its state to reflect the order in which they reply. If I understand correctly, Paul stated [elsewhere](https://forum.dfinity.org/t/consensus-and-inter-canister-calls/1424/2?u=pie-silo) that all of this can happen inside a single block/batch, as seems necessary for even vaguely acceptable performance. 
+
+The order in which the messages are processed by B and C, and the order their replies are seen by A, and so the final state of A, all seem to be non-deterministic depending on scheduling quirks.
+
+However if this computation is run by several independent DCs, they'll produce different arbitrary orderings and so different results in A, which is not allowed.
+
+This seems to mean that all participating DCs have to stay in lock-step not only for "external" messages coming in to the subnet, but also for the ordering of _every single internal message_. So every single message requires subnet-global consensus across multiple DCs. 
+
+Am I missing something? If this is the plan it seems really fatal for performance. Calls that would, on regular platforms, be sub-millisecond DC-local calls will take hundreds of ms.
+
+-------------------------
+
+PaulLiu | 2020-10-16 01:12:09 UTC | #7
+
+[quote="pie-silo, post:5, topic:1422"]
+Dfinity has an idea of running the same computation redundantly in multiple DCs and checking they produce exactly-identical results. It seems that won’t work unless you guarantee all DCs see the same messages, in the same order, within each batch?
+
+If you do try to ensure every DC sees the same messages in the same order in each batch, that seems to require reaching global consensus on the contents of the batch before starting to process it, and then a second global consensus on the results at the end?
+[/quote]
+
+Yes, you pretty much described the internal working of a subnet :slight_smile:
+
+-------------------------
+
+PaulLiu | 2020-10-16 01:16:41 UTC | #8
+
+[quote="pie-silo, post:6, topic:1422"]
+The order in which the messages are processed by B and C, and the order their replies are seen by A, and so the final state of A, all seem to be non-deterministic depending on scheduling quirks.
+[/quote]
+
+The order certainly is deterministic, because all nodes in a subnet will have to follow the same order to compute the same result. But we don't guarantee a particular order (e.g. the order in which messages are sent).
+
+It doesn't have to be lock-step, and simply following the algorithm of a deterministic scheduler should be sufficient.
+
+-------------------------
+
+ohmi | 2020-10-16 01:44:51 UTC | #9
+
+Good, I'm glad I am misunderstanding something, I really want to understand what you are calling persistence overhead and how that limits performance of updates and the system as a whole. 
+
+I understand now better how subnets process messages. Isn't there a problem with data returned from an update call (say the update call returns what should be the identical result of the query call asking for the new item)? I say a problem, because if that canister next processes a query call but that update wasn't persisted, it will return different data than the update, when it should not? Does data returned from an update have the same block-chained guarantees  if it wasn't read out of memory pages that were resolved from the previous batch via the full concensus algorithm?
+
+1. Memory value foo is set to "bar" originally
+2. update call sets foo to "baz: and returns foo: "baz"
+3. query call for foo returns "bar" because "baz" hasn't been resolved yet - it is in the same message batch. 
+4. update sets foo to "nope" and returns "nope"
+4.5 any additional queries still return "bar"
+5. the batch is resolved 
+6. query for foo returns"nope".
+
+The update query's return of "baz" seems like an error and arguably a bad one in numerous contexts.
+
+You say that a single canister can handle those 1000 update calls in a single second and return proper results for each. Current systems handle 100K updates (with acid transactions and rollbacks!) /sec on the same memory structures, so the IC still has an enormous scale issue to face directly because the updates are not just serialized but each executed as if there were a lock on the entire container memory, held and released for each execute message, ie., just like a single-thread of execution model would have. Isn't that real fundamental limit to performance in this architecture - for the entire length of execution time for an update call, it must be the only code in the entire IC changing those structures? 
+
+You are not saying one can query for the result of the first call before the last update call in the batch is executed; hence, even for a single update, it takes at least a update time tick, 1 second, before a canister caller can use or retrieve any updated information. And if the call really consumes cpu resources and takes say 100 ms, there isn't any way to improve throughput beyond 10/sec because each update must complete in a batch, and no more than 10 request could ever be done in one batch-time. This seems non-performant generally and specifically that floating point arithmetic, let alone full-precision numeric processing will not be that successful on the IC - something already acknowledged I guess.
+
+-------------------------
+
+pie-silo | 2020-10-16 01:52:59 UTC | #10
+
+[quote="pie-silo, post:5, topic:1422"]
+If you do try to ensure every DC sees the same messages in the same order in each batch, that seems to require reaching global consensus on the contents of the batch before starting to process it, and then a second global consensus on the results at the end?
+[/quote]
+
+It seems like this is pretty bad for latency. You need subnet-global consensus before you can even start processing the user request, and then again before you can deliver it...
+
+[quote="PaulLiu, post:8, topic:1422"]
+The order certainly is deterministic, because all nodes in a subnet will have to follow the same order to compute the same result.
+[/quote]
+
+Could you explain how, in this example, the nodes independently come to the same conclusion whether to deliver the message from B or C first?
+
+-------------------------
+
+ohmi | 2020-10-16 02:32:17 UTC | #11
+
+I can see this ordering decision taking place using specialized networking hardware in the IC right off the fiber, all done in fairly close to an average Ethernet packet transmission time. The subnet just needs to be told an order, it doesn't have to agree on one.
+
+-------------------------
+
+PaulLiu | 2020-10-16 03:00:29 UTC | #12
+
+[quote="ohmi, post:9, topic:1422"]
+* Memory value foo is set to “bar” originally
+* update call sets foo to "baz: and returns foo: “baz”
+* query call for foo returns “bar” because “baz” hasn’t been resolved yet - it is in the same message batch.
+* update sets foo to “nope” and returns “nope”
+  * any additional queries still return “bar”
+* the batch is resolved
+* query for foo returns"nope".
+[/quote]
+
+IC does not guarantee precise interleaving of update & query calls. So query call could return result of running against an older state than the absolute latest. It is up to the application to implement the ordering when it is required. For example, keeping and returning a sequence number of each update, and arrange query results in increasing sequence order.
+
+> You say that a single canister can handle those 1000 update calls in a single second and return proper results for each. Current systems handle 100K updates (with acid transactions and rollbacks!) /sec on the same memory structures
+
+Please take the number 1000 figuratively. Ideally the upper bound is limited by network I/O, not CPU or disk.
+
+> just like a single-thread of execution model would have. Isn’t that real fundamental limit to performance in this architecture
+
+As with any real application, they can have a multi-component multi-thread architecture. We expect developers to build one application out of many canisters.
+
+> And if the call really consumes cpu resources and takes say 100 ms, there isn’t any way to improve throughput beyond 10/sec because each update must complete in a batch, and no more than 10 request could ever be done in one batch-time.
+
+Yes, if all 10 requests are addressing the same canister, and each takes 100ms. Then the throughput for this canister is 10/s. I don't think this in any way limits the performance of IC, because if they can be parallelized, then multi-canister should be used instead of one; if they cannot, then 10/s is the theoretical limit already.
+
+-------------------------
+
+PaulLiu | 2020-10-16 03:15:14 UTC | #13
+
+[quote="pie-silo, post:10, topic:1422"]
+It seems like this is pretty bad for latency. You need subnet-global consensus before you can even start processing the user request, and then again before you can deliver it
+[/quote]
+
+Yes, consensus has to be reached periodically within a subnet, which resulted in batches of inputs to give to execution. If execution can be kept fully occupied in the mean time, I don't see how we can do any better than that.
+
+Of course it is a challenge to keep execution at or close to hardware capacity (which also means there is no room to grow unless we split the subnet), we'll have to see a typical workload in real world to understand whether we get 1000 messages per second each takes 1ms, or 10 messages each take 100ms. Blockchains that only increment/decrement counters are of the former category, but more versatile computation like smart contracts on Etherum or Wasm programs on the IC are of the latter. This is why I don't like the idea of TPS, because number of transactions really don't tell much about the actual computation throughput.
+
+-------------------------
+
+ohmi | 2020-10-16 05:37:17 UTC | #14
+
+If I don't care what the throughput or efficiency of the datacenter is (few developers do); if I care only about my canister throughput; there doesn't seem to be a reason to not use the number of update messages finalized per second per canister as a primary performance metric. Given a minimal real cost to update a single variable (literally one wasm instruction?) , the number of such updates successfully completed in a second (meaning you can then do a query and get the new data back) seem useful to me, measurable and consistent for any given set of hardware. The getting the data back is the kicker here - the upper limit is based on the number of messages updated with each block,  the blockchain consensus overhead, plus all the normal network buffering and propagation delays (this can be truly significant). It seems like we don't know the real numbers for the real hardware that is already being built?
+
+The expectation of developers to build one app out of many canisters is a bit of a surprise. The questions I have raised about single canister performance are multiplied wrt multiple nested canisters updates and query calls too across multiple subnets.
+
+The IC doesn't do real transactions, does it? It processes messages but not transactions in the traditional sense as a set of updates all of which must succeed or fail together. The IC doesn't make any such guarantees for more than 1 update message at a time? In fact, this is a bit of problem - transaction guarantees have to be provided elsewhere and the single message guarantees can't be used in it's place without something else to to it.
+
+So a manager canister calls worker canisters. Each update call for a manager canister generates of a set of messages sent to other canisters. All of these messages must succeed and return consistent data while the manager processes it's update message and finishes. If any one of them fails or times out or triggers a business logic error, then any update messages sent out to those containers must be rolled back somehow, otherwise the in-memory data structures will be inconsistent across the canisters. There is no provision in the IC to do that directly now, it must be coded by each developer of each canister(??). This isn't better or worse than today - the complicated details of real life distributed systems make this more or less a problem you cannot solve generally; one adapts ad-hoc approaches to fulfill the underlying business requirements of the model, on top of real-life implementation deficiencies/complexities that always arise. 
+
+Given the design as I understand it now, I don't see how splitting functionality across containers can improve the bottom line update performance of an app over one that is just in one canister. The performance of a manager canister will clearly be worse than the alternative if it makes any, even one, update call to another canister and then later continues to query that container or updates itself for bookkeeping. Each update to each other canister is resolved at some point in the future and only after that point will queries work. This means a multi-canister app cannot perform as well as single canister apps wrt updates or queries and the top performance basically will decrease linearly with every addtionally update or query call. If a single container can process 10 updates in a second, a container calling that one can only do 5/sec if it does one itself using the value returned from the first call via a query. 
+
+Beyond the standard difficulties designing and verifying any distributed system, the performance profile I postulate really makes the idea of decomposing an app into cooperative canisters unattractive.
+
+Much of hype about queries is that they work on read only pages and so can be considered 'fast'. This  exaggerates the difficulty searching vs. just raw processing. If the query call executes a real algorithm and then loops through data structures constructing a result data set, that's quite a bit of computation. If that query call itself must query another container, the unavoidable network overhead of inter-canister messages will decrease performance, I think substantially, because all network work is simply too slow. If the canisters are not in the same subnet I think one can forget about processing 100s of such read-only queries a second regardless; I believe  ~10 transactions per second is about the best that can be done with the best code today over the public Internet if it involves sending two IP packets to two different destinations and waiting for results. Fundamental physical limits start mattering right away when one must communicate across the world. Canisters in two subnets on opposite sides of the Earth probably won't be performant with 20K km of propagation delay between them.
+
+The process of designing a cooperating set of actors that work properly while sharing no resources except source code is not an easy thing - in fact, it probably requires more skill and thought than single actor models. I argue that few developers today can confidently design or build such systems as a matter of course. It's a domain visited by few, understood by fewer, and traditionally we, and our results, are very expensive. I'm also arguing that just adding canisters doesn't clearly improve performance in this context in a way that's meaningful to users or developers. Therefore, this idea that this will be a common thing in the IC needs much more exposition and information. 
+
+On the one hand, the IC doesn't require you to write authentication, logging, databases, backups, twistd, etc. that cruft up lots of systems today. If, on the other hand, you need training in general system design, and distributed system design in particular, to create any significant system (say you need real transactions), well, that's doesn't seem like the IC is all that great. 
+
+Especially if, at the end of it all, you have a requirement for X updates/sec for one particular canister and it turns out X is bigger than what the IC will guarantee for any given canister. Then you simply can't use the IC. One hopes one can decide one way or another before committing to the platform - hence knowing what the IC's X is today, tomorrow, and in the next drop, is important. 
+
+If that X turns out to be less than ~10, I think the IC will not succeed as currently intended. Successful distributed systems often require a lot more (they can be too complex to grasp at once) as do most simple web-based apps that do form submits (lots of direct traffic) really. If a single canister/subnet cannot support 50 updates per second, and multiple canisters only reduce throughput relative to single-canister, then I cannot think of a single production internet application I've ever written that could be successfully translated and work in production on the real IC network and achieve identical performance.
+
+-------------------------
+
+PaulLiu | 2020-10-16 05:50:16 UTC | #15
+
+[quote="ohmi, post:14, topic:1422"]
+The IC doesn’t do real transactions, does it?
+[/quote]
+
+IC does not offer distributed transaction across canisters. But each update call (i.e. each message) is transactional, if anything fails in processing a message, any outgoing message and any state changes will be discarded, as if the update call never took place. Note that I use "update call" to differentiate from the normal (synchronous) function calls a canister makes to itself. Asynchronous calls are handled as messages. This kind of atomicity is at message level, but not "transactional" as known in databases.
+
+On top of that, IC does guarantee message response, which hopefully makes it easy to implement distributed transactions should the application require such logic. So if you are really referring to distributed transactions, then yes, a multi-canister architecture will be less efficient.
+
+I was referring to horizontal scaling, which is applicable to many use cases (e.g. bigmap), but unfortunately not to distributed transactions.
+
+> Especially if, at the end of it all, you have a requirement for X updates/sec for one particular canister and it turns out X is bigger than what the IC will guarantee for any given canister. Then you simply can’t use the IC. One hopes one can decide one way or another before committing to the platform - hence knowing what the IC’s X is today, tomorrow, and in the next drop, is important.
+
+This I agree.
+
+> If that X turns out to be less than ~10, I think the IC will not succeed as currently intended.
+
+This I also agree. Although I cannot give you a concrete number at the moment, but we do expect the upper limit to be bounded by network bandwidth.
+
+> multiple canisters only reduce throughput relative to single-canister
+
+This I disagree. You gave a very specific use case, but there are many other use cases where parallelization (horizontal scaling) is not only possible but also easy and effective.
+
+-------------------------
+
+pie-silo | 2020-10-16 16:17:30 UTC | #16
+
+[quote="PaulLiu, post:13, topic:1422"]
+Yes, consensus has to be reached periodically within a subnet, which resulted in batches of inputs to give to execution. If execution can be kept fully occupied in the mean time, I don’t see how we can do any better than that.
+[/quote]
+
+I don't see how you can do it within the current concept of Dfinity either. But it's really unfortunate that incoming requests will need to sit around for probably a large fraction of a second before the actor gets to start working on them.
+
+The problem for Dfinity is that it claims to be a general-purpose computing platform, but its competitors in that space have not chosen to handicap themselves with seconds of latency in handling every request...
+
+Have any of you previously written interactive web apps on a framework with a minimum 3s of latency? Did you enjoy working like that? Did your customers and stakeholders enjoy using it?
+
+-------------------------
+
+pie-silo | 2020-10-16 16:25:40 UTC | #17
+
+[quote="ohmi, post:11, topic:1422, full:true"]
+I can see this ordering decision taking place using specialized networking hardware in the IC right off the fiber, all done in fairly close to an average Ethernet packet transmission time. The subnet just needs to be told an order, it doesn’t have to agree on one.
+[/quote]
+
+I don't think this is a matter of specialized versus generic hardware. (Anyhow, one would hope that the network traffic is encrypted!)
+
+The system is asserted to be trusted and to have no central authority, so there is no one to _tell_ the subnet what the order should be. The subnets need to either independently come to the same decision, or coordinate between themselves what order to process the messages in.
+
+And this cannot be done at wire speed or looking at packets one by one, as far as I can see. Suppose, in my scenario, B and C both respond approximately equally fast, and the messages arrive almost simultaneously to A. It seems like depending on whether the computer running B is slightly faster or slightly closer than the one running C, they might arrive in either order. Suppose the message from B arrives first. Should A process it, or should it wait for the reply from C and process that first?
+
+If it takes them in the order they come off the wire, the order is likely to differ between DCs.
+
+Suppose instead they try some static deterministic order based on maybe always waiting for them to arrive in the order they're listened-for by A, or sorted by the canister id: B then C. What if B is much slower to respond, or never responds? This seems likely to at best give bad performance and at worst deadlock.
+
+-------------------------
+
+ohmi | 2020-10-16 17:04:50 UTC | #18
+
+We have to trust the datacenters are running the trusted hardware configuration. This would include any custom hardware/firmware components. I would think very little of the running software in the datacenter is directly related to the IC  and none of it has any trust guarantees whatsoever built in - they didn't create WASM, or http request processing and we have to trust all that. I obviously can't speak directly to the algorithms actually chosen; to me, right when the messages come off the wire is the perfect time to batch them and dole them out - in a sense that chip is in reality the IC itself and so can be trusted to choose a "good" ordering if there really is any point to anything other than arrival. If it has it's own network connection that internal network could be dedicated to specialized handling of IC messages at close to network speeds. It's incredible how much work one can do in one average Ethernet package duration, even at 10 GB/s, in hardware. Processing the WASM RAM page updates is also something that seems tailor-made for a network->nvram custom controller.
+
+Oh, did I mention doing actual crypto on this chip also? 
+
+I recall seeing some mention of custom subnet types to support file storage and to extend the functionality of the IC itself. The configuration of those subnets might include custom hardware requirements. Hardware optimizations can be quite expensive, but my experience says to me that there could be a home run gain processing IC protocols in hardware.
+
+-------------------------
+
+PaulLiu | 2020-10-16 17:42:03 UTC | #19
+
+[quote="pie-silo, post:16, topic:1422"]
+Have any of you previously written interactive web apps on a framework with a minimum 3s of latency? Did you enjoy working like that? Did your customers and stakeholders enjoy using it?
+[/quote]
+
+The latency of update call is unfortunate due consensus, but that ultimately comes down from the security requirement. Hopefully the pain can be mitigated by low latency query calls. So FPS game is out of the question for now.
+
+(Yes, I worked on MMORPGs so I know the pain of latency)
+
+-------------------------
+
+4johnny | 2020-10-24 18:59:45 UTC | #21
+
+While I greatly appreciate the rigour and detail of this discussion, I believe the whole point of the IC is that developers (writing apps against it) should not need to care about any of it, aside from the SLA on specific calls. Indeed, the dev should be able to reasonably rely upon such “guarantees”, which can be composed in the dev’s architecture to ensure its own NFRs.
+
+A fully asynchronous system, and also one based on the Actor Model, means it is up to the calling developer to take additional steps they would otherwise get for “free”. These steps include using appropriate techniques and patterns, such as Domain-Driven Design (DDD), Reactive Systems, CQRS, Event Sourcing, Process Manager pattern, compensating actions, etc.
+
+Regarding SLAs, it would seem that the IC is still in its early days, both in terms of providing actual guarantees, and in terms of service levels (e.g., latencies) that should be reasonably expected by typical devs. Seems to me that Dfinity will improve such performance over time as the system matures. But that does not mean it will be ready for production use any time soon for most devs of today.
+
+The question becomes: What is the roadmap for SLA improvements? The answer will help devs of today decide whether it is too soon or not to commit writing their apps on the IC today. Or perhaps it would be more prudent to wait it out (for a later stage of the roadmap). Hard to say, given what we know publicly of the IC today.
+
+-------------------------
+
+pie-silo | 2020-10-30 16:37:03 UTC | #22
+
+[quote="4johnny, post:21, topic:1422"]
+I believe the whole point of the IC is that developers (writing apps against it) should not need to care about any of it, aside from the SLA on specific calls. Indeed, the dev should be able to reasonably rely upon such “guarantees”, which can be composed in the dev’s architecture to ensure its own NFRs.
+[/quote]
+
+I think I agree with you: as a developer looking at an application platform, I want some indication of what performance I can expect to attain, and how I have to structure my app to get adequate performance -- and some gut feel for how hard it will be for me to get good performance.
+
+Since it's at such an early stage I don't expect SLAs or hard numbers, but I think I'm not alone in wanting at least some indication of what to expect, and a bit of background color about why the performance promises are realistic.
+
+Mentioning SLAs raises another really interesting question: with major cloud platforms, you can get a credit if they significantly breach the SLA. They have money on the table for their performance and availability promises. Is such a thing even possible in a distributed system? It would be neat if DC providers had to pay me if my apps missed their availability/latency/throughput benchmarks. Although, then, I would worry about a vicious cycle that chases away DCs.
+
+-------------------------
+
+4johnny | 2020-10-30 17:55:37 UTC | #23
+
+Indeed, a related bigger question is:  Does the Network Nervous System have its own legal fund?
+
+Dominic talks a lot about the “platform risk” of existing cloud providers.  But the IC has its own platform risk.  Anyone can be sued up and down a supply chain.
+
+First-time devs and startups of the future might not be thinking of such things when they are just getting going.  But established enterprises definitely do.  They can be sued; and they will want to know who they can sue.  (This is a primary argument made by the Hedera folks in favour of their governance model.)
+
+-------------------------
+

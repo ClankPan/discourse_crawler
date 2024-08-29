@@ -1,0 +1,78 @@
+daniel-wong | 2024-05-15 13:14:05 UTC | #1
+
+Approximately 1 hour ago, DFINITY performed the [standard "hotfix" procedure](https://dashboard.internetcomputer.org/proposal/48792) in order to fix a security bug in the Cycles Minting Canister (CMC).
+
+What this means is that an NNS proposal to upgrade the CMC was made ([proposal 129728](https://dashboard.internetcomputer.org/proposal/129728)). and executed shortly after that. Unlike a normal release, the proposal was executed before publishing the source code (and without the usual three day delay before DFINITY votes). Because DFINITY has a large neuron following, NNS canister upgrade proposals are usually executed shortly after DFINITY votes.
+
+Shortly after executing [the proposal](https://dashboard.internetcomputer.org/proposal/129728), the source code was published in branch [hotfix-FOLLOW-1492-notify_create_canister-rc--2024-05-03](https://github.com/dfinity/ic/tree/hotfix-FOLLOW-1492-notify_create_canister-rc--2024-05-03). Thus, people can now verify the source code of the release, albeit after the fact. The only difference between that branch and the [most recent release](https://dashboard.internetcomputer.org/proposal/129631), is the the changes described in the "Solution" section below.
+
+This is a breaking change for apps that either
+
+1. make notify_create_canister calls on behalf of another principal, or
+2. use the deprecated notify method of the ICP ledger canister to create canisters on behalf of another principal.
+
+As far as DFINITY knows, the vulnerability has not been exploited. With this change, the vulnerability can no longer be exploited.
+
+# Nominal Workflow
+
+Normally, to create a canister with ICP, one can follow this procedure:
+
+1. Send ICP to the CMC. The destination subaccount corresponds to the "controller" principal of the canister to be created.
+2. Call CMC.notify_create_canister. The controller principal is passed via NotifyCreateCanister.controller, determining which ICP are to be used to create the canister.
+
+In this post, the above procedure will be referred to as the "notify_create_canister" workflow.
+
+Another way to create a canister with ICP is this:
+
+1. Send ICP to the CMC. (This is very similar to step 1 in the notify_create_canister workflow.)
+2. Call ledger.notify. This instructs ledger to call CMC's transaction_notification method.
+
+This will be referred to as the "ledger.notify" workflow. This is deprecated, and has very little usage.
+
+# How This Could Be Exploited
+
+There are a few ways that an attacker can exploit these workflows:
+
+1. An attacker A sends some ICP to the CMC. The destination subaccount corresponds to controller principal P, who is authorized to create canisters on restricted subnet S (whereas A is not authorized to create canisters on subnet S). Then, A calls CMC.notify_create_canister, and passes P via the NotifyCreateCanister.controller field. The result is that CMC creates a canister on subnet S. Whereas, CMC should not allow this, because P is the one who is authorized, yet P never took any action towards the creation of a canister on subnet S. Furthermore, A can specify an arbitrary controller for the new canister by using the NotifyCreateCanister.settings field (e.g. A can make himself the sole controller of the new canister).
+
+2. A similar alternative attack goes like this: somebody (usually P) sends ICP to the CMC. As in the normal flow, the destination subaccount corresponds to P. The intent is to fund canister creation by P, who is supposed to call notify_create_canister shortly after ICP is sent to the CMC. Unfortunately, A sees this ICP transaction and calls CMC.notify_create_canister before P does. The result is that CMC creates a canister, but using parameters specified by A instead of P. As in the other attack, A can make himself the sole controller of the new canister. In this case, A is able to spend P's ICP to create a canister (but must wait for the opportunity to arise). As in the other attack, A need not be authorized to create canisters on S, and can specify settings of the canister, including controllers.
+
+3. Similar to exploit 1, A sends ICP to the CMC, specifically to the subaccount for P. (One minor difference here is that A must use a special memo so that the CMC will understand that the ICP is to be used to create a new canister, as opposed to topping up an existing one.) Then, A calls ledger.notify. Here, A cannot explicitly specify the subnet where the canister is to be created, nor can A specify the settings of the canister. However, since P is authorized to create canisters on restricted subnet S, that is where the canister will end up being created. This is less severe than exploit 1, because P ends up being the controller of the canister, but it is still a violation of the restrictions on canister creation in subnet S.
+
+# The Source of the Problem
+
+Originally, there was a desire to let anybody call create canisters **on behalf of** someone else. Allowing "on behalf of" actions makes intuitive sense, since anyone is allowed to call claim_or_refresh on behalf of others in governance, which causes no security issues. Being able to call claim_or_refresh on behalf of someone else is desirable, because it can be used to help someone who was able to only partially complete the neuron creation process.
+
+The difference is that claim_or_refresh does not allow the caller to control the neuron creation process, only continue it. claim_or_refresh really is a "pure" notification: it just tells governance to look at one specific balance and react accordingly. claim_or_refrsh does not allow any additional information to be supplied.
+
+Whereas, NotifyCreateCanister does NOT merely tell CMC, "check this balance and react accordingly"; rather, NotifyCreateCanister includes additional fields that control canister creation (e.g. settings and subnet). Since anybody is allowed to call notify_create_canister, there is no assurance that these additional parameters have values that P would want. In fact, P might very well remain oblivious that canisters are being created in their name in a subnet where only they are authorized, particularly since P need not be the source of the ICP. Moreover, since anyone can send ICP to the CMC subaccount corresponding to P, if an attacker is willing to spend some ICP (e.g. in attacks 1 and 3), they can act at will as P for the purposes of subnet authorization.
+
+# The Solution
+
+The previous section suggests taking away "on behalf of" calls. Unfortunately, such revocation of an existing feature would break some app(s).
+
+The hotfix implements that suggestion. That is, the caller of notify_create_canister must be the controller principal P (stopping attacks 1 and 2), and the sender of the ICP must be P (to stop attack 3).
+
+There is one exception: the nns-dapp backend canister is allowed to call notify_create_canister on behalf of other principals. The reason for this exception is that the code nns-dapp runs is subject to prior public vetting and approval via NNS proposals. This can be relied upon to ensure that nns-dapp will not abuse this special privilege.
+
+# Migration
+
+Apps that currently rely on the (now revoked) ability to create canisters on behalf of another principal will need to make changes. Typically, such apps would use "on behalf of" calls from a back end canister to help users who only partially completed a canister creation operation that they initiated in the app. Indeed, this is how nns-dapp uses the ability to make "on behalf of" calls.
+
+What apps must now do instead is move their notify_create_canister calls so that the caller is the controller principal, the one corresponding to the destination CMC subaccount. This is most likely feasible, since the controller principle is most likely the source of the ICP.
+
+In the case of pushing a partially completed canister creation "over the finish line", what an app can do is this:
+
+1. Before even sending ICP to the CMC, record in a backend canister that the operation is about to take place, and is initially not done yet. Store the current time. Return the current time to the frontend.
+2. While logged in as the controller principal P, the frontend sends ICP belonging P to the CMC. The [TransferArgs.created_at_time](https://sourcegraph.com/github.com/dfinity/ic@ded1819c761276ae5a6e153517e9cda3f6446b98/-/blob/rs/rosetta-api/icp_ledger/ledger.did?L55) field is populated using the time chosen in step 1. Like prior to this change, the subaccount in the [TransferArgs.to](https://sourcegraph.com/github.com/dfinity/ic@ded1819c761276ae5a6e153517e9cda3f6446b98/-/blob/rs/rosetta-api/icp_ledger/ledger.did?L52) field [corresponds to controller](https://sourcegraph.com/github.com/dfinity/ic@ded1819c761276ae5a6e153517e9cda3f6446b98/-/blob/rs/rosetta-api/icp_ledger/src/account_identifier.rs?L239-247) P.
+3. After the transaction goes through, the frontend calls notify_create_canister (while P is logged in).
+4. Update the record in step 1 to show that it is now done. This could simply consist of deleting the record.
+
+If recovery is required, this can be detected by noting that the record in step 1 is marked as not done (yet). In that case, the frontend can proceed with the remaining steps. When resuming/retrying, performing step 2 (possibly again) will [not result in another ICP transfer, because the **same** time from step 1 is included](https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-1#transaction-deduplication-) in step 2. This is similar to what a [journaling file system](https://en.wikipedia.org/wiki/Journaling_file_system) does.
+
+# Questions & Concerns
+
+DFINITY is always actively evaluating the design and implementation of the Internet Computer. In the course of that work, security bugs are occasionally found. When such bugs have a high potential impact, fixes are quickly prioritized, implemented, and deployed such, as in this case. To avoid giving hints about the bug and how to exploit it, DFINITY decided that it was prudent to release the source code only after deploying the fix. Please, do not hesitate to reach out via the forum, or other venues if assistance is desired. Your continued support of the Internet Computer is very much appreciated.
+
+-------------------------
+

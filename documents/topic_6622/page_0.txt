@@ -1,0 +1,328 @@
+peterparker | 2021-08-21 11:42:16 UTC | #1
+
+I've got a main canister (manager) that generates (sub) canisters. I would like to transfer the remaining cycles of these (sub) canisters, before deleting them but, I am not sure where I should call `deposit_cycles`?
+
+In my manager, I have implemented following functions:
+
+```
+private func deleteCanister(manager: Principal, bucketId: Principal): async() {
+    await transferCycles(manager, bucketId);
+    
+    await ic.stop_canister({ canister_id = bucketId });
+
+    await ic.delete_canister({ canister_id = bucketId });
+};
+
+private func transferCycles(manager: Principal, bucketId: Principal): async() {
+    let status = await ic.canister_status({ canister_id = bucketId });
+    Cycles.add(status.cycles);
+    await ic.deposit_cycles({ canister_id = manager });
+};
+```
+
+Above does compile and does delete these (sub) canisters but, it does not seem to transfer the cycles.
+
+Am I missing any steps in my functions?
+
+Or should the `transferCycles` happens within the (sub) canisters instead of within the manager?
+
+-------------------------
+
+claudio | 2021-08-21 15:09:01 UTC | #2
+
+I think the transfer should happen in the subcanisters.
+
+At the moment, I think you are depositing the manager's cycles.
+
+-------------------------
+
+witter | 2021-08-22 00:20:46 UTC | #3
+
+Send cycles to the canister identifier by running a command similar to the following:
+
+```
+dfx wallet --network ic send <destination> <amount>
+```
+
+For example:
+```
+dfx wallet --network ic send gastn-uqaaa-aaaae-aaafq-cai 10000000000
+```
+If the transfer is successful, the command does not displays any output.
+
+-------------------------
+
+witter | 2021-08-22 00:22:33 UTC | #4
+
+You should implement receive_cycles first.
+
+Rust example:  https://github.com/Deland-Labs/dfinity-fungible-token-standard/blob/1afbc38cd904aa3042b9fbf739f92be98252dd98/canisters/dft_rs/src/token.rs#L532
+
+-------------------------
+
+witter | 2021-08-22 00:23:26 UTC | #5
+
+## Send cycles to a canister
+
+You can use `dfx wallet send` command of the `wallet_send` method to send a specific number of cycles to a specific canister. Keep in mind that the canister you specify must be a cycles wallet or have a `wallet_receive` method to accept the cycles.
+
+If you have deployed a cycles wallet on the Internet Computer main network, you can use the `dfx wallet send` command to send cycles between canisters running on the network.
+
+-------------------------
+
+witter | 2021-08-22 02:15:52 UTC | #6
+
+if you are using Motoko.
+
+https://sdk.dfinity.org/docs/language-guide/cycles.html
+
+-------------------------
+
+peterparker | 2021-08-22 11:56:50 UTC | #7
+
+Thank you for your answers. I tried both ideas, moving the `deposit_cycles` to the sub-canister and the example of the motoko [doc](https://sdk.dfinity.org/docs/language-guide/cycles.html).
+
+Good news, it works in a sample repo.
+
+Bad news, it does not work in my app (😢).
+
+Not sure the issue is linked to the auth or the permissions but, I think it definitely has to do with something like that. When I try to deposit the cycles from the sub containers I get an error that **only the controllers of the canister .... can control it** even though I do set the controllers (`update_settings`) when I create the sub-canisters.
+
+Still debugging....
+
+Meanwhile, for those interested, here my sample repo that transfer cycles before deleting canisters a manager generate on the fly: https://github.com/peterpeterparker/transfercycles
+
+![Capture d’écran 2021-08-22 à 13.51.11|562x500](upload://eoKFN74B1LTfoKeXWqbQqWWctqi.jpeg)
+
+-------------------------
+
+peterparker | 2021-08-22 14:36:48 UTC | #8
+
+I have solved (I think) the above error **only the controllers of the canister … can control it** by also adding the sub-canister principal ID in the list of controllers (somehow I had it in my example but, not in my app).
+
+Now I am facing the next error **Canister (principal id of the sub-canister) trapped explicitly: could not perform call** ...
+
+-------------------------
+
+claudio | 2021-08-22 16:10:09 UTC | #9
+
+Not sure what is going on, but
+
+https://github.com/peterpeterparker/transfercycles/blob/da17e2f12c849773b2dcdaab468e8f123f1435d9/src/transfercycles/sub.mo#L17
+
+Looks like it's making an unnecessary call to retrieve the status to discover the balance. Did you try just using `(Experimental)Cycles.balance()` instead? It's synchronous, and doesn't require the canister to be its own controller.
+
+-------------------------
+
+claudio | 2021-08-22 16:11:45 UTC | #10
+
+Also, sending the entire balance might cause the call itself to fail... maybe leave some slack.
+
+-------------------------
+
+claudio | 2021-08-22 16:30:51 UTC | #11
+
+I'm not sure if this is still the case  with dfx 0.8.0, but prior releases shipped with a local replica that would not charge any cycles for execution. If that is still the case, that could explain some difference in behaviour between testing on a local replica and running on the real network.
+
+-------------------------
+
+peterparker | 2021-08-22 18:15:12 UTC | #12
+
+[quote="claudio, post:9, topic:6622"]
+Did you try just using `(Experimental)Cycles.balance()` instead?
+[/quote]
+
+Thanks for the idea Claudio. This looks like promising. I tested on real network with my app (not the sample one) and did not face the error as above but got another one.
+
+> Canister pmtxw... attempted to send 897991667468 cycles when only 897991667468 were available in its balance
+
+I will now try out your other suggestion to "leave some slack". Not sure what value to use though, maybe 100000000000?
+
+-------------------------
+
+peterparker | 2021-08-22 19:11:48 UTC | #13
+
+Yoohoo it worked out 🥳. On the real network, I was able to delete a canister and transfer remaining cycles to my principal. I checked the balance of my manager canister in NNS and did notice the cycles being credited !
+
+Manager:
+
+```
+public func delete(bucketId: Principal) : async () {
+  let bucket = actor(Principal.toText(bucketId)): actor { transferCycles: () -> async () };
+
+  await bucket.transferCycles();
+
+  await ic.stop_canister({ canister_id = bucketId });
+
+  await ic.delete_canister({ canister_id = bucketId });
+};
+```
+
+Sub-canister:
+
+```
+public shared({ caller }) func transferCycles(): async() {
+  let balance: Nat = Cycles.balance();
+
+  let cycles: Nat = balance - 100_000_000_000;
+
+  if (cycles > 0) {
+    Cycles.add(cycles);
+    await ic.deposit_cycles({ canister_id = caller });
+  };
+};
+```
+
+I have updated the [sample repo](https://github.com/peterpeterparker/transfercycles) accordingly.
+
+To the remaining cycles of the sub-canister I subtract 100_000_000_000 which is currently the cost for the creation of a canister (see [documentation](https://sdk.dfinity.org/docs/developers-guide/computation-and-storage-costs.html#_details_cost_of_compute_and_storage_transactions_on_the_internet_computer)). Not sure it cannot be less, I did not test.
+
+I mark this post as the solution but, the credits go to @claudio ! Thanks a lot for the help 🙏
+
+-------------------------
+
+claudio | 2021-08-23 18:44:05 UTC | #14
+
+Great!
+
+I believe it can be much less. Maybe measure it?
+
+Also, it would be faster to inline the call to 'await b.id() ' in 'utils.mo' by calling 'Principal.fromActor(b)' instead. Then you can delete the 'id()' function too. Awaits are not cheap.
+
+-------------------------
+
+peterparker | 2021-08-23 19:06:39 UTC | #15
+
+[quote="claudio, post:14, topic:6622"]
+I believe it can be much less. Maybe measure it?
+[/quote]
+
+Before going live, it will need some tests to find the best suitable value. I also hope it costs less as the current value I used is the most expensive, the one to create a canister. Added to my long list of TODOs ;)
+
+[quote="claudio, post:14, topic:6622"]
+Also, it would be faster to inline the call to 'await b.id() ’ in ‘utils.mo’ by calling ‘Principal.fromActor(b)’ instead. Then you can delete the ‘id()’ function too. Awaits are not cheap.
+[/quote]
+
+Freak I did not know it was possible to pass `b` to `fromActor` directly. Sure happy to drop any unnecessary `await`.
+
+That's a super cool input, thanks a lot!!!
+
+-------------------------
+
+wang | 2021-09-02 17:48:07 UTC | #16
+
+From my tests, seems like ~5B cycles is the minimum.
+
+-------------------------
+
+peterparker | 2022-03-22 17:14:37 UTC | #17
+
+~~I just tested it too to finally set a correct value and from my tests the minimal cycles to retain to delete a canister is actually 4.1~~
+
+~~note: 4_000_000 isn't enough. I did not try all values between 4_000_000 and 4_100_000.~~
+
+**UPDATE**: the amount of cycles to retain in order to delete a canister is not a static value but a dynamic value. I have rollbacked to a high threshold until that dynamic value can be determined.
+
+Follow 👉 https://forum.dfinity.org/t/cannot-delete-canisters-anymore/11594/9?u=peterparker
+
+-------------------------
+
+icme | 2022-05-12 20:46:12 UTC | #18
+
+@peterparker (and looping in @claudio)
+
+I recently spent a few hours trying to replicate this working example locally, and while the "sub-canister" deletes successfully, it is not refunding the "manager" canister the cycles. Here's my exact example.
+
+## What versions I'm running:
+* dfx ->  0.9.3`
+* moc compiler -> `Some "0.6.21"` (defined in vessel)
+
+## Code
+```
+// "sub-canister"
+public shared({ caller = caller }) func transferCycles(): async() {
+    let balance: Nat = Cycles.balance() - 100_000_000_000;
+    Cycles.add(balance);
+    Debug.print("added balance = " # debug_show(balance)); // 900_000_000_000 cycles
+    await CA.depositCycles(caller);
+  }
+```
+
+```
+  public shared ({ caller = caller }) func delete(key: Text): async () {
+    // getCanisterIDIfExists is a helper function that prevents duplicate creation
+    switch(getCanisterIDIfExists(key)) {
+      case null {
+        Debug.print("canister for key=" # key # " does not exist");
+      };
+      case (?canisterId) {
+        let canisterPrincipal  = Principal.fromText(canisterId);
+
+        let subCanister = actor(canisterId): actor { transferCycles: () -> async() };
+        Debug.print("transferring cycles for " # canisterId);
+        await subCanister.transferCycles();
+        Debug.print("transferred cycles for " # canisterId);
+
+        Debug.print("stopping & deleting canisterId=" # canisterId);
+        await IC.stop_canister({ canister_id = canisterPrincipal });
+        await IC.delete_canister({ canister_id = canisterPrincipal });
+        Debug.print("deleted " # canisterId);
+      }
+    };
+  };
+```
+
+## How I'm testing this out (locally)
+
+1. First I build my "manager" canister and deploy it to my local network.
+
+2. Then I create a sub-canister through the "manager" canister by calling a `create` api I have defined on the "manager" canister. When I create a sub-canister, I'm passing 1T cycles to it and my "manager" canister is correctly losing 1T cycles. I can verify this after creating the canister by running dfx canister status 
+
+`dfx canister status` (on the manager canister) --> `Balance: 3_000_000_000_000 Cycles`
+`dfx canister status` (on the sub-canister) --> `Balance: 1_000_000_000_000 Cycles`
+
+3. I then run the delete api I have pasted the code of above. As I do this I can also see the following logging (in my local dfx):
+```
+[Canister t6rzw-2iaaa-aaaaa-aaama-cai] transferring cycles for tqtu6-byaaa-aaaaa-aaana-cai
+[Canister tqtu6-byaaa-aaaaa-aaana-cai] added balance = 900_000_000_000
+[Canister t6rzw-2iaaa-aaaaa-aaama-cai] transferred cycles for tqtu6-byaaa-aaaaa-aaana-cai
+[Canister t6rzw-2iaaa-aaaaa-aaama-cai] stopping & deleting canisterId=tqtu6-byaaa-aaaaa-aaana-cai
+[Canister t6rzw-2iaaa-aaaaa-aaama-cai] deleted tqtu6-byaaa-aaaaa-aaana-cai
+```
+
+4. I then attempt to verify the canister transfer and deletion by running dfx canister status again
+`dfx canister status` (on the manager canister) --> `Balance: 3_000_000_000_000 Cycles`
+`dfx canister status` (on the sub-canister) --> `Error: The replica returned an HTTP Error: Http Error: status 404 Not Found, content type "", content: Requested canister does not exist`
+
+**Step 4.** Shows that the sub-canister is being deleted successfully, but that 900_000_000_000 cycles from the sub-canister have not been refunded to the "manager" canister. It also doesn't seem like these cycles are being refunded to the wallet either - so, where are they going (locally).
+
+
+## Follow up question(s) - in the case this is a bug
+
+1. If this isn't a bug in my code or proces, is this an issue with local vs. mainnet dfx? (i.e. this works on the main net, but not local). 
+2. If so, is there a way around this so that I can test this code as much as possible locally before deploying to main net in order to eliminate testing costs?
+
+-------------------------
+
+peterparker | 2022-05-13 05:21:23 UTC | #19
+
+[quote="icme, post:18, topic:6622"]
+If this isn’t a bug in my code or proces, is this an issue with local vs. mainnet dfx? (i.e. this works on the main net, but not local).
+[/quote]
+
+Just tested my sample project, it worked out locally (dfx v0.9.3, see screenshot).
+
+Here's my repo for comparison purpose: https://github.com/peterpeterparker/delcan
+
+![Capture d’écran 2022-05-13 à 07.17.56|690x431](upload://vxtSn55lUHNvV5fQ0rSBOKVEPXS.jpeg)
+
+-------------------------
+
+icme | 2022-05-16 04:03:33 UTC | #20
+
+Confirmed that the solution provide above by @peterparker worked.
+
+The issue I had spawned from how I was importing the management canister module into my main and child canister. The code ended up being nearly identical to the examples provided above
+
+-------------------------
+

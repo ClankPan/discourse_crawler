@@ -1,0 +1,120 @@
+akhilesh.singhania | 2021-09-30 12:12:08 UTC | #1
+
+This post summarises the difficulties that need to be surmounted in order to support multithreaded canister smart contract execution on the Internet Computer. This question has come up in a number of venues so I hope that writing down the current thinking in one place can be helpful.
+
+# Background
+
+The canister smart contract model is inspired by the traditional [actor model](https://doc.akka.io/docs/akka/current/typed/guide/actors-intro.html). In the actor model, an application is partitioned into a group of actors. The actors make progress by sending messages to each other and processing messages sent to them. Typically, even though the system may consist of multiple threads, individual actors are designed to run in a single threaded manner. This guarantees that when an actor is executing on a thread, it has exclusive access to its data and no multithreaded synchronisation is needed.
+
+# Problem
+
+The subnet blockchain on the Internet Computer is a collection of nodes. When one subnet executes an update message on a canister, then all [honest] nodes on the subnet must execute the message. Further, all nodes must arrive at the same result after the execution finishes i.e. the execution of update messages has to be deterministic across all nodes in a subnet.
+
+Hence, if we allowed a message execution to occur over multiple threads, then we would have to ensure that the execution is still deterministic. As an example, let’s consider a hypothetical function below.
+
+```
+
+global0 = 0;
+
+fn handler() -> int {
+    if compare_and_swap(&global_variable, 0, 1) {
+        return 1;
+    }
+    return 0;
+}
+```
+
+Let’s say that there are two threads that are both executing the above function concurrently. It is possible that on some nodes, the first thread returns 1 and on some nodes it returns 0. So in order to support multithreaded execution, we will need to address problems like this. We are not aware of any straightforward solution to this problem.
+
+# Workarounds
+If a canister can only be single threaded, then it means that it can only execute one update message at a given time. This can impact the ability to scale a canister that needs to execute many update messages. There are any number of ways to address this problem. 
+
+## Partition shared state into shards
+
+One way is to shard the canister state into multiple canisters which can execute concurrently.
+
+So in the above example, one could do something like the following.
+
+Global canister:
+
+```
+global0 = 0;
+
+fn compare_and_swap_global(old_val, new_val) -> bool {
+    if global0 == old_val {
+        global0 = new_val;
+        return true;
+    }
+    return false;
+}
+```
+
+Shard canisters:
+
+```
+fn handler() {
+    if global_canister::compare_and_swap_global(0, 1).await {
+        return 1;
+    }
+    return 0;
+}
+```
+
+There is a new global canister that manages the shared state. And instead of having a single canister there are now shard canisters that send messages to the global canister to update the shared state.
+
+## Embrace the actor model
+
+As discussed in the background section above, the other way to work around the problem is to try to partition the application into smaller actors that can all execute in parallel. An example is discussed in this [stackoverflow post](https://stackoverflow.com/a/34972354) where a HTTP service could be decomposed into a set of actors each performing a chunk of the required work.
+
+-------------------------
+
+senior.joinu | 2021-09-30 15:14:48 UTC | #2
+
+I believe there is also a solution that would work for a single canister scenario.
+I first met this concept working with Hyperledger Sawtooth, so maybe one could find more details there.
+
+Basically, to be able to run multiple update calls to a single canister in parallel safely, we need to make sure, that we never meet a race condition. On a very simple level this could be achieved by canister developers using `thread markers`.
+
+Imagine the following canister (pseudocode):
+```
+@thread(1)
+state var X = 10;
+
+@thread(1)
+update func setX(newX) {
+  X = newX;
+}
+
+@thread(4)
+state var Y = 12;
+
+@thread(4)
+update func setY(newY) {
+  Y = newY;
+}
+
+@thread(1 | 4)
+update func setXandY(newX, newY) {
+  X = newX;
+  Y = newY;
+}
+```
+
+The idea here is that the developer could mark functions which are safe to execute in parallel (since they never modify the same state) giving them some ids and mark other functions with some overlapping ids (hope this sounds ok). 
+
+In the example above, we clearly see, that it is absolutely safe to execute `setX` and `setY` in parallel, so we mark it with binary `1` and `4` (this example uses binary masking to detect overlaps), so the replica, knowing this information, could parallelize the execution of messages coming to these endpoints. And we clearly see that the function `setXandY` is not safe to execute in parallel with any of two other, so we mark it with binary `1 | 4` (or 5) so the replica could also check the bits and understand what should it do.
+
+I believe that this technique should fit well into existing code structure and to not cause much pain.
+
+Since there is actually no real motivation to parallel execution for the developers, this resource economy should be incentivised in some form or other (like reduced cycles consumption for multitasking canisters).  
+
+The only question remains - what should we do, when there is a bug in a developer's code and there is a race condition where they mark it shouldn't be. My opinion - we don't do anything. As far as I understand the IC situation would lead to failed or unpredictable message execution result because of consensus. So the only thing we could do is to explain replicas that there is a possibility of such an event and it should be prepared for it.
+
+-------------------------
+
+akhilesh.singhania | 2021-10-01 07:27:12 UTC | #3
+
+This is a nice idea.  I had a discussion with some folks where we would let the canister decide out of all the messages in its input queues, which one it would like to handle next.  If that feature were implemented, then something like what you propose could be built purely in the application space.
+
+-------------------------
+

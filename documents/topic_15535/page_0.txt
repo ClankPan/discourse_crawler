@@ -1,0 +1,209 @@
+CarbonDev | 2022-09-20 09:14:40 UTC | #1
+
+Hi,
+
+I'm having a problem with the Gateway protocol that I can't figure out. I'm trying to use the response body streaming, but the streaming seems to fail somewhere after http_request_streaming_callback is called.
+
+What happens:
+My Canister sends a HttpResonse with a straeming strategy from the canister after its called
+My http_request_streaming_callback function gets called only 1 time (I can see that from the logs) despite more tokens.
+Then I get the HttpResponse in the client with only the part of the body which was in the original HttpResponse, so nothing from http_request_streaming_callback was added.
+
+That both happens in the local replica and on the ic.
+
+So my theory is that my StreamingCallbackHttpResponse is wrong somehow, but I can't figure out how. When I query http_request_streaming_callback from dfx it returns  
+```
+(
+  record {
+    token = opt record { key = "test.txt"; index = 2 : nat64 };
+    body = blob "chunk2";
+  },
+)
+```
+
+the token is of the type:
+```
+type StreamingCallbackToken = record {
+  key: text;
+  index: nat64;
+};
+```
+
+The result looks like it should in the spec (https://internetcomputer.org/docs/current/references/ic-interface-spec#http-gateway-interface) I think?
+
+I'm totally stuck, would be great if somebody could help me.
+
+-------------------------
+
+cryptoschindler | 2022-09-20 10:00:15 UTC | #2
+
+Those are the types we successfully use for streaming:
+
+```
+import Assets "../CanisterAssets";
+import Marketplace "../Marketplace";
+import Sale "../Sale";
+import Shuffle "../Shuffle";
+import Tokens "../Tokens";
+
+module {
+  public type HeaderField = (Text, Text);
+  public type HttpResponse = {
+    status_code: Nat16;
+    headers: [HeaderField];
+    body: Blob;
+    streaming_strategy: ?HttpStreamingStrategy;
+  };
+  public type HttpRequest = {
+    method : Text;
+    url : Text;
+    headers : [HeaderField];
+    body : Blob;
+  };
+  public type HttpStreamingCallbackToken =  {
+    content_encoding: Text;
+    index: Nat;
+    key: Text;
+    sha256: ?Blob;
+  };
+
+  public type HttpStreamingStrategy = {
+    #Callback: {
+        // start custom
+        callback: shared () -> async ();
+        // end custom
+        token: HttpStreamingCallbackToken;
+    };
+  };
+
+  public type HttpStreamingCallbackResponse = {
+    body: Blob;
+    token: ?HttpStreamingCallbackToken;
+  };
+
+  public type Dependencies = {
+    _Assets : Assets.Factory;
+    _Shuffle : Shuffle.Factory;
+    _Tokens : Tokens.Factory;
+    _Marketplace : Marketplace.Factory;
+    _Sale : Sale.Factory;
+  }
+}
+```
+
+-------------------------
+
+frederikrothenberger | 2022-09-20 10:17:42 UTC | #3
+
+Hi @CarbonDev 
+
+Service worker dev here. You typings seem to be fine. Could you point me to a deployed canister that shows this behavior?
+
+-------------------------
+
+CarbonDev | 2022-09-20 10:42:49 UTC | #4
+
+Thanks for the quick response, this canister has the problem: 6cgjb-xaaaa-aaaag-aae6q-cai
+For a request to https://6cgjb-xaaaa-aaaag-aae6q-cai.raw.ic0.app/test.txt  it should stream back "hallochunk2chunk2", but I only get "hallo".
+
+`dfx canister --network=ic call 6cgjb-xaaaa-aaaag-aae6q-cai http_request '(record { method = "GET"; url = "/test.txt"; headers = vec {}; body = blob ""})'` 
+returns
+
+```
+(
+  record {
+    body = blob "hallo";
+    headers = vec {
+      record { "Content-Length"; "5" };
+      record { "Content-Type"; "text/raw" };
+    };
+    streaming_strategy = opt variant {
+      Callback = record {
+        token = record { key = "test.txt"; index = 1 : nat64 };
+        callback = func "6cgjb-xaaaa-aaaag-aae6q-cai".http_request_streaming_callback;
+      }
+    };
+    status_code = 200 : nat16;
+  },
+)
+```
+and
+`dfx canister --network=ic call 6cgjb-xaaaa-aaaag-aae6q-cai http_request_streaming_callback '(record { key = "test.txt"; index = 1})'`
+
+returns
+
+
+```
+(
+  record {
+    token = opt record { key = "test.txt"; index = 2 : nat64 };
+    body = blob "chunk2";
+  },
+```
+
+-------------------------
+
+cryptoschindler | 2022-09-20 10:59:27 UTC | #5
+
+What does your `HttpStreamingStrategy` look like? I remember there was some weird bug for motoko asset canisters, don't know if it has been fixed now but this lead to the weird callback type 
+```
+callback: shared () -> async ();
+```
+
+When you then specify callback you do the following
+
+```
+// start custom
+      let self: Principal = this;
+      let canisterId: Text = Principal.toText(self);
+      let canister = actor (canisterId) : actor { http_request_streaming_callback : shared () -> async () };
+      // end custom
+
+...
+
+  streaming_strategy = ?#Callback({
+            token = Option.unwrap(token);
+            callback = canister.http_request_streaming_callback;
+          });
+
+...
+
+```
+
+-------------------------
+
+CarbonDev | 2022-09-20 11:03:22 UTC | #6
+
+I'm using rust with the Candid Func type for that
+```
+pub enum StreamingStrategy {
+    Callback {
+        callback: Func,
+        token: StreamingCallbackToken,
+    },
+}
+```
+but I don't think its a problem with the streaming strategy, because the callback gets called one time when I do a http request, it seems to fail somewhere after the first callback returns
+
+-------------------------
+
+frederikrothenberger | 2022-09-20 11:14:00 UTC | #7
+
+@CarbonDev: I see you are using the raw domain. Then unfortunately I cannot help you because this domain does not use the service worker (but icx-proxy instead).
+
+@Daniel-Bloom: Any idea what's wrong here?
+
+-------------------------
+
+CarbonDev | 2022-10-09 16:54:59 UTC | #8
+
+Hi, I still haven't found a solution, could there be a bug in the gateway?
+
+-------------------------
+
+peterparker | 2022-10-09 17:34:18 UTC | #9
+
+I've got a sample repo https://github.com/peterpeterparker/icstreaming I used to test the streaming strategy with images on the local replica. Just upgraded it to dfx v0.11.2 and ran a test locally with a 3mb images and everything was alright - i.e. strategy delivered the image with mulitple chunks. So not a direct answer but, maybe by comparing the sample and your code you might notice something different?
+
+-------------------------
+

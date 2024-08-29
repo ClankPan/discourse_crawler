@@ -1,0 +1,80 @@
+0x4d5a | 2024-02-14 10:59:15 UTC | #1
+
+How to efficiently insert a value in a Map, supposing thousands of values in a Vec for a single Principal. Appending a `Vec` by moving ownership to a new variable and then merging it back seems inefficient. Are there ways to directly extend the original `Vec`?
+@ielashi 
+
+```
+pub static USERS_TRADED_IDS:RefCell<StableBTreeMap<Principal , Vec<u64> , Memory>>=RefCell::new(
+    StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(5))),
+    )
+);
+    pub fn add_id(_user_id: Principal, id: u64) {
+        let res = USERS_TRADED_IDS.with(|id| {
+            let user_ids_opt = id.borrow_mut().get(&_user_id);
+
+            let mut user_id: TradedIds = match user_ids_opt {
+                None => TradedIds(Vec::new()),
+                Some(ids) => ids,
+            };
+
+            user_id.0.push(id);
+            id.borrow_mut().insert(_user_id, user_id);
+        });
+
+
+    }
+```
+
+-------------------------
+
+ielashi | 2024-02-14 11:57:16 UTC | #2
+
+If you plan to store thousands of elements per key, then you're better creating a [composite key](https://en.wikipedia.org/wiki/Composite_key). Rather than storing all traded Ids into a single value, you instead insert keys of the form `(Principal, TradedId)`.
+
+```rust
+    pub static USERS_TRADED_IDS:RefCell<StableBTreeMap<(Principal, u64), ()> , Memory>>=RefCell::new(..);
+
+
+    pub fn add_id(_user_id: Principal, traded_id: u64) {
+        USERS_TRADED_IDS.with(|id| {
+            id.borrow_mut().insert((user_id, tradde_id), ());
+        })
+    }
+```
+
+Then, to retrieve traded ids for a given principal, you can use the [range](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/btreemap/struct.BTreeMap.html#method.range) method on the BTreeMap.
+
+-------------------------
+
+alexander | 2024-02-14 18:11:34 UTC | #3
+
+Some concerns from my point of view:
+1. **Key Proliferation**: The significant increase in the number of keys due to the combination of Principal and TradedId for each entry, potentially affecting the map's insertion and lookup performance as it grows.
+2. **Full Scan Concerns**: The need to iterate over all map values to retrieve data associated with a single Principal, undermining the efficiency of key-based access and resembling a full database scan.
+3. **Loss of Key-Based Access Advantages**: Fragmenting data across numerous composite keys complicates the straightforward retrieval of all related data for a single Principal, diluting one of the primary benefits of using maps for fast key-based data access.
+4. **Additional Memory Consumption by Duplication**: The approach results in the Principal key being duplicated for each transaction, leading to unnecessary memory consumption and increasing the overall memory footprint, which is particularly problematic when dealing with long or complex Principals.
+
+-------------------------
+
+ielashi | 2024-02-15 12:19:58 UTC | #4
+
+[quote="alexander, post:3, topic:27568"]
+* **Key Proliferation**: The significant increase in the number of keys due to the combination of Principal and TradedId for each entry, potentially affecting the map’s insertion and lookup performance as it grows.
+* **Full Scan Concerns**: The need to iterate over all map values to retrieve data associated with a single Principal, undermining the efficiency of key-based access and resembling a full database scan.
+[/quote]
+
+I wouldn't say these are significant concerns. `StableBTreeMap` is designed to efficiently store many millions of keys, with some production instances having > 160M keys at the moment. It doesn't need to do full scans in order to retrieve data. Asymptotically, whether storing all the values in a single key or using composite keys, the performance in both cases is logarithmic.
+
+[quote="alexander, post:3, topic:27568"]
+**Loss of Key-Based Access Advantages**: Fragmenting data across numerous composite keys complicates the straightforward retrieval of all related data for a single Principal, diluting one of the primary benefits of using maps for fast key-based data access.
+[/quote]
+That depends on the use-case of course. Using `range(..)` should feel as straightforward as iterating through any rust iterator if setup correctly.
+
+[quote="alexander, post:3, topic:27568"]
+**Additional Memory Consumption by Duplication**
+[/quote]
+That is correct.
+
+-------------------------
+

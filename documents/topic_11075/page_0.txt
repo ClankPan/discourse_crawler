@@ -1,0 +1,202 @@
+icme | 2022-02-23 01:04:59 UTC | #1
+
+I'm writing this post to clarify any misconceptions I have regarding which types are and which types are not stable on the IC. By stable, I refer to keyword `stable` bound data persisting on the canister through upgrades without the use of the [system preupgrade/postupgrade methods](https://smartcontracts.org/docs/language-guide/upgrades.html#_preupgrade_and_postupgrade_system_methods), and without using the [ExperimentalStableMemory API](https://smartcontracts.org/docs/language-guide/stablememory.html).
+
+Please let me know if any of my statements below are incorrect, or if the reasoning behind a statement has gaps or shows misunderstanding. My knowledge thus far is based on reading through the [Stable variables and upgrade methods docs](https://smartcontracts.org/docs/language-guide/upgrades.html), as well as the forums.
+
+1. `HashMap` is **not** stable due to it having member functions (i.e. being a class) [[Source](https://smartcontracts.org/docs/language-guide/upgrades.html#_preupgrade_and_postupgrade_system_methods)]. One can then conclude as well that `TrieMap`, `Buffer`, `Heap`, `RBTree`, and `Stack` are not stable as well.
+
+2. If I must create a new **stable** data structure not currently in motoko-base, it must not be a class, or object with member fields that are functions. For example, a functional rewrite of `Buffer` could be stable (make Buffer a record type, bring methods outside of the class, and add the buffer as an additional parameter to each function).
+
+3. `List`, `Array`, `Trie`, and `Iterator` are stable.
+
+4. All primitives are stable.
+
+5. `Func` is stable, but only if it does not store unstable data within it in, like an object with member functions (i.e. the example below is **not** stable)
+```
+type NatStorage {
+  public func addNat(n: Nat): NatStorageFunc;
+}
+public func natStorageFunc(data: List<Nat>):  {
+  object {
+    data: List<Nat>;
+    public func addNat(n: Nat): NatStorage {
+      natStorageFunc((n, d));
+    };  
+  } 
+};
+```
+
+6. A record can be stable, but only if it does not hold functions or any non-stable structures as property values. See the following examples (a, b, and c) [[Source "Note" section](https://smartcontracts.org/docs/language-guide/upgrades.html#_typing)].
+  a. **Stable** -> `{ id: Text; name: Text; age: Nat; attributes: Trie<Text, Text> };`
+  b. **Not Stable** -> 
+```
+  {
+    id: Text; 
+    name: Text; 
+    age: Nat; 
+    attributes: Trie<Text, Text>; 
+    getAttr: (Text) -> Text; 
+    // This is not stable due to the object containing a local function.
+  };
+```  
+
+  c. **Stable** ->
+```
+actor {
+    type User = {
+      id: Text; 
+      name: Text; 
+      age: Nat; 
+      attributes: Trie<Text, Text>;
+    };
+
+    stable let users = List<User> = List.empty();
+
+    public func getAttr(t: Trie<Text, Text>, attributeName: Text): Text { ... };
+)
+```
+
+-------------------------
+
+rossberg | 2022-02-23 06:54:57 UTC | #2
+
+[This section](https://smartcontracts.org/docs/language-guide/language-manual.html#stability) in the language reference should answer all questions.
+
+-------------------------
+
+icme | 2022-02-23 22:45:04 UTC | #3
+
+@rossberg Thanks for linking this! This answers all of my questions except for #2.
+
+> 2. "If I must create a new **stable** data structure not currently in motoko-base, it must not be a class, or object with member fields that are functions. For example, a functional rewrite of `Buffer` could be stable (make Buffer a record type, bring methods outside of the class, and add the buffer as an additional parameter to each function)"
+
+Technically then, can I then take any of these `motoko-base` classes (`HashMap`, `TrieMap`, `Buffer`) and rewrite them to be stable? It would be huge in terms of upgrades if I could rewrite these data structures to be stable.
+
+For example, 
+
+```
+//StableHashMap.mo
+module {
+  public type StableHashMap<K, V> = {
+    var table : [var KVs<K, V>] = [var];
+    var _count : Nat = 0;
+  }
+
+  public func init<K, V>(): StableHashMap<K,V> { { table = [var]; _count = 0 } };
+
+  public func get<K, V>(map: StableHashMap<K, V>, k : K) : ?V {
+    ...copy in original HashMap logic but utilize map parameter instead of encapsulated local functions
+  };
+
+  public func replace<K, V>(map: StableHashMap<K, V>, k : K, v : V) : ?V {
+     ...copy in same as above
+  }
+}
+```
+
+Then this can be used in the actor class like
+```
+//MyAPI.mo
+import StableHashMap "./StableHashMap";
+
+actor {
+  stable var stableHashMap = StableHashMap.init<Text, Nat>();
+
+  public func replaceEntry(key: Text; value: Nat): ?V {
+    StableHashMap.replace(stableHashMap, key, value);
+  };
+}
+```
+
+<br/>
+<br/>
+<br/>
+As an aside, the documentation site search didn't bring the link you provided up when one searches with the "stable" keyword, but does when I searched with "stability" :smile:
+
+-------------------------
+
+icme | 2022-02-23 23:02:29 UTC | #4
+
+Unless there's an additional cost that I'm not seeing here that would be super expensive over time.
+
+Something like the map `StableHashMap` parameter being passed in by value instead of reference, and pulling the entire map into the refactored `get` and `replace` methods.
+
+-------------------------
+
+rossberg | 2022-02-24 07:42:56 UTC | #5
+
+Yes, that's a perfectly viable solution. The other is to use a regular HashMap in a regular variable and save/restore it via a stable variable in pre/postupgrade hooks, but that is more expensive during an upgrade.
+
+There is no hidden cost to your approach. Under the hood, the parameter is just a pointer into the heap.
+
+-------------------------
+
+mymikemiller | 2022-06-28 08:47:56 UTC | #6
+
+I always wondered why the Motoko developers chose to have functions like `Array.map(myArray, ...)` rather than `myArray.map(...)` like most languages. I guess this is why. Seems they made the reasonable choice to prefer upgrade speed over readability.
+
+Thanks @rossberg for the excellent explainer, and @icme for asking all the same questions I had. Glad I eventually found this thread. If this was explained to me sooner, I would have been less frustrated with the abnormally verbose syntax.
+
+-------------------------
+
+ClankPan | 2022-07-07 04:03:18 UTC | #7
+
+I thought [the same thing](https://forum.dfinity.org/t/stable-hashmap-without-need-for-an-upgrade-func/10040?u=clankpan), so I'll share it here. 
+
+When upgrading, stable variables are identified by the compiler by their names, not by memory addresses (or pointers). Currently class definitions need to be written to separate modules. Therefore, if the module is split, the same namespace cannot be identified and stable will not be valid. I believe this is the cause of the current situation.
+
+To solve the problem fundamentally, the compiler must be changed.
+
+-------------------------
+
+rossberg | 2022-07-07 07:57:24 UTC | #8
+
+@ClankPan, of course, there is good reason that Motoko ties stability to variable names. Memory addresses are not meaningful across canister upgrades. The new code may e.g. be generated by a newer compiler version with a completely different memory layout.
+
+If we wanted to keep object addresses meaningful, then we'd need to lock down the internals of the Motoko compiler and its runtime system for all eternity (because somebody might need to upgrade a 5 year old canister). Unfortunately, that's completely impractical – language internals, including those affecting memory layout, change all the time. For example, most of the GC improvements we implemented last year would not have been possible that way.
+
+So, instead, Motoko temporarily serialises the contents of stable variables across upgrades. This way, we only need to keep the format of the serialised data fixed, and that is independent of any other internals.
+
+Alternatively, you can use the (experimental) stable memory interface. Then it is up to you to lay out your data, and it is your responsibility to keep it backwards compatible forever.
+
+I'm not sure what you mean by "class definitions need to be written to separate modules". You can put class definitions anywhere, and as many of them as you want. Though stable variables are not possible in regular classes anyway, they are a feature of actors.
+
+-------------------------
+
+ClankPan | 2022-07-08 03:01:03 UTC | #9
+
+[quote="rossberg, post:8, topic:11075, full:true"]
+@ClankPan, of course, there is good reason that Motoko ties stability to variable names. Memory addresses are not meaningful across canister upgrades. The new code may e.g. be generated by a newer compiler version with a completely different memory layout.
+[/quote]
+Yes, it is difficult to manage stables by address. Thank you.
+
+[quote="rossberg, post:8, topic:11075, full:true"]
+I'm not sure what you mean by "class definitions need to be written to separate modules". You can put class definitions anywhere, and as many of them as you want. Though stable variables are not possible in regular classes anyway, they are a feature of actors.
+[/quote]
+
+Sorry, this is my mistake.
+It means that classes defined in another module (also in another file) cannot use the lexical scope.
+
+For example, a class defined in actor can be partially stabled like closures.
+ ```
+actor {
+  stable var stable_var: Nat = 0;
+
+  // make closure
+  let counterClosure = func(){ stable_var+=1;};
+
+  // make class
+  class CounterClass() { 
+    public func inc() {stable_var+=1;}
+  };
+  let counterClass = CounterClass();
+
+  counterClosure();
+  counterClass.inc();
+
+};
+```
+
+-------------------------
+

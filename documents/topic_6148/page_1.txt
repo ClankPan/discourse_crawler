@@ -1,0 +1,1100 @@
+rossberg | 2021-12-13 14:57:44 UTC | #103
+
+There are two basic requirements for an implementation of stable vars:
+
+1. Variable access must be (amortised) constant time, not time linear in the size of the data it holds. (Otherwise, it will be a gigantic performance/cost foot gun.)
+
+2. It must be possible to reclaim stable memory no longer used, without irrecoverable fragmentation. (Otherwise it will be a space/cost trap for long-running apps.)
+
+It is not obvious how to implement stable vars directly in stable memory with the current API such that these requirements are satisfied.
+
+Also, keep in mind that we cannot afford changing the implementation of stable variables often, since every old version must be supported forever, and complexity of the system roughly increases quadratically with each change (and testable correctness worsens quadratically). In practice, I think that means we'll only have one, at most two, more shots in production. Hence I'd be super-reluctant to introduce half-hearted solutions, even if  it's just a stop-gap measure.
+
+-------------------------
+
+nomeata | 2021-12-13 13:28:18 UTC | #105
+
+[quote="rossberg, post:103, topic:6148"]
+It is not obvious how to implement stable vars directly in stable memory with the current API such that these requirements are satisfied.
+[/quote]
+
+I don’t see how the API matters, besides for performance: You could have the compiler emit the code it would if we had multi-mem and mem64 on the Wasm level, and then replace the reads and writes with the system API calls – either very naively access for access, or a bit cleverer with page or object level caching. It would be more instruction expensive, but it _would_ give the right semantics, and that may be good enough for plenty of services already (we don’t hear much complaint about people hitting the per-message cycle limit).
+
+For the sake of the argument, assume we _had_ multi-mem amd 64 bit memory, and stable memory on the Wasm and IC level: How would we implement stable vars then? It would be great having a plan and knowing how much it would take – even if we then conclude that we don’t have the dev capacity right now, or that there is no reasonable way to shim that on top of the existing System API.
+
+-------------------------
+
+rossberg | 2021-12-13 14:56:44 UTC | #106
+
+We'd need to implement some form of cross-memory GC, probably a sort of generalisation of a generational GC. I don't think that a GC over stable memory, while technically possible, is viable with the System API.
+
+There is a small detail that a shim cannot fully emulate: with the Wasm extensions, you can read values from stable memory or copy arbitrarily large blocks inside stable memory directly. A shim would always need to reserve a "sufficiently large" scratch area in regular memory to copy out and in again, which might get in the way of a specific heap layout, especially during GC.
+
+-------------------------
+
+nomeata | 2021-12-13 15:05:00 UTC | #107
+
+>  I don’t think that a GC over stable memory, while technically possible, is viable with the System API.
+
+No way to tell without trying :-). The kind of incremental GCs we are pondering for the IC have pretty good page-wise locality, don’t they? We want that anyways for normal GC… and then a page-level caching fake multi-memory might not be too bad. (Not too bad for me means just a few factors slower :-))
+
+And even then, it would be good to have at least the design ready so that we are not rushed to implement something suddenly quickly once the system does provide the features and someone has promised on Twitter that all will be good now.
+
+Ah, right, I forgot that the multi-memory extension also brings us bulk memory operations. Anyways, I would have imagined the fake-multi-mem instrumentation to anyways need some region in regular memory to do its thing (not a problem for us, the Motoko compiler can be helpful here, similar to the fake-multi-value-simulation now). Wouldn’t a single scratch page be enough, even for lager memcopies? If not, we can simply not use big bulk memory instruction in the compiler while we only simulate the support.
+
+-------------------------
+
+rossberg | 2021-12-13 16:02:17 UTC | #108
+
+I agree that it would be good to have a design "ready", but then there are plenty of other things that would be good to have yesterday. ;)
+
+As for cost, I'd expect 1-2 orders of magnitude cycle overhead using a shim. I don't think that would be within the bounds of what even the most cost-insensitive devs would be happy to swallow. It would also vastly increase the likelihood of a method running into cycle limits.
+
+-------------------------
+
+jzxchiang | 2021-12-15 01:40:05 UTC | #109
+
+[quote="rossberg, post:101, topic:6148, full:true"]
+Eventually, we would like to improve this, but that requires Wasm multi-memory support on the IC at a minimum.
+[/quote]
+
+Curious why support for Motoko `stable` variables would require both multi-mem and mem64? I thought mem64 would be sufficient.
+
+-------------------------
+
+rossberg | 2021-12-15 07:51:17 UTC | #110
+
+@jzxchiang, that's referring to what I say in the paragraph before:
+
+[quote="rossberg, post:101, topic:6148"]
+Motoko temporarily serialises the heap to stable memory for upgrades (using the pre/post upgrade hooks). Keeping stable vars in stable memory would be vastly more expensive, because every variable access would involve API calls and de/serialising (arbitrarily large) data structures. And having to do GC on the stable memory.
+[/quote]
+
+That is, efficiently storing stable variables in stable mem directly and implementing GC on stable memory requires multi-mem to avoid the API overhead.
+
+-------------------------
+
+jzxchiang | 2021-12-15 08:18:32 UTC | #111
+
+But why couldn't you store them in plain old linear wasm memory along with the other non-stable variables?
+
+-------------------------
+
+rossberg | 2021-12-15 08:38:12 UTC | #112
+
+Well, you could, but then 64 bit wouldn't help much if you want a maintainable canister. The problem is the need to copy the entire heap to stable memory at every upgrade, which is expensive, and gets more expensive the larger the heap gets. In particular, it is likely to run out of cycles during upgrade long before you even hit the 4G limit. So you'd be stuck with an unupgradable canister.
+
+-------------------------
+
+dsarlis | 2022-03-31 08:30:31 UTC | #114
+
+Hi all, I would like to share the team’s current thinking on the topic of increasing canister smart contract memory. This is a topic we know is important to the community and some people have been reaching out asking for the current status.With this update, we want to manage everyone’s expectations around the timeline of further increasing canister smart contract memory.
+
+As we had discussed in our rollout plan when the [original](https://forum.dfinity.org/t/increased-canister-smart-contract-memory/6148/37) proposal had been shared with you, we were going to start with bumping the limit for stable memory to 8GB and keep growing it as the system stabilizes. Based on the experience we have gathered running the production system since then, we have come to the conclusion that further increasing the limit for stable memory now (e.g. up to the subnet memory limit) provides marginal benefits to canisters while it opens up the opportunity for extra risks given some limitations of the current system.
+
+More specifically:
+
+* Increasing the available stable memory of canisters can easily backfire if developers are not careful handling access to their bigger stable memory efficiently. A limit that is quite easy to hit is the instructions limit on canister upgrades (that is if you don’t manually store all data you need directly to stable memory, a task that is not trivial). Some of this will be alleviated by the upcoming [DTS feature](https://forum.dfinity.org/t/deterministic-time-slicing/10635).
+
+* The stable memory api is still unsatisfactory as it requires copying data to and from wasm heap and can easily become quite expensive cycles-wise if large chunks of memory need to be moved around. Future work includes adding support for wasm64 and multiple memories on the IC and these should greatly help improve the story around handling of stable memory, including improving the performance of stable memory calls. We believe that these are important to do before we further increase the size of stable memory.
+
+We believe that the work outlined above is important to be done before we attempt to further increase the available size of stable memory in order to provide developers with a safe and efficient platform to build on. As usual, we will keep the community posted on the progress of these necessary features, so please stay tuned.
+
+-------------------------
+
+jzxchiang | 2022-04-01 06:35:11 UTC | #115
+
+I hate to ask this, but do you have any updates on the timeline for a possible wasm64 and multiple memories implementation?
+
+I'm guessing there will be proposal beforehand, and judging by the fact that there hasn't been one submitted yet, it seems like it's still quite a few quarters away.
+
+The uncertainty puts developers (i.e. myself) in somewhat of a bind. For example, I develop in Motoko and am not sure whether I should migrate all of my Motoko stable variables to using the [ExperimentalStableMemory](https://smartcontracts.org/docs/base-libraries/ExperimentalStableMemory.html) library. It's still marked as experimental.
+
+Any clarity would be greatly appreciated, thanks.
+
+-------------------------
+
+rossberg | 2022-04-01 17:19:38 UTC | #116
+
+[Memory-64](https://github.com/WebAssembly/memory64/blob/main/proposals/memory64/Overview.md) and [multiple memories](https://github.com/WebAssembly/multi-memory/blob/main/proposals/multi-memory/Overview.md) are extension proposals for Wasm itself, which have not yet been standardised, although they are already at [phase 3](https://github.com/WebAssembly/proposals) of the Wasm proposal process. AFAIK, wasmtime (the engine used by the replica) already implements them, but it would be risky to start depending on them before their standardisation has been finalised (which would be phase 4). And that process is outside Dfinity's direct control, it is blocked on other engine vendors implementing the proposals.
+
+-------------------------
+
+claudio | 2022-04-04 13:02:19 UTC | #117
+
+The reason Motoko's ExperimentalStableMemory library is still marked experimental is that we don't really like it as a long term solution since it is rather low-level, hard to use, expensive and non-modular. A library is free to access it and can thus mess with any other libraries use of stable memory. It's like a big global variable that everyone in the program has access to and thus goes against the grain of Motoko's focus on safety.
+
+A better design would be for the main actor to selectively hand out handles to isolated regions of stable memory that libraries could use, but only once given a capability to use them. That would, for example, prevent libraries messing with each others' stable memory invariants. We don't, off hand, have a good design for this, especially one that allows individuals regions to grow yet remain contiguous with efficient access.
+
+I would not refrain from taking a dependency on the library if it suits your purpose, just be aware that the API may change some time in the future. That being said, I don't see that happening anytime soon.
+
+Also, be aware that the cost of accessing stable memory is quite high at the moment: even reads and writes of individual words require allocating space in the Wasm heap to do an expensive, particularly when small, bulk transfer from Wasm memory to stable memory, due to the peculiarities of the current System API. 
+
+We have some ideas on how replicas could lower these costs substantially, but at the moment they are just ideas and rely on the above Wasm proposals becoming fully available.
+
+-------------------------
+
+icme | 2022-04-04 13:59:58 UTC | #118
+
+[quote="claudio, post:117, topic:6148"]
+Also, be aware that the cost of accessing stable memory is quite high at the moment: even reads and writes of individual words require allocating space in the Wasm heap to do an expensive, particularly when small, bulk transfer from Wasm memory to stable memory, due to the peculiarities of the current System API.
+[/quote]
+
+@claudio 
+
+**Note**: for the context of my response I am referring to **stable** as using the `stable` keyword and **not** the ExperimentalStableMemory library)
+
+Does this mean that declaring a stable variable in Motoko, and reading/updating that variable (or record fields within that variable) is much more expensive than keeping that variable unstable, but saving it via preupgrade/post upgrade methods?
+
+For example, are there specific benefits to keeping a variable as unstable, but then persisting that variable to stable memory only during upgrades as opposed to always having that variable be stable?
+
+Let’s say I have a `List<Nat>` data structure (which is stable). Are there any performance benefits to me initializing this list as an unstable variable (no `stable` keyword), but then using the system preupgrade/postgrads apis to save it to stable memory only during upgrades, vs. just initializing the List using the `stable` keyword from the start and keeping it that way (no additional steps needed for upgrades)?
+
+If so, a pro-con list of the two scenarios (variable always stable vs. unstable but write to stable memory via system apis on upgrade) would be nice, along with estimated costs in terms of cycles and performance (i.e. a read heavy vs. write heavy application, or one that might get upgraded frequently, etc.).
+
+-------------------------
+
+claudio | 2022-04-04 14:17:19 UTC | #119
+
+At the moment, there is no performance difference between stable and ordinary variables during normal computation. The only difference is that stable variables are serialized and deserialized  in bulk on upgrade, while ordinary variables are just discarded.
+
+If we move to an implementation where stable variables are maintained in stable memory throughout their lifetime, rather than just between upgrades, then there may well be a performance tradeoff between the two sorts of variables.
+
+-------------------------
+
+jzxchiang | 2022-04-05 06:26:47 UTC | #120
+
+Thanks for the update.
+
+In the meantime, I'm wondering if Motoko has incorporated any changes recently that can help developers use as much of the 4 GB canister memory as possible. For example, I believe the compacting GC was launched a while back, and some other changes may have landed since then.
+
+Do you happen to know how much of the 4 GB we can use with stable variables before running into issues serializing/deserializing during upgrade? If that limit is, say, 3 GB, what would happen if we try upgrading a canister with more than 3 GB worth of stable variables?
+
+These kind of scenarios (almost always involving some sort of canister upgrade) are a bit frightening to think about...
+
+-------------------------
+
+claudio | 2022-04-05 22:01:57 UTC | #121
+
+Motoko, by default, currently still uses the copying collector as that conveniently leaves us with half of wasm memory to perform naive serialization of stable variables, but limits us to roughly 2GB of live data. Our current serializer serialize stable variables  to wasm memory before copying the blob to stable memory, which is suboptimal. 
+
+We are working to replace our current serializer so that it can serialize stable variables directly to stable memory in a streaming fashion, reducing the current 2x space overhead drastically. This should enable us to recommend  or even default to the compacting GC. That should make much more than half of wasm memory available for live data.
+
+The replica team is also working on allowing long running messages that span several rounds which should mitigate the current risk of running out of cycles during large GCs and upgrades.
+
+-------------------------
+
+jzxchiang | 2022-04-06 00:17:57 UTC | #122
+
+That's great. So even if we use the compacting GC right now, it won't be that effective because the streaming stable variable feature hasn't landed yet. Is that an accurate summary? Do you know if streaming is on the order of months or weeks away?
+
+> which should mitigate the current risk of running out of cycles
+
+Do you mean the per-block instruction limit? I wasn't aware that deterministic time cycles would actually save the user some cycles.
+
+-------------------------
+
+dsarlis | 2022-04-06 07:14:47 UTC | #123
+
+> Do you mean the per-block instruction limit? I wasn’t aware that deterministic time cycles would actually save the user some cycles.
+
+No, what Claudio meant is that a message will be able to run across multiple rounds (on each round consuming up to the limit allowed for a single execution), therefore being able to run longer overall and not be limited by the single message limit. In fact, running a long computation will likely cost a bit more in total but the key is you'll actually be able to do it. More details in the relevant [thread](https://forum.dfinity.org/t/deterministic-time-slicing/10635).
+
+-------------------------
+
+claudio | 2022-04-06 15:38:10 UTC | #124
+
+If you use the compacting GC right now, and the heap has lots of data, then you run the risk of not having enough heap space left to serialize your stable variables to the heap on the way to stable memory. 
+
+I think the streaming serialization feature will be out in Motoko in a small number of weeks - the PR is almost ready for review - when it is included in dfx is out of our hands though.
+
+Deterministic Time Slices (running messages for multiple rounds, with higher budgets) is a bigger change so I expect a few months, rather than weeks.
+
+-------------------------
+
+Seb | 2022-04-13 22:21:35 UTC | #125
+
+Would it be possible to release this document to the community so we can get a better understanding of the vision ?
+
+-------------------------
+
+ggreif | 2022-06-13 19:05:14 UTC | #126
+
+[quote="claudio, post:124, topic:6148"]
+I think the streaming serialization feature will be out in Motoko in a small number of weeks - the PR is almost ready for review - when it is included in dfx is out of our hands though.
+[/quote]
+
+@jzxchiang
+
+Streaming serialisation of stable variables is [now released](https://github.com/dfinity/motoko/releases/tag/0.6.27) in `moc`, please watch the `dfx` releases (and release notes) about when it will be fully launched. But you can definitely gather experience with it by dropping-in `moc` into a (sufficiently recent) `dfx` install.
+
+Update: dfx 0.10.1-beta.1 seems to have it.
+Update: dfx 0.10.1 is installable, but not promoted yet
+Update: it is now the default! :slight_smile:
+
+-------------------------
+
+flyq | 2022-07-08 03:14:11 UTC | #127
+
+Now, Canister has 8GB stable memory and some low-level system api to use them, such as `stable64_xxxx()`.
+
+The typical way to use stable memory today is to serialize the state in the wasm heap into bytes before upgrading, and then overwrite it into stable memory. After the upgrade, restore to the wasm heap state from stable memory. And because the state in the wasm heap is often serialized as a whole, developers can only use 2GB in the wasm heap even in Rust, (the other 2GB is used to temporarily store serialized copies), and can only use 2GB to stable memory. And I doubt that a 2GB copy can be done within one block time (1s). Moreover, I actually encountered a situation where the canister on the mainnet could not be upgraded, but could be reinstalled, and it was difficult to find the problem.
+
+As far as I know, here some canisters or tools trying to use more stable memory:
+1. The Internet Identity. the user anchors' data is the only state which needs to be persisted, and will  grow dynamicly. By determining the maximum space that each user anchor can occupy, it can be determined that the data of the newly added user anchor should be stored in the offset position of the stable memory.
+
+2. https://forum.dfinity.org/t/stablebtreemap-in-canisters/14210, I tried to use it, but it's a bit tricky to use when [the situation gets complicated](https://forum.dfinity.org/t/stablebtreemap-in-canisters/14210/3?u=flyq).
+
+3. https://forum.dfinity.org/t/ic-stable-memory-rust-library/14158, Good idea, but need to reimplement common data structures such as HashMap, Vec and more.
+
+I think the perfect way to use stable memory is similar to using wasm heap. Wasm heap is also a stack-based linear memory space. We don't need to consider these low-level interfaces when we use it. Why do we need to implement a memory allocator and memory manager when we use stable memory? This way we can directly use the lots of libraries in std. I'm looking forward to Dfinity's official implementation of such a tool.
+
+And, when I re-read the whole post, I found that wasm has the concept of [multiple memories](https://forum.dfinity.org/t/increased-canister-smart-contract-memory/6148/116?u=flyq) and [stable vars](https://forum.dfinity.org/t/increased-canister-smart-contract-memory/6148/103?u=flyq), I think they are what I want, to be able to use stable memory like wasm heap. Unfortunately, it seems that neither of these features will make it into production anytime soon.
+
+-------------------------
+
+abk | 2022-10-07 14:35:06 UTC | #128
+
+# Increasing Stable Memory to 32 GiB
+
+As part of this effort to give canisters more memory we’re proposing to increase the size of stable memory to 32 GiB in an upcoming release. In addition to benefiting all canister developers, this expansion is a critical part of the Bitcoin integration work.
+
+## How to use it
+
+You won’t need to make any changes in how you call the 64-bit stable memory APIs. Calls to `stable64_grow` will now let you increase stable memory up to 32 GiB. Note that the `stable64_size` and `stable64_grow` functions work with Wasm pages which are 64 KiB, so this corresponds to 524,288 Wasm pages.
+
+## Limitations
+
+Due to technical limitations of the current implementation, writes to stable memory will be limited to 8 GiB per message. This means that existing canisters will not see any breakage and all canisters will still be able to copy the entire Wasm heap to stable memory in pre-upgrade hooks. But canisters which want to take advantage of the full 32GiB should consider a design where most persistent data is used directly from stable memory. Libraries like [`ic_stable_structures`](https://docs.rs/ic-stable-structures/0.1.1/ic_stable_structures/) and [`ic-stable-memory`](https://crates.io/crates/ic-stable-memory) can help with this.
+
+-------------------------
+
+cryptoschindler | 2022-10-10 05:27:01 UTC | #129
+
+Are there plans to move the Motoko Stable Memory library out of its experimental status?
+
+-------------------------
+
+abk | 2022-10-11 06:52:43 UTC | #130
+
+I asked the Motoko team and they said there are no immediate plans.
+
+-------------------------
+
+lastmjs | 2022-10-12 16:10:29 UTC | #131
+
+Does anyone know if asset canisters already use stable memory? If so, I assume asset canisters will automatically be able to store up to 32gb once this goes live?
+
+-------------------------
+
+domwoe | 2022-10-12 16:49:52 UTC | #132
+
+No, asset canisters don't use stable memory currently.
+
+ @senior.joinu might be working on one if I remember correctly.
+
+-------------------------
+
+senior.joinu | 2022-10-13 10:54:02 UTC | #133
+
+> `stable64_grow` will now let you increase stable memory up to 32 GiB
+
+Please consider adding an API to retrieve an amount of free memory left in a subnet. 32GiBs is the soft limit, but if your subnet runs out of physical space earlier, your canister can still end up with only some megabytes of available storage.
+
+Something like `stable64_pages_left() -> u64` should do the trick.
+
+Horizontal scaling is the only way to build truly autonomous software, but now this approach is blocked because of missing API.
+
+I know this may be not the right place for this proposal, but anyway.
+
+-------------------------
+
+senior.joinu | 2022-10-13 16:15:15 UTC | #134
+
+Yea, `ic-stable-memory` is in the middle of a huge update one of which is a stable collection for data certification. You can read more about this collection that I want to implement [here](https://forum.dfinity.org/t/discussion-data-certification-on-ic/15379).
+
+Once this new collection is implemented it will be possible to implement such a stable memory based asset canister - everything we need in order to compose it will be available as a library.
+
+-------------------------
+
+abk | 2022-10-17 08:10:42 UTC | #135
+
+Can you say more precisely how you'd want to use such an API? I think it sounds reasonable, but we also already have the memory allocation which you can be used to ensure your canister doesn't run out of memory.
+
+For example, you could start with a memory allocation of 1GB and increase it by 500MB each time your canister's free memory becomes less than 500MB. If the subnet gets low on memory you'll notice it because the call to increase the memory allocation will fail. This way you'll still have some memory you can use when you notice that the subnet is running out, whereas with the `stable64_pages_left` API you might see 32GB available on one call, and then have it immediately go to 0 on the next call.
+
+-------------------------
+
+senior.joinu | 2022-10-17 13:35:41 UTC | #136
+
+The actual reasoning is the whole story, so here it goes.
+
+This is all because of `ic-stable-memory`. In this library there is a stable memory allocator and a bunch of custom collections, like `Vec` or `BTreeMap`, which store data completely in stable memory.
+
+The goal is to somehow have both: 
+1. **transactional execution** - if there is not enough stable memory to complete message execution (we want to allocate two memory blocks during the call, we allocated one, but there is no memory for another), the state of the canister should reset to what it was at the beginning of this execution;
+2. **horizontal scaling opportunity** - when your canister is close to being out of memory, you should somehow be able to react to this situation and run some code (for example, when your canister sees, that there is only 10MBs left in the subnet, it may want to spin up a copy of itself on another subnet).
+
+It turns out, that you can have any one of these easily, but not both. **Transactional execution** can be achieved by simply trapping when there is no more memory. **Horizontal scaling** can also be performed at the same exact moment. But you can't both trap and run some code afterwards.  
+
+Initially I was thinking like: `Ok, I'll just grow() stable memory on-demand and make all collections' methods transaction-like, so they would manually restore the state back to how it was before the failure. And also all methods would return an Error in that case, so developers could just react to that error and do something in order to automatically scale their app`.
+But, unfortunately, this solution only works for some simple use-cases and very much makes your code unreadable. 
+For example, it won't work for `BTreeMap`, because it basically means, that you have (for each insert operation) allocate additional `logN + 1` of nodes in advance (in order to see if there is enough memory) and if there is, you should somehow pass these newly allocated nodes inside your insertion code (which is very much recursive) in order to fill them with correct values and attach them to the tree. It is both complex and slow.
+User code also becomes a mess, since you have to react to every `Error` returned by every collection, in order to reset all the previous operations you did during this transaction (and yes, everyone would have to manually do that).
+
+Then I was thinking: `Yea, this idea is bad, but what about if I will grow() some amount of stable memory in advance, to always keep it above some level and if I can't, I will execute some user-specified canister method like "on_low_stable_memory()"? I won't do any transaction-specific stuff inside collections - just trap and the state is safe.`
+This solution sounds good and pretty simple to implement (and I assume, this is what you propose), but it doesn't work in practice.
+For it to work in practice we have to make sure, that the level of grown stable memory that we keep is **always bigger or equal** than our maximum possible allocation during a single call. For example, if our canister has a single method that allocates exactly 1MB each time it is called, than we only need to make sure, that we have 1MB of stable memory in advance. In this scenario, after each such call we will allocate 1MB of grown stable memory and then `grow()` 1MB more. If we can't `grow()` more - we just call `on_low_stable_memory()` hook and everything is good.
+
+But real collections do not work like that. For example, let's imagine a canister that stores a history of transactions (a ledger) in a vector. Vectors work in such a way, so when they reach their maximum capacity they try to allocate twice as much of memory to continue growing.  
+For example, we had a vector that had capacity of 10 elements; once we inserted the 11th element, this vector will reallocate into a new memory block that can now hold 20 elements. 
+This means, that in order for such a vector to work properly in our "grow-in-advance" setup, we always have to grow twice the size of this vector in advance. This means, that if our transaction history occupies 2GBs of stable memory, than we have to have 4GBs more of grown in advance memory (which is, by the way, completely unused, until you can't grow more). 
+
+Ofc, you can imagine special collections that won't reallocate that way and will work maybe a little slower, but only consuming a small portions of new memory in order to continue growing (and that is what I initially was going towards). But the main question stays the same: how much stable memory exactly do you have to allocate in advance in order to keep it cheap (to not pay much for unused storage) and fail-proof? 
+
+I'm building this library for almost half a year now (reinventing for myself all the uni's CS program), and I don't know how to answer this question.
+
+So, my final though (and this is what I propose here) - `let's completely decouple both these processes. Let's make transactions trap, when they reach memory limit and let's give a user some way of understanding, how likely it is for their canister to fail.` 
+This concept of `on_low_stable_memory()` taught me one more interesting thing: **If your canister can't grow now, it doesn't mean that it won't be able to grow after a couple of minutes!**. Memory is very flexible on IC. Some canisters decrease the total amount of available memory in a subnet, but some - increase (when destroyed).
+
+So, providing a user with some kind of `on_low_stable_memory()` system hook is actually a bad idea, because you won't be able to answer the question: "if the subnet again has enough memory to allocate (after some canisters died), should this hook be called once again, when there is no more memory again?". Everyone would have a different answer to it.
+
+So it is better to just not do that, but instead give everyone a tool to track the available memory and to react how they like. For example, if we had a `stable64_pages_left()` method, we could use `heartbeat` in order to achieve the same result as with `on_low_stable_memory()`, but with less effort and more freedom.
+
+----------------------
+
+This is it.
+
+P.S. Actually, as far as I understand, all of these points are also valid for common heap memory. You can easily run out of heap without even reaching 4GB's, because of how the system works. Maybe, there should also be a method for that? Or maybe `stable64_pages_left()` will automatically resolve this issue also, because when serialized the heap and stable memory are the same kind of memory, so it doesn't matter and if `stable64_pages_left()` shows 0, then you're probably won't be able to store more data on the heap also.
+
+-------------------------
+
+abk | 2022-10-17 15:48:17 UTC | #137
+
+[quote="senior.joinu, post:136, topic:6148"]
+So, my final though (and this is what I propose here) - `let's completely decouple both these processes. Let's make transactions trap, when they reach memory limit and let's give a user some way of understanding, how likely it is for their canister to fail.`
+[/quote]
+
+This makes sense to me, but I'm not sure how much the proposed API would help with it because the returned value would only be reliable for the current execution. Taking your example, if a user calls `stable64_pages_left` during a heartbeat and it returns 32 GB, it's still possible that a small `stable64_grow` call would fail on the very next message if some other canister took up the rest of the subnet's memory in between the calls.
+
+If a canister needs a reliable way of determining how much memory they have left then it would make more sense to reserve a memory allocation and check how the current memory usage compares to that allocation.
+
+-------------------------
+
+senior.joinu | 2022-10-17 17:57:46 UTC | #138
+
+[quote="abk, post:137, topic:6148"]
+Taking your example, if a user calls `stable64_pages_left` during a heartbeat and it returns 32 GB, it’s still possible that a small `stable64_grow` call would fail on the very next message if some other canister took up the rest of the subnet’s memory in between the calls
+[/quote]
+
+Yea, and that's fine. That means that the next time this canister's `heartbeat` will be invoked, `stable64_pages_left()` will return something close to `0` and the code can react to that by spawning a new canister and maybe by offloading new requests there.
+
+This is exactly what I want. The state stays correct and the dapp can keep scaling.
+
+[quote="abk, post:137, topic:6148"]
+If a canister needs a reliable way of determining how much memory they have left then it would make more sense to reserve a memory allocation and check how the current memory usage compares to that allocation.
+[/quote]
+
+Do you mean a flow like this?
+1. Inside your `heartbeat` function check, whether the canister has at least 500MBs of free memory.
+2. If it doesn't, try to grow additional pages.
+3. If you can't grow, execute some other code to scale. 
+
+Okay, now I get it. Yes, this is indeed the same, with an exception of you being forced to always pay for 500MBs more than you use. But, I believe that even 10MB will do the job for most cases.
+
+UPD:
+In any ways, and API like `stable64_pages_left()` is more suitable for this kind of tasks. Especially if it can hint an amount of heap memory left also for those who don't use stable memory.
+
+-------------------------
+
+abk | 2022-10-18 06:53:10 UTC | #139
+
+The bump to 32 GiB stable memory is was approved in [Proposal 86279](https://dashboard.internetcomputer.org/proposal/86279):
+
+> * Runtime: Increase stable memory to 32GB
+
+ and will be rolled out this week. So you can try it out as soon as your canister's subnet has been updated to replica version [cbf9a3bb](https://github.com/dfinity/ic/tree/cbf9a3bbd63f37f343f5ebc44e88eafff1481767). As a reminder, you can  follow the proposals to update subnets on the [dashboard](https://dashboard.internetcomputer.org/governance).
+
+-------------------------
+
+Manu | 2022-12-14 13:50:25 UTC | #140
+
+Hi everybody! 
+
+We've done more testing with canisters with a lot of stable memory and have seen that we can actually increase the limit even further, so since release https://dashboard.internetcomputer.org/proposal/92573 canisters can now hold 48GiB of stable memory.  Hope you will build cool canisters with lots of memory!
+
+-------------------------
+
+integral_wizard | 2022-12-14 15:59:14 UTC | #141
+
+If I create a canister does it automatically book 48Gb of memory or is it filling it up as it goes? I'm thinking of DDOS cases against user-canister dApps. Sending a fleet of bots that create a canister with 48Gb of memory space?
+
+-------------------------
+
+Severin | 2022-12-14 16:00:51 UTC | #142
+
+No, not by default. You can reserve more space than you're using with your canister's settings (see `dfx canister update-settings --help`), but you'll be charged for the reserved memory as if you were using it.
+
+-------------------------
+
+Sormarler | 2022-12-14 17:35:00 UTC | #143
+
+What's the theoretical limit for a canister size?
+
+-------------------------
+
+h1teshtr1path1 | 2022-12-14 18:03:30 UTC | #144
+
+ --memory-allocation <MEMORY_ALLOCATION>
+            Specifies how much memory the canister is allowed to use in total. This should be a
+            value in the range [0..12 GiB]. A setting of 0 means the canister will have access to
+            memory on a “best-effort” basis: It will only be charged for the memory it uses, but
+            at any point in time may stop running if it tries to allocate more memory when there
+            isn’t space available on the subnet
+This is what i can see, does that mean allocating 0, we can use canister memory beyond 4GB? or did i misunderstood something?
+
+-------------------------
+
+Severin | 2022-12-15 07:12:09 UTC | #145
+
+[quote="h1teshtr1path1, post:144, topic:6148"]
+This is what i can see, does that mean allocating 0, we can use canister memory beyond 4GB? or did i misunderstood something?
+[/quote]
+
+I'm no expert on this, but that matches how I read it.
+
+-------------------------
+
+dsarlis | 2022-12-15 10:23:34 UTC | #146
+
+You can use more than 4GiB for the canister's stable memory. The heap is still limited to 4GiB, that's still limited by the fact that our current Wasm runtime supports 32-bit native memory (there's work to allow for using 64-bit memory though).
+
+-------------------------
+
+h1teshtr1path1 | 2022-12-15 10:32:27 UTC | #147
+
+And what should I do to upgrade canister to use more than 4 GiB stable memory? Same? --memory-allocation 0?
+
+-------------------------
+
+dsarlis | 2022-12-15 10:37:00 UTC | #148
+
+You shouldn't have to do anything really. By default, canisters use "best-effort" memory allocation when they are created (i.e. if you don't specify anything with the memory-allocation option). As long as you use the 64-bit stable memory apis (should be available through both Motoko and Rust CDK) in your canister, you should be able to use more than 4GiB stable memory.
+
+-------------------------
+
+tokuryoo | 2023-03-24 05:41:11 UTC | #149
+
+The State Manager runs on the Exexution Layer and the State Manager stores state on the SSD. I think it is very important to adopt 64-bit WASM to increase capacity. However, "[How it works - Internet Computer Execution Layer](https://internetcomputer.org/how-it-works/execution-layer)" has "The replicated state that can be held by a single subnet is not bounded by the available RAM in the node machines, but rather by the available SSD storage." written on it.  In the short term, the method of increasing memory is a very good approach. However, I believe that SSD should be utilized because lower server costs lead to cheaper Cycle. There may be a way to store large amounts of data with not much memory. I would be glad to receive your opinion. Please let me know if my understanding is incorrect.
+
+-------------------------
+
+haida | 2023-05-07 02:18:12 UTC | #150
+
+Using stable to modify variables in motoko, can 32G stable memory be used? From what version of ic is it supported?
+
+-------------------------
+
+abk | 2023-05-08 11:52:36 UTC | #151
+
+The motoko devs should be able to answer this better, but my understanding is that currently motoko stable variables are actually held on the wasm heap and just transferred to stable memory during upgrades. This would mean that they cannot use the full stable memory size yet.
+
+cc @claudio
+
+-------------------------
+
+Manu | 2023-05-11 08:35:27 UTC | #152
+
+hey everybody, a quick update on the stable memory limits: DFINITY will propose in the next replica version to further increase the stable memory limit to 64GiB (from the current 48GiB). Our testing shows that this will work without issue, and also in practice we've seen eg the bitcoin canister use > 40GiB of stable memory for some months now, and this has been running without problems, which makes us confident we can further increase. 
+
+An increase to 64GiB would also give the bitcoin canister more headroom to store the entire UTXO set, which has been growing rapidly in the past months.
+
+-------------------------
+
+tcpim | 2023-05-24 05:49:44 UTC | #153
+
+New to stable structure in rust. A couple of questions @Manu 
+
+For the BoundedStorable impl MAX_SIZE, does it mean it will always take up that amount of bytes in the memory? For example, I use a StableBTreeMap<String, Vec < String>>. The size Vec< String> can increase over time, is it a good practice to put a very large size as the max size of Vec<String>?
+
+Continued on example StableBTreeMap<String, Vec< String>> above, can I use StableVec within a StableBtreeMap? For example, StableBTreeMap<String, StableVec< String>>. If yes, how to initiate it in thread_local! with MEMORY_MANAGER? Would appreciate an example. 
+
+Thanks
+
+-------------------------
+
+skilesare | 2023-05-23 23:48:50 UTC | #154
+
+https://forum.dfinity.org/t/completed-icdevs-org-bounty-24-stablebtree-mokoko-up-to-10k/14867
+
+This seems to be working for us up to about 2MB chunks. The error may have been in my other code as upgrades were not working for some reason when I added a 2gb btree. Everything below that worked flawlessly.
+
+-------------------------
+
+ielashi | 2023-05-24 08:29:29 UTC | #155
+
+[quote="tcpim, post:153, topic:6148"]
+For the BoundedStorable impl MAX_SIZE, does it mean it will always take up that amount of bytes in the memory?
+[/quote]
+
+Yes, that is correct.
+
+[quote="tcpim, post:153, topic:6148"]
+For example, I use a StableBTreeMap<String, Vec < String>>. The size Vec< String> can increase over time, is it a good practice to put a very large size as the max size of Vec?
+[/quote]
+
+No, I would advise against that since, as mentioned in your earlier question, the BTree does allocate the maximum amount of bytes that you specify.
+
+In general, if you have a situation where you want to store 1-many data, and that data can be large, I recommend instead of representing it as:
+
+```
+StableBTreeMap<Key, Vec<Value>>
+```
+
+To instead represent it as:
+
+```
+StableBTreeMap<(Key, Value), ()>
+```
+
+In this case, the `Key` and `Value` are composed together to form a composite key. Whenever you want to retrieve all the values of `Key`, you can use the StableBTreeMap's [range](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/btreemap/struct.BTreeMap.html#method.range) method. See [this tutorial](https://mmapped.blog/posts/14-stable-structures.html#data-structures), which contains an example of how to use and scan composite keys.
+
+[quote="tcpim, post:153, topic:6148"]
+Continued on example StableBTreeMap<String, Vec< String>> above, can I use StableVec within a StableBtreeMap? For example, StableBTreeMap<String, StableVec< String>>. If yes, how to initiate it in thread_local! with MEMORY_MANAGER? Would appreciate an example.
+[/quote]
+Stable structures cannot be nested at the moment, so I'd suggest the composite key approach above.
+
+-------------------------
+
+tcpim | 2023-05-25 20:23:44 UTC | #156
+
+Thanks @ielashi 
+
+>Stable structures cannot be nested at the moment
+
+Will this be supported in the future? Or this is not possible technically
+
+-------------------------
+
+ielashi | 2023-05-26 07:11:28 UTC | #157
+
+In theory it can be done, but initializing stable structures incurs some overhead because each structure is stored in its virtual address space (this was an intentional decision, as it makes the library much safer to use), so I don't expect it to be added to our roadmap at the moment.
+
+However, we currently are exploring removing the `MAX_SIZE` constraint from the values, so then you would be able to declare things like `StableBTreeMap<Key, Vec<Value>>`. However, even then, I'd only use this representation if you know your vector won't grow too large, because we'd need to serialize/deserialize this entire vector on each access.
+
+-------------------------
+
+peterparker | 2023-05-26 11:18:39 UTC | #158
+
+[quote="ielashi, post:157, topic:6148"]
+However, we currently are exploring removing the `MAX_SIZE` constraint from the values, so then you would be able to declare things like `StableBTreeMap<Key, Vec<Value>>`.
+[/quote]
+
+Oh please do! I am exploring `StableBTreeMap` for the very first time today and this limitation / error is literally the first problem I am facing right now.
+
+I use a `Principal` as key and currently it isn't implemented in `candid`.
+
+```
+error[E0277]: the trait bound `candid::Principal: BoundedStorable` is not satisfied
+  --> src/stabletest_backend/src/lib.rs:34:39
+   |
+34 |     static CONTROLLERS_STATE: RefCell<ControllersState> = MEMORY_MANAGER.with(|memory_manager|
+   |                                       ^^^^^^^^^^^^^^^^ the trait `BoundedStorable` is not implemented for `candid::Principal`
+```
+
+In addition, I use entities that contains blob, so not sure what value I should set for the `MAX_VALUE` since it is depending on what the users save.
+
+```
+error[E0277]: the trait bound `MyEntity: BoundedStorable` is not satisfied
+  --> src/stabletest_backend/src/lib.rs:34:39
+   |
+34 |     static CONTROLLERS_STATE: RefCell<ControllersState> = MEMORY_MANAGER.with(|memory_manager|
+   |                                       ^^^^^^^^^^^^^^^^ the trait `BoundedStorable` is not implemented for `MyEntity`
+```
+
+-------------------------
+
+peterparker | 2023-05-26 13:35:18 UTC | #159
+
+Regarding my above issue with `Principal`, it can be solved by wrapping it. If it can help anyone else:
+
+```
+use candid::CandidType;
+use serde::Deserialize;
+use candid::Principal;
+
+use candid::{decode_one, encode_one};
+use ic_stable_structures::{BoundedStorable, Storable};
+use std::borrow::Cow;
+
+#[derive(CandidType, Deserialize, Clone, PartialOrd, Ord, Eq, PartialEq)]
+pub struct MyPrincipal(Principal);
+
+impl Storable for MyPrincipal {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        Cow::Owned(encode_one(self).unwrap())
+    }
+
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        decode_one(&bytes).unwrap()
+    }
+}
+
+impl BoundedStorable for MyPrincipal {
+    const MAX_SIZE: u32 = 29;
+    const IS_FIXED_SIZE: bool = false;
+}
+```
+
+-------------------------
+
+ielashi | 2023-05-26 13:44:34 UTC | #160
+
+@peterparker Using candid for serializing and deserializing is an overkill. It's also not going to work, because candid adds some magic bytes, which will make the principal exceed the 29-byte max size you specified.
+
+Try something like this (untested):
+
+```
+impl Storable for MyPrincipal {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        Cow::Borrowed(self.0.as_slice())
+    }
+
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        Self(Principal::from_slice(bytes.as_ref()))
+    }
+}
+```
+
+-------------------------
+
+peterparker | 2023-05-26 14:46:25 UTC | #161
+
+Thanks Islam. I don't get any compilation issue and I'm able to add and get values but, if I `dfx deploy` changes I loose the state. So probably something incorrect in my sample. Not sure if it is linked to this. I'm trying to debug.
+
+-------------------------
+
+tcpim | 2023-05-26 17:50:17 UTC | #162
+
+[quote="ielashi, post:157, topic:6148"]
+However, even then, I’d only use this representation if you know your vector won’t grow too large, because we’d need to serialize/deserialize this entire vector on each access.
+[/quote]
+
+If I use MAX_SIZE for StableBTreeMap<Key, Vec<Value>> in current way, will it still serialize/deserialize this entire vector on each read?
+
+From the comment of this piece of code from this [blog](https://mmapped.blog/posts/14-stable-structures.html#data-structures), it seems the answer is yes, but I want to confirm, Thanks!
+```
+impl<K, V, M> struct BTreeMap<K, V, M>
+where
+  K: BoundedStorable + Ord + Clone,
+  V: BoundedStorable,
+  M: Memory,
+{
+    /// Adds a new entry to the map.
+    /// Complexity: O(log(N) * K::MAX_SIZE + V::MAX_SIZE).
+    pub fn insert(&self, key: K, value: V) -> Option<V>;
+
+    /// Returns the value associated with the specified key.
+    /// Complexity: O(log(N) * K::MAX_SIZE + V::MAX_SIZE).
+    pub fn get(&self, key: &K) -> Option<V>;
+
+    /// Removes an entry from the map.
+    /// Complexity: O(log(N) * K::MAX_SIZE + V::MAX_SIZE).
+    pub fn remove(&self, key: &K) -> Option<V>;
+
+    /// Returns an iterator over the entries in the specified key range.
+    pub fn range(&self, range: impl RangeBounds<K>) -> impl Iterator<Item = (K, V)>;
+
+    /// Returns the number of entries in the map.
+    /// Complexity: O(1).
+    pub fn len() -> usize;
+}
+```
+
+-------------------------
+
+peterparker | 2023-05-27 10:44:18 UTC | #163
+
+[quote="peterparker, post:161, topic:6148"]
+I don’t get any compilation issue and I’m able to add and get values but, if I `dfx deploy` changes I loose the state.
+[/quote]
+
+Found my issue, it's because I used the stable structures together with existing data stored on the heap without explicitely taking care of the serialization in `pre/post_upgrade`.
+
+I had to land on the [quickstart example](https://github.com/dfinity/stable-structures/tree/main/examples/src/quick_start) to understand that both conflicts when upgrading and to ultimately figure out what's happening.
+
+Would it be worth to add a note within the README @ielashi ?
+
+-------------------------
+
+ielashi | 2023-05-27 10:59:20 UTC | #164
+
+[quote="tcpim, post:162, topic:6148"]
+If I use MAX_SIZE for StableBTreeMap<Key, Vec> in current way, will it still serialize/deserialize this entire vector on each read?
+[/quote]
+
+Yes, that is correct, so I'd only favor this approach if you expect the vectors to be small or medium-sized. For large datasets, I recommend the composite key approach. We use the composite key approach in the Bitcoin canister to store this list of UTXOs of each Bitcoin address.
+
+[quote="peterparker, post:161, topic:6148"]
+Thanks Islam. I don’t get any compilation issue
+[/quote]
+
+You wouldn't get a compilation issue, but what I would expect to happen is that if you try to insert a 29-byte principal, inserting it into the stable BTreeMap will cause a panic, because the candid serialization will add its own overhead and will make its serialized length exceed 29 bytes. Does that make sense?
+
+[quote="peterparker, post:163, topic:6148"]
+Found my issue, it’s because I used the stable structures together with existing data stored on the heap without explicitely taking care of the serialization in `pre/post_upgrade`.
+
+I had to land on the [quickstart example](https://github.com/dfinity/stable-structures/tree/main/examples/src/quick_start) to understand that both conflicts when upgrading and to ultimately figure out what’s happening.
+
+Would it be worth to add a note within the README @ielashi ?
+[/quote]
+
+IIUC you were using stable structures but kept serializing/deserialization the heap data without using the memory manager? Contribution to the docs are more than welcome :)
+
+-------------------------
+
+peterparker | 2023-05-27 14:15:06 UTC | #165
+
+[quote="ielashi, post:164, topic:6148"]
+Does that make sense?
+[/quote]
+
+Absolutely.
+
+[quote="ielashi, post:164, topic:6148"]
+Contribution to the docs are more than welcome :slight_smile:
+[/quote]
+
+Coolio. [https://github.com/dfinity/stable-structures/pull/83](https://github.com/dfinity/stable-structures/pull/83)
+
+-------------------------
+
+peterparker | 2023-05-27 17:06:08 UTC | #166
+
+I struggle with the `MAX_SIZE` variable. On one hand, my lack of passion for backend code and confidence makes me worry about calculating the wrong value (😅). On the other hand, as mentioned earlier, developers using my tool may upload unpredictable sizes due to the use of blobs. Additionally, I'm uncertain about the consequences of setting a value now and realizing, after two months, that it should be increased.
+
+In summary, the `MAX_SIZE` option is not necessarily a deal-breaker, but it's definitely a big challenge for me which I would be happy to spare.
+
+So, is it acceptable to set a random large value for anything, like 64 GB, or would this cause any issues?
+
+-------------------------
+
+peterparker | 2023-05-28 11:44:01 UTC | #167
+
+[quote="ielashi, post:164, topic:6148"]
+Yes, that is correct, so I’d only favor this approach if you expect the vectors to be small or medium-sized. For large datasets, I recommend the composite key approach.
+[/quote]
+
+Dumb question, what do you mean with "composite key approach"? Like a key that contains multiple information?
+
+I'm interested by the question of handling vector dataset in StableBTreeMap because I would like to convert e.g. an Hashmap of BTreeMap.
+
+```
+// Basically
+pub type Collection = BTreeMap<MyEntityKey, MyEntity>;
+pub type State = HashMap<CollectionKey, Collection>;
+```
+
+I use such pattern because developpers can define their own keys - the canisters I provide is generic. Therefore as you pointed out, serialize/deserialize the entire HashMap won't be performant.
+
+So if I get it right, your advice would be to flatten the above to a single StableBTreeMap in which the key contains basically both `CollectionKey` and `MyEntityKey`, correct?
+
+Side note: or is it actually possible to create StableBTreeMap on the fly (at runtime)?
+
+-------------------------
+
+ielashi | 2023-05-30 11:37:46 UTC | #168
+
+I totally understand. Setting a reasonable `MAX_SIZE` is quite a significant design decision, and it's not very obvious what value to set in many cases.
+
+[quote="peterparker, post:166, topic:6148"]
+So, is it acceptable to set a random large value for anything, like 64 GB, or would this cause any issues?
+[/quote]
+No. The BTree always allocates the maximum size of the value, so if you hypothetically put 64GB, you'll run out of memory very quickly :slight_smile: The trade-off here is between memory usage and flexibility in the future.
+
+[quote="peterparker, post:167, topic:6148"]
+So if I get it right, your advice would be to flatten the above to a single StableBTreeMap in which the key contains basically both `CollectionKey` and `MyEntityKey`, correct?
+[/quote]
+
+Yes, exactly, and I'd still recommend this pattern even when we remove the `MAX_SIZE` requirement from the BTreeMap in the near future.
+
+Given the current `MAX_SIZE` limitation though, there's a trick where you can split your unbounded data into chunks. For example, you can have the following BTree:
+
+```rust
+StableBTreeMap<(CollectionKey, MyEntityKey, ChunkIndex), Blob<CHUNK_SIZE>>
+```
+
+In the above BTree, we split `MyEntity` (the unbounded value) into chunks of size `CHUNK_SIZE`, where `CHUNK_SIZE` is some reasonable value of your choice.
+
+For illustrative purposes, let's say you have a `CHUNK_SIZE` of 2, and you'd like to store the entities: `(key_1, [1,2,3])` and `(key_2, [4,5,6,7,8])`.
+
+In this case, the stable BTreeMap above will look like the following:
+
+```
+StableBTreeMap => {
+  (collection, key_1, 0) => [1, 2],
+  (collection, key_1, 1) => [3],
+  (collection, key_2, 0) => [4, 5],
+  (collection, key_2, 1) => [6, 7],
+  (collection, key_2, 2) => [8],
+}
+```
+
+[quote="peterparker, post:167, topic:6148"]
+Side note: or is it actually possible to create StableBTreeMap on the fly (at runtime)?
+[/quote]
+
+In theory, yes, but in practice, not currently, because each StableBTreeMap requires its own virtual address space, so creating them does incur an overhead, so I'd recommend against this approach.
+
+-------------------------
+
+peterparker | 2023-05-30 17:24:38 UTC | #169
+
+Got it! Thank you for the detailed explanation, everything is clear now. Although I'm confident that someone smarter than me could certainly solve my requirements using chunking as you suggested, as I don't have any time constraints, I'll wait for the `MAX_SIZE` removal in the near future.
+
+-------------------------
+
+lastmjs | 2023-06-05 16:13:55 UTC | #170
+
+I've suggested this before, but I want to bring it up again. It would be nice if we could agree on a schedule for increasing the stable memory size, for example increasing it xGiB per quarter or per year based on some agreed-upon criteria. Right now it seems to just increase when DFINITY has a need for it to increase. Having this schedule would help us plan out future capabilities for our users of Azle, Kybra, and Sudograph.
+
+-------------------------
+
+ulan | 2023-06-06 08:36:34 UTC | #171
+
+We also received requests from the community to increase the stable memory. We need to do thorough testing and make sure there are no technical issues before committing to a fixed schedule. Since it is a non-trivial amount of work, I think we can allocate time for it in July/August. Would that work for you or is it more urgent?
+
+-------------------------
+
+lastmjs | 2023-06-06 14:32:21 UTC | #172
+
+It's not urgent for us, we just want to push to get on a schedule for our future selves.
+
+-------------------------
+
+ielashi | 2023-09-06 07:27:05 UTC | #173
+
+An update on that front: DFINITY plans to propose in an upcoming replica version to further increase stable memory from 64GiB to 96GiB. So far our biggest canister on the IC, the Bitcoin canister, has been pushing close to 64GiB, and the growth in Bitcoin's UTXO set has been accelerating. With further testing we can see that we can support a larger stable memory without issues and can continue increasing that storage limit.
+
+-------------------------
+
+ulan | 2024-01-08 14:52:33 UTC | #174
+
+Another update: we did more testing with 400GB of stable memory and the tests were successful. DFINITY plans to propose in an upcoming replica version to increase from 96GiB to 400GiB. More increases are planned later this year.
+
+-------------------------
+
+Maxfinity | 2024-01-08 19:31:36 UTC | #175
+
+Really awesome! Thanks for pushing this one Dfinity.
+
+-------------------------
+
+Sawyer | 2024-01-09 16:09:19 UTC | #176
+
+When can we also expect storage specific cannisters so I can get my data off of Google drive. At $5gb/year, it's just too costly.
+
+I get 200 gb/year at $30 with gdrive
+
+-------------------------
+
+TusharGuptaMm | 2024-01-09 20:37:40 UTC | #177
+
+Would be applicable for Motoko Canisters as well? Usable ?
+
+-------------------------
+
+ulan | 2024-01-09 20:52:54 UTC | #178
+
+[quote="Sawyer, post:176, topic:6148"]
+When can we also expect storage specific cannisters so I can get my data off of Google drive.
+[/quote]
+
+I can only comment from the engineering side, since that's where I work: we are working on increasing storage capacity more. I am not aware of any plans to decrease the cost.
+
+[quote="TusharGuptaMm, post:177, topic:6148, full:true"]
+Would be applicable for Motoko Canisters as well? Usable ?
+[/quote]
+
+I think it should be accessible to Motoko using the low-level API that works directly with the stable memory. Here is the Motoko-specific discussion: https://forum.dfinity.org/t/motoko-stable-memory-in-2022/10433
+
+-------------------------
+
+ulan | 2024-01-15 13:27:47 UTC | #179
+
+> DFINITY plans to propose in an upcoming replica version to increase from 96GiB to 400GiB
+
+The replica proposal with the change: https://dashboard.internetcomputer.org/proposal/127031
+
+-------------------------
+
+hokosugi | 2024-01-16 04:54:17 UTC | #180
+
+I wonder what the plan is to increase heap memory. With DeAI, which I've been eyeing, the LLM upload seems to hang due to lack of heap memory.
+To increase heap memory beyond 4GB would require a change to 64-bit Wasm, which would be a daunting task, but a plan should be in place.
+
+-------------------------
+
+patnorris | 2024-01-18 15:40:21 UTC | #181
+
+Thank you for bringing this up! Within the DeAI group we've indeed identified the heap memory size as a key limitation. Are there any plans for upgrading to 64-bit Wasm and increasing the heap memory with it, that you (or someone else on the team) could share at this point, @ulan ?
+
+-------------------------
+
+NathanosDev | 2024-01-18 15:47:56 UTC | #182
+
+I don't think this is a fair comparison with Google Drive. First, Google Drive is not replicating your data 13 times. Second, Google undoubtedly profits from your data in other ways. An e2ee on-chain alternative to Google Drive will likely never be able to compete on price because it can't mine your data and profit from using that data for driving advertisement revenue. If you want a cheaper way to store your data without giving it all to Google then you need to host your own solution.
+
+-------------------------
+
+Sawyer | 2024-01-19 06:13:43 UTC | #183
+
+I mean it's not just me who wants to replace legacy cloud. Dfinity and Dom profess everyone to ditch the traditional clouds of the world and start building on ICP. If we guys don't compete on cost why would the bottom line-focused enterprises move to IC. Like the truly large-scale operations. They would need to keep their costs to a minimum. 
+
+Unless we're building software which maybe expensive than normal but has different capabilities. 
+
+Just that we might not get the huge adoption as AWS/GCP as they compete on costs, which would matter to 95% of the businesses.
+
+-------------------------
+
+NathanosDev | 2024-01-22 16:44:52 UTC | #184
+
+> which maybe expensive than normal but has different capabilities.
+
+Is this not what we're doing already? An equivalent to Google Drive that leverages the IC fully would be decentralized under an SNS and private via vetkeys. I'm personally willing to pay more for privacy and decentralization, but I can't speak for everyone.
+
+You're right that there will be people and businesses that just want to spend as little money as possible, but why would they want to build on a blockchain? Money aside, it's quite a bit more complicated to build on the IC compared to traditional platforms so you need to have benefits that will outweigh that increase in complexity.
+
+-------------------------
+
+Sawyer | 2024-01-23 07:47:17 UTC | #185
+
+The reason for my assumptions was Dom and other guys suggested people to move from web2 clouds to IC hence competing on costs becomes a criterion for discussion. But I understand building on IC might not be for everyone, especially the one's competing on prices.
+
+IC has different use cases, which imo isn't going to be as widely adopted as web2 clouds.
+
+-------------------------
+
+Sawyer | 2024-01-23 08:37:18 UTC | #186
+
+Does this image represent the actual figures?
+![image|542x500](upload://h5u7EBStxrdjzJE3Ie7ZQXng1B7.jpeg)
+
+-------------------------
+
+Severin | 2024-01-23 08:52:48 UTC | #187
+
+It depends how you measure. This table certainly forgets about storage cost, where AWS would be cheaper than ICP. I also wonder how they compute OUT cost. If you do it via queries, right now it's free. If you do it via update calls you'll have some, but not too much cost
+
+-------------------------
+
+ulan | 2024-01-23 15:52:58 UTC | #188
+
+[quote="patnorris, post:181, topic:6148"]
+Are there any plans for upgrading to 64-bit Wasm and increasing the heap memory with it, that you (or someone else on the team) could share at this point, @ulan ?
+[/quote]
+
+Yes, we are looking into supporting Wasm64 in near future (in a few months) unless we find blockers. Active work on it will start soon.
+
+-------------------------
+
+patnorris | 2024-01-25 13:13:25 UTC | #189
+
+Awesome, thank you! I'm sure a bunch of DeAI projects (and many others of course) will be super thrilled about these news :)
+
+Actually, if you find the time, could you speak to any other benefits (besides increased heap memory) that the support for Wasm64 will bring? That's a question we wondered about in the DeAI group the other day and thought would be interesting to know more about
+
+-------------------------
+
+ulan | 2024-01-26 06:24:23 UTC | #190
+
+I guess some compilers might be able to generate faster code for Wasm64 if they optimize for 64-bit.
+
+On the Wasm engine side, I should mention that we expect that memory accesses will slower compared to 32-bit. That's because on Wasm32, the Wasm engine can use page protection to elide bounds checks on accesses. On 64-bit this optimization doesn't work and there will be bounds checks.
+
+Do you have an example code that compiles to Wasm64 that we could use for benchmarking?
+
+-------------------------
+
+rossberg | 2024-01-26 08:07:47 UTC | #191
+
+@ulan, I'm curious: since these differences in the engine are not directly observable to programs running on the IC, do you intend this to translate to different cycle costs for 64-bit memory accesses?
+
+-------------------------
+
+ulan | 2024-01-26 08:21:41 UTC | #192
+
+If the performance difference is large enough, then we will have to reflect that in cycle costs to follow the general principle that the cycle costs should be close to the real costs.
+
+-------------------------
+
+apotheosis | 2024-01-26 19:34:37 UTC | #193
+
+Pushing this back up as AI on the IC gets a lots of excitement. This would need to be done even before / making GPU subnets.
+
+"I wonder what the plan is to increase heap memory. With DeAI, which I’ve been eyeing, the LLM upload seems to hang due to lack of heap memory.
+To increase heap memory beyond 4GB would require a change to 64-bit Wasm, which would be a daunting task, but a plan should be in place."
+
+-------------------------
+
+icpp | 2024-01-31 17:08:43 UTC | #194
+
+[quote="ulan, post:190, topic:6148"]
+Do you have an example code that compiles to Wasm64 that we could use for benchmarking?
+[/quote]
+
+Are you looking for a wasm file or for the actual code that you then compile yourself?
+
+-------------------------
+
+ulan | 2024-02-02 17:41:24 UTC | #195
+
+> Are you looking for a wasm file or for the actual code that you then compile yourself?
+
+Ideally both: a source code that compiles to 64-bit Wasm.
+
+-------------------------
+
+timo | 2024-02-07 10:21:19 UTC | #196
+
+Related question to the new 400GB stable memory limit: what is the memory limit of a subnet? How many canisters can live on the same subnet that each utilise the max stable memory?
+
+-------------------------
+
+domwoe | 2024-02-07 10:35:11 UTC | #197
+
+Currently, there's a limit of 700GB according to https://internetcomputer.org/docs/current/developer-docs/production/resource-limits.
+
+Hence, I guess, the answer is one for now.
+
+-------------------------
+
+lastmjs | 2024-02-07 19:25:13 UTC | #198
+
+So...what happens when you are the second canister that tries to use the limit? Unfortunately I might have to start explaining this much differently, in practical reality it doesn't seem like each canister can have access to 400 GiB of storage, more like 36 canisters could do this right now assuming they're all deployed to different subnets.
+
+-------------------------
+
+icpp | 2024-02-12 05:43:15 UTC | #199
+
+@ulan ,
+
+From C++ side, I am not able yet to build a wasm64.
+
+I rely on the wasi-sdk, and work is going on to provide the pre-build artifacts I need.
+See [here](https://github.com/WebAssembly/wasi-sdk/issues/185) & [here](https://github.com/WebAssembly/meetings/pull/1479)
+
+I will keep an eye on it. I already have the infrastructure build into icpp-pro, but I need those artifacts to build against.
+
+-------------------------
+
+KinicDevContributor | 2024-03-07 04:51:42 UTC | #200
+
+> * Controllers can opt out by setting `reserved_cycles_limit` to zero. Such opted-out canisters would not be able to allocate from the newly added `250GiB`, which means that these canisters will trap if they try to allocate storage when the subnet usage grows above `450GiB`.
+
+[https://dashboard.internetcomputer.org/proposal/126094](https://dashboard.internetcomputer.org/proposal/126094)
+
+Canister traps the allocation.
+
+-------------------------
+

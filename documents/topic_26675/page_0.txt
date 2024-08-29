@@ -1,0 +1,90 @@
+kayabaNerve | 2024-01-30 19:12:58 UTC | #1
+
+Hello,
+
+I know the ICP offers tECDSA functionality. Accordingly, I wanted to note my experiment (yet to be proven) which offers linear-signing complexity without a biprime of unknown factorization. This means every signer only produces a single proof/message, and the total amount of proofs published is linear.
+
+A write-up can be found here: https://github.com/kayabaNerve/threshold-threshold-ecdsa/blob/develop/write-up.md
+
+This scheme also is currently attempting to be a robust scheme, meaning so long as `t` honest signers are online, a signature will be produced. This may be of particular note for adversarial deployments, as seen on the ICP.
+
+I do have active comments on security, largely focusing on biasing/k-sum attacks. I do believe the fundamental protocol is viable however, and *hope* the way messages are proven upfront enable eliminating most potential issues.
+
+Any comments/feedback would be appreciated.
+
+---
+
+I initially commented this on the ICP Developer Discord, not wanting to make a post on the forum as that felt a bit too formal for what I had to say (given the notes on immaturity), yet was encouraged to post here by domwoe.
+
+Potential relevancy to https://forum.dfinity.org/t/proposal-50x-price-reduction-for-chain-key-ecdsa-signing-threshold-ecdsa-signing/23560, the Scalability working group, and the BTC on ICP working group.
+
+---
+
+As an edit, I did additionally sketch an even-faster non-robust two-round protocol (which potentially may end up requiring a binomial nonce and non-standard assumptions). The write-up for that is available here:
+
+https://github.com/kayabaNerve/threshold-threshold-ecdsa/blob/two-round/write-up.md
+
+-------------------------
+
+timo | 2024-02-04 15:00:03 UTC | #2
+
+What does "achieves 67-of-100 signing in less than 3s per party" mean? Does it mean each party's CPU is busy for 3s producing the single proof/message that it then publishes? How long does it take to combine the proofs to get the final ECDSA signature?
+
+-------------------------
+
+kayabaNerve | 2024-02-06 09:09:04 UTC | #3
+
+It means the entire protocol, defined as:
+
+- A single participant's proving times
+- A single participant's verification times for all proofs by all participants
+- The actual calculations over the signature
+
+Complete in that time, on a single 2GHz core (which also has had a myriad of architectural optimizations disabled).
+
+It should be much further reducible (~0.5-0.8s), yet I'm quite happy with that time due to the real world performance of a contemporary for a much smaller signing set. With a few threads and the boost clock enabled, I'd expect it to hit a quarter second of computational time and be only beat by OT protocols (though none have been posited with linear complexity).
+
+The two-round protocol I sketched should be much faster as it only has a single proof in the first-round, with the second round's proofs not needing verification if the signature is valid (a much cheaper check). Those proofs only serve as useful for identification. Even if that needs a hash commitment in an additional round, hashes are of negligible performance cost in this discussion.
+
+(And yes, this protocol's third round proofs can be similarly delayed. The 3s benchmark was including them regardless)
+
+You're welcome to run the code for yourself to have the times printed out. `cargo test --release` should be so sufficient.
+
+---
+
+EDIT: I was a bit nervous at having to justify 3s, as 3s is quite atrocious when you forget how atrocious tECDSA itself is. From https://forum.dfinity.org/t/proposal-50x-price-reduction-for-chain-key-ecdsa-signing-threshold-ecdsa-signing/23560 however,
+
+> the baseline being the current throughput of 0.5 signatures / second.
+
+Considering this should jump 4x just by using gmp instead of malachite, that'd cause it to achieve 1.25 signatures/second without any of the techniques proposed to further accelerate the existing mechanism (parallelism) as an experiment (not yet productionized). These numbers likely aren't directly comparable though (inconsistent reference hardware, my number being computational and ignoring bandwidth/latency, yet I believe the protocol superior on latency (I'd have to double check bandwidth yet would presume it as well)).
+
+---
+
+Edit 2: I just realized the 0.5 sigs / second number is *likely* for the current subnet which is <1/5th the size of the set my number was evaluated for. There's definitely too many variables in play to do any off-hand comparison, yet I'd love to see a proper one.
+
+-------------------------
+
+tkachenko | 2024-05-02 16:31:25 UTC | #4
+
+I'm not sure if those protocols are directly comparable. Can you give us more details about in which security model your protocol operates?
+
+I didn't look at your implementation, but an ECDSA protocol like https://eprint.iacr.org/2021/291, which is also based on class groups, provides fairness guarantees (either all nodes get the output or none), whereas the protocol implemented on ICP (https://eprint.iacr.org/2022/506), has guaranteed output delivery. Also, I believe that there is a difference between the network assumptions synchronous vs. asynchronous. AFAICT, most of the computation time of ICP's tECDSA is spent with the asynchronous aspect of verifiable secret sharing (see section 3.4), namely in publicly verifying other parties' dealings correctness.
+
+-------------------------
+
+kayabaNerve | 2024-05-02 17:48:46 UTC | #5
+
+With months of hindsight, I can apologize for the lack of clarity. I'm currently working on the proper paper with a coauthor, and we are open to further coauthors.
+
+Informally and immediately, the protocol posits as three round robust. Participants in a round `r` must build upon a common transcript (round `r-1`), yet any `t` participants in a `t`-of-`n` multisig may perform that round.
+
+If the creators of a nonce secret share it to all other parties, you get the same properties. That requires producing `n` secret shares and either point to point communication or broadcasting `t*n` messages (as each participant in creation must so broadcast). This work has each participant broadcast a single, constant sized message per round.
+
+Rushing adversaries may complete the protocol early and not share the result. Any honest participant may contribute the `t+1`th share (treating the `t`th share which gives a rushing adversary the output as malicious) to give everyone the signature. That argues so long as there's `t` honest signers online, the signature will be yielded to everyone given a reliable broadcast mechanism.
+
+VSS only has each party verify `n` shares, yet each share is verified by `t` commitments, creating a local multiexp still of quadratic size. This work would have larger constants (using class groups) yet maintain its performance at scale.
+
+I hope that clarifies, and am happy to provide further commentary.
+
+-------------------------
+

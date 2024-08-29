@@ -1,0 +1,216 @@
+skilesare | 2021-06-16 13:35:41 UTC | #1
+
+I know there is a soft cap on incoming message(about 2MB), but it appears that this extends to return values as well:
+
+Status: rejected
+  Message: IC0504: Canister rrkah-fqaaa-aaaaa-aaaaq-cai violated contract: ic0.msg_reply_data_append: application payload size (4224046) cannot be larger than 3145728
+
+ I see that cancan has implemented retrieving chunks and assembling them on the client-side, but it would be nice if we could return large files via http_request with just one call. It makes src of media and image tags much easier.  I've also seen http_request_stream_callback floating around, so maybe this can be used for larger file sizes, but I'm not sure how it works.  Does anyone have any sample code they can point to?
+
+-------------------------
+
+paulyoung | 2021-06-17 00:27:27 UTC | #2
+
+I’d like to know this too.
+
+I planned on looking into this more, but haven’t yet: https://github.com/dfinity/agent-rs/blob/b5094bdace81eaeb59ddfc5fbb27fe784e4d65ef/ic-utils/src/interfaces/http_request.rs#L42
+
+-------------------------
+
+jzxchiang | 2021-06-23 05:48:26 UTC | #3
+
+[quote="skilesare, post:1, topic:5247"]
+application payload size
+[/quote]
+
+Where do you see that the incoming request payload limit is 2MB? Why is it a soft cap? I'm curious about this too.
+
+-------------------------
+
+ComputerInternetMan | 2021-06-23 11:39:34 UTC | #4
+
+I believe this is because GC ( garbage collection) currently utilizes a  2GB user mode virtual address space for ‘32 bit computers’.
+Purportedly they are going to be implementing a ‘trash compactor’ in the future to free up base memory.
+
+-------------------------
+
+jzxchiang | 2021-06-23 18:17:39 UTC | #5
+
+Wait 2 GB or 2 MB???
+
+-------------------------
+
+ComputerInternetMan | 2021-06-23 19:13:20 UTC | #6
+
+Latest I could find…. 
+https://www.notion.so/Announcing-Improved-Asset-Canisters-7b5815f6ca46461dae4b7f22501f4e39
+
+-------------------------
+
+ComputerInternetMan | 2021-06-23 20:27:55 UTC | #7
+
+And I think this is the updated thread that connects to the doc. https://forum.dfinity.org/t/can-we-somehow-achieve-or-build-a-canister-with-a-interface-bahaving-like-a-classic-web-server/1257/39
+
+-------------------------
+
+skilesare | 2021-06-23 22:50:45 UTC | #8
+
+The incoming message size for requests is like 3.x MB. It looks like intercanister it might be more, but that may just be for the replica. I haven’t tried sending more than 4MBs in a message in prod yet.
+
+-------------------------
+
+jzxchiang | 2021-06-24 01:13:00 UTC | #9
+
+Do you mind linking the code in the ic codebase that states this, if you have it handy? Or is this just from experience
+
+-------------------------
+
+ericswanson | 2021-06-25 16:59:50 UTC | #10
+
+Here's an example from icx-proxy in agent-rs that uses the streaming callback to return files of any size through a single HTTP request:
+
+https://github.com/dfinity/agent-rs/blob/main/icx-proxy/src/main.rs#L242
+
+-------------------------
+
+jzxchiang | 2021-06-26 07:14:34 UTC | #11
+
+[quote="ericswanson, post:10, topic:5247"]
+https://github.com/dfinity/agent-rs/blob/main/icx-proxy/src/main.rs#L242
+[/quote]
+
+Interesting... seeing this created a bunch of questions / observations in my head.
+
+1. I believe this "streaming" solution is only for canisters that implement a `http_request` method, e.g. asset canisters. It wouldn't work for canister calls on other methods.
+2. As OP mentioned, I'm not sure how `http_request_stream_callback`, which is called by the code you linked above, works. Is this callback a function that runs in the Rust client or some arbitrary canister method running in IC? What is this callback token?
+3. How does it actually stream the response body (as I'm guessing it doesn't support streaming request bodies)? Is it basically HTTP/1.1-style chunked transfer encoding, i.e. break up the response body into chunks and call the callback with a chunk as an argument for each chunk? That's crazy how it's simulating HTTP/1.1 on top of Candid-encoded arguments and results wrapped inside CBOR-encoded request/response bodies all running on top of HTTP/2, which has its own streaming solution and binary encoding. Crazy stuff.
+4. Matter of fact, I don't even understand what `icx-proxy` is. Is it a binary that we run somewhere and have our frontend client call via HTTP, which is then proxied to backend canisters? This way, our frontend client doesn't need to call the canisters directly via Candid, CBOR, etc?
+5. The agent JS library apparently [doesn't](https://github.com/dfinity/agent-js/blob/90b073dc735bfae9f3b1c7fc537bd97347c5cc68/apps/sw-cert/src/sw/http_request.ts#L4) support this. That makes this not so useful for, say, a mobile client that wants to stream a video file from an IC canister. I guess technically I could compile the agent Rust library to a wasm module and call that from JS? Seems like a headache.
+
+Sorry, I'm deep in the weeds tonight...
+
+-------------------------
+
+skilesare | 2021-06-26 12:34:11 UTC | #12
+
+Keep going into the weeds…I’d love to see some code that implements this stuff.  Hoping to get there now that my ‘vacation’ is over.  A week without a computer…ugh…😞
+
+-------------------------
+
+ericswanson | 2021-06-29 20:39:18 UTC | #13
+
+1. The asset canisters use a set of conventions, through their call interface, that support a form of streaming.  The `http_request` method returns the first part of the response body (which may be the entirety of the response body), but if the response it too large to be returned in a single call, part of its return data includes a way to retrieve the rest.
+2. The callback runs in the (asset) canister, on the IC.  Given a token, it returns the next piece of data in the stream, as well as a token for the piece after that.
+3. When using a `streaming_strategy`, `icx_proxy` sends the data piece by piece with `hyper::Body::send_data()`.  I believe `hyper` in that case uses chunked encoding, but I am not certain.
+4. `icx_proxy` is a process that runs on the boundary nodes.  It responds to `HTTP` requests by calling canister methods (`http_request`, and then possibly the streaming callback) and translating the results as an HTTP response.
+5. I don't know if the intent is for the agent JS library to call `http_request` directly.  However, the JS library should be able to make direct HTTP requests to retrieve data of any size, just as it can from any other web server.
+
+I hope that helps.  More generally, the way to use `http_request` and the streaming callback is:
+- Call `http_request`
+- If `http_request` returned a `Callback` `streaming_strategy`, call the callback, first with the `token` returned by `http_request`, then using the `token`s returned by the callback, until the callback returns no token.
+
+This is what `icx-proxy` does: https://github.com/dfinity/agent-rs/blob/main/icx-proxy/src/main.rs#L272
+
+-------------------------
+
+skilesare | 2021-06-30 03:44:26 UTC | #14
+
+This is great! I'll try to work up an motoko example. I'm guessing that I need to manually implement the returning of the callback, or will the canister do it automagically based on my motoko function return size?
+
+-------------------------
+
+jzxchiang | 2021-06-30 06:45:39 UTC | #15
+
+Thanks, this was super helpful.
+
+However, I'm still not sure I understand what `icx_proxy` does.
+
+When a browser makes an Ajax call to an IC canister to fetch data, what the agent library actually does under the hood is translate the canister RPC call to an HTTP request to `/api/v2/canister/<effective_canister_id>/call` and poll `/read_state` for the response (for update calls).
+
+Is the proxy involved at all in this flow?
+
+Or is it only involved when the URL path is *anything but* `/api/v2/canister/<effective_canister_id>/{call,read_state,query}` or `/api/v2/status`? In other words, if the path is something like `/image/foo.png`, then the proxy steps in to translate that into the appropriate HTTP request to `/api/v2/canister/...` with the image path as an argument in a call to a `http_request` canister method?
+
+-------------------------
+
+alexeychirkov | 2021-06-30 07:12:05 UTC | #16
+
+> Where do you see that the incoming request payload limit is 2MB? Why is it a soft cap? I’m curious about this too.
+
+Please take a look at [this thread](https://www.reddit.com/r/dfinity/comments/nrmvim/ama_we_are_akhi_alexandra_islam_and_dimitris_from/h1eexn9/?context=3)
+
+-------------------------
+
+ericswanson | 2021-06-30 16:24:51 UTC | #17
+
+Right, you'll need to manually implement returning the callback.
+
+-------------------------
+
+ericswanson | 2021-06-30 16:33:37 UTC | #18
+
+If the agent is making those `/api/` calls are going through HTTP, then yes, I believe that `icx-proxy` is involved.
+
+The relevant code starts here: https://github.com/dfinity/agent-rs/blob/main/icx-proxy/src/main.rs#L437
+
+`icx-proxy` forwards `/api/` requests to the IC, and almost anything else to `http_request` on a canister.  The exception is `/_/`, which in practice is forwarded in development to `dfx` in order to serve candid data.
+
+-------------------------
+
+jzxchiang | 2021-06-30 18:04:10 UTC | #19
+
+Oh, so icx-proxy runs in a local dfx start setup also then?
+
+It is all starting to make sense.
+
+-------------------------
+
+LevenSton | 2021-08-31 02:16:07 UTC | #20
+
+Have you already written mototko examples? Does it work?  i also have this problem. thanks very much!!
+
+-------------------------
+
+jzxchiang | 2021-08-31 05:19:26 UTC | #21
+
+Funny enough, I'm actually looking at this right now, and it's your lucky day! Here are two examples:
+
+This one's in Motoko:
+
+https://github.com/DepartureLabsIC/non-fungible-token/blob/1c183f38e2eea978ff0332cf6ce9d95b8ac1b43d/src/main.mo#L468
+
+This one's in Rust:
+
+https://github.com/dfinity/certified-assets/blob/b06c8a7a53fdb214596ba12cd10be8508b6f2192/src/lib.rs#L683
+
+-------------------------
+
+LevenSton | 2021-09-01 03:31:58 UTC | #22
+
+thanks so much!!   
+I wrote a motoko example , and deploy local, and then called a test function, put into 1 million data, and then queryed the data through the http_request interface
+http://localhost:8000/?canisterId=rrkah-fqaaa-aaaaa-aaaaq-cai&/getAll
+and got a error:
+Replica Error (5): "IC0501: Canister rrkah-fqaaa-aaaaa-aaaaq-cai exceeded the cycles limit for single message execution."
+
+Do you have some experience。？ thanks!
+
+-------------------------
+
+skilesare | 2021-09-01 11:02:59 UTC | #23
+
+You may have to chunk it back out as well. Allocating arrays can be expensive. I store my chunks as chunks so they can go out the same way they came in.
+
+Also, try buffers instead of arrays.
+
+
+Array.append<Nat8>(first8MBk,next2MB) chews up a ton of cycles for allocation because you are making a whole new array each time.
+
+-------------------------
+
+eddy | 2021-09-10 06:49:44 UTC | #24
+
+Have you found a solution for big data reading now?
+
+-------------------------
+

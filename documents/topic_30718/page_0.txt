@@ -1,0 +1,130 @@
+demali.icp | 2024-05-13 19:47:33 UTC | #1
+
+I'm currently working on integrating multiple authentication methods into my project(sveltekit), specifically **Internet Identity, NFID, **and** Plug Wallet**. While my implementations for Internet Identity and NFID are functioning as intended, I'm facing challenges with Plug Wallet integration.
+
+* When I attempt to communicate with the actor using the `handleWhoAmI()` method, I neither receive a response nor encounter an error.
+
+I suspect it could be because of how plug wallet creates the actor but creating a separate function to call the backendActor directly does not make a difference. 
+
+Here is the Code
+
+```
+import { createActor, canisterId } from 'declarations/wallet_integrations_backend';
+import { writable } from 'svelte/store';
+import { backend } from "$lib/canisters";
+import { idlFactory } from "declarations/wallet_integrations_backend/wallet_integrations_backend.did.js";
+import { AuthClient } from "@dfinity/auth-client";
+import { HttpAgent } from "@dfinity/agent";
+
+let actor;
+let principal = writable("");
+
+async function handleLogin(buttonId) {
+    let authClient = await AuthClient.create();
+    try {
+        if (buttonId === "ii") {
+            await new Promise((resolve, reject) => {
+                authClient.login({
+                    identityProvider: process.env.DFX_NETWORK === "ic"
+                        ? "https://identity.ic0.app"
+                        : `http://rdmx6-jaaaa-aaaaa-aaadq-cai.localhost:4943`,
+                    onSuccess: () => {
+                        setActorAfterLogin(authClient);
+                        handleWhoAmI();
+                        resolve();
+                    },
+                    onError: reject
+                });
+            });
+        } else if (buttonId === "nfid") {
+            const APP_NAME = "NFID example";
+            const APP_LOGO = "https://nfid.one/icons/favicon-96x96.png";
+            const CONFIG_QUERY = `?applicationName=${APP_NAME}&applicationLogo=${APP_LOGO}`;
+            const identityProvider = `https://nfid.one/authenticate${CONFIG_QUERY}`;
+
+            await authClient.login({
+                identityProvider,
+                onSuccess: () => {
+                    setActorAfterLogin(authClient);
+                    handleWhoAmI();
+                },
+                onError: (error) => {
+                    console.error("NFID login failed:", error);
+                    throw error;
+                }
+            });
+        } else if (buttonId === "plug") {
+            if (!window.ic?.plug) {
+                console.error("Plug wallet is not available.");
+                return;
+            }
+            const whitelist = [canisterId];
+            const hasAllowed = await window.ic.plug.requestConnect({ whitelist });
+            if (!hasAllowed) {
+                console.error("Connection was refused.");
+                return;
+            }
+            console.log("Plug wallet is connected.");
+            try {
+                const backendActor = await window.ic.plug.createActor({
+                    canisterId: canisterId,
+                    interfaceFactory: idlFactory, 
+                });
+                actor = backendActor;
+                handleWhoAmI();
+            } catch (e) {
+                console.error("Failed to initialize the actor with Plug.", e);
+            }
+            console.log("Integration actor initialized successfully.");
+        }
+    } catch (error) {
+        console.error("Login failed:", error);
+    }
+}
+
+async function handleWhoAmI() {
+    const principalResult = await actor.whoami();
+    principal.set(principalResult.toString());
+}
+
+function setActorAfterLogin(authClient) {
+    const identity = authClient.getIdentity();
+    const agent = new HttpAgent({ identity });
+    actor = createActor(canisterId, { agent });
+}
+
+```
+* Plug Wallet connects and creates the actor, but `handleWhoAmI()` does not return a response.
+* The method **should** return the principal of the authenticated user.
+* No response or error is received
+
+Any insights or suggestions on why handleWhoAmI() might not be working with the Plug Wallet actor would be greatly appreciated.
+
+I also want to ensure that my implementation follows the **best security practices**. Any advice or resources on this would be helpful.
+
+Thank you for your time and assistance!
+
+-------------------------
+
+jennifertran | 2024-05-14 05:45:03 UTC | #2
+
+1. As a best practice, could you check if the wallet is connected using ` await ic.plug.isConnected()` before creating the actor? 
+
+2. I would also recommend better error handling of the following since `window.ic.plug.requestConnect` either returns a public key or an error.
+
+
+```
+const hasAllowed = await window.ic.plug.requestConnect({ whitelist });
+if (!hasAllowed) {
+                console.error("Connection was refused.");
+                return;
+ }
+```
+
+Overall, though, your code does seem correct based on the [Plug-related source code of ic-auth](https://github.com/id-daniel-mccoy/ic-auth/blob/5955cdd47ce280b991cde3295258a2a3d3d8eef2/frontend/components/Plug.tsx#L40) which is a tool that makes it easy to integrate IC authentication with II and different wallets.
+
+3. Are you passing in the correct canister id or interface factory? Tagging @mzibara if he has any insight.
+4. Have you also looked into [ic-auth](https://github.com/id-daniel-mccoy/ic-auth) by @realdanmccoy instead of implementing your own solution (which is perfectly fine as well)?
+
+-------------------------
+

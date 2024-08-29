@@ -1,0 +1,62 @@
+massimoalbarello | 2023-08-26 15:09:38 UTC | #1
+
+I'm trying to relay a client's message to the IC via a gateway in such a way that when the canister calls `caller()` it gets the principal of the client (instead of the one of the gateway).
+
+To achieve this, I'm modifying both the Javascript `@dfinity/agent` (in the client) and the Rust `ic-agent` (in the gateway) libraries so that the client's agent sends the serialized envelopes to the gateway (instead of the IC) while the gateway's agent relays the payloads to the `/call` and `read_state` endpoints of the IC and then sends the responses back to the client.
+
+The client's agent knows the `RequestId` corresponding to the content of the first envelope (the one that the gateway relays to `/call`) . Also, the certificate that is returned by the IC, once the polling on `/read_state` is in the `replied` state, contains the same `RequestId` of the first envelope (the one relayed by the gateway to `/call`).
+
+This way, the client should be able to verify that the response is coming from the IC (as it's certified) and that it is the response corresponding to the first envelope it sent to the gateway (as the certificate contains the corresponding `RequestId`).
+
+Is my interpretation correct?
+
+If so, is this enough to prevent the gateway from performing man-in-the-middle attacks (besides not relaying the requests/responses)?
+
+-------------------------
+
+domwoe | 2023-08-26 15:20:40 UTC | #2
+
+This looks good to me.
+
+Tagging @kpeacock to be aware of this use case.
+
+-------------------------
+
+sea-snake | 2023-08-26 15:34:46 UTC | #3
+
+I'm doing something similar with a crypto wallet (returning both signed request id and signed read status request). I was able to do it withing a custom Identity implementation that does all of this when transformRequest is called, there wasn't a need to modify any dfinity lib.
+
+-------------------------
+
+massimoalbarello | 2023-08-26 16:49:44 UTC | #4
+
+Thanks, could you share the repo where you did this?
+
+-------------------------
+
+sea-snake | 2023-08-27 00:04:29 UTC | #5
+
+It's still very much work in progress but here you go:  
+https://github.com/slide-computer/identity/blob/master/src/index.ts
+
+The basic approach:
+1. transformRequest is called when a request is made
+    - If the scope is allowed in delegation, just sign it with delegation
+    - else forward call to wallet by url with postmessage callback (web)
+2. Callback is received that contains signed request id and also a signed read state request for this signed request. Return signed request and add signed read state request to map.
+3. When transformRequest is called to make read state request, check if it's a read state request and within the map, if that's the case simply return signed read state request from this map.
+
+This approach is definitely a bit hacky, but is the only flow I could think of that works cross platform by url while allowing callbacks with results by either postmessage (web) or callback url (native).
+
+The use of delegations also makes it work without any user interaction for calls to backend canisters that are belong to the dapp in a different frontend canister.
+
+As for relaying messages through a different non http gateway, it probably makes more sense to make a custom agent that implements the `Agent` interface. Ideally it would be nice if it still works with existing identity implementations (Ecdsa, Ed25519 etc).
+
+-------------------------
+
+kpeacock | 2023-08-28 16:45:48 UTC | #6
+
+My recommendation is often exactly what @sea-snake suggested - rather than modifying the package, you can `extend` or reference the HttpAgent implementation as a starting point, and write your own `Agent` compliant class that suits your particular use case. You could even go as far as publishing it as a separate package or opening a pull request to add it to `agent-js` if you think the use case is broadly useful for other people
+
+-------------------------
+

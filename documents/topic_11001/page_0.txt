@@ -1,0 +1,223 @@
+infu | 2022-02-20 14:04:22 UTC | #1
+
+We have been running tests on local replica for the last three weeks. 
+
+A few days ago we started testing on the real IC network. Tests burned ~ 30Tcycles.
+All canisters are written in Motoko and implement our own NFTA protocol.
+
+The test tries to simulate real usage - minting, transferring, burning, purchasing with.
+There were 3 IC network tests.
+Each test ~ 300 threads working for ~14 hours each and doing ~ half-million transactions added to history. One NFTA transaction uses from 1 to 3 IC update transactions.
+
+During tests, the subnet message throughput raised from ~13/s update calls to 90/s
+![icd|690x173](upload://ps460qzAoqThodraBn6vtm5Dmtq.png)
+
+During the first test canisters were loaded with ~3T cycles and at some point we started getting errors.
+
+ ```#system_transient Canister n7njf-sqaaa-aaaai-qcmhq-cai is out of cycles: requested 2000590000 cycles but the available balance is 2770416633363 cycles and the freezing threshold 2790027551738 cycles'```
+
+These errors were on inter-canister calls, which ruined the cluster data integrity. 
+
+Additionally, canisters using Hashmaps consumed unreasonable amounts of memory. 700mb for 65000records (accountid 32byte) -> {Nat64, Nat64} (wasn't different during local tests)
+
+Canister upgrades worked without issues.
+Projected cycle costs were the same as measured costs.
+
+During the next test, canisters were kept loaded with ~ 7Tcycles. There were no inter-canister call errors. :steam_locomotive:
+
+Hashmaps were replaced with Triemaps and the memory consumption dropped from 700mb to 25mb. 
+
+
+![dashboard_2|568x500](upload://yqCHOv8pexilF9s7kcnw9jIAp7f.jpeg)
+
+Memory = Prim.rts_memory_size()
+Heap = Prim.rts_heap_size()
+ICE =  Inter-Canister call Errors caught with try-catch
+Dashboard here - ```https://nftanvil.com/dashboard```
+Code here - ```https://github.com/infu/nftanvil```
+
+![history|309x500](upload://qA8RuurDdfpO444I68ZKLqFPcGO.jpeg)
+This is what the transaction history looks like.
+
+Under load, there were unseen before client errors showing once in a while. However, these can easily be caught and retried.
+
+```Error: Server returned an error:  Code: 503 ()  Body: Certified state is not available yet. Please try again...```
+
+
+**TLDR: We are very happy with the results and launching is in sight. :steam_locomotive:**
+
+The current cluster can support:
+History transactions (auto-scaling) - unlimited 
+Nfts (auto-scaling)- unlimited - up to 327 million if no more canisters are added.
+Non-fungible token inventories - 32 million - unlimited with rebalancing.
+Fungible token accounts - 10 million - few options are available to scale that up too.
+
+You can try the dapp. It is in **test mode** and after authenticating with IE you are given 8 testICP. All tokens fungible & non-fungible are temporary during the tests and will be erased. 
+```https://nftanvil.com/mint```
+
+-------------------------
+
+skilesare | 2022-02-27 19:26:55 UTC | #2
+
+I just wanted to bump this up. We need more “report from production” posts. There is great info here and it looks like hash maps may just be best avoided. This is unfortunate as I have a number of them already deployed. 😬 I guess I’ll switch them to trie maps in the next upgrade.
+
+-------------------------
+
+skilesare | 2022-02-27 19:32:17 UTC | #3
+
+Was your code motoko or rust?
+
+-------------------------
+
+Fulco | 2022-02-27 19:55:37 UTC | #4
+
+Hey infu,
+
+This is really great stuff thank you! for sharing this
+
+-------------------------
+
+infu | 2022-03-01 10:06:54 UTC | #5
+
+It's all Motoko.
+TrieMaps have 99% the same interface as Hashmaps, so perhaps they can be easily switched. Maybe the problem is in AssocList. I remember getting high memory usage with it too and it's used inside HashMaps. They are a var Array of AssocLists. 
+
+9days later 
+![image|247x500](upload://2nL91Yj0HHFLqiJsboz1JEKg1i5.jpeg)
+
+Canisters 3,4,5 have bigger images, so there are less nfts in each. They hit the memory limit set by us to 1gb instead of the max count limit like 1,2,3.
+
+Ratio heap:memory slightly increased on NFT type canisters (They use only var array). From 1 : 2.1 to 1 : 2.9 
+``` private stable var _token : [var ?TokenRecord] = Array.init<?TokenRecord>(65535, null);```
+
+Upgraded a few times (without changing types) and all is good.
+
+Was surprised to see even higher freezing_threshold 8T. That happened on the biggest 1.5GB canister.
+
+```Canister p6u54-wyaaa-aaaai-qcmka-cai is out of cycles: requested 2000590000 cycles but the available balance is 6993673709288 cycles and the freezing threshold 8071506052621 cycles```
+
+At the frontend (during 5days) 153 users got 507 errors like these:
+
+```Call failed:
+  Canister: kbzti-laaaa-aaaai-qe2ma-cai
+  Method: config_get (query)
+  "Status": "rejected"
+  "Code": "SysTransient"
+  "Message": "IC0515: Certified state is not available yet. Please try again..." 
+```
+
+These errors happened at two exact hours and then disappeared. Maybe someone fixed them. 
+
+41 users got 107 errors like these:
+```Code: 400 () Body: Specified ingress_expiry not within expected range: Minimum allowed expiry: 2022-03-01 07:57:27.063```
+Which also happened at a specific time and disappeared.
+
+Overall sentry io reports 95% crash free rate and users seem happy with how it works.
+
+> "Crash Free Sessions" is the percentage of sessions in the specified time range not ended by a crash of the application. Crash- The app had an explicit unhandled error or hard crash.
+
+-------------------------
+
+justmythoughts | 2022-04-01 16:18:09 UTC | #6
+
+@infu What made you choose TrieMaps over Red Black Trees (RBTree.mo)? Did you try out Red Black Trees and find any results on performance/memory usage or go straight to TrieMap?
+
+
+@claudio @rossberg Any input on why the Motoko HashMap library takes up 28X memory vs. TrieMap? I would expect it to take up maybe 2-3X (Hash Table Array doubling & collision lists), but this seems like a pretty unexpected result, suggesting that either the HashMap implementation or mutable Arrays (the underlying hash table) take up more memory than expected.
+
+I’m wondering if part of this memory usage comes from the new table that gets created each time, and that table gets thrown away but the memory footprint remains and isn’t being overwritten. I’m referring to line 92 where the new table is being created in the replace method of this code https://github.com/dfinity/motoko-base/blob/master/src/HashMap.mo
+
+-------------------------
+
+icme | 2022-04-14 22:52:43 UTC | #7
+
+[quote="justmythoughts, post:6, topic:11001"]
+Any input on why the Motoko HashMap library takes up 28X memory vs. TrieMap? I would expect it to take up maybe 2-3X (Hash Table Array doubling & collision lists), but this seems like a pretty unexpected result, suggesting that either the HashMap implementation or mutable Arrays (the underlying hash table) take up more memory than expected.
+[/quote]
+
+Tagging #Motoko to hopefully get some additional eyes on this.
+
+I'm also very curious about this large memory discrepancy between HashMap and TrieMap. 
+
+@claudio do you have any ideas regarding why the memory usage is so much higher for HashMap? And were there any benchmarks run on the modules in `motoko-base` beforehand that can be referenced?
+
+Based on the table resizing code link @justmythoughts posted, the load factor for the current HashMap implementation is 1 (hash table waits until `count >= size of the array` to double. I could see memory usage being 4X or 10X if the load factor was 0.25 or 0.1 respectively, but it makes no sense that the memory usage is 28X that of TrieMap with a load factor of 1.
+
+I wonder if it hash anything to do with this issue, and not necessarily that the HashMap is less space efficient
+
+https://forum.dfinity.org/t/motoko-canister-memory-size-increased-after-upgrade/6448/2?u=icme
+
+-------------------------
+
+infu | 2022-04-17 17:08:40 UTC | #8
+
+I haven't tried RBTrees. I will check that out when I get to do more tests.
+
+Maybe we should also consider asynchronicity.
+
+What happens to the memory and locally scoped variables when 100 async requests (which had to do something with HashMaps) at the same time get paused "awaiting" for inter-canister calls to finish.
+
+My tests were doing 100s of async calls per sec.
+
+-------------------------
+
+icme | 2022-06-20 22:18:47 UTC | #9
+
+[quote="infu, post:1, topic:11001"]
+Under load, there were unseen before client errors showing once in a while. However, these can easily be caught and retried.
+
+`Error: Server returned an error:  Code: 503 ()  Body: Certified state is not available yet. Please try again...`
+[/quote]
+
+Just received this error as well. The error is annoying, but very infrequent. Also confirming @infu's approach that retrying the request succeeds.
+
+[quote="infu, post:8, topic:11001"]
+My tests were doing 100s of async calls per sec.
+[/quote]
+
+My tests were **not** doing 100s of async calls per sec. In my case I had 3 repeat processes that were uploading 150KB of data per request. Each request took a couple (4-10) seconds to complete due to the size of the data, so think much slower, but larger body requests
+
+@PaulLiu any insights on what might be happening that sets this error off, or how developers can better design their interactions with the replica/canister to avoid it?
+
+-------------------------
+
+PaulLiu | 2022-06-20 22:54:52 UTC | #10
+
+This error could happen when the call went to a subnet node that is behind others in progress (e.g., when a new node is added, or a node falling behind due to any power/network/cpu/memory/disk conditions). Although we always strive to make services as reliable as possible, things like this still could happen in real world. After all, the whole point of consensus is to ensure overall progress despite hiccups or failures in individual nodes.
+
+So yes, re-try at client side is the correct strategy.
+
+We are also thinking of possible ways to mitigate transient failures like this, possibly by redirecting requests away from nodes that are known for playing catch-ups or being behind. Hopefully we'll soon improve on the situation.
+
+-------------------------
+
+rncrmn | 2023-02-02 13:32:03 UTC | #11
+
+Hi @infu 
+
+I'm curious about this as well, how it goes for the RBTrees? is it better than the TrieMap?
+
+-------------------------
+
+skilesare | 2023-02-02 13:40:32 UTC | #12
+
+You will get a lot better performance and upgradeability features out of https://github.com/ZhenyaUsenko/motoko-hash-map.  I know that @icme just released something for heap-based tries...might be time to do another comparison between those two as I'd image they are state of the art and likely have particular features that are better in particular situations.  For example, the motoko-hash-map preserves insertion order which can be useful.
+
+-------------------------
+
+rncrmn | 2023-02-02 13:41:55 UTC | #13
+
+Thank you so much @skilesare .
+
+-------------------------
+
+rncrmn | 2023-02-02 13:43:47 UTC | #14
+
+[quote="skilesare, post:12, topic:11001"]
+might be time to do another comparison between those two as I’d image they are state of the art and likely have particular features that are better in particular situations. For example, the motoko-hash-map preserves insertion order which can be useful.
+[/quote]
+
+Yes, this is a great idea.
+
+-------------------------
+

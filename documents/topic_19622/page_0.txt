@@ -1,0 +1,150 @@
+jaesharma | 2023-04-27 01:10:01 UTC | #1
+
+How can we parse a string to proper IDL format. for ex. i have this string:
+
+```
+'(vec {"vblpp-belrg-pegia-ruuee-oechi-bunsx-mx5qo-c7y2e-rn73a-kpwbx-3qe"; "disyz-2uaaa-aaaam-cajva-cai" })'
+```
+
+how can we parse it into proper IDL format?
+i need this specific thing to use with `to_candid` method in motoko. i cannot pass this string in `to_candid` because it'll assume whole thing as "string", so will need to parse it beforehand.
+solution does not need to be in motoko, if we can parse this in javascript or nodejs side that will also be fine.
+dfx cli does the same thing when `dfx canister install` command is executed with arguments but it is written in rust so was not that helpful for me.
+
+-------------------------
+
+Severin | 2023-04-26 07:07:49 UTC | #2
+
+Would `@dfinity/candid` do the trick? https://github.com/dfinity/agent-js/tree/main/packages/candid
+
+-------------------------
+
+jaesharma | 2023-04-26 07:36:11 UTC | #3
+
+in candid library i checked encode & decode methods but for them to work we need to pass exact types also. but this string here is arbitrary. how can we parse this without any type information?
+maybe i'm missing something here but it should be possible right?
+
+-------------------------
+
+kpeacock | 2023-04-26 15:59:02 UTC | #4
+
+No, `@dfinity/candid` doesn't have support for parsing arbitrary pieces of IDL. We don't have a definite answer for this today
+
+-------------------------
+
+infu | 2023-04-26 17:08:34 UTC | #5
+
+There was a person who wanted to do the same a week ago. 
+Makes me wonder, why do you want to parse this thing?
+
+-------------------------
+
+chenyan | 2023-04-26 18:13:17 UTC | #6
+
+We only have the value parser in Rust. You can compile the code in Wasm and run them in JS.
+
+But what's the real goal here? Where does this string come from? `to_candid` takes Motoko values, e.g. `to_candid(["a", "b", "c"])`. If you need the binary encoding, you can also run `didc encode '(vec {...})'`.
+
+-------------------------
+
+jaesharma | 2023-04-27 00:40:16 UTC | #7
+
+@chenyan @infu ok so i'm working on something where i have input field in frontend. user type their arguments here then i use these argument (in string format) to call install method of ic-management. so i need to convert this string to proper motoko IDL so it can be used with `to_candid` method.
+```
+IC.install({
+   arg: to_candid(arguments),
+   ...rest_of_arguments
+});
+```
+
+-------------------------
+
+jaesharma | 2023-04-27 00:38:45 UTC | #8
+
+@chenyan yeah so i was thinking the same. i found [this](https://github.com/dfinity/sdk/blob/85fb816675c0888c2b60f8517d14e996b8b20faa/src/dfx/src/util/mod.rs#L163) in dfx cli code.
+am i in right direction here?
+also how can i generate wasm from this? there are too many dependecies because this is big code base so i'm getting too many errors in local. was wondering if there is already existing wasm of this somewhere or something?
+
+-------------------------
+
+chenyan | 2023-04-27 00:51:59 UTC | #9
+
+Do you know the Candid type for the init args? If so, you can generate a better UI than string input. Here is an example where we dynamically generate UI based on the types in Motoko Playground: https://github.com/dfinity/motoko-playground/blob/main/src/components/DeployModal.tsx#L378. We also have the encoder in JS to encode the binary message from the UI: https://github.com/dfinity/motoko-playground/blob/main/src/components/DeployModal.tsx#L181
+
+Also, you don't have to use Motoko to call the management canister. You can do this solely in JS: https://github.com/dfinity/agent-js/blob/61848d7c089afd201a56ae598260ea94f192d130/e2e/node/basic/basic.test.ts#L77
+
+-------------------------
+
+infu | 2023-04-27 11:28:38 UTC | #10
+
+Chances are you will be ok using a js object instead of a candid string.
+
+Check:
+[https://github.com/infu/icblast]
+[https://jglts-daaaa-aaaai-qnpma-cai.ic0.app/]
+
+Icblast can proxy calls to other canisters. From the examples:
+```
+let ic = icblast({ identity }); // can switch identity or go local
+
+// we need to specify "ic" preset because this canister doesn't support downloading IDL spec
+let aaa = await ic("aaaaa-aa", "ic");
+
+// each method has also a version with $ suffix. It will not make a call but return the encoded arguments.
+// Useful for proxy calls
+let encoded = aaa.canister_status$({
+  canister_id: Principal.fromText("kbzti-laaaa-aaaai-qe2ma-cai"),
+});
+
+// we need to specify "wallet" preset for this canister as well
+let wallet = await ic("vlgg5-pyaaa-aaaai-qaqba-cai", "wallet");
+
+// now we make a wallet proxy call
+let response = await wallet.wallet_call({
+  args: encoded,
+  cycles: 0,
+  method_name: "canister_status",
+  canister: Principal.fromText("aaaaa-aa"),
+});
+
+// each method has also version with $ prefix. It will decode responses
+let decoded = aaa.$canister_status(response.Ok.return);
+
+console.log(decoded);
+```
+
+It doesn't cover the init arguments, however. I personally don't like using them at all, because I have to provide them every time I upgrade the canister. Instead, I create an init method that sets my initial configuration and stores it in memory.
+
+Anyway if you want to provide Init arguments, you can go to the idl.js file. Here is an example:
+export const init = ({ IDL }) => {
+  const InitArgs = IDL.Record({ 'ledger_id' : IDL.Principal });
+  return [InitArgs];
+};
+
+You can take this line out and add it to the end of the file:
+```
+export const InitArgs = IDL.Record({ 'ledger_id' : IDL.Principal });
+```
+This also works for types in the idlFactory. It seems init can also return initArgs, so. you can just type:
+```
+import {init} from "...mycan.idl.js";
+let [InitArgs] = init(IDL);
+```
+
+Then you can do something like
+```
+import { IDL } from "@dfinity/candid";
+import { Principal } from "@dfinity/principal";
+import { InitArgs } from "....mycan.idl.js"
+
+let arg = IDL.encode(InitArgs, {ledger_id:Principal.fromText("aaaaa-aa"));
+//you will have the binary you can pass
+
+IC.install({
+   arg,
+   ...rest_of_arguments
+});
+```
+
+-------------------------
+

@@ -1,0 +1,97 @@
+zensh | 2024-03-09 04:26:42 UTC | #1
+
+While studying the development documentation of IC, I carefully read about the [security best practices](https://internetcomputer.org/docs/current/developer-docs/security/rust-canister-development-security-best-practices), which mentioned "For expensive calls, consider using captchas or proof of work".
+
+Our project, ICPanda, https://forum.dfinity.org/t/upcoming-icpanda-dao-launch-sns/27967, needs to use CAPTCHAs for its airdrop feature.
+
+After some research, I found that existing Rust CAPTCHA crates all internally depend on random number generator, making them unsuitable for direct use in IC's canisters. This includes the `nmattia/captcha` used by the [Internet Identity](https://github.com/dfinity/internet-identity) project, which involved some complex hacks.
+
+Therefore, I decided to write my own CAPTCHA library that can accept externally provided random numbers, allowing it to be used in canisters. It is the `ic-captcha` crate: https://github.com/ldclabs/ic-captcha
+
+Usage example:
+```rs
+use ic_captcha::CaptchaBuilder;
+
+let builder = CaptchaBuilder::new();
+
+let captcha = builder.generate(b"random seed 0", None);
+println!("text: {}", captcha.text());
+println!("base_img: {}", captcha.to_base64(0));
+```
+
+The ICPanda project integrates the ic-captcha crate to generate CAPTCHAs, preventing bots from calling the airdrop interface. The complete implementation can be seen at https://github.com/ldclabs/ic-panda/blob/main/src/ic_panda_luckypool/src/api_update.rs#L35.
+
+Unlike the CAPTCHA implementation by Internet Identity, ICPanda does not temporarily save the CAPTCHA challenge state in the canister. Instead, it signs it and returns it to the caller, who must then pass back the CAPTCHA code and the challenge state in subsequent requests. This challenge state also includes a check for expiration time.
+
+The core code is as follows:
+```rs
+#[ic_cdk::update(guard = "is_authenticated")]
+async fn captcha() -> Result<types::CaptchaOutput, String> {
+    let rr = ic_cdk::api::management_canister::main::raw_rand()
+        .await
+        .map_err(|_err| "failed to get random bytes".to_string())?;
+
+    let captcha = CAPTCHA_BUILDER.generate(&rr.0, None);
+    let now = ic_cdk::api::time();
+    let challenge = types::ChallengeCode {
+        code: captcha.text().to_lowercase(),
+    };
+
+    let challenge =
+        store::captcha::with_secret(|secret| challenge.sign_to_base64(secret, now / SECOND));
+    Ok(types::CaptchaOutput {
+        img_base64: captcha.to_base64(0),
+        challenge,
+    })
+}
+
+#[ic_cdk::update(guard = "is_authenticated")]
+async fn airdrop(args: types::AirdropClaimInput) -> Result<Nat, String> {
+    let now = ic_cdk::api::time() / SECOND;
+    let expire_at = now - CAPTCHA_EXPIRE_SEC;
+    let challenge = types::ChallengeCode {
+        code: args.code.to_lowercase(),
+    };
+    store::captcha::with_secret(|secret| {
+        challenge.verify_from_base64(secret, expire_at, &args.challenge)
+    })?;
+
+    let user = ic_cdk::caller();
+    ...
+}
+```
+
+-------------------------
+
+sea-snake | 2024-03-01 15:37:21 UTC | #2
+
+You'll likely run into more `get_random` Rust errors 😅
+
+So the common approach is to use ChaCha20 RNG with a seed from the management canister like you did above.
+
+```rs
+let seed = random_bytes().await; // 32 byte seed from management canister
+let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed); // RNG instance that does not need system random
+```
+
+And then you can avoid the `get_random` build errors by overriding it with a custom implementation, in case your library that expects an RNG has it as dependency.
+
+```rs
+// Throw runtime error, in practice it should never be invoked when above implementation is used
+fn custom_getrandom(_buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    Err(getrandom::Error::UNSUPPORTED)
+}
+
+register_custom_getrandom!(custom_getrandom);
+```
+
+For reference the [Internet Identity source code](https://github.com/dfinity/internet-identity/tree/main/src/internet_identity/src) has a similar implementation that also uses challenge signatures. Might be interesting to compare implementations to optimize the ic-captcha crate further :D
+
+-------------------------
+
+deandre | 2024-03-07 09:35:53 UTC | #3
+
+This is great! Now people can introduce anti-spam on sites and applications.
+
+-------------------------
+

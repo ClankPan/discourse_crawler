@@ -1,0 +1,63 @@
+icme | 2024-03-30 19:08:08 UTC | #1
+
+**TLDR:** With recent DTS and Motoko GC changes, Motoko canisters can now overflow their heap memory and render canisters unrecoverable. To help developers avoid and monitor this, `heap_memory_size` should be added to the canister_status API.
+
+Currently, `canister_status` provides the total memory used by a canister (both stable and heap memory), but doesn't provide a way for the caller to differentiate between stable and heap memory from the result.
+
+This is important since stable memory has 400GB available to it, but a significant percentage of canisters (a majority?) still primarily use [heap memory, which is limited to 4GB](https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794).
+
+When this heap memory limit is hit, the canister becomes unresponsive and in most cases may no longer be recoverable. Previously, the old Motoko GC and lower DTS limits made this not possible for Motoko, as the canister would usually start hitting instruction limits between 400MB - 2GB
+
+When DTS limits were originally raised in late 2022, @ulan mentioned that [DTS wasn't raised to > 6x in order avoid Motoko canisters as security to prevent overflowing their heap memory](https://forum.dfinity.org/t/deterministic-time-slicing/10635/53?u=icme). Now that Motoko has the incremental GC and [DTS has been raised to 40B (8X)](https://forum.dfinity.org/t/deterministic-time-slicing/10635/96?u=icme) to support AI use cases, previously [Motoko canisters were safe guarded by hitting the instruction limit](https://forum.dfinity.org/t/officializing-the-incremental-gc-in-motoko/26220/11?u=icme), but it is now easy and inevitable that Motoko canisters will start overflowing their 4GB heap memory.
+
+To help prevent this from happening, I propose the following two changes:
+
+1. Provide a **monitoring solution** for developers by adding `heap_memory_size` to the management canister's `canister_status` endpoint
+2. Provide a **programmatic (dynamic) solution** by adding the [`canister_on_low_heap_memory`](https://forum.dfinity.org/t/canister-lifecycle-hooks/17089?u=icme) Lifecycle Hook
+
+While I understand that canister lifecycle hooks may take some time to be implemented, I believe that adding `heap_memory_size` should be a low lift in the interim.
+
+-------------------------
+
+chenyan | 2024-03-30 19:24:09 UTC | #2
+
+Heap memory size can be read in Wasm directly. In Motoko, you can use `Prim.rts_heap_size()`; In Rust, you can use `core::arch::wasm32::memory_size(0)`.
+
+-------------------------
+
+icme | 2024-03-30 19:44:14 UTC | #3
+
+Yes, and there are a few libraries that already do this (i.e. CanDB) that require you to set scaling limits beforehand and has builtin checks to then safeguard the canister's heap, but otherwise using the lower level APIs requires developers to insert this check into every update call, or add a recurring timer check to their canister. I've reviewed a lot of canister code from other projects, and most canisters **do not** have these checks in place. `memory_allocation` is a fixed amount of memory that the canister allocates (not flexible), and the current solution of using Prim is in my opinion lower-level abstraction than it needs to be.
+
+Ideally the 2 higher level (monitoring and programmatic) abstractions of heap memory being added to `canister_status` and the [`canister_on_low_heap_memory`](https://forum.dfinity.org/t/canister-lifecycle-hooks/17089) Lifecycle Hook are implemented.
+
+I also wanted to bring this up since the canister heap limit previously was something Motoko developers did not have to worry about, but now they do. They may not have even been thinking about this problem, as I have seen numerous examples (I provided one above) of large projects that previously may have had code that guarded against this differently.
+
+It's a backwards compatibility thing. Projects that are using older versions of dfx (pre incremental GC) would have hit the instruction limit, which is easier to recover from than hitting the heap limit. 
+
+It's a pretty easy lift to just add the heap memory size?
+
+-------------------------
+
+chenyan | 2024-03-30 20:20:37 UTC | #4
+
+Yeah, I agree. We need something like the lifecycle hooks to really safe guard the limit. But I don't see a difference between reading the heap size from Prim and reading from `canister_status`. Cost-wise, reading from `Prim` is probably cheaper and faster?
+
+-------------------------
+
+icme | 2024-03-30 20:28:15 UTC | #5
+
+Reading from `canister_status` provides this data universally for monitoring purposes. For example, canisters that currently leverage this are the ckToken minting canisters, SNS canisters, and canister monitoring applications that provide proactive email notifications like [CycleOps](https://forum.dfinity.org/t/meet-cycleops-proactive-automated-no-code-canister-management-for-the-internet-computer/20969).
+
+The `canister_status` endpoint having been implemented at the protocol level also ensures that this data is always correct. For example, if I call `canister_status` I always know that the `cycles` or `memory_size` returned is accurate as opposed to relying on the implementation inside a specific canister that computes a result and returns it through a coded canister API.
+
+-------------------------
+
+chenyan | 2024-03-31 17:44:49 UTC | #6
+
+I agree that it's a useful info to add to `canister_status`, but I don't see myself using that API, for a few reasons: 
+1) Unless we have Wasm GC, replica can only report the allocated heap memory size, not the live memory size. The former is not particularly useful in predicting when we will use up the heap memory. For Motoko incremental GC, I think the runtime reserves some heap space to prevent the GC from using the whole 4G memory. So even with extended DTS, we will not hit the heap out of bounds trap. 
+2) Memory can grow dramatically within a single message. An external monitoring service probably won't enough frequency to check when that happens. If I'm concerned about using too much memory, it's more sensible to check this inside the canister, either via the future lifecycle hooks, or a Wasm `memory_size` instruction directly. Reading this data from `canister_status` within a canister is too expensive.
+
+-------------------------
+

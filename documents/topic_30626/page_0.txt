@@ -1,0 +1,406 @@
+peterparker | 2024-05-10 19:48:16 UTC | #1
+
+Is the exchange rate canister absolutely required to deploy the CMC locally or is there a way to deploys it with some constants?
+
+I deployed the CMC with following parameters:
+
+```
+const sourceArg: CyclesCanisterInitPayload = {
+      exchange_rate_canister: [],
+      last_purged_notification: [0n],
+      governance_canister_id: [Principal.fromText(governanceCanisterId)],
+      minting_account_id: [{bytes: minterAccountIdentifier.toUint8Array()}],
+      ledger_canister_id: [Principal.fromText(icpLedgerCanisterId)]
+    };
+
+    const arg = IDL.encode(init({IDL}), [[sourceArg]]);
+```
+
+But I am facing following error at runtime in my local replica:
+
+> Panicked at 'average_icp_xdr_conversion_rate is not set', rs/nns/cmc/src/main.rs:731:14
+> [Governance] Error when refreshing XDR rate in run_periodic_tasks: External: Error calling 'get_average_icp_xdr_conversion_rate': code: Some(5), message: IC0503: Canister rkp4c-7iaaa-aaaaa-aaaca-cai trapped explicitly: Panicked at 'average_icp_xdr_conversion_rate is not set', rs/nns/cmc/src/main.rs:731:14
+
+-------------------------
+
+0x5279616e | 2024-05-10 20:55:57 UTC | #2
+
+The exchange rate canister is not required for the CMC to operate. You can use ic-admin to submit a XDR ICP conversion rate proposal.
+
+Usage:
+```bash
+ic-admin propose-xdr-icp-conversion-rate [OPTIONS] --xdr-permyriad-per-icp <XDR_PERMYRIAD_PER_ICP>
+```
+
+-------------------------
+
+peterparker | 2024-05-11 04:30:15 UTC | #3
+
+Do you mean that once the NNS Governance and CMC are installed for the first time locally, a proposal to submit an XDR to ICP conversion rate must be submitted and executed?
+
+If yes, is this mandatory, or is there another way to set up those values when I spin up a local test environment? Such as an initial parameter maybe?
+
+If no, can you point me to which type of proposal should be submitted, since I don't use ic-admin?
+
+-------------------------
+
+0x5279616e | 2024-05-11 18:20:18 UTC | #4
+
+In order for the average conversion rate to be populated, at least one rate must be submitted via proposal or retrieved using an exchange rate canister.
+
+The proposal is an `ExecuteNnsFunction`: https://github.com/dfinity/ic/blob/master/rs/nns/governance/canister/governance.did#L6.
+
+For the arguments:
+
+The NNS function is ten: https://github.com/dfinity/ic/blob/master/rs/nns/governance/proto/ic_nns_governance/pb/v1/governance.proto#L523
+
+The blob value is created by candid encoding the following: https://github.com/dfinity/ic/blob/master/rs/nns/common/src/types.rs#L94
+
+-------------------------
+
+peterparker | 2024-05-12 07:58:17 UTC | #5
+
+Those NNS and CMC canisters are so depressing...
+
+Thanks for the useful links and information; I'll start exploring from there.
+
+-------------------------
+
+peterparker | 2024-05-12 12:04:01 UTC | #6
+
+What are the exact values that need to be encoded to define the XDR ICP conversion rate? This seems to be documented nowhere.
+
+```
+pub struct UpdateIcpXdrConversionRatePayload {
+    pub data_source: String,
+    pub timestamp_seconds: u64,
+    pub xdr_permyriad_per_icp: u64,
+    pub reason: Option<UpdateIcpXdrConversionRatePayloadReason>,
+}
+```
+
+-------------------------
+
+peterparker | 2024-05-12 12:09:19 UTC | #7
+
+I'm trying this:
+
+```
+const arg = IDL.encode(
+      [
+        IDL.Record({
+          data_source: IDL.Text,
+          timestamp_seconds: IDL.Int,
+          xdr_permyriad_per_icp: IDL.Int,
+        })
+      ],
+      [{
+        data_source: '{"icp":["Binance"],"sdr":"xe.com"}',
+        timestamp_seconds: 1683500400,
+        xdr_permyriad_per_icp: 41388
+      }]
+  );
+```
+
+but I get an error:
+
+```
+error_message: 'The payload could not be decoded into a UpdateIcpXdrConversionRatePayload: Fail to decode argument 0 from table0 to record {\n' +
+```
+
+Unless I did not find the information, there seem to be an absolute lack of documentation here.
+
+-------------------------
+
+peterparker | 2024-05-12 12:17:56 UTC | #8
+
+```
+const arg = IDL.encode(
+    [
+      IDL.Record({
+        data_source: IDL.Text,
+        timestamp_seconds: IDL.Int64,
+        xdr_permyriad_per_icp: IDL.Int64,
+        reason: IDL.Opt(
+          IDL.Variant({
+            OldRate: IDL.Null,
+            DivergedRate: IDL.Null,
+            EnableAutomaticExchangeRateUpdates: IDL.Null
+          })
+        )
+      })
+    ],
+    [
+      {
+        data_source: '{"icp":["Binance"],"sdr":"xe.com"}',
+        timestamp_seconds: 1683500400,
+        xdr_permyriad_per_icp: 41388,
+        reason: []
+      }
+    ]
+  );
+```
+
+Still no luck...
+
+> error_message: 'The payload could not be decoded into a UpdateIcpXdrConversionRatePayload: Fail to decode argument 0 from table2 to record {\n' +
+>  '  data_source : text;\n' +
+> '  xdr_permyriad_per_icp : nat64;\n' +
+>  '  timestamp_seconds : nat64;\n' +
+>  '  reason : opt variant {\n' +
+> '    EnableAutomaticExchangeRateUpdates;\n' +
+>  '    DivergedRate;\n' +
+> '    OldRate;\n' +
+>  '  };\n' +
+>  '}',
+> error_type: 16
+
+-------------------------
+
+peterparker | 2024-05-12 12:31:40 UTC | #9
+
+It expects a Candid encoding right, not some protobufsh**?
+
+The rust doc says that the payload is a payload...
+
+```
+    /// The payload of the NNS function.
+    #[prost(bytes = "vec", tag = "2")]
+    #[serde(with = "serde_bytes")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+```
+
+-------------------------
+
+peterparker | 2024-05-12 12:42:40 UTC | #10
+
+Ok `IDL.Nat64` instead of `IDL.Int64` solves the encoding issue.
+
+That said, now the proposal is executed but I still get the same issue as the original issue of this post.
+
+Here results of `listProposals` after `makeProposal`.
+
+```
+proposals: [
+{
+  id: 1n,
+  ballots: [Array],
+  rejectCost: 100000000n,
+  proposalTimestampSeconds: 1715517584n,
+  rewardEventRound: 0n,
+  failedTimestampSeconds: 0n,
+  deadlineTimestampSeconds: 1715560784n,
+  decidedTimestampSeconds: 1715517584n,
+  proposal: [Object],
+  proposer: 666n,
+  latestTally: [Object],
+  executedTimestampSeconds: 1715517584n,
+  topic: 2,
+  status: 4,
+  rewardStatus: 1
+  }
+   ]
+  }
+```
+
+`status: 4,` ------> Proposal is executed.
+
+However I still get
+
+> 2024-05-12 12:39:46.062604543 UTC: [Canister rkp4c-7iaaa-aaaaa-aaaca-cai] Panicked at 'average_icp_xdr_conversion_rate is not set', rs/nns/cmc/src/main.rs:731:14
+ | 2024-05-12 12:39:46.062604543 UTC: [Canister rrkah-fqaaa-aaaaa-aaaaq-cai] [Governance] Error when refreshing XDR rate in run_periodic_tasks: External: Error calling 'get_average_icp_xdr_conversion_rate': code: Some(5), message: IC0503: Canister rkp4c-7iaaa-aaaaa-aaaca-cai trapped explicitly: Panicked at 'average_icp_xdr_conversion_rate is not set', rs/nns/cmc/src/main.rs:731:14
+
+-------------------------
+
+peterparker | 2024-05-12 12:57:26 UTC | #11
+
+Also
+
+> | 2024-05-12 12:39:44.156991084 UTC: [Canister rrkah-fqaaa-aaaaa-aaaaq-cai] [Governance] Proposal 1 decided, thanks to majority. Tally at decision time: Tally { timestamp_seconds: 1715517584, yes: 249914442162901, no: 0, total: 249914442162901 }
+| 2024-05-12 12:39:44.156991084 UTC: [Canister rkp4c-7iaaa-aaaaa-aaaca-cai] [cycles] conversion rate update: IcpXdrConversionRate { timestamp_seconds: 1683500400, xdr_permyriad_per_icp: 41388 }
+| 2024-05-12 12:39:44.156991084 UTC: [Canister rrkah-fqaaa-aaaaa-aaaaq-cai] [Governance] Execution of proposal: 1 succeeded. (Proposal title: Some("ICP/XDR Conversion Rate"))
+
+-------------------------
+
+0x5279616e | 2024-05-12 13:22:08 UTC | #12
+
+The timestamp_seconds value is too old (older than 30 days). Try something more recent like 1715472000. There is a 30 day filter in the computation of the average rate. That should work. The rest looks good to me.
+
+https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/nns/cmc/src/main.rs?L964-991
+
+-------------------------
+
+peterparker | 2024-05-12 13:34:06 UTC | #13
+
+Thanks! It seems to have worked out, and I no longer face the error.
+
+If anyone is ever interested in the solution:
+
+- Once you have spun up a CMC and an NNS governance canister, you must make a proposal.
+- When you spin up the Governance canister, you must provide it with a neuron.
+- This neuron is then used to make the proposal.
+- The proposal should include a timestamp for the XDR rate that is more recent than 30 days old.
+- Diverged should be used in such a way that the CMC stops querying the exchange rate.
+
+Here is the code for the make proposal part:
+
+```
+import {IDL} from '@dfinity/candid';
+import {GovernanceCanister, NnsFunction, type MakeProposalRequest} from '@dfinity/nns';
+import {createAgent} from '@dfinity/utils';
+import {MAIN_IDENTITY_KEY} from '../../constants/constants';
+import type {ModuleInstallParams} from '../../types/module';
+import {NEURON_ID} from './governance.constants';
+
+export const makeIcpXdrProposal = async ({identities}: Pick<ModuleInstallParams, 'identities'>) => {
+  const {[MAIN_IDENTITY_KEY]: identity} = identities;
+
+  const agent = await createAgent({
+    identity,
+    host: 'http://127.0.0.1:5987',
+    fetchRootKey: true
+  });
+
+  const {makeProposal} = GovernanceCanister.create({
+    agent
+  });
+
+  const arg = IDL.encode(
+    [
+      IDL.Record({
+        data_source: IDL.Text,
+        timestamp_seconds: IDL.Nat64,
+        xdr_permyriad_per_icp: IDL.Nat64,
+        reason: IDL.Opt(
+          IDL.Variant({
+            OldRate: IDL.Null,
+            DivergedRate: IDL.Null,
+            EnableAutomaticExchangeRateUpdates: IDL.Null
+          })
+        )
+      })
+    ],
+    [
+      {
+        data_source: '{"icp":["Binance"],"sdr":"xe.com"}',   // Example of payload data found it some proposal
+        timestamp_seconds: BigInt(Math.floor(Date.now() / 1000)), // Timestamp should not be < than 30 days from now
+        xdr_permyriad_per_icp: BigInt(41388),
+        reason: [{DivergedRate: null}]
+      }
+    ]
+  );
+
+  const request: MakeProposalRequest = {
+    neuronId: BigInt(NEURON_ID),
+    url: 'https://forum.dfinity.org',
+    title: 'ICP/XDR Conversion Rate',
+    summary: `Set ICP/XDR conversion rate to ${41_388}`,
+    action: {
+      ExecuteNnsFunction: {
+        nnsFunctionId: NnsFunction.IcpXdrConversionRate,
+        payloadBytes: arg
+      }
+    }
+  };
+
+  await makeProposal(request);
+};
+```
+
+-------------------------
+
+0x5279616e | 2024-05-12 13:37:03 UTC | #14
+
+You do not need to use a diverged rate reason. If you do not initialize the CMC with an exchange rate canister, it will not attempt to make a request.
+
+-------------------------
+
+peterparker | 2024-05-12 13:45:37 UTC | #15
+
+Gotcha. Thanks again for the few tips!
+
+-------------------------
+
+jasonzhu | 2024-06-13 18:19:17 UTC | #16
+
+Hi @peterparker, if I understand correctly, the error you are seeing from the replica log comes from the NNS Governance heartbeat. Other than seeing the error message (which can prevent one from seeing useful logs), did you run into other issues? I'm trying to understand if it will help if we simply remove the error message.
+
+-------------------------
+
+peterparker | 2024-06-14 04:54:01 UTC | #17
+
+Not sure what you mean. I saw errors because I had to undergo all the mumbo jumbo I described [above](https://forum.dfinity.org/t/exchange-rate-canister-required-to-deploy-cmc/30626/13?u=peterparker). Once done, issue was solved.
+
+-------------------------
+
+jasonzhu | 2024-06-14 05:51:18 UTC | #18
+
+I'm seeing that the error you are initially trying to solve is this:
+
+> Panicked at ‘average_icp_xdr_conversion_rate is not set’, rs/nns/cmc/src/main.rs:731:14
+[Governance] Error when refreshing XDR rate in run_periodic_tasks: External: Error calling ‘get_average_icp_xdr_conversion_rate’: code: Some(5), message: IC0503: Canister rkp4c-7iaaa-aaaaa-aaaca-cai trapped explicitly: Panicked at ‘average_icp_xdr_conversion_rate is not set’, rs/nns/cmc/src/main.rs:731:14
+
+which indicates NNS Governance is trying to fetch the conversion rate and it failed. However, an accurate conversion rate is only needed for maturity modulation (and probably some neurons' fund stuff), which I doubt most people will need locally.
+
+I'm wondering do you see any other issues (e.g. NNS Governance behaving in a bad way) than simply seeing this error message (in a large volume) on the replica logs? 
+
+Zooming out a little bit: we no longer use the exchange rate proposal since a year ago, and I don't suppose anyone want to send such a proposal every time they set up a local environment. I'm trying to figure out whether there is a way to set up a NNS locally without having to make an exchange rate proposal.
+
+-------------------------
+
+peterparker | 2024-06-14 06:36:05 UTC | #19
+
+Gotcha, thanks for the explanation!
+
+Indeed, I can confirm that I absolutely do not need maturity modulation. A fixed rate would be perfectly suitable for local development.
+
+I did not see any other issues so far, but I have to say that once everything was deployed correctly, I stopped the effort and jumped to another task. I've got various tasks in Juno which will require using the CMC, notably deploying canisters in other subnets (e.g., feature  [#452](ttps://github.com/junobuild/juno/issues/452)), but I have other priorities right now. Happy to update this thread if I encounter any errors when I implement those features.
+
+-------------------------
+
+skilesare | 2024-06-26 12:58:29 UTC | #20
+
+Do you by any chance have what these Keys and Constants are? I'm trying to follow the SNS test rep at https://github.com/dfinity/sns-testing and keep getting these messages in my console. It would be nice if this step was added to the script.
+
+-------------------------
+
+peterparker | 2024-06-26 13:04:47 UTC | #21
+
+[quote="skilesare, post:20, topic:30626"]
+Keys and Constants
+[/quote]
+
+Which keys and constants? The installation parameters?
+
+[quote="skilesare, post:20, topic:30626"]
+step was added to the script
+[/quote]
+
+Not that I do not use that script. This thread was about trying to install the CMC in [Juno Docker](https://github.com/junobuild/juno-docker), which ultimately succeeded. Still need to run few checks though.
+
+-------------------------
+
+skilesare | 2024-06-26 13:10:42 UTC | #22
+
+It looks like the next steps to test an SNS scenario seem to run an XDR command which will fix it.
+
+Basically am just trying to capture a clean state with a passed SNS that I control for use with pic.js.
+
+I think I'm close.
+
+-------------------------
+
+peterparker | 2024-06-26 13:14:20 UTC | #23
+
+[quote="skilesare, post:22, topic:30626"]
+pic.js
+[/quote]
+
+Juno Docker built-in CLI uses NodeJS, so if it can be interesting:
+
+- All the args I used to deploy the Governance -> https://github.com/junobuild/juno-docker/blob/4e8b10d1672a8c3b366e8aef672a0e8606a0cea9/cli/src/modules/governance/governance.install.ts#L19 (this requires protobuf :weary:)
+
+- The post install script that makes the proposal to initialize the mumbo jumbo required by the CMC -> https://github.com/junobuild/juno-docker/blob/4e8b10d1672a8c3b366e8aef672a0e8606a0cea9/cli/src/modules/governance/governance.post-install.ts#L8
+
+-------------------------
+

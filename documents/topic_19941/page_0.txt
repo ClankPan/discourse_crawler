@@ -1,0 +1,278 @@
+qwertytrewq | 2023-05-12 17:29:52 UTC | #1
+
+In Ethereum it's simple: a call either executes fully or not at all.
+
+But in IC we have multiple "checkpoints" at which state is written and is never reverted to state before a checkpoint. Correct?
+
+So, in Ethereum we don't need a data consistency strategy (except of fixing reentrancy vulnerabilities). But in IC we do need. Please teach me data consistency strategy for IC.
+
+Probably the strategy should be usually based on idempotent calls? I mean that consistency may be reached by calling a "questionable" function several times, if needed, to reach consistency?
+
+-------------------------
+
+diegop | 2023-05-12 19:01:48 UTC | #2
+
+Hi there,
+
+Maybe i am alone in asking, but I am not sure I follow.
+
+AFAIK, In the IC a call to a canister ALSO executes or it does not. But perhaps I may be misunderstanding or forgetting something.
+
+your question make me wonder if I have something wrong, so let me ping some folks.
+
+-------------------------
+
+free | 2023-05-12 19:27:21 UTC | #3
+
+If your canister update call makes no downstream calls of its own, then the call will complete atomically, even if it takes multiple rounds to do so. If you do make downstream canister calls (whether to local or remote canisters; or even back to the canister itself) then execution is suspended until a response is received, then it is resumed. Other calls may execute in the meantime.
+
+Another way of looking at it is that every message execution is atomic and canisters function as actors (single threaded processes, executing messages sequentially). So whether the message succeeds or fails, no other message will execute before it completes. But a call tree like `user -> canisterA -> canisterB` actually consists of 3 messages:
+* a `user -> canisterA` ingress request, executed atomically by `canisterA` (up to the point where it awaits the response from `canisterB`);
+* a `canisterA -> canisterB` canister request, executed atomically by `canisterB`;
+* and a `canisterB -> canisterA` response, executed atomically by `canisterA` (from the point where `await` returns to the end of the method invoked by the user).
+
+If you use explicit callbacks in Rust, it's quite obvious what the atomic units of execution are: you'll have the `canisterA` update handler that the user calls (this registers a callback function to be executed upon completion of the request it sends to `canisterB`), a `canisterB::` update handler that `canisterA` calls; and a `canisterA` callback handler that `canisterA` registers to be invoked when a response is received. With `await` it's less obvious, but basically if you cut your handler functions at every `await`, it is the resulting pieces that are executed atomically.
+
+Edit: Oh, and after every message execution, the state is committed. So if e.g. the `user -> canisterA` call succeeds (up to the point where `canisterA` awaits the response from `canisterB`); the `canisterA -> canisterB` request succeeds; but handling the `canisterB -> canisterA` traps; then `canisterA` will persist whatever changes were made by the first message; `canisterB` will persist the changes made by the execution of the second message; but `canisterA` will have no record of having received a response from `canisterB`.
+
+-------------------------
+
+kpeacock | 2023-05-12 19:27:24 UTC | #4
+
+If there is a modification made to a canister, you will receive back a `request_id`. You can then make a `request_status` call to the IC with that `request_id`, and determine whether that change has a successful status, a rejection, or an error. Of course, agents like `agent-js` or `agent-rs` will do this for you with friendlier pattern for their respective languages.
+
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#state-tree-request-status
+
+Any queried data will also be up to date as of the time it's called. It's recommended you use certified data that has gone through a round of consensus for higher levels of security.
+
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-certified-data
+
+State is mutable though, so you need to use data structures and application logic that ensure consistency of requests over time, if your dapp calls for immutability. For example a `what_time_is_it` method could never have data consistency, while a `get_transaction(id)` method can be consistent as long as your code is sound
+
+-------------------------
+
+skilesare | 2023-05-12 21:07:52 UTC | #5
+
+You may want to look up SAGA roll back and strategies for architecting your system around it in asynchronous systems.  This comes into play when you have multiple canisters invovled.
+
+-------------------------
+
+diegop | 2023-05-12 22:30:29 UTC | #6
+
+@kpeacock @free  @skilesare 
+
+Honest question: Am I missing something?
+
+I feel like the *initial* premise is not addressed simply enough. AFAIK If i send a message to ONE canister, it either executes completely or not. Checkpoints, rounds, multiple canisters, etc... that is all ancillary.
+
+Possible I am over simplifying this?
+
+-------------------------
+
+qwertytrewq | 2023-05-13 07:42:58 UTC | #7
+
+But what if my method should do several IPC payments (calling the Ledger canister)?
+
+Payments can't be cancelled. Should I lay aside all the payments as the last step, because after a payment I can't do a rollback?
+
+Do I now understand this issue fully, or you have something to add to my knowledge?
+
+-------------------------
+
+free | 2023-05-13 09:57:21 UTC | #8
+
+[quote="diegop, post:6, topic:19941"]
+I feel like the *initial* premise is not addressed simply enough. AFAIK If i send a message to ONE canister, it either executes completely or not. Checkpoints, rounds, multiple canisters, etc… that is all ancillary.
+[/quote]
+
+If that canister doesn't make any downstream canister calls, then yes, the message is executed atomically. If it succeeds, whatever changes it made to the state of the canister are persisted. If it fails, it's as if it had never existed.
+
+But "no downstream calls" is a significant caveat. As soon as a canister makes any downstream calls of its own and awaits them, changes made to the canister are persisted mid-way through handling the call and these changes become visible to later calls. When the reply to the downstream call is received, that is a separate message, which may in turn succeed (and persist its changes) or fail (making it look like it never existed).
+
+[quote="qwertytrewq, post:7, topic:19941"]
+But what if my method should do several IPC payments (calling the Ledger canister)?
+
+Payments can’t be cancelled. Should I lay aside all the payments as the last step, because after a payment I can’t do a rollback?
+[/quote]
+
+ICP ledger calls are idempotent. So as long as you ensure beforehand e.g. that enough funds exist, you can keep retrying the payments until they eventually succeed.
+
+But more generally, from this point of view the IC is more similar to traditional applications (with some additional features, such as guaranteed responses or larger atomic units of execution) than e.g. to Ethereum, which executes a whole call tree spanning multiple smart contracts atomically.
+
+-------------------------
+
+qwertytrewq | 2023-05-13 13:11:49 UTC | #9
+
+[quote="free, post:8, topic:19941"]
+ICP ledger calls are idempotent.
+[/quote]
+
+How so? They transfer money. Calling two times transfers money two times. That't not idempotent.
+
+-------------------------
+
+qwertytrewq | 2023-05-13 13:18:26 UTC | #10
+
+This transfers money. And if called twice, transfers money twice!
+```
+ledger.transfer({
+  memo = 0;
+  amount = toAuthor;
+  fee = 10000;
+  from_subaccount = ?Principal.toBlob(userId);
+  to = author
+});
+```
+
+-------------------------
+
+Maxfinity | 2023-05-13 14:38:34 UTC | #11
+
+Add timestamp field.
+
+-------------------------
+
+free | 2023-05-13 14:38:57 UTC | #12
+
+I seem to remember hearing that. I may well be wrong about it. My apologies.
+
+Looking at the API, it does look as if there is no nonce or anything that may uniquely identify a specific transfer.
+
+-------------------------
+
+Maxfinity | 2023-05-13 14:40:18 UTC | #13
+
+My personal opinion, is that the idempotence was too weak on the IC's token. The semantics should have resembled something like Ethereum where you transfer and then can query the state of the transaction by transaction hash, with txhash making it unique.
+
+-------------------------
+
+free | 2023-05-13 14:48:51 UTC | #14
+
+[This piece of code](https://github.com/dfinity/ic/blob/5c05dfaac047f01f9dfd131096028f1049b9e1d9/rs/rosetta-api/ledger_canister_core/src/ledger.rs#L201-L218) makes it look like if you set a timestamp on the transaction (as @Maxfinity suggested), the transaction will be deduplicated based on its timestamp and hash. So there does appear to be deduplication going on.
+
+That being said, I'm a total novice when it comes to using the IC. I don't even know where the ICP ledger documentation might be found. I work on Message Routing, so I'm much more comfortable discussing how the deterministic state machine works. I should probably limit myself to that. (o:
+
+-------------------------
+
+timo | 2023-05-14 11:00:06 UTC | #15
+
+[quote="qwertytrewq, post:7, topic:19941"]
+But what if my method should do several IPC payments (calling the Ledger canister)?
+[/quote]
+
+It can be seen as a shortcoming of most other ledger, including the ICP ledger, that making multiple payments atomically isn't possible such as one-to-many batch payments, many-to-one or just multiple independent transfers seen as one large atomic one. With Bitcoin it is possible. I am working on a ledger interface that allows atomic multi-party transfers. That may make calling code simpler and new use cases possible. So I am certainly interested in your use case.
+
+[quote="qwertytrewq, post:7, topic:19941"]
+Payments can’t be cancelled. Should I lay aside all the payments as the last step, because after a payment I can’t do a rollback?
+[/quote]
+
+Laying them aside for the last step does not completely solve the problem if the first goes through and the second doesn't. You can do something like this:
+```
+try {
+  await ledger.transfer(/* first transfer */);
+  // first one has succeeded
+  try {
+    await ledger.transfer(/* second transfer */);
+  } catch (e) {
+    // register second transfer in a backlog
+    return /* some transfer id referring to the backlog */
+  };
+} catch (e) {
+  // first one did not succeed
+  // we don't even try the second one
+  // we abort the whole process
+  return
+};
+```
+Then provide a dedicated function that can replay specific transfer ids from the backlog. The receiver could call such a function if something went wrong. That function has to be made idempotent by a lock so that the user cannot request to replay the same transfer twice.
+Or you can have a timer replay the backlog automatically at certain interval. 
+
+In practice though this should never happen. It is hard to see why a call to the ledger should fail unless your own code does too many calls to the ledger.
+
+-------------------------
+
+qwertytrewq | 2023-05-14 11:10:53 UTC | #16
+
+[quote="timo, post:15, topic:19941"]
+So I am certainly interested in your use case.
+[/quote]
+
+I send a (split) payment to a product author, shareholders, and up to two affiliates (one for buying and one for selling).
+
+I consider to store amounts of payments per every user in a StableTrieMap, when triggering author/affiliate payments, and pay on request. I am somehow afraid that in a too good future :slight_smile:  heap memory may overflow. I am going to mitigate this by removing trie map keys after successful payments. I also consider to run payments disbursement periodically.
+
+Storing in a scalable CanDB, however, seems not an option, because its querying would itself also involve inter-canister calls.
+
+-------------------------
+
+timo | 2023-05-14 11:33:45 UTC | #17
+
+[quote="qwertytrewq, post:16, topic:19941"]
+I consider to store amounts of payments per every user in a StableTrieMap, when triggering author/affiliate payments, and pay on request.
+[/quote]
+
+That seems like a good strategy to track the various users' credits internally and let them withdraw on request whenever they want to. That could also reduce the total number of ledger calls made if users can withdraw total accumulated credit. I have done something similar with RBTree and delete keys that have withdrawn their credit. You should be good until 10m+ users. With the incremental GC available in moc-0.9.0 now even more. By the time heap memory becomes a problem more convenient ways to use the 64GB stable memory in Motoko will have arrived. Then you can switch to using that.
+
+-------------------------
+
+skilesare | 2023-05-14 11:53:41 UTC | #18
+
+The ledger working group will soon be taking up https://forum.dfinity.org/t/batch-transfers-icrc4/18461 to try to address some of this.
+
+-------------------------
+
+mariop | 2023-05-15 06:49:02 UTC | #19
+
+Hi @qwertytrewq ,
+
+Let's start with the ICP Ledger. The Ledger supports transactions deduplication. This feature is opt-in because canisters don't need it but it should be used by clients that attempts a transaction from outside the IC. You have to mark the transaction for it to be deduplicated by the Ledger. Marking is done by setting the [created_at_time](https://github.com/dfinity/ic/blob/5c05dfaac047f01f9dfd131096028f1049b9e1d9/rs/rosetta-api/icp_ledger/ledger.did#L25) field in the transfer payload. Once that's set, the Ledger will do structural deduplication of your transaction. You can read about the semantic of transaction deduplication in the section of the [ICRC-1 standard repository](https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/README.md#transaction-deduplication-).
+If you submit a transaction multiple times and the transaction is marked for deduplication then only one of them will go through while the others will return the error [TxDuplicate](https://github.com/dfinity/ic/blob/5c05dfaac047f01f9dfd131096028f1049b9e1d9/rs/rosetta-api/icp_ledger/ledger.did#L73) with the index of the block where the Ledger recorded the transaction. Clients should consider a transaction to be successful when they receive a TxDuplicate.
+A common pattern among services that require payments on the IC is to register the intent of payment first so that the client can attempt a payment multiple times using deduplication. Usually it goes like this:
+1. a client asks the service to buy something
+2. the service either returns an existing ticket or creates a new ticket for the payment and returns it
+3. the client makes the payment by submitting a transfer to the ledger with the data of the ticket, which includes the value of created_at_time
+4. the client notifies the service about the payment
+5. the service marks the ticket as payed
+
+To answer your original question, idempotency is the right approach. Canisters operations should be idempotent and protocols should use idempotency to guarantee consistency of the system when the protocol is run multiple times with the same parameters.
+
+-------------------------
+
+qwertytrewq | 2023-05-15 09:15:22 UTC | #20
+
+Hi @mariop ,
+
+How my canister checks (items 4-5) that the payment really happened?
+
+With ICP, it apparently can be done using `query` method, but with arbitrary ICRC-1 token checking a transaction by ID seems impossible. Do I miss something?
+
+-------------------------
+
+mariop | 2023-05-15 09:29:00 UTC | #21
+
+[quote="qwertytrewq, post:20, topic:19941"]
+How my canister checks (items 4-5) that the payment really happened?
+
+With ICP, it apparently can be done using `query` method, but with arbitrary ICRC-1 token checking a transaction by ID seems impossible. Do I miss something?
+[/quote]
+
+DFINITY's main implentation of ICRC-1 has two additional endpoints, [one called get_transactions and one called get_blocks](https://sourcegraph.com/github.com/dfinity/ic@a6bc55f5ed12ffb99d4b863f1d4bdd36d73321d6/-/blob/rs/rosetta-api/icrc1/ledger/ledger.did?L274), that allows you to verify that a certain transaction really happened.
+
+Keep in mind that those endpoints are not standard. ICRC-1 doesn't have a way to check the transactions log. That will be an extension called ICRC-3 but it is yet to be discussed by the working group.
+
+If you want to use ICRC-1 only then the approach is to use subaccounts and icrc1_balance_of to check payments. A payer would transfer tokens to a subaccount of the receiver that is calculated from the payer principal and the invoice id (e.g. the sha256 of the bytes concatenation).
+
+-------------------------
+
+qwertytrewq | 2023-05-19 13:53:48 UTC | #22
+
+What's about the following strategy?
+
+On a `shared` call `f` save changes in a (stable) variable, such as of `BTree` type. Every say 100 calls "commit": set a flag disabling `f` calls and commit all 100 calls to a CanDB DB.
+
+Is it a good strategy?
+
+It has the advantage that this way the queue (or other data structure) of queued operations won't overflow canister memory, because our stable variable will all the time have no more than 100 members.
+
+-------------------------
+

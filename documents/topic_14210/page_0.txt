@@ -1,0 +1,243 @@
+ielashi | 2022-07-07 21:30:27 UTC | #1
+
+Hey everyone,
+
+While working on the Bitcoin integration we developed `StableBTreeMap`. It is a KV store that has a similar interface to a standard `BTreeMap` in Rust, but it manages its own memory. This data structure allowed us to store large amounts of state in the subnet while minimizing our memory footprint as well minimizing the time it takes to persist this map to disk.
+
+Several of you have been asking if this same data structure can be useful for canister developers. In theory, the answer is yes. This data structure can allow canisters to store state that can grow to several gigabytes in size, without having to define a `pre_upgrade` /`post_upgrade` hooks in the canister.
+
+@senior.joinu has been doing some great work with the `ic-stable-memory` library, and @ovictor already worked on porting `StableBTreeMap` for use in canisters. Given the interest, I made some updates to the `StableBTreeMap` API to make it more canister friendly, and I published some examples on how to use it [here](https://github.com/ielashi/stable-btreemap-example).
+
+This data structure has been tested with tens of millions of keys, but as I mentioned in an [earlier post](https://forum.dfinity.org/t/direct-integration-with-bitcoin/6147/349?u=ielashi), we didn’t test this data structure within a canister, so please experiment with it cautiously.
+
+Hope this helps!
+
+-------------------------
+
+ovictor | 2022-07-08 01:50:50 UTC | #2
+
+Great work! I see that you have created boundaries for memory allocation,  thanks for sharing!
+
+-------------------------
+
+flyq | 2022-07-08 02:10:11 UTC | #3
+
+Well done!
+I also recently tried to use StableBTreeMap in canister and it works very well.
+
+Someone did a benchmark test of storing to stable memory and wasm heap, they are basically the same: https://github.com/aewc/balance/tree/bench#readme
+
+But when it comes to some complex requirements, it gets a little tricky.
+My canister has several data structures, including some fixed-length data, dynamically growing Vectors and Maps. In this way, it is more troublesome to divide the stable memory in advance. For example, I divide 1GB for A, 2GB for B, 1GB for C, and finally D, etc.
+
+This will cause a problem that even if the entire canister has no state at the beginning, it needs to occupy at least 4GB of stable memory. The most important thing is that after these fixed quotas are used up in the future, they need to be redistributed.
+
+The reason for this is that StableBTreeMap is implemented based on Vec, and a StableBTreeMap must occupy the entire contiguous memory space. If StableBTreeMap can be implemented based on List, then in the same continuous memory space, A, B, C, D can be stored alternately.
+
+Considering that the existing StableBTreeMap has been carefully designed and extensively tested, another option is to map contiguous Vecs to Lists.
+
+-------------------------
+
+justmythoughts | 2022-07-08 03:54:20 UTC | #4
+
+[quote="flyq, post:3, topic:14210"]
+Someone did a benchmark test of storing to stable memory and wasm heap, they are basically the same: [GitHub - aewc/balance at bench](https://github.com/aewc/balance/tree/bench#readme)
+[/quote]
+
+
+Not sure what you’re seeing, the benchmarks show reading from/writing to the wasm heap is much more performant than stable storage. Writes are 40% quicker and reads are 50% quicker, at least in the testing repo you linked.
+
+From the README of the benchmark repo you linked to…
+
+```
+analysis:
+write 100_000 map entries to stable memory:   5.3927s
+write 100_000 map entries to wasm heap:       3.2827s
+
+write 100 MB vector to stable memory:         2.9031s
+write 100 MB vector to wasm heap:             3.0960s
+
+read 100_000 map entries from stable memory:  3.6159s
+read 100_000 map entries from wasm heap:      1.8864s
+
+read 100 MB vector from stable memory:        1.4479s
+read 100 MB vector from wasm heap:            1.8138s
+```
+
+-------------------------
+
+flyq | 2022-07-08 04:18:16 UTC | #5
+
+Yes, but:
+1. Considering that when the amount of data is relatively large, there is no order of magnitude difference between them, and they are all kept at a very low absolute value in small size, I think this is acceptable.
+2. For Vec, stable memory even has an advantage.
+
+Of course, when we need extreme performance in the future, we can mix wasm heap and stable memory to work together
+
+-------------------------
+
+justmythoughts | 2022-07-08 04:43:47 UTC | #6
+
+[quote="flyq, post:5, topic:14210"]
+Considering that when the amount of data is relatively large, there is no order of magnitude difference between them, and they are all kept at a very low absolute value in small size, I think this is acceptable.
+[/quote]
+
+In these tests the elements are stored into an **empty** BTreeMap. I don’t think one can deduce that from this data without doing the following.
+
+1. It would be interesting to first see what performance difference looks like **as the size of the BTreeMap increases** (1, 2, 10, 50 million items). 
+
+2. Also the performance difference should be tested for a single query call to retrieve 1-10 items or a single update call to insert 1-10 items in order to determine how much of the response time is due to the query/update call and how much is due to the difference between the accessing data on the wasm heap/stable storage.
+
+@chenyan @berestovskyy does DFINITY have any internal performance benchmarks on accessing (read from/write to) stable storage vs.  the wasm heap?
+
+-------------------------
+
+ielashi | 2022-07-08 08:51:45 UTC | #7
+
+[quote="flyq, post:3, topic:14210"]
+But when it comes to some complex requirements, it gets a little tricky.
+My canister has several data structures, including some fixed-length data, dynamically growing Vectors and Maps. In this way, it is more troublesome to divide the stable memory in advance. For example, I divide 1GB for A, 2GB for B, 1GB for C, and finally D, etc.
+
+This will cause a problem that even if the entire canister has no state at the beginning, it needs to occupy at least 4GB of stable memory. The most important thing is that after these fixed quotas are used up in the future, they need to be redistributed.
+
+The reason for this is that StableBTreeMap is implemented based on Vec, and a StableBTreeMap must occupy the entire contiguous memory space. If StableBTreeMap can be implemented based on List, then in the same continuous memory space, A, B, C, D can be stored alternately.
+
+Considering that the existing StableBTreeMap has been carefully designed and extensively tested, another option is to map contiguous Vecs to Lists.
+[/quote]
+
+I agree with these observations. The limitation of fixed-length data and having separate address space for each individual `StableBTreeMap` helped us simplify the implementation significantly and reduced the likelihood of bugs, particularly those related to memory management, that could corrupt our entire state.
+
+There are some work-arounds to some of these issues you raised though:
+
+### Support for storing dynamically growing vectors
+We already support this, although indirectly. In the Bitcoin integration, we have a map called [address_to_outpoints](https://github.com/dfinity/ic/blob/master/rs/bitcoin/canister/src/state.rs#L285), which in theory is equivalent to a `Map<BitcoinAddress, Vec<UnspentOutPoint>>`. The code at the moment is a bit difficult to decipher, but I can explain how we do it.
+
+Instead of representing the data as a `BTreeMap<X, Vec<Y>>`, we can represent it as a `BTreeSet<X ⋅ Y>`, where `X ⋅ Y` is the concatenation of `X` and `Y`. Because of the properties of a `BTree`, we can efficiently query all the entries in the map that have the prefix `X` using the [range](https://github.com/dfinity/ic/blob/master/rs/stable-structures/src/btreemap.rs#L745) method, which is equivalent to calling `map.get(X)` in the former represenation of the data.
+
+One important advantage of this approach is that you can only read from stable memory the parts of the list that you need, and in cases where you want to append an element, then you don't need to read/deserialize that list from stable memory at all.
+
+### Multiple instances of `StableBTreeMap`
+
+Yes, the current way of giving each map a non-overlapping range in memory is quite wasteful in terms of a canister's memory allocation and not flexible. If I understood your suggestion correctly, you're suggesting an implementation of the `Memory` trait that can give `StableBTreeMap` the illusion of having a continuous address space, but behind the scenes this memory could be split up into different parts of the real address space. I agree that this approach would solve the issue, and would allow you to have multiple instances of `StableBTreeMap` without unnecessarily allocating a large amount of memory in advance. I don't think it would be that complicated to implement either.
+
+-------------------------
+
+flyq | 2022-07-08 09:58:22 UTC | #8
+
+[quote="ielashi, post:7, topic:14210"]
+Because of the properties of a `BTree`, we can efficiently query all the entries in the map that have the prefix `X` using the [range](https://github.com/dfinity/ic/blob/master/rs/stable-structures/src/btreemap.rs#L745) method
+[/quote]
+Yes, entries with the same prefix will be stored in close proximity. Similarly, `Map<X, Map<Y, Z>>` can also be replaced by `Map<X*Y, Z>`.
+
+I don't see `BTreeSet`, it means `BTreeMap<X, vec![]>`?
+
+
+[quote="ielashi, post:7, topic:14210"]
+If I understood your suggestion correctly, you’re suggesting an implementation of the `Memory` trait that can give `StableBTreeMap` the illusion of having a continuous address space, but behind the scenes this memory could be split up into different parts of the real address space.
+[/quote]
+Agree
+
+Naturally, we are going to use wasm pages to divide different areas. The growth rates of the four types of data A, B, C, and D are different. Any suggestions on the size of the chunks(now is page size) when a new chunks is allocated to data?
+
+-------------------------
+
+ielashi | 2022-07-08 11:54:30 UTC | #9
+
+[quote="flyq, post:8, topic:14210"]
+I don’t see `BTreeSet`, it means `BTreeMap<X, vec![]>`?
+[/quote]
+
+Yes, for now that's what we use. We probably should define a `StableBTreeSet` as a syntactic sugar around this for readability.
+
+> Naturally, we are going to use wasm pages to divide different areas. The growth rates of the four types of data A, B, C, and D are different. Any suggestions on the size of the chunks(now is page size) when a new chunks is allocated to data?
+
+Good question. I don't have a suggestion on what the chunk size should be off the top of my head. Thinking out loud, bigger chunk sizes are likely to translate to better performance, since the canister will need less `stable_read` calls to read the btree's virtual address space. On the other hand, bigger chunk sizes would cause us to potentially allocate more of the canister's memory than we really need. The upper bound to how much memory a canister would unnecessarily allocate is `S * C`, where `S` is the number of stable structures we have, and `C` is the chunk size in wasm pages.
+
+Given `S * C`, and thinking about how many maps we need and how much memory we're willing to sacrifice in favor of performance, we can probably come up with a reasonable chunk size for our use-cases.
+
+You could even imagine an adaptive chunk size. When a stable structure asks for more memory, it's initially given small chunks, and these get progressively larger as the structure grows, but maybe I'm thinking too far ahead already :) 
+
+Maybe @ulan and/or @roman-kashitsyn have more insights here.
+
+-------------------------
+
+stefan.schneider | 2022-07-08 15:00:44 UTC | #10
+
+One direction worth investigating for the future might be to generalize the underlying allocators. Both StableBTreeMap and senior.joinu's data structures use an allocator if I understand correctly. On one hand, it's what needs to be generalized to remove the fixed size contstraint of StableBTreeMap. Secondly multiple data structures using the same allocator is also a path to having them side by side.
+
+-------------------------
+
+skilesare | 2022-07-08 15:18:01 UTC | #11
+
+Is anyone porting this to Motoko?  If not under active dev I think this is a bounty candidate.  If there is some work on the rust side we can look at it as well.
+
+-------------------------
+
+ielashi | 2022-07-11 10:37:56 UTC | #12
+
+[quote="stefan.schneider, post:10, topic:14210, full:true"]
+One direction worth investigating for the future might be to generalize the underlying allocators. Both StableBTreeMap and senior.joinu’s data structures use an allocator if I understand correctly. On one hand, it’s what needs to be generalized to remove the fixed size contstraint of StableBTreeMap. Secondly multiple data structures using the same allocator is also a path to having them side by side.
+[/quote]
+
+Definitely. That was the original direction that we first explored when building `StableBTreeMap`.  I agree that having a generic dynamic allocator would open up more options for us. It is a more ambitious undertaking though, which is why we opted for the simpler fixed-size allocator on the grounds that it's easier to implement initially and easier to verify its correctness.
+
+> Is anyone porting this to Motoko? If not under active dev I think this is a bounty candidate. If there is some work on the rust side we can look at it as well.
+
+I'm not aware of anyone porting this to Motoko. On the Rust side, we've been making additions on an as-needed basis. For example, just last week a [stable Cell](https://github.com/dfinity/ic/blob/master/rs/stable-structures/src/cell.rs#L70) was added to the library, but I don't expect any big updates in Rust for the time being unless there's a need for it by the community.
+
+-------------------------
+
+Wonder0729 | 2023-07-23 04:24:18 UTC | #13
+
+Hi, @ielashi.
+Congratulations on your achievement.
+
+After reading your topic carefully, I have some questions?
+1. Can I use StableBTreeMap as a NoSQL database?
+2. Can I store large data over 4GB?
+
+I would appreciate it if you could tell me exactly about this.
+
+-------------------------
+
+ielashi | 2023-07-24 12:51:41 UTC | #14
+
+@Wonder0729 Yes and yes :slight_smile:
+
+-------------------------
+
+Wonder0729 | 2023-07-24 13:19:42 UTC | #15
+
+@ielashi
+Thanks for your reply.
+
+Currently, I am developing simple community site on the internet computer and then I want to store data on NoSQL databases like MongoDB for web2.
+In a large amount of data, I need to filter out specific data with multiple conditions(ie. modified date, name, title, categories).
+I will be grateful if you can share your idea/example.
+
+Best Regard.
+
+-------------------------
+
+ielashi | 2023-07-24 14:39:38 UTC | #16
+
+That question is too broad. I suggest you look at [the documentation](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/) and [our examples](https://github.com/dfinity/stable-structures/tree/main/examples). If you run into issues or are stuck on something specific, we'd be happy to help you out then.
+
+-------------------------
+
+pramitgaha | 2023-07-28 21:09:57 UTC | #19
+
+hello @ielashi 
+I'm getting some error!
+here is the minimal code: https://github.com/pramitgaha/map_error
+
+-------------------------
+
+ielashi | 2023-08-03 07:19:11 UTC | #20
+
+[This line](https://github.com/pramitgaha/map_error/blob/main/src/map_backend/src/lib.rs#L48) is the issue. You're setting the `MAX_SIZE` of each entry in your map to `u32::MAX`. Internally, the map allocates the `MAX_SIZE` memory for each entry. You've configured it to allocate 4GiB of memory for every single entry in your map, and that's why it fails.
+
+I recommend you set the `MAX_SIZE` to be as tight as possible. We're also working on removing the `MAX_SIZE` requirement from BTreeMaps, and we should have a beta release of it this month. See [this discussion](https://forum.dfinity.org/t/stable-structures-removing-the-bounded-size-requirement/21167).
+
+-------------------------
+

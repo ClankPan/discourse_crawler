@@ -1,0 +1,128 @@
+flyq | 2021-06-18 13:00:25 UTC | #1
+
+the [document](https://sdk.dfinity.org/docs/language-guide/language-manual.html#syntax-decls) said: 
+> * Visibility `private` restricts access to `<id>` to the enclosing object, module or actor.
+> * Visibility `public` extends `private` with external access to `<id>` using the dot notation `<exp>.<id>` .
+
+as I test in:
+```mo
+actor Main {
+    var a = 1;
+    var b = 1;
+    var c = 1;
+
+    public func add1()  {
+        c := a + b;
+    };
+
+    public func addx() : async () {
+        c := a + b;
+    };
+
+    private func add2() : Nat {
+        c := a + b;
+        return c;
+    };
+
+    public func add3() : async Nat {
+        c := a + b;
+        return c;
+    };
+
+    private func add4() : async Nat {
+        c := a + b;
+        return c;
+    };
+
+    public func add5() : async Nat {
+        add1();
+        return c;
+    };
+
+    public func add6() : async Nat {
+        ignore add3();
+        return c;
+    };
+
+    public func add7() : async Nat {
+        ignore await add3();
+        return c;
+    };
+
+    public func reset() : async Nat {
+        c := 1;
+        return c;
+    };
+
+    public query func geta() : async Nat {
+        return a;
+    };
+
+    public query func getb() : async Nat {
+        return b;
+    };
+
+    public query func getc() : async Nat {
+        return c;
+    };
+};
+```
+code above is compiled successful.
+
+the candid file is:
+[details="candid"]
+```did
+service : {
+  add1: () -> () oneway;
+  add3: () -> (nat);
+  add5: () -> (nat);
+  add6: () -> (nat);
+  add7: () -> (nat);
+  addx: () -> ();
+  geta: () -> (nat) query;
+  getb: () -> (nat) query;
+  getc: () -> (nat) query;
+  reset: () -> (nat);
+}
+```
+[/details]
+
+In the actor, are the following conclusions correct:
+1. Although add1 does not have async, it is also "export" and publicly available, just like addx. But add1 and addx are not exactly the same, because there is oneway more in add1 in candid. Can someone explain what oneway means?
+2. Although add4 has async, it is private and invisible to the outside wasm/canister. In this case, why not restrict private functions from being modified with async?
+3. add5 calls add1 without using asynchronous
+4. add6 calls add3 without using asynchronous, although add3 is decorated with async. When a function in the canister calls others functions, even if which is an asynchronous function, it can be called synchronously.
+5. add7 calls add3 with using asynchronous
+
+-------------------------
+
+stephenandrews | 2021-06-18 13:12:02 UTC | #2
+
+Based on some of my testing (I had similar questions too):
+
+1. I think oneway is essentially a query call? But if it is not async it can not use await (like JS)
+2. private functions can still call out to external canisters and therefore may need to await and must be async funcs
+3. Yup, an async func can call a non async func.
+4. Yup, you don't have to await the return. async func's return a "future" which has to be consumed using await (which holds the stack and returns the value eventually). If you ignore the "future" it's essentially sync
+5. Yup, As above, await forces it to wait for the future to resolve
+
+Hope that helps :slight_smile:
+
+-------------------------
+
+claudio | 2021-06-18 14:22:20 UTC | #3
+
+* *Although add1 does not have async, it is also “export” and publicly available, just like addx. But add1 and addx are not exactly the same, because there is oneway more in add1 in candid. Can someone explain what oneway means?*
+  A shared function with return type `()` (not `async ()`) returns control immediately and cannot be awaited. It still executes asynchronously and has its state changes committed (so is _not_ a query). If it throws an error, that error cannot be caught by the caller. These oneway functions are useful for fire-and-forget scenarios. (Your example doesn't have an explicit return type, but an omitted return type defaults to `()`. This is a known pitfall of the syntax and perhaps we should fix it).
+*  *Although add4 has async, it is private and invisible to the outside wasm/canister. In this case, why not restrict private functions from being modified with async?*
+  Local async functions are independently useful for abstracting out code that sends messages and performs awaits.
+  (An ordinary,  non-async returning local function is not allowed to send messages or await.)
+* *add5 calls add1 without using asynchronous*
+   `add5` will not wait for `add1()` to complete before returning (because `add1` returns just `()` and is oneway, `add5` *cannot* wait for `add1()` to complete).
+* *add6 calls add3 without using asynchronous, although add3 is decorated with async. When a function in the canister calls others functions, even if which is an asynchronous function, it can be called synchronously.*
+   `add6` will not wait for `add3()` to complete. Instead `add3()` will execute and finish asynchronously to `add6`. This example is similar to `add5` (except that `add6` could choose to await the `async ()` result of `add3()`, while `add5` cannot await the `()` result of `add1()`.
+* *add7 calls add3 with using asynchronous*
+   `add7` waits for  `add3()` to complete but discards the value before returning `c` or propagates the error thrown by `add3()`.
+
+-------------------------
+

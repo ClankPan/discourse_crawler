@@ -1,0 +1,136 @@
+tomijaga | 2023-11-27 20:14:50 UTC | #1
+
+Hello Motoko devs, I'm excited to introduce you to the MemoryBuffer library, a buffer that leverages the recently released  [Stable Regions](https://forum.dfinity.org/t/motoko-stable-regions/19182) in Motoko. Drawing Inspiration from @matthewhammer's [initial stable buffer example for arbitrary-sized blobs](https://github.com/dfinity/motoko-base/pull/550), I've refined and expanded upon it to develop a robust and dynamic persistent buffer. This solution efficiently utilizes the expanding capacity of stable memory, currently scaling up to 64 GB, to allocate memory for values of any size.
+
+## Core Components
+
+This implementation revolves around two primary modules:
+
+1. **MemoryBuffer:** A buffer that stores its values in stable memory.
+2. **MemoryRegion:** A utility for managing memory allocation and deallocation.
+
+> **Caution:** *The structure of both modules is likely to change. I advise against using it in production environments at this stage. This post showcases the current implementation of a persistent buffer and aims to refine it further through community feedback. If you find any bugs, please open an issue [here](https://github.com/NatLabs/memory-buffer/issues).*
+
+### MemoryRegion
+- **Repository:** [MemoryRegion on GitHub](https://github.com/NatLabs/memory-region#readme), [and mops](https://mops.one/memory-region)
+- **Function:** Allocates and recycles memory blocks efficiently, storing only the addresses and sizes of deallocated memory blocks for later use. It leverages @icme's [stable BTreeMap](https://github.com/canscale/StableHeapBTreeMap) library for efficiently storing and retrieving memory blocks in `O(log n)` time.
+- **Internal Structure:** The MemoryRegion stores deallocated memory blocks using two btrees:
+	- `BTree<address: Nat, size: Nat>` 
+		- Sorts memory blocks by their addresses, enabling efficient merging of adjacent memory blocks. This approach helps optimize memory usage on the heap and reduces fragmentation.
+	- `BTree<size: Nat, Set<address: Nat>>` 
+		- Sorts memory blocks by sizes, requiring that each block in the previous btree is duplicated.
+		- This design supports the retrieval of the smallest block that is equal to or greater than a requested size. In cases where the selected block is larger than needed, it is split and reinserted into the btree, while ensuring that both btrees ar synchronized.
+
+### MemoryBuffer
+- **Repository:** [MemoryBuffer on GitHub](https://github.com/NatLabs/memory-buffer#readme), [and mops](https://mops.one/memory-region)
+- **Design:** The design of MemoryBuffer is centered around two distinct Regions. The first, the Blob Region, stores the buffer's serialized values. The second region is reserved for pointers, which track the location and size of the serialized data. This dual-region approach allows for dynamic allocation of arbitrarily sized data while ensuring quick access through a set of fixed-sized pointers in the pointers region. However, it's important to note that there is a slight memory trade-off. Each value added to the buffer requires an extra 12 bytes for storing its pointers in stable memory.
+#### Understanding the Structure
+![Pasted image 20231030014831|648x500](upload://XiC49KpZcFWKyaQNi88BE4Dr3p.png)
+
+
+To access an element, we first locate its pointer in the pointers region by multiplying the desired index by 12 (each pointer's size). For instance, index 4's pointer is at address 48 in the pointers region. Reading the first 8 bytes gives us the address, and the following 4 bytes provide the size of the memory block. This enables a direct path to the value:
+
+
+![Screenshot 2023-11-27 at 10.58.54 AM|690x48](upload://xzlqeVGroG1iNXv0aC7OfSYsIj0.png)
+
+
+#### Blobify
+The `MemoryBuffer` requires that each value be serialized to a `Blob` type before it can be stored in stable memory. The `Blobify` module offers a generic interface for serializing and deserializing that data. It also provides default implementations for the primitive types in motoko.
+Here's a snippet displaying the interface with an example using the `to_candid()` and `from_candid()` methods.
+
+> **Consideration:** Custom serialization methods may be more memory-efficient compared to `to_candid()` and `from_candid()`, which are optimized for inter-canister communication rather than compact storage.
+
+```typescript
+public type Blobify<T> = {
+      to_blob: (T) -> Blob;
+    from_blob: (Blob) -> T;
+}
+
+public let blobify_data: Blobify<Data> = {
+    to_blob = func (data: Data) : Blob {
+		to_candid(data);
+	}; 
+	from_blob = func (blob: Blob) : Data {
+		let ?data : ?Data = from_candid(blob);
+		data 
+	};
+};
+```
+
+## Performance Benchmarks
+
+Benchmarks were carried out with 10k `Nat` entries for each function with the incremental GC and [`mops bench`](https://docs.mops.one/cli/mops-bench). Here's how the MemoryRegion and MemoryBuffer perform against their base lib counterparts.
+#### MemoryRegion vs Region
+MemoryRegion generates more instructions compared to the Region but offers features that the **Region** does not support.
+
+**Instructions**
+
+|              |  allocate() | deallocate() | deallocate() merge blocks | allocate() reallocation |
+| :----------- | ---------: | -----------: | ------------------------: | ---------------------: |
+| Region       |  7_690_443 |        ----- |                     ----- |                  ----- |
+| MemoryRegion | 12_540_675 |   90_775_947 |               239_162_910 |             84_871_033 |
+
+**Heap**
+
+|              | allocate() | deallocate() no merge | deallocate() merging blocks | allocate() reuse stored blocks |
+| :----------- | --------: | -----------: | ------------------------: | ---------------------: |
+| Region       |     9_140 |        ----- |                     ----- |                  ----- |
+| MemoryRegion |     9_140 |    1_735_636 |                 4_217_956 |              2_326_636 |
+
+### Buffer vs MemoryBuffer
+The MemoryBuffer, in comparison to the standard Buffer, offers larger storage capacity but at the cost of slower operations and more instructions, primarily due to the intensive stable memory read/write processes and the serialization required for each added element. 
+Moreover, the last four functions introduce an extra cost compared to the first three. They involve deallocating and reallocating memory, which increases the instruction count and heap allocations of these operations. 
+
+**Instructions**
+
+| Methods             |         Buffer |  MemoryBuffer |
+| :------------------ | -------------: | ------------: |
+| add()               |      7_506_635 |    37_471_730 |
+| get()               |      2_442_253 |    22_743_302 |
+| put()   new_bytes == prev_bytes|      2_803_133 |    26_629_193 |
+| put()   new_bytes > prev_bytes |      3_143_921 |    89_478_142 |
+| remove()            | 10_855_068_046 | 1_438_465_552 |
+| insert()            |  9_555_436_925 | 1_374_513_438 |
+| removeLast()        |      5_543_704 |   377_115_486 |
+
+**Heap**
+
+| Methods             |  Buffer | MemoryBuffer |
+| :------------------ | ------: | -----------: |
+| add()               | 154_740 |      687_984 |
+| get()               |   9_008 |      762_888 |
+| put() (new == prev) |   9_008 |      687_936 |
+| put() (new > prev)  |   9_008 |    1_711_632 |
+| remove()            |  57_716 |    3_441_436 |
+| insert()            | 154_896 |    2_305_752 |
+| removeLast()        |  57_700 |    6_300_332 |
+
+> *Benchmarks were generated using @zenvoich's mops
+> Generated by running [`mops bench`](https://docs.mops.one/cli/mops-bench) in the project directory*
+
+### Prospective Improvements
+The benchmark data reveals that the bottleneck for the MemoryBuffer is deallocating and reallocating memory blocks with the MemoryRegion. To address these issues, several enhancements are being considered:
+
+- **Adopting Optimized Data Structures:** Moving from the dual-b-tree structure to a more specific **Max Value B+Tree** store in the MemoryRegion. This new structure can retrieve and split the largest memory block in `O(log n)` time while preserving the performance of its various functions. An additional benefit of this single data-structure approach is it eliminates the need to duplicate memory blocks and operations previously required to synchronize the two B-trees. Current progress on a set of augmented btrees for this and other more general purposes can be found [here](https://github.com/NatLabs/augmented-btrees#readme)
+- **Heap Cache Implementation:** An LRU cache on the heap for the  MemoryBuffer might accelerate access to frequently used elements and pointers, reducing the overhead of disk reads and writes.
+- **Class-based Interface:** Considering a shift from imperative to a class-based model for the MemoryBuffer. This approach is easier to work with and allows functions to be passed into the buffer during initialization. This model enables the buffer to send notifications to the owner or execute custom functions when stable memory is running low.
+
+If there are any suggestions, recommendations or ideas for improvements, please feel free to share them below.
+
+## Questions?
+- **Performance Metrics:** What's the best indicator of performance? The Instructions count, heap allocations or total cycles consumed? Is there a way to derive the cycles consumed from the number of instructions and heap allocations?
+
+-------------------------
+
+Gekctek | 2023-11-27 22:43:34 UTC | #2
+
+Great work. This will be super helpful
+
+-------------------------
+
+cryptoschindler | 2024-01-24 10:14:56 UTC | #3
+
+could be worth adding this to [awesome motoko](https://github.com/motoko-unofficial/awesome-motoko)
+
+-------------------------
+

@@ -1,0 +1,344 @@
+jzxchiang | 2022-01-22 19:49:52 UTC | #1
+
+As of today, wasmtime has [implemented](https://github.com/bytecodealliance/wasmtime/blob/e0c8961333b2c1c82d59b726f4ef0b09d889f4d1/docs/stability-wasm-proposals-support.md):
+
+* bulk memory operations
+* memory64
+* multi-memory
+
+The first is fully standardized. The latter two are in a late [stage](https://github.com/WebAssembly/proposals/blob/main/README.md) of standardization. IMO it's only a matter of time (i.e. 1-2 years) before they are fully standardized.
+
+-----
+
+In Motoko, stable memory is accessed either via stable variables or via the new ExperimentalStableMemory library.
+
+The first is dev-friendly and fast, but requires annoying (and expensive) preupgrade and postupgrade hooks to copy data from IC's stable memory to the canister wasm's linear memory (and vice versa). Of course, that means this is limited by a canister wasm's linear memory, which is currently 4 GB. (In reality, it's less, closer to 2 GB or 3 GB depending on the Motoko GC you use during compilation.) These hooks can also trap if they hit a cycle limit, which is bad.
+
+The second is safe and gives access to more storage, up to 300 GB supposedly. But it's not dev-friendly at all. You have to manually convert high-level data structures like Tries into low-level reads and writes on primitives like Nat32 and Blob. It's also slower at runtime due to System API calls, but as a result also requires no preupgrade and postupgrade hooks. Unfortunately, it's also marked as experimental so probably not safe to rely on long-term.
+
+-----
+
+I'm wondering what the plan is regarding stable memory in 2022, given the recent developments in wasmtime. I'm especially curious about Motoko, which is what I use.
+
+Stable memory is really important. Almost all canisters will need to be upgraded at some point, so most data on the IC actually needs to be stored in stable memory.
+
+My understanding from reading this [thread](https://forum.dfinity.org/t/increased-canister-smart-contract-memory/6148/) is that the best way forward is to:
+
+* Store stable memory (which is 64-bit) in a separate 64-bit wasm memory, which is now possible due to  wasmtime having implemented memory64 and multi-memory
+* Amend the System API (or other low-level IC interface) to allow that new wasm memory to cheaply "persist" to IC stable memory, without relying on expensive System API calls through the existing stable memory interface (e.g. `ic0.stable64_read`)
+* Implement cross-memory garbage collection, which is necessary in a high-level language like Motoko
+
+Does that sound right? If so, is this on the roadmap for this year?
+
+Dealing with storage on the IC is perhaps the biggest headache I've encountered while developing. It'd be great to have a more unified interface to stable memory, without having to worry about a bunch of gotchas (that are typically gleaned from some post hidden in some thread).
+
+Thank you!
+
+-------------------------
+
+claudio | 2022-01-23 22:33:18 UTC | #2
+
+[quote="jzxchiang, post:1, topic:10433, full:true"]
+
+
+* Store stable memory (which is 64-bit) in a separate 64-bit wasm memory, which is now possible due to  wasmtime having implemented memory64 and multi-memory
+* Amend the System API (or other low-level IC interface) to allow that new wasm memory to cheaply "persist" to IC stable memory, without relying on expensive System API calls through the existing stable memory interface (e.g. `ic0.stable64_read`)
+* Implement cross-memory garbage collection, which is necessary in a high-level language like Motoko
+[/quote]
+
+I would say the first two points have always been on the roadmap in the sense that the system API was initially conceived with the intention to ultimately replace it by much more efficient multiple memories (and now 64-bit) multiple memories. I have no insight into the scheduling of that work though.
+
+Regarding Motoko cross-memory garbage collection: that would be nice, if only it were that simple. 
+
+One of the challenges of stable memory is that is more than just some extra store: to be useful for upgrade, the format of the data it contains must be compatible across not only canister but compiler upgrades. It is for that reason than Motoko actually copies out the stable variable data to an (extension of) Candid instead of doing just a raw dump of the stable variable heap representation. We want to decouple the representation of the data at rest from the in-flight data representation so the compiler is free to evolve in memory representation as it likes, e.g. to adopt 64-bit pointers or change the object representation or whatever. So the honest answer is that we would love to do something better, have discussed it internally frequently, but don't really know what that something is at the moment. In the short term, Motoko could certainly take advantage of native Wasm access to stable memory, for example, to improve the perf of ExperimentalStableMemory.mo and eventually offer something better. 
+
+(I do wonder how easy it would be for Rust to take much advantage of Wasm multiple memories, since it presumably requires LLVM  and Rust code to be aware of multiple memories and produce Wasm instructions exploiting them.)
+
+In the near term, there is other work afoot that will hopefully reduce the risk associated with running out of cycles during Motoko stable variable serialization in the upgrade hooks as well as plans to mitigate the space overhead of stable variable serialization which currently does more copying than it should (serializing into main memory before copying out to stable memory and vice versa). Multiple memory instructions would make optimizing serialization both easy and cheap.
+
+Of course, another alternative would be to use stable memory for a more traditional in-memory database or file system that might be easier to expose to Rust and provide a more tried and trusted route to upgrade safety, by decoupling application state from the transient, run-time data representation that can and arguably should be able to change from one version of the compiler to the next. Orthogonal persistence is all very well, until you need to consider the ability to upgrade, where having an explicit, independent representation of the application state turns out to be very handy.
+
+I'd love to hear suggestions about how to move forward, or pointers to existing work in this area.
+
+-------------------------
+
+jzxchiang | 2022-01-24 23:51:12 UTC | #3
+
+Thanks, this is a helpful overview.
+
+> It is for that reason than Motoko actually copies out the stable variable data to an (extension of) Candid instead of doing just a raw dump of the stable variable heap representation.
+
+Is the purpose of Candid here to check that a canister's stable memory at some version A is compatible with its stable memory at some version B?
+
+Let's say I don't change my Motoko code between A and B, but I do upgrade my `moc` canister. But `moc` changed the format of how stable variables in laid out in stable memory. So now I get a Candid warning when trying to upgrade. What can I even do about that? Is my only choice to downgrade my compiler version and file an issue on Github?
+
+> In the short term, Motoko could certainly take advantage of native Wasm access to stable memory, for example, to improve the perf of ExperimentalStableMemory.mo and eventually offer something better.
+
+How different would that "something better" look like compared to ExperimentalStableMemory.mo? A big concern I have with relying on that library right now is that it's marked "experimental". I wonder what a new API would look like.
+
+> In the near term, there is other work afoot that will hopefully reduce the risk associated with running out of cycles during Motoko stable variable serialization in the upgrade hooks as well as plans to mitigate the space overhead of stable variable serialization which currently does more copying than it should (serializing into main memory before copying out to stable memory and vice versa).
+
+Is this perhaps an advantage of splitting up a single canister into multiple canisters?
+
+For example, if your one canister stores a bunch of "tables" (e.g. users, posts, topics), maybe it's better to split that canister into 3 separate ones, one for users, one for posts, one for topics. Then, if you need to update the schema for a topic, you would only need to upgrade the topics canister, which would incur a smaller cycle cost, since only the stable memory for the topics canister needs to be serialized and deserialized. Also, each canister would get access to its own 4 GB (potentially up to 300 GB) of stable memory. Is that a fair assessment?
+
+-------------------------
+
+rossberg | 2022-01-25 14:20:09 UTC | #4
+
+The reuse of Candid's serialisation mechanism to save stable variables is just an implementation detail (and in retrospect, probably a bad one that will change eventually). It is not semantically observable by the programmer.
+
+-------------------------
+
+lastmjs | 2022-01-27 14:00:10 UTC | #5
+
+Just a suggestion to not give up on the dream of orthogonal persistence, where developers can store very large amounts of data in data structures existing in the same memory their code runs in without hassle. I hope we can work towards the linear memory or heap being increased greatly and abstracting away the concept of stable memory. I don't want to have to think about all of that as a developer (even a developer of libraries).
+
+Is there an in-depth explanation of how memory is working on the IC? I don't quite understand all of the limitations and how/why stable memory is necessary, the serialization required, etc. I'd love to dig in more to try and come up with solutions.
+
+-------------------------
+
+PaulLiu | 2022-01-27 16:44:46 UTC | #6
+
+[quote="lastmjs, post:5, topic:10433"]
+I hope we can work towards the linear memory or heap being increased greatly and abstracting away the concept of stable memory. I don’t want to have to think about all of that as a developer (even a developer of libraries)
+[/quote]
+
+Fully agree with this. I recently [wrote about my thoughts](https://github.com/ninegua/tipjar/blob/main/NOTES.md#do-canisters-dream-of-lookup-tables) in designing the data schema for tipjar. Essentially I used mutually recursive data types instead of normalized tables like in a database.
+
+Basically I don't want to keep upgrading my canisters. In almost all other blockchains, smart contracts are designed to be immutable, and people seem to be fine with that. So give me linear memory (that can grow as needed) and I'd be fine not having to think about stable memory & upgrades.
+
+-------------------------
+
+rossberg | 2022-01-27 20:03:51 UTC | #7
+
+@PaulLiu, if you never want to upgrade, then you indeed don't have to bother with stable memory, even now.
+
+-------------------------
+
+jzxchiang | 2022-02-25 02:01:14 UTC | #8
+
+I totally agree with this sentiment. Orthogonal persistence was one of the main things that attracted me to the IC (from a purely programming perspective, not even blockchain related).
+
+> Fully agree with this. I recently [wrote about my thoughts ](https://github.com/ninegua/tipjar/blob/main/NOTES.md#do-canisters-dream-of-lookup-tables) in designing the data schema for tipjar. Essentially I used mutually recursive data types instead of normalized tables like in a database.
+
+Interesting, thanks for sharing. By "direct object references", do you just mean nested objects? Like a User record directly contains an array of Allocation records? I wasn't aware that could be mutually recursive.
+
+Do you mean this would work?
+
+```
+type A = {
+    b : B;
+};
+
+type B = {
+    a : A;
+};
+```
+
+(I would try this out but I'm on a phone right now.)
+
+-------------------------
+
+jzxchiang | 2022-02-25 02:03:39 UTC | #9
+
+Just to follow up on this, I believe I will hit memory limits using Motoko stable variables very soon. There are workarounds, but I wanted to ask...
+
+What is your plan with `ExperimentalStableMemory`? Can I build on it? Will the interface change in the near future?
+
+-------------------------
+
+claudio | 2022-10-28 15:57:30 UTC | #10
+
+(@Manu asked someone to follow up on this)
+
+The library is marked experimental because its rather easy to shoot yourself in the foot. In particular, without coordination, separate libraries that import `ExperimentalStableMemory` can easily wind up trashing each others' memory.
+
+That said, I you can build on this if you are careful. The library will at most  be replaced by something roughly similar but with better isolation guarantees.
+
+Regarding the recent extension of stable memory limits from 8GB to 32GB:
+
+The library already use 64-bit addresses so supports the 32GB stable memory limit out of the box.
+However, in order to do that, you do need to tell the compiler how many stable memory pages (at most) to dedicate to ExperimentalStableMemory.mo using the `--max-stable-pages <n>` compiler flag. (With dfx, you can set this with the optional "args" string property of a motoko canister in the dfx.json file - this contains additional command line arguments to pass to the `moc` compiler during a build.)
+
+By default, the compiler allows at most 65536 (64K) pages (4GB), reserving the remainder (previously 4GB, but now 28GB) for  Motoko stable variable storage.
+
+From https://github.com/dfinity/motoko-base/blob/master/src/ExperimentalStableMemory.mo:
+
+> Memory is allocated, using* `grow(pages)` *, sequentially and on demand, in units of 64KiB pages, starting with 0 allocated pages. New pages are zero initialized. Growth is capped by a soft limit on page count controlled by compile-time flag `--max-stable-pages <n>` (the default is 65536, or 4GiB).
+
+> ...
+
+> NB: The IC's actual stable memory size (`ic0.stable_size`) may exceed the page size reported by Motoko function* `size()` . This (and the cap on growth) are to accommodate Motoko's stable variables. Applications that plan to use Motoko stable variables sparingly or not at all can increase `--max-stable-pages` as desired, approaching the IC maximum (currently 8GiB). All applications should reserve at least one page for stable variable data, even when no stable variables are used.
+
+A tutorial sample using `ExperimentalStableMemory` is here (thought it doesn't mention the compiler flag): 
+
+https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/stablememory/
+
+
+(An example on passing (other) command line args to moc via dfx.json is here https://forum.dfinity.org/t/stable-types-build-error-moving-to-0-9-3-and-later-versions-of-the-sdk/15225/35?u=claudio)
+
+-------------------------
+
+tomijaga | 2022-11-15 20:14:09 UTC | #11
+
+@claudio Thanks for making this post! It's very helpful.
+I have a question about setting the `--max-stable-pages` of canisters created dynamically (from a parent canister). Do they take the max pages from their parent? Or is there a different way to set them
+
+-------------------------
+
+claudio | 2022-11-15 23:17:27 UTC | #12
+
+Do you mean do the instances of an imported actor class receive the same `--max-stable-pages` setting as the importing actor. 
+
+Yes, I think that will be the case.
+
+-------------------------
+
+tomijaga | 2022-11-16 09:00:05 UTC | #13
+
+Yes, that's what I mean, creating an instance of another canister. 
+Thank you!
+
+-------------------------
+
+skilesare | 2022-11-30 13:51:44 UTC | #14
+
+Is there any hope of the stable variable in motoko being tied to the stable memory we are talking about here?  I'm guessing the stable variable use case is still limited to the 8GB heap(and now we can use most of it because of the better streaming upgrade code)?
+
+-------------------------
+
+claudio | 2022-11-30 20:47:02 UTC | #15
+
+Stable variables reside in the 4GB main heap in flight, and get copied to/from stable memory only during upgrade, so the 4GB limit still applies, I'm afraid.
+
+You can now access up to  32GB (was 8GB) using stable memory, though you should  reserve up to 4GB for any stable variables you may use.
+
+-------------------------
+
+jzxchiang | 2022-12-01 01:38:16 UTC | #16
+
+I wonder if it's possible to make stable variables directly store their bytes in stable memory, given the new performance improvements in using the System API.
+
+That way, memory type (i.e. heap, stable memory) is completely transparent to the developer.
+
+-------------------------
+
+rossberg | 2022-12-01 07:42:10 UTC | #17
+
+The overhead of storing stable data in stable memory is not just because of stable memory itself being more costly, it also is because a stable _data layout_ is necessarily less efficient and flexible. In particular, storing something in a stable variable would then require not just moving a pointer, but a _deep copy_ of the entire data _each time_, which can have extremely intransparent cost.
+
+Moreover, stable data layout _can never be changed_, so, it would never be possible to tune memory layout, GC, etc. for it.
+
+So, while it is possible in principle to store stable data in stable memory, in practice  it would likely still be many times more costly, with no chance of future improvement.
+
+-------------------------
+
+jzxchiang | 2022-12-01 07:59:58 UTC | #18
+
+Dumb question, but why can stable data layout not be changed? And why can't pointers be used?
+
+I thought each canister had their own stable memory. Or is it because the heap can be wiped during canister upgrade but stable memory cannot? I think I'm missing something.
+
+-------------------------
+
+rossberg | 2022-12-01 08:03:55 UTC | #19
+
+The pointer cannot be used when it points into non-stable memory, because then the data wouldn't be stable.
+
+The layout cannot be changed because the whole point of stable memory is that it survives upgrades and remains usable afterwards. Since the upgraded code may have been compiled with an arbitrary future version of the Motoko compiler, that arbitrary future version needs to remain compatible with the old stable memory layout.
+
+-------------------------
+
+skilesare | 2022-12-01 16:15:09 UTC | #20
+
+And we are still waiting on wasm to add 64 bit support so the heap can grow to more than 4GB right?  Any movement on that front?
+
+-------------------------
+
+cyberowl | 2022-12-12 11:46:30 UTC | #21
+
+Quick question. Let's say I have a canister with 2GB of user data. I change the data type and now have to copy all the data in `postupgrade` in order to upgrade the canister without wiping the data. Would I be able to upgrade? What if I have 3GB of user data?
+
+-------------------------
+
+Samer | 2023-02-07 13:51:51 UTC | #22
+
+As someone who is writing [documentation for Motoko](https://7po3j-syaaa-aaaal-qbqea-cai.ic0.app/title-page.html), I would love to know how to present the use of stable vars and stable memory to programmers.
+
+Right now it isn't clear what best practices should be.
+
+One idea I had while tinkering with a stable memory lib for my project, is to implement some kind of **'Memory Boot Record'** in stable memory and initiate code from there.
+
+I'm not sure
+
+-------------------------
+
+skilesare | 2023-02-07 14:08:25 UTC | #23
+
+It is a great question.  The "stable" keyword is currently confusing as it only has tangential relevance to "stable memory".  My understanding is that @matthewhammer  is working on generalizing "stable memory" in a similar manner to "stable", including garbage collection. I'm not sure how this will affect the vocabulary, but it is unlikely we go backward.  "stable" should probably have been "managed" or some something else.  Perhaps we get a breaking change at some point.
+
+-------------------------
+
+matthewhammer | 2023-02-07 18:14:51 UTC | #24
+
+[quote="skilesare, post:23, topic:10433"]
+My understanding is that @matthewhammer is working on generalizing “stable memory” in a similar manner to “stable”, including garbage collection.
+[/quote]
+
+The MVP will only be a small generalization over what is now called `ExperimentalStableMemory`, giving independent, dynamically allocatable `Region`s (there is now only one global stable memory region that can be grown, like a pre-allocated, shared `Region` in the new terminology).
+
+In particular, the new API will still be:
+
+- low level, with operations like `grow` and `loadBlob` and `storeBlob` taking offsets into a `Region`'s big array of bytes.
+- compatible with stable vars, another more "high level" way to represent stable data that is orthogonal, but uses the same IC-level machinery under the hood (namely, stable memory space).
+
+Eventually, we want the `Region` type to be collected by GC, but that's not part of the MVP.
+
+In terms of the larger story about stable data in Motoko, there's expectations that eventually, the IC execution layer will generalize stable memory so that it can be as inexpensive and plentiful as ordinary canister memory is today.
+
+If and when that shift happens, lots of things will likely change in the Motoko GC story, and the Rust stable memory story too.  I don't have a timeline for that shift, but it seems inevitable given enough time for things to evolve, as it seems like the most faithful way to realize the "orthogonal persistence" promise.  cc @claudio @luc-blaeser
+
+-------------------------
+
+claudio | 2023-02-08 08:37:02 UTC | #25
+
+ In addition to the Motoko doc on stable variables and upgrades there is this example you might find useful:
+
+https://github.com/dfinity/examples/blob/master/motoko/life/README.md
+
+-------------------------
+
+cyberowl | 2023-03-23 05:40:38 UTC | #26
+
+Is the following a good dfx.json example on how to update stable memory?
+```
+{
+  "version": 1,
+  "dfx": "0.13.1",
+  "canisters": {
+    "hello": {
+      "type": "motoko",
+      "main": "src/hello/main.mo",
+      "args": "-v --max-stable-pages 786432"
+    }
+  },
+  "defaults": {
+    "build": {
+      "packtool": "",
+      "args": ""
+    }
+  },
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:8000",
+      "type": "ephemeral"
+    }
+  }
+}
+```
+
+Then we just need to use "mo:base/ExperimentalStableMemory" to store correct?
+
+-------------------------
+

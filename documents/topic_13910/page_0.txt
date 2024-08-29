@@ -1,0 +1,208 @@
+neokree | 2022-06-19 09:55:44 UTC | #1
+
+Hello everyone,
+
+When trying to play with the EXT standard I was blocked with this build error, that I can't understand why it happens in my code but not in the EXT token example code. 
+
+My code:
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=2075416228
+
+The original EXT example code. I'm trying to replicate the metadata structure. 
+```
+/*
+ERC721 - note the following:
+-No notifications (can be added)
+-All tokenids are ignored
+-You can use the canister address as the token id
+-Memo is ignored
+-No transferFrom (as transfer includes a from field)
+*/
+
+import Cycles "mo:base/ExperimentalCycles";
+import HashMap "mo:base/HashMap";
+import Principal "mo:base/Principal";
+import Result "mo:base/Result";
+import Iter "mo:base/Iter";
+
+//Get the path right
+import AID "mo:ext/util/AccountIdentifier";
+import ExtCore "Core";
+import ExtCommon "mo:ext/Common";
+import ExtNonFungible "mo:ext/NonFungible";
+
+shared (install) actor class ExtNFT() = this {
+  
+  // Types
+  type AccountIdentifier = ExtCore.AccountIdentifier;
+  type SubAccount = ExtCore.SubAccount;
+  type User = ExtCore.User;
+  type Balance = ExtCore.Balance;
+  type TokenIdentifier = ExtCore.TokenIdentifier;
+  type TokenIndex  = ExtCore.TokenIndex ;
+  type Extension = ExtCore.Extension;
+  type CommonError = ExtCore.CommonError;
+  type BalanceRequest = ExtCore.BalanceRequest;
+  type BalanceResponse = ExtCore.BalanceResponse;
+  type TransferRequest = ExtCore.TransferRequest;
+  type TransferResponse = ExtCore.TransferResponse;
+  type Metadata = ExtCommon.Metadata;
+  type MintRequest  = ExtNonFungible.MintRequest ;
+  
+  private let EXTENSIONS : [Extension] = ["@ext/common", "@ext/nonfungible"];
+  
+  //State work
+  private stable var _registryState : [(TokenIndex, AccountIdentifier)] = [];
+  private var _registry : HashMap.HashMap<TokenIndex, AccountIdentifier> = HashMap.fromIter(_registryState.vals(), 0, ExtCore.TokenIndex.equal, ExtCore.TokenIndex.hash);
+	
+	private stable var _tokenMetadataState : [(TokenIndex, Metadata)] = [];
+  private var _tokenMetadata : HashMap.HashMap<TokenIndex, Metadata> = HashMap.fromIter(_tokenMetadataState.vals(), 0, ExtCore.TokenIndex.equal, ExtCore.TokenIndex.hash);
+  
+  private stable var _supply : Balance  = 0;
+  private stable var _minter : Principal  = install.caller;
+  private stable var _nextTokenId : TokenIndex  = 0;
+
+
+  //State functions
+  system func preupgrade() {
+    _registryState := Iter.toArray(_registry.entries());
+    _tokenMetadataState := Iter.toArray(_tokenMetadata.entries());
+  };
+  system func postupgrade() {
+    _registryState := [];
+    _tokenMetadataState := [];
+  };
+
+	public shared(msg) func setMinter(minter : Principal) : async () {
+		assert(msg.caller == _minter);
+		_minter := minter;
+	};
+	
+  public shared(msg) func mintNFT(request : MintRequest) : async TokenIndex {
+		assert(msg.caller == _minter);
+    let receiver = ExtCore.User.toAID(request.to);
+		let token = _nextTokenId;
+		let md : Metadata = #nonfungible({
+			metadata = request.metadata;
+		}); 
+		_registry.put(token, receiver);
+		_tokenMetadata.put(token, md);
+		_supply := _supply + 1;
+		_nextTokenId := _nextTokenId + 1;
+    token;
+	};
+  
+  public shared(msg) func transfer(request: TransferRequest) : async TransferResponse {
+    if (request.amount != 1) {
+			return #err(#Other("Must use amount of 1"));
+		};
+		if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(request.token));
+		};
+		let token = ExtCore.TokenIdentifier.getIndex(request.token);
+    let owner = ExtCore.User.toAID(request.from);
+    let spender = AID.fromPrincipal(msg.caller, request.subaccount);
+    let receiver = ExtCore.User.toAID(request.to);
+		
+    switch (_registry.get(token)) {
+      case (?token_owner) {
+				if(AID.equal(owner, token_owner) == false) {
+					return #err(#Unauthorized(owner));
+				};
+				if (AID.equal(owner, spender) == false) {
+					return #err(#Unauthorized(spender));
+				};
+				_registry.put(token, receiver);
+				return #ok(request.amount);
+      };
+      case (_) {
+        return #err(#InvalidToken(request.token));
+      };
+    };
+  };
+
+  public query func getMinter() : async Principal {
+    _minter;
+  };
+  public query func extensions() : async [Extension] {
+    EXTENSIONS;
+  };
+  
+  public query func balance(request : BalanceRequest) : async BalanceResponse {
+		if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(request.token));
+		};
+		let token = ExtCore.TokenIdentifier.getIndex(request.token);
+    let aid = ExtCore.User.toAID(request.user);
+    switch (_registry.get(token)) {
+      case (?token_owner) {
+				if (AID.equal(aid, token_owner) == true) {
+					return #ok(1);
+				} else {					
+					return #ok(0);
+				};
+      };
+      case (_) {
+        return #err(#InvalidToken(request.token));
+      };
+    };
+  };
+  
+	public query func bearer(token : TokenIdentifier) : async Result.Result<AccountIdentifier, CommonError> {
+		if (ExtCore.TokenIdentifier.isPrincipal(token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(token));
+		};
+		let tokenind = ExtCore.TokenIdentifier.getIndex(token);
+    switch (_registry.get(tokenind)) {
+      case (?token_owner) {
+				return #ok(token_owner);
+      };
+      case (_) {
+        return #err(#InvalidToken(token));
+      };
+    };
+	};
+  
+	public query func supply(token : TokenIdentifier) : async Result.Result<Balance, CommonError> {
+    #ok(_supply);
+  };
+  
+  public query func getRegistry() : async [(TokenIndex, AccountIdentifier)] {
+    Iter.toArray(_registry.entries());
+  };
+  public query func getTokens() : async [(TokenIndex, Metadata)] {
+    Iter.toArray(_tokenMetadata.entries());
+  };
+  
+  public query func metadata(token : TokenIdentifier) : async Result.Result<Metadata, CommonError> {
+    if (ExtCore.TokenIdentifier.isPrincipal(token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(token));
+		};
+		let tokenind = ExtCore.TokenIdentifier.getIndex(token);
+    switch (_tokenMetadata.get(tokenind)) {
+      case (?token_metadata) {
+				return #ok(token_metadata);
+      };
+      case (_) {
+        return #err(#InvalidToken(token));
+      };
+    };
+  };
+
+  public query func getActor() : async Principal {
+    Principal.fromActor(this)
+  }
+}
+```
+
+Can anyone help me?
+
+-------------------------
+
+neokree | 2022-06-19 10:51:18 UTC | #2
+
+ok I found out the solution. The EXT token standard implements in the Core a submodule called  `TokenIndex` (which is `ModuleIndex` in my play) and that implements the equals and hash functions, which i thought were automatically applied from the `Nat` type. 
+
+Also, seems like Motoko doesn't automatically import methods of primitive types like Nat and Nat32, so I added the import from `mo:base/Nat` to use `Nat.equals`
+
+-------------------------
+

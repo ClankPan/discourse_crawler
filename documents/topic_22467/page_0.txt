@@ -1,0 +1,144 @@
+Iceypee | 2023-08-30 19:11:06 UTC | #1
+
+Can you accept cycles inside a query function?
+
+![image|690x47](upload://9jatrMYxSZ9qu0P4JvEXVN8C3Ir.png)
+
+I hope the image isn't too small but it says ic0_msg_cycles_accept128 cannot be executed in replicated query mode. Does this mean query calls cannot accept cycles? Or did I do something wrong in the code?
+
+If queries cannot accept a cycles fee along with no intercanister calls to transfer some kind of wrapped cycles or convert icp to cycles. How can one prevent prevent a query call ddos? 
+
+I know right now one of the forum posts stated query response and calls are free. But for the future that won't be true and a gas fee needs to be accepted.
+
+-------------------------
+
+bogwar | 2023-08-31 10:31:21 UTC | #2
+
+At the moment query methods cannot accept cycles. One way to avoid DoS attacks is to make it so that query methods reject early if invoked in a replicated execution context. 
+
+For this, one needs to determine if the method is invoked in replicated mode or unreplicated mode. This can be done (although it's a bit hacky) by checking the existence of a certificate using ic0.data_certificate_present. Since the certificate is available only in unreplicated execution and this method returns 1 if the certificate is present and 0 otherwise, it essentially tells you if execution is replicated or not. 
+
+Another (perhaps more cumbersome way) is to add at the application level some registration/rate limiting/subscription mechanism where callers first need to deposit cycles with the callee and only service requests from callers that have prepaid.
+
+-------------------------
+
+Iceypee | 2023-09-01 17:55:21 UTC | #3
+
+Appreciate it. Now I have three follow up questions.
+1. since queries arent charged yet, it doesnt matter if they cant accept cycles. Once they do start taking cycles from the canister, will that fact change and we can call expirementalCycles.accept() inside it?
+2. How is this done in motoko?
+>For this, one needs to determine if the method is invoked in replicated mode or unreplicated mode. This can be done (although it’s a bit hacky) by checking the existence of a certificate using ic0.data_certificate_present. Since the certificate is available only in unreplicated execution and this method returns 1 if the certificate is present and 0 otherwise, it essentially tells you if execution is replicated or not.
+
+
+
+3. Is it possible to ddos that application level function?
+>Another (perhaps more cumbersome way) is to add at the application level some registration/rate limiting/subscription mechanism where callers first need to deposit cycles with the callee and only service requests from callers that have prepaid.
+
+Lets just say  I spam this function 1000000 times without actually paying. Updates are supposedly like 100 times more expensive right? I mean once queries start charging canisters they are hypothetically ddos-able too right? But putting it in an update would just make things worse, no?
+```
+public func deposit_cycles: async Nat
+{
+ ExperimentalCycles.accept(1000000)
+assert(//cycls accepted)
+return 5
+}
+```
+
+-------------------------
+
+bogwar | 2023-09-04 07:27:55 UTC | #4
+
+1. There may be some confusion in our discussion: the *replicated* execution of query methods is already charged to the canister that is called. This is the case, for example, whenever a canister calls such a method.  So it makes sense to think through these issues already and what I was suggesting was a couple of ways to protect against cycles depletion through queries in replicated execution. 
+
+What is not charged right now (but will most likely change in the future) is their *unreplicated* execution.
+
+2. I'm not sure what "this" refers to
+
+3. Do you mean ddos ic0.data_certificate_present? That's a system API method called by the canister as part of a guard to not perform expensive computation in replicated execution. It should not be too expensive to call (but I don't know the number)
+
+-------------------------
+
+Iceypee | 2023-09-04 07:54:41 UTC | #5
+
+1. Wait from this link, it says that non-replicated messages are queries. What do mean when you say replicated query execution? https://internetcomputer.org/how-it-works/execution-layer/#non-replicated-message-execution 
+
+![image|690x126](upload://cD3oH8PdHXRMZChREYJfprUS6Lt.png)
+
+1. continuted. Additionally from this forum posts from another team member queries are currently free, no? https://forum.dfinity.org/t/canister-gas-cycle-cost/19828/2?u=iceypee
+![image|690x247](upload://e9lCgiaN9wCpZPe3GHAJGF4YXCk.png)
+
+
+2. My point 2  was in reply to your suggestion in the block below. How is that done in Motoko?
+![image|690x89](upload://wnVYhYrkBrGhCdaZjupv3XohdG4.png)
+
+
+3. For point 3, was in reply to your second suggestion pasted below. 
+![image|690x89](upload://5nmKwwsYj2PQCLvvFESCfjmCZVq.png)
+I was wondering if by creating a function at the application level where users first deposited cycles, could that function itself could be ddosable? I give an example below. Is that what you meant in your suggestion? 
+```
+public func deposit_cycles: async Nat
+{
+ ExperimentalCycles.accept(1000000)
+assert(//cycls accepted)
+return 5
+}
+```
+
+I appreciate the help.
+
+-------------------------
+
+bogwar | 2023-09-04 09:36:28 UTC | #6
+
+1. Unfortunately, there is some confusing terminology that's being used. Let me explain.
+
+The methods exposed by canisters can be either *query methods* or *update methods*. 
+
+The execution of these methods can be either replicated (the execution is done by all nodes in the subnet) or not replicated (the execution is done by only one node of the subnet). 
+
+Update methods can only be invoked in replicated execution; query methods can be executed either replicated, or not replicated.
+
+The confusing part is that sometime we say *update call* to mean replicated execution of the method that is called and *query call* to mean the unreplicated execution of that method. So, you can make an update call to a query method (the query method is executed in the replicated mode). You can make a query call to a query method (the query method is exected in unreplicate mode). So, what Severin was saying in that post is that the non-replicated execution of query methods is not charged.  However, update calls to query methods (replicated execution of query methods) are charged. 
+
+2. You could call getCertificate -- if it returns None then you're in replicated execution. Otherwise, you're in unreplicated execution. 
+
+3. That's a good question -- you could only accept registration calls from canisters (by rejecting all ingress calls to the registration method via inspect_message) and then you could rate limit the "registration" calls per canister id, to accept, say one call a day. Then for someone to DoS the canister they'd need to create/control many canisters.
+
+-------------------------
+
+Iceypee | 2023-09-08 06:54:55 UTC | #7
+
+Makes sense. So if I want to prevent ddos, just fail if CertifiedData.getCertificate == null?
+
+-------------------------
+
+bogwar | 2023-09-08 10:00:09 UTC | #8
+
+Yes, that should prevent the call from being executed in replicated mode, so canisters cannot use this endpoint.  
+In addition, you should also reject calls to this endpoint in [`canister_inspect_message`](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-inspect-message): that would prevent the canister for paying for any ingress messages that target this endpoint.
+
+-------------------------
+
+Iceypee | 2023-09-08 17:42:11 UTC | #9
+
+In motoko is there a way to do that? I know there are some low level calls I never figured out how to do in Motoko.
+
+-------------------------
+
+domwoe | 2023-09-10 14:51:29 UTC | #10
+
+If you are asking about ingress message inspection, then this is covered in the docs: https://internetcomputer.org/docs/current/motoko/main/message-inspection
+
+-------------------------
+
+Samer | 2024-07-11 18:46:50 UTC | #11
+
+[quote="Iceypee, post:9, topic:22467, full:true"]
+In motoko is there a way to do that? I know there are some low level calls I never figured out how to do in Motoko.
+[/quote]
+
+More docs for message inspection in motoko
+https://motoko-book.dev/advanced-concepts/system-apis/message-inspection.html
+
+-------------------------
+

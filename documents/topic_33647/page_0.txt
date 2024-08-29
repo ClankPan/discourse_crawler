@@ -1,0 +1,229 @@
+BennyTheDev | 2024-07-28 15:49:50 UTC | #1
+
+Hi all,
+
+afaik there is a 500 parallel messages queue limit inter-canister. However, while trying to do some parallel calls to "sign_with_ecdsa", I figured there is a cap at around 20 calls. Thinking it might be related to the subnet size, I tried an instance of a canister on a fiduciary but getting the same queue limits.
+
+Are management canister calls having fixed lower queue limits or is this rather a busy resource issue (too many signing ecdsa on the mamangement canister)?
+
+Error message below, thanks in advance!
+
+Rejection code 4, sign_with_ecdsa request failed: signature queue for key ecdsa:Secp256k1:key_1 is full.
+
+-------------------------
+
+BennyTheDev | 2024-07-28 16:00:37 UTC | #2
+
+Figured it. looks like ecdsa support is indeed "20" by default in subnet configs ("max_queue_size").
+
+However, I cannot find any documentation that states if this is applied to a subnet as a whole or per canister call?
+
+Reference:
+https://forum.dfinity.org/t/subnet-management-fuqsr-application/33655
+
+-------------------------
+
+jennifertran | 2024-07-28 16:30:01 UTC | #3
+
+The number of [call contexts](https://internetcomputer.org/docs/current/references/ic-interface-spec#call-contexts) per subnet for threshold signatures is 18. 
+
+You can see the source code [here](https://github.com/dfinity/ic/blob/9ff9f96b038b38f56deda1ade528fe6ac3fa7794/rs/execution_environment/src/execution_environment.rs#L2652) and call context limits [here](https://github.com/dfinity/ic/blob/9ff9f96b038b38f56deda1ade528fe6ac3fa7794/rs/protobuf/def/state/metadata/v1/metadata.proto#L217).
+
+(Also, looks like I did not refresh and while I was typing up my response, you found the same answer!)
+
+-------------------------
+
+BennyTheDev | 2024-07-28 17:02:51 UTC | #4
+
+Hi,
+
+thank you. Would be nice to understand a few things better then:
+
+Why can I in practice still pass +2 more (20), which matches a default option per subnet (see below)? I am getting this number repeatedly as cap. 
+
+```
+"ecdsa_config": {
+          "quadruples_to_create_in_advance": 1,
+          "key_ids": [
+            {
+              "curve": "secp256k1",
+              "name": "test_key_1"
+            }
+          ],
+          "max_queue_size": 20,
+          "signature_request_timeout_ns": null,
+          "idkg_key_rotation_period_ms": 604800000
+        }
+```
+
+Secondly, my (mis)understanding was that up to 500 inter-canister calls can be parallelized, including their call contexts.
+
+Why are ECDSA-relevant context messages limited like that in the first place? Sure, they are relatively resource-consuming, but in the end the canister (maintainers) are paying for this.
+
+Would be helpful to understand these things better. 
+
+Just imagine popular ICP canisters having to deal with hundreds of signatures at peak. Sure, internal queues are necessary but there is a risk of never being able to catch up if there are limits per subnet as low as 18 (or 20).
+
+EDIT: as of the source code you pointed me to, it is indeed the subnet config, which seems to be "20" in the subnets I deployed the canisters into. However, that number "18", where did you get that from then?
+
+```
+ registry_settings
+  .chain_key_settings
+  .get(&key_id)
+  .map(|setting| setting.max_queue_size)
+  .unwrap_or_default()
+```
+
+Ref: https://github.com/dfinity/ic/blob/9ff9f96b038b38f56deda1ade528fe6ac3fa7794/rs/execution_environment/src/execution_environment.rs#L624
+
+-------------------------
+
+cryptoschindler | 2024-07-29 09:20:12 UTC | #5
+
+I think the confusion with 18 call contexts stems from this [line](https://github.com/dfinity/ic/blob/9ff9f96b038b38f56deda1ade528fe6ac3fa7794/rs/protobuf/def/state/metadata/v1/metadata.proto#L241), which does not actually set the limit for call contexts but rather resembles a protobuf field number for uniquely identifying a field within a message.
+
+I think the limit is defined [here](https://github.com/dfinity/ic/blob/4bebd6f6a8bfc220982f8ade6b86ac69dcb05f84/rs/registry/subnet_features/src/lib.rs#L10) and indeed 20 per subnet. I'd guess the reason this cap is lower than usual queue limits is that the amount of t-ECDSA signatures that can be created per second by one subnet is still less than 10. A "simple" way to increase throughput would probably be to create more signing subnets.
+
+Some older threads about this topic
+https://forum.dfinity.org/t/exploring-the-potential-of-zero-knowledge-rollups-zkr-for-improved-cross-chain-efficiency-on-the-ic/17767/8?u=cryptoschindler
+https://forum.dfinity.org/t/technical-working-group-scalability-performance/14265/43?u=cryptoschindler
+https://forum.dfinity.org/t/threshold-ecdsa-signatures/6152/180?u=cryptoschindler
+
+
+Tagging some people that should be able to shed some more light on the current limitations, future improvements and how to possibly work around them on the application layer. 
+
+@dieter.sommer @Manu @dsarlis @bjoern
+
+-------------------------
+
+BennyTheDev | 2024-07-29 10:46:53 UTC | #6
+
+Thank you. 
+
+I assume cloning the same canisters across multiple subnets can emulate a better throughput then? I just want to avoid such scenarios if possible, as I would consider it "spamming". 
+
+However, looking forward to ideas and future upgrades to tackle this.
+
+Thanks for all the great work!
+
+-------------------------
+
+cryptoschindler | 2024-07-29 11:11:07 UTC | #7
+
+[quote="BennyTheDev, post:6, topic:33647"]
+I assume cloning the same canisters across multiple subnets can emulate a better throughput then?
+[/quote]
+
+You'd get around the queue limit, but the inherent number of signatures per second (actual throughput) would not increase through this.
+
+-------------------------
+
+BennyTheDev | 2024-07-29 11:49:59 UTC | #8
+
+I assume you mean the throughput per subnet not entire ic?
+
+EDIT: btw, as I understood the throughput of 1/s has been chosen because there are concerns of complexity for processing are larger than linear. I couldn't find an actual analysis of the complexity. But if it is proven to be < n^2, it should be solvable. e.g. dynamic queue limits, where 1s is guaranteed and a cutoff at a max, depending on the load.
+
+-------------------------
+
+cryptoschindler | 2024-07-29 12:06:36 UTC | #9
+
+Right now there is only one subnet creating t-ECDSA signatures. That's why I said a simple solution would be to add more signing subnets.
+
+You can find more background information here
+https://forum.dfinity.org/t/tecdsa-subnet-id-and-takeover-threshold/18336/5?u=cryptoschindler
+
+-------------------------
+
+cryptoschindler | 2024-07-29 12:10:56 UTC | #10
+
+[quote="BennyTheDev, post:8, topic:33647"]
+EDIT: btw, as I understood the throughput of 1/s has been chosen because there are concerns of complexity for processing are larger than linear. I couldn’t find an actual analysis of the complexity. But if it is proven to be < n^2, it should be solvable. e.g. dynamic queue limits, where 1s is guaranteed and a cutoff at a max, depending on the load.
+[/quote]
+
+Unfortunately I don't have a background in cryptography :smiley: Hopefully some of my colleagues can tune in soon, although currently it's the main holiday season so it might take some time for them to respond
+
+-------------------------
+
+BennyTheDev | 2024-07-29 12:56:49 UTC | #11
+
+no worries, have enough on my plate anyway ,)
+
+-------------------------
+
+andrea | 2024-07-30 08:37:39 UTC | #12
+
+Hi @BennyTheDev. The limit of a queue of 20 is actually per signing subnet. This is not a hard limit and could be changed if there is demand. Threshold ECDSA has the same limit and I am not aware of this being a bottleneck for existing applications. I believe the current choice was made keeping user experience in mind, as increasing the queue size would also increase the max latency one may expect for signing.
+
+Re: protocol complexity. The online signing phase is linear, however the offline phase has quadratic computational complexity in the optimistic case, and cubic in the worst case (i.e. in the presence of many adversarial nodes). The offline phase is used to precompute presignatures that are then used to sign the messages more efficiently. However, if the number presignatures is too large, then the finalization rate of the subnet can also be affected and thus slow down the processing of signatures. Instead of increasing all parameters immediately, I think we should progressively increase the parameters based on the community needs as well as the protocol optimizations.
+
+I'd be curious to hear if you have an idea on the throughput/latency that you may needed in your application!
+
+-------------------------
+
+BennyTheDev | 2024-07-30 13:00:58 UTC | #13
+
+Thank you for looking into this!
+
+If quadratic is already optimistic, then it's understandable.
+
+However, as of the expected throughput requirements, I can give our estimated best/avg/worst case scenarios. 
+
+Please keep in mind that I am referring to peak requirements in high-demand periods, which we could easily face. Also keep in mind that I may still have a fuzzy understanding how it exactly works in ICP. The below is based on my current obversation of canister behavior vs. signatures:
+
+We are implementing a journal within our canister that signs messages as well as unspents for transactions. The journal-length depends on the number of bitcoin transactions that are being processed:
+
+best: 100
+avg: 250
+worst: 500
+
+Based on our expectations, we will need to be able to process 283 journal entries in average.
+
+Each journal entry may either process a single signature or multiple ones, signing n-unspents for Bitcoin transactions.
+
+For simplicity, let's assume we'd only have to process 1 signature per journal-entry and our canister being the only one across ICP requesting signatures. We also leave out utxo-consolidation that canister will need to handle. 
+
+Then this would take ~283 seconds to process (at best).
+
+Since we are operating on Bitcoin blocks, which have an avg. block time of 10 minutes, this would be enough to fit in in theory.
+
+Now imagine there are 2-3 popular canisters on ICP with similar throughput requirements: this would, as of my understanding how it works, lead to our canister not being able to catch up with the Bitcoin blocks we are processing in an consumer-friendly manner.
+
+The risk is that at peak the journal takes hours or even days to catch up. While users expect their signatures and Bitcoin transactions being processed close to the current Bitcoin block height.
+
+The same would apply for anything Ethereum related (when it comes to signatures at least) only that the block times are signifcantly shorter than Bitcoin's.
+
+Hope that helps understanding what the canister is supposed to do and why I feel it's causing bottlenecks.
+
+-------------------------
+
+lastmjs | 2024-07-31 17:54:24 UTC | #14
+
+@Manu @dieter.sommer there are a couple roadmap items relating to increasing throughput and decreasing latency for threshold protocols. Are you able to give us any current estimates for target threshold signatures per second? And a timeline for achieving the target?
+
+I'm especially interested in this: "Considerably improving threshold signing throughput for threshold Schnorr & threshold EdDSA, based on a new cryptographic protocol architecture."
+
+Info on the throughput improvements for that new cryptographic protocol architecture would be excellent!
+
+-------------------------
+
+lastmjs | 2024-07-31 17:45:09 UTC | #15
+
+And would this "new cryptographic protocol architecture" not apply to threshold ECDSA?
+
+-------------------------
+
+dieter.sommer | 2024-08-02 08:54:46 UTC | #16
+
+AFAIK this roadmap item is not planned to be worked on any time soon unfortunately. There have been some ideas around on how the throughput of t-ECDSA and t-EdDSA / Schnorr could be improved dramatically using a completely different approach. As far as I remember, this would be way over an order of magnitude improvement for EdDSA / Schnorr from what I recall, but the theory has not been fully worked out yet. As I am not a cryptographer myself, I cannot give you more information on how this would be done.
+
+For now, work on improvements of the performance of the current protocol implementations is being performed, with smaller, but still quite noticeable gains in performance.
+
+-------------------------
+
+BennyTheDev | 2024-08-02 16:53:16 UTC | #17
+
+Alright, then I guess we need to find some strategies on app level for the time being. Thanks!
+
+-------------------------
+

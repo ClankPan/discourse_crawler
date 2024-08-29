@@ -1,0 +1,326 @@
+ulan | 2024-05-17 09:50:33 UTC | #1
+
+Dear community,
+
+in few weeks we will propose a replica change that will initialize the new `wasm_memory_limit` field of canister settings to `3GiB` by default (the actual value depends on the current memory usage and is explained below). That will effectively reduce the Wasm memory available to a canister from `4GiB` to `3GiB`.
+
+If you know about the risks of reaching `4GiB` and have programmed your canister carefully to use the entire `4GiB` of Wasm memory, then you can opt out of the change by setting `wasm_memory_limit=4GiB` in canister settings using `dfx` version `0.20.1-beta.0` (or higher).
+
+Otherwise, please read on to understand the upcoming change.
+
+# Motivation
+
+The reason why we are proposing this change is to protect canisters from getting bricked. As you might know, the Wasm memory is 32-bit, which means that it cannot grow beyond the hard limit of `4GiB`.
+
+If a canister stores user data in the Wasm memory (instead of the stable memory), then its memory usage will increase with the number of users. Eventually, such a canister could reach `4GiB` at which point it won't be able to allocate more memory and will stop working. It is also likely that the pre-upgrade hook will fail to allocate, which will make the canister and its data unrecoverable.
+
+Even if the canister doesn't store user data in Wasm memory, its memory usage may increase due to memory leaks.
+
+In order to avoid such catastrophic scenarios, we implemented a soft limit for the Wasm memory. When the limit is set and the canister exceeds it, then messages will start failing. This will alert the developer to the potential memory issue and allow them to safely upgrade the canister to a version that uses less memory.
+
+See also [the original proposal thread](https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794/10) and [the NNS motion proposal](https://dashboard.internetcomputer.org/proposal/105322).
+
+# How to set the limit?
+
+The new field is supported in `dfx` version `0.20.1-beta.0` and versions that come after it. The mainnet also supports it.
+
+You can query the current value of the limit for you canister using the `dfx canister status` command:
+
+```txt
+> dfx canister status <canister-id>
+Canister status call result for <canister-id>.
+Status: Running
+...
+Wasm memory limit: 0 Bytes
+...
+```
+It most likely will be `0` meaning that it is not initialized and the limit is not enforced.
+
+You can set the limit using the `dfx canister update-settings` command:
+
+```txt
+> dfx canister update-settings <canister-id> --wasm-memory-limit 3221225472
+```
+That sets that limit to `3GiB` which can be confirmed with `dfx canister status`:
+
+```txt
+> dfx canister status <canister-id>
+Canister status call result for <canister-id>.
+Status: Running
+...
+Wasm memory limit: 3_221_225_472 Bytes
+...
+```
+
+# How will the limit be initialized by default?
+
+In few weeks we will propose a replica change with the following logic for each canister:
+
+- if `wasm_memory_limit` is already initialized, then do nothing for this canister.
+- otherwise:
+   
+   - if Wasm memory usage is below `2GiB`, then set the limit to `3GiB`.
+   - otherwise, set the limit to the midpoint between the current usage and `4GiB`: `(usage+4GiB)/2`.
+
+# How to opt out?
+
+If you want to keep today's behavior, then you can set the limit to `4GiB` (which is the current hard limit for 32-bit Wasm canisters). Be advised though, that if your canister reaches the hard limit, then it can potentially stop working and become unrecoverable.
+
+# How is the limit enforced?
+
+The Wasm memory limit is a *soft* limit because it is not enforced for all message types. Currently, it is enforced only in `update`, `init`, and `post_upgrade` calls if they perform the `memory.grow()` operation. There is a pending replica change to enforce the limit in these calls even if they don't grow memory.
+
+Here is why we chose to not enforce the limit for other message types:
+
+- `heartbeat/timer`: the limit is tentatively not enforced. It will be enforced after the canister logging feature ships. Without canister logging, it is difficult to debug failures in heartbeats and timers because the developer doesn't get the error message.
+- `query`: queries are read-only, so even if they allocate memory, that allocation will be reverted when the query finishes. Also, developers that use queries to fetch canister data for backups should be able to do so even if the memory usage exceeds the limit.
+- `response callback` (code that runs after `await` point): it is difficult for developers to meaningfully recover from traps in response callbacks because some canister changes have already been committed before the `await` point. Introducing a new failure mode due to the Wasm memory limit, could lead to hard-to-debug issues.
+- `pre_upgrade`:  the limit is not enforced to allow upgrading the canister that is above the limit to a new version that reduces the memory usage.
+
+# Example error message
+
+If the limit is enforced and the canister exceeds it, then the user will see the following error message:
+
+```txt
+Canister exceeded its current Wasm memory limit of 1000000 bytes. The peak Wasm
+memory usage was 1310720 bytes. If the canister reaches 4GiB, then it may stop
+functioning and may become unrecoverable. Please reach out to the canister
+owner to investigate the reason for the increased memory usage. It might be
+necessary to move data from the Wasm memory to the stable memory. If such high
+Wasm memory usage is expected and safe, then the developer can increase the Wasm
+memory limit in the canister settings.
+```
+
+# What to do if you see the error
+
+Please consider it as the proverbial canary in the coal mine. It warns about the underlying problem that the Wasm memory usage of the canister is growing for some reason. It could be due to a memory leak or a mis-design that stores all user data in Wasm memory instead of using the stable memory.
+
+1. Understand why the memory usage is growing. This is the most difficult step and there is no general recipe for it. It most likely requires inspecting the source code and finding data structures that can grow large.
+2. Back up the canister data if possible (e.g. if your canister has query endpoints that allow fetching the data).
+3. Upgrade the canister to the version that fixes the memory issue. For example, by moving large objects to the stable memory or by fixing the memory leak.
+
+-------------------------
+
+icme | 2024-05-14 22:47:14 UTC | #2
+
+[quote="ulan, post:1, topic:30766"]
+in few weeks we will propose a replica change that will initialize the new `wasm_memory_limit` field of canister settings to `3GiB` by default. That will effectively reduce the Wasm memory available to a canister from `4GiB` to `3GiB`.
+[/quote]
+
+I understand the motivation behind this, but reducing from 4GiB to 3GiB is somewhat drastic. What about a smaller increment, like from 4GiB or 3.8-3.9GiB? That still leaves 100-200MB of heap available if the developer hits the new wasm memory limit which should be enough for recovery or migration, right?
+
+Also, I remember proposing the `canister_on_low_heap_memory` hook for canisters in https://forum.dfinity.org/t/canister-lifecycle-hooks/17089
+
+Would a higher "safe" limit plus adding a heap memory lifecycle hook suffice?
+
+Also, as a follow-up, what are the implications of this feature on the work that's being done to bring 64-bit heap memory to canisters?
+
+-------------------------
+
+diegop | 2024-05-14 21:33:59 UTC | #3
+
+
+
+-------------------------
+
+diegop | 2024-05-14 21:34:37 UTC | #4
+
+
+
+-------------------------
+
+icme | 2024-05-15 00:24:55 UTC | #5
+
+[quote="icme, post:2, topic:30766"]
+Also, as a follow-up, what are the implications of this feature on the work that’s being done to bring 64-bit heap memory to canisters?
+[/quote]
+
+@ulan  to follow-up on this, it's my understanding that 64-bit wasm environments are coming to the IC very soon (within months).
+
+This means canister heaps will no longer be limited by 32-bit wasm and can store as much data as the subnet allows them to support. Therefore, I'm not sure why it makes sense to add a new `wasm_memory_limit` field, and then raise the storage available to the canister heap soon after.
+
+I might be out of the loop on this, but it seems like releasing wasm 64 will put a bandaid on the need to. fix this issue, especially with the 64-bit changes to the Motoko compiler that @luc-blaeser is working on that will allow for a "stable heap".
+
+Looping @claudio in on this as well.
+
+Is there another reason (security, etc.) why an implicit heap limit is being put in place right before wasm 64 comes out, when the memory overflow has existed for 3 years?
+
+-------------------------
+
+sideffect0 | 2024-05-15 03:25:39 UTC | #6
+
+How can we do these updates to canisters under SNS DAO?
+
+-------------------------
+
+peterparker | 2024-05-15 04:42:09 UTC | #7
+
+Thanks for the share Ulan.
+
+[quote="ulan, post:1, topic:30766"]
+How to set the limit?
+[/quote]
+
+Could you please share the specifications as well?
+
+Dfx isn't the only tooling suite on the IC. For example, I'll need to implement support for this in the Juno ecosystem, and the foundation will also need to incorporate it into the JS library `@dfinity/ic-management`.
+
+[quote="ulan, post:1, topic:30766"]
+Back up the canister data if possible
+[/quote]
+
+Considering that creating a backup is a recommended action in case of an error, wouldn't it be more prudent for the foundation to first propose the "[Canister backup and restore](https://forum.dfinity.org/t/canister-backup-and-restore-community-consideration/22597/26)" feature, which has been eagerly anticipated by everybody for a long time, before proposing this change?
+
+I'm inquiring because I assume it hasn't been planned that way, but if it has, that would be excellent.
+
+[quote="ulan, post:1, topic:30766"]
+For example, by moving large objects to the stable memory
+[/quote]
+
+Regarding the last actionable item, are there any comprehensive guides or examples available that can help community developers in migrating their large GB data from heap to stable storage? I assume the process is more complex than simply adding a clone function in a `post_upgrade` method.
+
+-------------------------
+
+ulan | 2024-05-15 09:08:35 UTC | #8
+
+[quote="icme, post:2, topic:30766"]
+I understand the motivation behind this, but reducing from 4GiB to 3GiB is somewhat drastic. What about a smaller increment, like from 4GiB or 3.8-3.9GiB?
+[/quote]
+
+The goal is to make it possible to successfully run the `pre_upgrade()` hook of the canister. Whether 200MB is sufficient or not depends on the canister. Usually, canisters that don't use the stable memory as the primary storage do something like this:
+```
+let buffer = serialize(state);
+write_to_stable_memory(buffer);
+```
+
+If the canister has reached `3.8GiB`, then it is likely the serialized state is larger than `200MB` and allocation of `buffer` would fail.
+
+There is a tradeoff in choosing the default value:
+
+- if it is too low, then many canisters will hit the limit even if they wouldn't reach 4GiB.
+- if it is too high, then the limit doesn't help to prevent the disaster for canisters that would reach 4GiB.
+
+Another thing to consider:
+
+- if the default is set to `3GiB`, then developer who would prefer `3.8GiB` can always increase the limit to `3.8GiB` when they see the error and thus get the same behavior as if the default was set to `3.8GiB`.
+- if the default is set to `3.8GiB`, then developer who would prefer `3GiB` cannot do anything when they see the error.
+
+> Also, I remember proposing the `canister_on_low_heap_memory` hook for canisters in [Canister Lifecycle Hooks](https://forum.dfinity.org/t/canister-lifecycle-hooks/17089)
+> Would a higher “safe” limit plus adding a heap memory lifecycle hook suffice?
+
+These two feature solve different problems. The goal of `wasm_memory_limit` is to make developers aware of out-of-memory problem. If the developer already knows about that problem and even implements the low-memory hook, then they can set `wasm_memory_limit` to any value they see fit (like they would set the freezing threshold to protect against going out of cycles).
+
+If the community feels strongly about setting the default value higher, then we could go with `3.5GiB`. I think going higher than then would defeat the purpose of `wasm_memory_limit`.
+
+> This means canister heaps will no longer be limited by 32-bit wasm and can store as much data as the subnet allows them to support.
+
+The existing 32-bit canisters will still be limited by 32-bit memory. In order to transition from 32-bit to 64-bit, the developer would need to upgrade the canister and migrate their code and data (which is not trivial). I expect many production canisters to remain 32-bit even if 64-bit is available.
+
+-------------------------
+
+ulan | 2024-05-15 09:17:40 UTC | #9
+
+[quote="sideffect0, post:6, topic:30766, full:true"]
+How can we do these updates to canisters under SNS DAO?
+[/quote]
+
+You would need to make a proposal to change the canister settings with `ManageDappCanisterSettings`. The flow is similar to changing the freezing threshold setting for example.
+
+Here is the relevant change in SNS: https://github.com/dfinity/ic/commit/8dbfa7e59483ef1383257d42b6d564c195f5884e
+
+If it is not working, please let me know and I'll loop in the SNS team.
+
+-------------------------
+
+ulan | 2024-05-15 09:47:50 UTC | #10
+
+[quote="peterparker, post:7, topic:30766"]
+Could you please share the specifications as well?
+[/quote]
+
+https://github.com/dfinity/interface-spec/pull/278
+
+In summary, it is adding a new `wasm_memory_limit` limit field to canister settings.
+
+> the foundation will also need to incorporate it into the JS library `@dfinity/ic-management` .
+
+Thanks, I'll update that.
+
+> Considering that creating a backup is a recommended action in case of an error, wouldn’t it be more prudent for the foundation to first propose the “[Canister backup and restore](https://forum.dfinity.org/t/canister-backup-and-restore-community-consideration/22597/26)” feature, which has been eagerly anticipated by everybody for a long time, before proposing this change?
+
+I think `wasm_memory_limit` is a strict improvement over the situation we have right now regardless of canister backup/restore. It gives the developer more control:
+
+- if they want to wait for canister backup/restore, then they can set the limit to `4GiB` now and lower it when the backup/restore ships.
+- if they already have a canister-level backup/restore, then they are going to benefit from the limit.
+- if the developer hasn't read this post and is unaware of the limit, then they can increase the limit to `4GiB` after they see errors.
+
+> Regarding the last actionable item, are there any comprehensive guides or examples available that can help community developers in migrating their large GB data from heap to stable storage?
+
+I am not aware of such a guide. I saw a presentation recently about migrating the NNS dapp from the heap to stable structures. I'll ask the author if they can share the slides publicly or maybe even write a guide. The general idea is to do the migration incrementally.
+
+-------------------------
+
+peterparker | 2024-05-15 10:15:57 UTC | #11
+
+Fair points, agree. Thanks for the additional links and feedback.
+
+-------------------------
+
+diegop | 2024-06-12 14:13:45 UTC | #12
+
+
+
+-------------------------
+
+peterparker | 2024-06-19 13:47:49 UTC | #13
+
+The related specification seems to have been merged. Has the related proposal already been submitted?
+
+Following proposal maybe? https://forum.dfinity.org/t/proposal-to-elect-new-release-rc-2024-05-15-23-02/30859
+
+-------------------------
+
+ulan | 2024-06-19 14:03:23 UTC | #14
+
+@peterparker: the spec has been merged, but it doesn't specify the default value of 3GiB yet.
+
+As of now, the Wasm memory limit field is available and functional.
+
+Setting the default value to 3GiB (or higher depending on the current memory usage) is the only remaining step both in the replica and the spec. That is currently blocked by SNS. The proposal to set the default value will come after there is a new version of SNS that adjusts the limit for the framework canisters. I expect about 2-3 weeks.
+
+-------------------------
+
+peterparker | 2024-06-19 14:11:43 UTC | #15
+
+Thanks for the feedback, gotcha!
+
+I want to enforce 1 GB max, so I gonna implement that on my hand.
+
+-------------------------
+
+peterparker | 2024-06-19 16:12:42 UTC | #16
+
+Sorry for the additional question, and if it has already been explained, but what happens if one controller sets a `wasm_memory_limit` below the current heap size? For example, trying to set a 2 GB limit on a canister that holds 3 GB on the heap? Does `update_settings` crash or produce an error?
+
+-------------------------
+
+ulan | 2024-06-19 16:16:46 UTC | #17
+
+No problem at all! That is a valid operation (similar to setting the freezing threshold very low). The canister will behave as if it has already exceeded the limit: new updates calls will fail with "Wasm memory limit exceeded", other messages like queries and response callbacks where the soft limit is not enforced, will continue working.
+
+This may be useful to "freeze" the canister in some cases.
+
+-------------------------
+
+ulan | 2024-06-19 16:17:25 UTC | #18
+
+I am working on a documentation page that explains all these nuances.
+
+-------------------------
+
+peterparker | 2024-06-19 16:29:26 UTC | #19
+
+Thanks for the clear explanation!
+
+-------------------------
+

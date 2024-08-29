@@ -1,0 +1,173 @@
+eugaia | 2024-02-16 05:32:20 UTC | #1
+
+Hi,
+
+I'm trying to understand how the security of ECDSA master keys change as the number of nodes in the fiduciary subnet changes, and I have some questions:
+
+1 - Do the ECDSA master key shares get updated periodically (each epoch I think) like the BLS key shares do, or are they unchanged over time?
+2 - Does the complexity of the ECDSA production master key (key_1 I believe) change if the number of nodes in the fiduciary subnet changes, or is degree / order of the polynomial a static number (of about 30)?
+3 - If it was decided that the fiduciary subnet should one day have say 100 nodes one day instead of the current 26/28, would it be possible to scale up the existing key_1 to become more complex to accommodate the higher number of nodes while still retaining the 2/3 threshold security, or would a new master key with about 100 shares need to be created to fullfil the higher security threshold (probably on a new subnet with a higher node count)?
+4 - If the order of the polynomial in 2 is static, what is this number?
+5 - Does the order / complexity of a canister master key depend on the number of nodes in the subnet, and would that change if the number of nodes in the subnet changed?
+
+Thanks in advance for any responses,
+Marcus.
+
+-------------------------
+
+andrea | 2024-02-16 08:09:35 UTC | #2
+
+Hi @eugaia,
+
+> 1 - Do the ECDSA master key shares get updated periodically (each epoch I think) like the BLS key shares do, or are they unchanged over time?
+
+The shares are periodically refreshed similarly to the BLS keys. At the moment there are two events that trigger the subnet to update their shares:
+* When the membership of the subnet changes, so when nodes are added or removed.
+* Periodically the nodes of the subnet rotate their own encryption key. As soon as this happens the node update the shares of the key. 
+
+There is one difference with BLS signatures though. Since the ECDSA protocol is more complex, the nodes run a precomputation phase to generate *presignatures*  ahead of time, before signatures are requested. These presignatures are then used to compute ECDSA signatures more efficiently when a request comes in. Note however that these presignatures are computed using the shares of the key, and cannot be used if the key shares get updated. So if the shares are updated very frequently, all the precomputed presignatures must be discarded and recomputed, which also affects the efficiency of the signing protocol. 
+
+>2 - Does the complexity of the ECDSA production master key (key_1 I believe) change if the number of nodes in the fiduciary subnet changes, or is degree / order of the polynomial a static number (of about 30)?
+
+I am assuming that by complexity here you assume the threshold required to sign/recover the key. The threshold is in fact dynamic and is based on the number of nodes of the subnet. If new nodes are added to the subnet, new shares are created for the participants and the threshold is updated to take into account the new nodes.
+
+> 3 - If it was decided that the fiduciary subnet should one day have say 100 nodes one day instead of the current 26/28, would it be possible to scale up the existing key_1 to become more complex to accommodate the higher number of nodes while still retaining the 2/3 threshold security, or would a new master key with about 100 shares need to be created to fullfil the higher security threshold (probably on a new subnet with a higher node count)?
+
+If the subnet would grow the, the threshold would be automatically adjusted to the new size. Note that the ECDSA key has threshold 1/3 (more precisely f+1, where f is the maximum number of tolerate corrupt parties), e.g. on a subnet of size 28 the threshold is 10. 
+
+> 5 - Does the order / complexity of a canister master key depend on the number of nodes in the subnet, and would that change if the number of nodes in the subnet changed?
+
+Canister keys are derived directly from the master key, so their level of security is the same as the for the master key, and the threshold is adjusted dynamically with the subnet size. I am not sure if this is what you were asking though.
+
+Hope this helps!
+Andrea
+
+-------------------------
+
+eugaia | 2024-02-16 14:09:45 UTC | #3
+
+Hi @andrea,
+
+Thank you for your thorough responses.  I believe your answers satisfy most of the questions in my mind, but I have a couple of follow-ups if I may?
+
+[quote="andrea, post:2, topic:27617"]
+I am assuming that by complexity here you assume the threshold required to sign/recover the key.
+[/quote]
+
+Yes, though let me explain a little my understanding, which may be wrong, and if I am, please correct me.
+
+My understanding was that each 'share' itself uses an elliptic curve as the foundation, and then the resulting threshold curve uses a cross-multiplication process to somehow create a polynomial of order (n-1), where n is the number of threshold nodes required, and uses Lagrange interpolation to obtain a unique polynomial.
+
+If this is (kind of) true, then I was wondering if it was still possible to go up/down the number of nodes by changing the order of the polynomial and still be valid?  From your response, I understand that the threshold does change depending on the number of nodes, so I'm wondering if either (a) the order of the polynomial used for the Lagrange interpolation changes, while still being valid for signing, or (b) I'm wrong, and Lagrange interpolation isn't used in this instance and some other mechanism is used?
+
+I do trust that when the number of nodes changes that the threshold is adjusted accordingly, I'm just trying to understand the mathematics of it a little better.  Specifically what is is that determines the threshold (e.g. Lagrange interpolation or something else?), and how is that changed to always be valid for a new number of nodes (e.g. some kind of mapping that happens when node numbers are increased or decreased?).
+
+e.g. When the number of nodes changes from a threshold of m to a threshold of n, is there some internal mapping from a polynomial of order (m-1) to one of (n-1) that still allows valid signatures to be created?
+
+[quote="andrea, post:2, topic:27617"]
+If the subnet would grow the, the threshold would be automatically adjusted to the new size. Note that the ECDSA key has threshold 1/3 (more precisely f+1, where f is the maximum number of tolerate corrupt parties), e.g. on a subnet of size 28 the threshold is 10.
+[/quote]
+
+Just to clarify, you are saying here that up to 10 corrupt parties are acceptable, so for a subnet of size 28, a minimum of 18 correct entries are required?
+
+Thanks in advance for the further clarification,
+Marcus.
+
+-------------------------
+
+andrea | 2024-02-16 17:13:57 UTC | #4
+
+>to somehow create a polynomial of order (n-1), where n is the number of threshold nodes required
+
+Yes that's correct, the DKG protocol uses verifiable secret sharing based on Shamir secret sharing. This works using a random polynomial of degree `t-1` where `t` is the threshold. The shared secret is the constant term of the polynomial, while the shares are the evaluation of the polynomial at fixed points. To reconstruct the secret, the parties can do interpolation of the polynomial and recover the constant term. Note that in the protocol the nodes never actually reconstruct the keys, instead they compute signature shares, which are then interpolated to reconstruct the full signature.
+
+> I was wondering if it was still possible to go up/down the number of nodes by changing the order of the polynomial and still be valid? From your response, I understand that the threshold does change depending on the number of nodes, so I’m wondering if either (a) the order of the polynomial used for the Lagrange interpolation changes, while still being valid for signing,
+
+Yes that's possible. Here the idea is that anytime the nodes want to update their shares, e.g. whenever new nodes join, they jointly create a new polynomial. The new polynomial can have different order than the old one, it has the same constant term as the old polynomial, but the other coefficients are otherwise random. Parties gets as shares the evaluations of the new polynomial at fixed points. This is what happens behind the scene of the DKG protocol used to reshare an existing secret. 
+
+>Just to clarify, you are saying here that up to 10 corrupt parties are acceptable, so for a subnet of size 28, a minimum of 18 correct entries are required?
+
+In general, for `n` nodes the IC can tolerate less than a third corrupt nodes, more precisely up to `f=floor((n-1)/3)` corrupt nodes. The threshold for ECDSA key is `t=f+1`, so one more than the maximum number of tolerated corrupt parties. So for a subnet of 28 nodes, f=9 and t=10.
+
+-------------------------
+
+eugaia | 2024-02-16 21:57:21 UTC | #5
+
+Hi @andrea,
+
+Thank you again for your responses.  Your explanations are greatly appreciated and I think I'm close to understanding now.
+
+[quote="andrea, post:4, topic:27617"]
+The shared secret is the constant term of the polynomial
+[/quote]
+
+Ah, so is the reason the degree of the polynomial can change with the threshold, but the signatures still work because when you verify the signature, you are in effect verifying the constant term of the polynomial - which does not change between different polynomials?
+
+Is the constant term of the polynomial in effect the private key?
+
+When constructing a new "random polynomial of degree t - 1", is the previous polynomial used as a starting point to construct the next one, or is this not necessary?  Is the only starting point for the next polynomial the constant term in the previous polynomial, or perhaps more accurately, the share of the constant term?
+
+Even though the constant term of the polynomial is shared from one polynomial to the next, is it done in such a way that no single node ever knows the whole of the 'shared secret' (i.e. the constant term) - just a part of it?
+
+Thanks again,
+Marcus.
+
+-------------------------
+
+andrea | 2024-02-19 18:37:28 UTC | #6
+
+> Is the constant term of the polynomial in effect the private key?
+
+Yes, that's correct.
+
+> Is the only starting point for the next polynomial the constant term in the previous polynomial, or perhaps more accurately, the share of the constant term?
+
+What do you mean by "starting point" here? The new polynomial will have the same constant term as the original, but the other coefficients are random. 
+
+> Even though the constant term of the polynomial is shared from one polynomial to the next, is it done in such a way that no single node ever knows the whole of the ‘shared secret’ (i.e. the constant term) - just a part of it?
+
+Yes, the secret is never fully reconstructed. The high-level idea is that the parties secret-share their own shares of the key to the other participants. These shares can then be combined to create new shares of the original key. In a few more words:
+* We start from a shared key `[k]`, where `[.]` denotes a (linear) secret sharing scheme of the value `k`: each party `P_i` holds a share `k_i`, consisting of the evaluation of the secret polynomial `s(X)` at distinct points. 
+* In the resharing DKG protocol, every party `P_i` creates `[k_i]`, i.e. they share the value `k_i` with the other parties. This is done again by creating random polynomials `s_i(X)` with `k_i` in the constant term and handing out the evaluations of these polynomials to the other participants.
+* Let `l_i(X)` be the Lagrange polynomials at the evaluation points used in the secret sharing scheme. Since the `k_i` are evaluations of the polynomial `s(X)`, we have that `k=l_1(0)k_1+ l_2(0)k_2+...+ l_n(0)k_n`. If we apply the same linear combination to the shares `[k_i]`, then we obtain a new share of `[k] = l_1(0)[k_1]+ l_2(0)[k_2]+...+ l_n(0)[k_n]`. In polynomial terms, this new share corresponds to `s'(X)=\Sum_i l_i(0)*s_i(X)`, which has `k` in its constant term. 
+* In the actual protocol, nobody has the full polynomials. All participants collect shares of the various `k_i` (i.e. evaluations of the `s_i(X)`), and then locally compute the above linear combination on their shares. This results in a new share of the original key. 
+
+There are a few details missing, so I hope I did not confuse you with the above! :D
+
+-------------------------
+
+eugaia | 2024-02-20 13:26:18 UTC | #7
+
+@andrea Once again, thank you for your explanations.
+
+[quote="andrea, post:6, topic:27617"]
+The new polynomial will have the same constant term as the original, but the other coefficients are random.
+[/quote]
+
+That's what I was thinking.
+
+[quote="andrea, post:6, topic:27617"]
+There are a few details missing, so I hope I did not confuse you with the above! :smiley:
+[/quote]
+
+I think I understood your explanation, but I'd quite like to have a look at the code.  Can you point me to the section of the IC Github repository where the code is that does the above?
+
+Thanks again,
+Marcus.
+
+-------------------------
+
+andrea | 2024-02-27 10:34:56 UTC | #8
+
+The crate implementing most of the protocol is [here](https://github.com/dfinity/ic/tree/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src). The part where the interpolation happens is [here](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/transcript.rs#L142). However the [paper](https://eprint.iacr.org/2022/506) may also help understanding this. 
+
+Enjoy!
+
+-------------------------
+
+eugaia | 2024-02-27 22:30:48 UTC | #9
+
+@andrea You're a star!  Thank you so much for taking the time to respond.
+
+-------------------------
+

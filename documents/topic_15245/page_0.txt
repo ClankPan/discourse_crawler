@@ -1,0 +1,178 @@
+saikatdas0790 | 2022-09-02 07:55:53 UTC | #1
+
+I tried following [this mechanism](https://internetcomputer.org/docs/current/developer-docs/build/cdks/cdk-rs-dfinity/multiply-dependency) as documented in the official docs.
+
+I created a minimum reproduction [here](https://github.com/saikatdas0790/importing_canisters) for the behaviour that I'm going to explain below.
+
+Basically I'm trying to import one canister from the other using this bit of code
+
+```rust
+#[ic_cdk_macros::import(canister = "imported_canister")]
+struct ImportedCanister;
+```
+
+The imported canister is defined in the `dfx.json` file.
+
+The issue with the current state of the code is that it works if you directly deploy it using `dfx deploy`. But since the `import` macro has a compilation error with the message
+> error: Could not find DFX bindings for canister named 'imported_canister'. Did you build using DFX?
+
+The other cargo commands will not work. The automatic Candid generation relies on the ability to run `cargo test` and so will other cargo commands. The code also lights up RED with compilation errors wherever the imported canister struct is used.
+
+This is disappointing behaviour considering that Rust provides fantastic compiler guarantees and having to work around the compiler is janky and should be fixed.
+
+Thoughts?
+
+-------------------------
+
+lwshang | 2022-09-06 14:01:55 UTC | #2
+
+Hi @saikatdas0790, we are implementing a new mechanism to generate Rust bindings from candid for inter-canister calls. The high level idea it to utilize `build.rs` to explicitly generate Rust file during build time. One of the considerations for this design is to make the canister can be built via `cargo build` instead of requiring dfx.
+
+The implementation may takes a few weeks since there are still some problems to be solved. For example, how do we pass the callee canister ID to the caller? Currently, we rely on environment variables set by dfx during compile time.
+
+-------------------------
+
+lastmjs | 2022-09-08 19:20:49 UTC | #3
+
+The import macro seems to have a lot of problems, are you familiar with how to do cross canister calls from Rust without it?
+
+-------------------------
+
+saikatdas0790 | 2022-09-09 03:44:48 UTC | #4
+
+There are 2 alternatives that I'm still considering:
+- Making a raw call using the ic_cdk as demonstrated [here](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.call.html)
+- Making an intercanister call using ic-kit as demonstated [here](https://docs.rs/ic-kit/0.5.0-alpha.4/ic_kit/ic/struct.CallBuilder.html)
+
+Note that IC kit is very much alpha and the current release(0.5.0-alpha.4) is missing key features like being able to spawn canisters dynamically. Here's a [link](https://github.com/Psychedelic/ic-kit/issues/23) to a conversation with the brilliant @qti3e regarding the above
+
+Both of the above mechanisms require dynamic calls, meaning you need to pass function names as strings and are not as type aware as the call with the `import` macro that the Dfinity example provides.
+
+Curious about what your thoughts on the above are.
+
+-------------------------
+
+lastmjs | 2022-09-09 12:37:21 UTC | #5
+
+We use ic_cdk::api::call::call for almost all cross canister calls in Rust, unless we need call_raw. It's statically type safe
+
+-------------------------
+
+lastmjs | 2022-09-09 12:38:19 UTC | #6
+
+You do pass function names as strings, but it works extremely well and I'd be surprised if most Rust devs aren't doing it this way
+
+-------------------------
+
+saikatdas0790 | 2022-09-14 17:20:07 UTC | #7
+
+Hi @lastmjs and @lwshang,
+
+I was thinking about what we had discussed here.
+In [this example](https://github.com/saikatdas0790/importing_canisters), how would I find the canister_id to be passed to `ic_cdk::api::call::call`?
+
+The thing about the `import` macro is, it also figures out the canister_id to be called depending on whether I'm running locally or on mainnet. How would that work for a direct call using `ic_cdk`?
+
+-------------------------
+
+lastmjs | 2022-09-14 20:58:51 UTC | #8
+
+You can look in `.dfx/local/canister_ids.json` to find the canister ids, that's one way. Once you push to production you'll have a root level `canister_ids.json`. You can also use `dfx` to get the canister id based on the name. In your Rust code you can check if you're in production and choose which id to use. One way to do this would be to use `ic_cdk::api::id` to get the id of your canister and thus check if you're in production or not.
+
+-------------------------
+
+saikatdas0790 | 2022-09-15 03:53:58 UTC | #9
+
+I'll try to explain again because I believe I wasn't clear enough in my earlier message.
+
+So the thing is, I have a caller and a callee in a dfx project. 
+
+With the import macro, if I specify the canister name, it figures out what canister to call automagically no matter which environment i'm running on and no matter how many times i start fresh on a local replica.
+
+If I am manually looking at the canister_ids.json file, then I will be hard coding canister IDs in the caller canister code depending on the environment running on. This will simply NOT DO. Apart from clean canister installs on a local replica, if we have 2 different devs working on the project, that's 3 different canister IDs (prod, dev 1 local, dev 2 local) that need to be updated and kept in sync and forgetting to update once will lead to service outage.
+
+IF you're suggesting dynamically reading the `canister_ids.json` and injecting those values into code, then that could work. But my Rust skills are still kinda weak, and I think I would probably need to write a macro to do it, but I'm kinda lost. Any guidance there is appreciated. Also, obviously, happy to share findings.
+
+Using `ic_cdk::api::id` would work if I needed to know the canister ID of the callee from inside itself. How would the caller canister get that ID for it to make that call?
+
+Please let me know if I'm making sense or I misinterpreted what you were saying :)
+
+-------------------------
+
+PeanutNJam | 2023-02-12 12:20:19 UTC | #10
+
+[quote="saikatdas0790, post:7, topic:15245"]
+this example
+[/quote]
+
+Hi, sorry for this late message on this thread, but i have a similar problem. I wish to call a method main in an adjacent canister from a canister called rustycan. Ive already tried that import derived trait, and now i try using the ic0 call in ic-cdk::api. The ::call method needs three args, and T is what i try to implement below for Called and trait ArgumentDecoder (note theres theres two - with+w/o lifetimes. I am doing something stupid, but hope you could point me in the right direction so i can critique my work. PS: as a follow up, what if the main method takes no args, why do i need to give the T: ArgumentDecoder param regardless? Here is the code:
+
+#[derive(Debug, PartialEq)]
+struct Called {
+    s: u64,
+} 
+
+impl ArgumentDecoder for Called {
+    fn encode(self, ser: &mut IDLBuilder) -> Result<()>{
+        Ok(())
+    }
+
+}
+
+impl<'a> ArgumentDecoder<'a> for Called {
+    fn decode(_de: &mut candid::de ::IDLDeserialize<'a>) -> candid::Result<Self> {
+       Ok(Called { s: (10u64) })
+    }
+}
+
+#[update]
+#[ic_cdk::export::candid::candid_method(update)]
+async fn call_canister(principal: Principal) -> Result<(), ()>{
+    let called = Called {s: 10u64};
+    let s = "main".to_string();
+    if let Ok(_x) = ic_cdk::api::call::call(principal, &s , called).await {
+       return Ok(());
+    }
+    Err(())
+}
+
+-------------------------
+
+lastmjs | 2023-02-13 19:10:29 UTC | #11
+
+[quote="PeanutNJam, post:10, topic:15245"]
+ic_cdk::api::call::call(principal, &s , called).await
+[/quote]
+
+Try passing in a tuple for called: `ic_cdk::api::call::call(principal, &s , (called,)).await` Also just derive `CandidType` on your `Called` struct.
+
+-------------------------
+
+PeanutNJam | 2023-02-13 20:40:58 UTC | #12
+
+Thanks for this, i found the pub-sub example and copied it last night. I understand it much better now... but i reckon that motoko version is correct, while the rust is not, ie, the counter is not reset and remains zero for the rust impl.
+
+-------------------------
+
+famouscat8 | 2023-08-10 13:42:26 UTC | #13
+
+Any progress? Any progress?
+
+-------------------------
+
+lwshang | 2023-08-10 16:14:32 UTC | #14
+
+Yes. In recent published `ic-cdk` v0.10, we have the new `ic-cdk-bindgen` crate which replaces `#[import]` macro.
+
+You may want to read the changelog: https://github.com/dfinity/cdk-rs/blob/main/src/ic-cdk/CHANGELOG.md#added.
+
+The cdk-rs examples are using this new approach. For example. https://github.com/dfinity/cdk-rs/blob/main/examples/profile/src/profile_inter_rs/build.rs
+
+-------------------------
+
+famouscat8 | 2023-08-10 16:36:35 UTC | #15
+
+thks for reply, great job!
+
+-------------------------
+

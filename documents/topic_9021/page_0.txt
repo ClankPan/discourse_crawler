@@ -1,0 +1,282 @@
+Hazel | 2021-11-22 23:10:26 UTC | #1
+
+I'm trying to generalize some watch/notify functionality into a module. I have the following def:
+
+```
+public type Event<X>  = {
+            #Create : X;
+            #Mutate : X;
+            #Delete : X;
+    };
+public type Notify<X> = shared (Event<X>) -> ();
+```
+
+
+However, the compiler doesn't like this 
+```
+type error [M0031], shared function has non-shared parameter type
+```
+
+Understandable. But, I expected the compiler to instead give me an error at the time of implementing a truly non-shared "Event<Bad>" for Notify. Which is likely easier said than done. 
+
+Is there a good away around this?
+
+-------------------------
+
+rossberg | 2021-11-23 09:21:38 UTC | #2
+
+Not currently, I'm afraid. We have plans to add shared generic types in the future, so that you could write
+```motoko
+type Notify<shared X> = shared (Event<X>) -> ()
+```
+But unfortunately, that is highly non-trivial to implement for generic functions or classes (as opposed to just types), because it will require constructing and passing types around at runtime. So I fear it will take a bit longer.
+
+-------------------------
+
+icme | 2022-05-22 19:02:32 UTC | #3
+
+I'm trying to perform parallel execution of an async function on each of the elements of a collection (i.e. `Buffer<T>`) and then to collect the results. 
+
+This would behave something like [Promise.allSettled()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/allSettled) in Javascript.
+
+The code looks something like this
+```
+  public func mapParallel<A, B>(as: StableBuffer<A>, f: shared (A) -> async B): async StableBuffer<B> {
+    let executingFunctionsBuffer = StableBuffer.init<async B>();
+    var i = 0;
+    label execute loop {
+      if (i >= as.count) break execute;
+      StableBuffer.add<async B>(executingFunctionsBuffer, f(as[i]));
+      i += 1;
+    };
+    let collectingResultsBuffer = Buffer.init<B>();
+    i := 0;
+    label collect loop {
+      if (i >= as.count) break execute;
+      Buffer.add<B>(collectingResultsBuffer, await executingFunctionsBuffer.elems[i]);
+    };
+
+    collectingResultsBuffer;
+  };
+```
+Attempting to compile returns - `type error [M0031], shared function has non-shared parameter type`
+
+**Note**: I've been able to get the above code to work and compile if it is not generic, and is specific in the types of A and B.
+
+My specific use case is that I'd like to be able to spin down multiple canisters at the same time
+
+This means for a list of canisters I'd like to do each of the following steps in parallel, then collect the results and move on to the next step.
+
+1. Transfer cycles from the canisters (execute in parallel, then collect results)
+2. Stop each canister (execute in parallel, then collect results)
+3. Delete each canister (execute in parallel, then collect results)
+
+My current approach is to do this in a for loop awaiting the spin down of each canister one by one, but if one has a fleet of canisters this could take some time to do so.
+
+The benefits of going canister by canister instead of all at once is that if a particular canister fails, it's easier to troubleshoot and diagnose the issue.
+
+However, I think there's a use case here for performing parallel async operations and providing a generic interface for doing so, especially since each of the parallel operations for these steps (`deposit_cycles`, `stop_canister`, `delete_canister` would be hitting the management canister, and are therefore is not dependent on the fleet of canisters to be deleted. These deletion calls are then [guaranteed to eventually succeed once the requests are sent to the management canister and reach processing status](https://smartcontracts.org/docs/current/references/ic-interface-spec/#http-call-overview).
+
+-------------------------
+
+skilesare | 2022-05-22 21:46:30 UTC | #4
+
+[quote="icme, post:3, topic:9021"]
+issue.
+[/quote]
+
+Maybe consider pull instead of push? You can call an async function on your own canister with an identifier and then have a query function that reports size and completion of the se
+
+A variation of this is what we are using with dRoute and it only uses one shot calls and never awaits. When the set is done we trigger the continuation. It isn’t great for programmer experience, but it is more true to the actor model that everyone is going to end up realizing is required if you want to do anything of significance with the ic.  I’m working on some patterns and clear best practices for making this easier for the dev.
+
+-------------------------
+
+icme | 2022-05-22 22:06:07 UTC | #5
+
+[quote="skilesare, post:4, topic:9021"]
+Maybe consider pull instead of push? You can call an async function on your own canister with an identifier and then have a query function that reports size and completion of the se
+[/quote]
+
+This makes complete sense from an use case where one wants to update a number of different canisters and then query to make sure those updates were persisted correctly, but what about the use case where the developer wants to delete a canister and ensure that it no longer exists.
+
+The pull case in the scenarios of parallel canister deletion would then be the equivalent of making one-shot calls to the IC Management canister, and then querying each canister's status at some point in the future to ensure that it does not exist.
+
+In the case of canister deletion, this involves stopping the canister first. I haven't tested it out, but what happens if by using one-shot every 1 out of 10,000 times the `delete_canister` message just so happens to make it to the IC Management canister before the `stop_canister` message? The canister would not be deleted, I believe it would just be stopped + an error.
+
+A query call in this case is definitely quicker than waiting for the update call, but how do I know if the update or deletion completed? The only way to know when the change has been made is to await the completion of the update calls, in which case why not just await the update calls in the first place? (unless you want to involve heartbeat or some other query trigger for checking).
+
+-------------------------
+
+skilesare | 2022-05-22 22:12:47 UTC | #6
+
+The stopping and deletion is certainly a tricky situation! Hmmm.
+
+-------------------------
+
+jzxchiang | 2022-05-24 01:12:26 UTC | #7
+
+Whoa interesting. I wasn't aware it was possible to make async calls in parallel with the language features currently available in Motoko.
+
+-------------------------
+
+icme | 2022-05-24 01:25:39 UTC | #8
+
+Yep, I was testing it and just got it working locally the other day - I haven't tested it on the main net yet though.
+
+-------------------------
+
+rossberg | 2022-05-25 10:11:49 UTC | #9
+
+That definitely is intended to work. That's why we have `async T` as a first-class type of futures.
+
+-------------------------
+
+icme | 2022-05-26 05:27:23 UTC | #10
+
+Haven't gotten a generically typed async function as one of the parameters to work. I tried removing the `shared` keyword from `f` in the example I posted [above](https://forum.dfinity.org/t/motoko-sharable-generics/9021/3?u=icme), and received the `async has non-shared content type` error message.
+
+Was this feature implemented? https://forum.dfinity.org/t/parametric-polymorphism-and-async/1192. It seems related (along with the error message).
+
+I'm fine explicitly including the async function inside the parent function being executed, but just figured I'd bring this up in case I'm not using the correct syntax or missing something.
+
+-------------------------
+
+rossberg | 2022-05-26 07:54:40 UTC | #11
+
+@icme, right, sorry I missed that part. I was only replying to @jzxchiang's general observation about async.
+
+I'm afraid you cannot yet write something like `mapParallel` as a generic function, for the reason you guessed. But if you specialise it to concrete types it ought to work. I know, that's not very satisfying...
+
+-------------------------
+
+infu | 2023-06-27 21:39:32 UTC | #12
+
+@claudio I am trying to make a library that works with async functions - RxMo.
+
+Not sure why a `func () : () { ... }` can't create promises (like in JS) and needs 'send capability' specified with the keyword 'async'. 
+Security wise there seems to be no benefit - One can use 
+```
+Timer.setTimer(#seconds 1, func() : async () {
+                    //... do something async
+                })
+```
+Things would be better if functions could return async promises without having send capabilities unless I am missing something?
+
+After trying to 'wrap' other data structures like BTree inside a database, I've reached the conclusion, it's better not to wrap them at all. I would have to proxy every function. Instead, the db/library could be doing what it's supposed to do by managing the event flow. This reduced the code from thousands of lines to 100. Then I wanted to improve RxMo and let it handle async code, but that means I need to pass the 'send capability' all the way thru everything.
+
+This is non-async code that works and looks okay.
+![image|530x500, 100%](upload://vc3ygjJoZ3qPwsvT65zd2eveZY3.png)
+
+Then I changed the library and made it pass that send capability along the pipeline. The code one needs to write is now:
+![image|628x499](upload://cCqQCjJbp5KPaJk8iJAB8NCqTjd.png)
+It's already complicated, this makes it outright impossible to write that kind of code (it would look a lot better if 'async has non-shared content type' was a warning tho). So I wanted to know what's the reason for the need for explicit 'send capability'. And if there isn't one, let's get rid of it.
+![image|690x48](upload://i39P5tqOMaDip5baGVhj3YgCYk5.png)
+This should probably just work
+![image|550x278, 50%](upload://drOqKB13EeIX1WAgV6iVKs7oX5Y.png)
+
+Also this:
+![image|690x167](upload://iIaITiRh6sssB2bGM9bVqrJE5Zo.png)
+
+I would prefer it if it was a warning, not an error. I don't intend to use it with non-shared content type, but I can't specify that A is not going to include non-shared.
+
+-------------------------
+
+claudio | 2023-06-29 09:40:09 UTC | #13
+
+Oh dear, it looks like Timers are compromising our type system. The intention was indeed to prevent library code from sending messages without explicit permission, and Timers breaks that.
+
+I guess my first question is, though ugly, does the async code work? 
+My second question is what exactly you are objecting to:
+  1. The additional type annotations on the funcs (in the arguments to `mapAsync`)
+  2. The `await*`s
+  3. both?
+
+I did have an [experiment](https://github.com/dfinity/motoko/pull/3936) to remove the shared requirement on `async* A`, but it turns out be less useful without also removing it from `async A`, which is much harder than I [expected](https://github.com/dfinity/motoko/issues/3892).
+
+-------------------------
+
+infu | 2023-06-28 12:09:10 UTC | #14
+
+The code works, yes. I can probably just use async instead of async*. Trying out a few things now.
+That breaking will actually help me avoid specifying async all the way thru at the cost of adding a Timer when I need async. But if you 'fix' the breaking, my library will break :) 
+
+[quote="claudio, post:13, topic:9021"]
+My second question is what exactly you are objecting too
+[/quote]
+I am making a demo use case, which will be ready soon. 
+
+[quote="claudio, post:13, topic:9021"]
+The additional type annotations on the funcs (in the arguments to `mapAsync`)
+[/quote]
+For some unknown to me reason, Motoko required me to specify them once they became async. It could figure them out in the sync version.
+
+For security, I think 'allowing' certain features when importing a library is better. Async isn't the only thing that needs protecting and you can't really add them all where async is.
+```func (x: Nat) : async,stablememory,cycles,certificates (Nat) { ... }```
+maybe this will be better
+``` import Something "mo:something" stablememory, certificates, timers ```
+
+I also wonder, is there a performance difference between these two (if nothing async happens, but we carry it around to provide the send capability:
+```
+let f = func () : async () { 
+  let f = func () : async () { 
+    let f = func () : async () {  }
+    ignore f();
+   }
+  ignore f();
+ }
+ignore f();
+```
+and this:
+
+```
+let f = func () : () { 
+  let f = func () : () { 
+    let f = func () : () {  }
+    f();
+   }
+  f();
+ }
+f();
+```
+
+-------------------------
+
+claudio | 2023-07-03 09:55:02 UTC | #15
+
+Sorry for the delay:
+
+>  But if you 'fix' the breaking, my library will break :) 
+
+I think we probably will want to fix this though, perhaps by restricting the access to timers to the main actor, unless deliberately handed out to libraries by the main actor.
+. 
+> > The additional type annotations on the funcs (in the arguments to `mapAsync`)
+
+> For some unknown to me reason, Motoko required me to specify them once they became async. It could figure them out in the sync version.
+
+Ok, that's actually a known (to me) issue. It might be fixable. (created an issue https://github.com/dfinity/motoko/issues/4094)
+
+
+> For security, I think 'allowing' certain features when importing a library is better. Async isn't the only thing that needs protecting and you can't really add them all where async is.
+```func (x: Nat) : async,stablememory,cycles,certificates (Nat) { ... }```
+maybe this will be better
+``` import Something "mo:something" stablememory, certificates, timers ```
+
+That's suggesting adopting some sort of effect system to control this. That's an interesting idea, and one we've had in the back of our minds for a while. Restricting it to imports is an interesting suggestion too.
+
+>I also wonder, is there a performance difference between these two (if nothing async happens, but we > carry it around to provide the send capability:
+These actually have quite different semantics if the functions actually did anything, since other calls could interfere with the asynchronous version, but not with the synchronous ones. Performance will also be worse for the first one since each async need to wait scheduled by the IC.
+
+-------------------------
+
+nolma | 2024-01-10 03:14:07 UTC | #16
+
+Any update on sharable generics?
+
+-------------------------
+
+claudio | 2024-01-10 09:31:58 UTC | #17
+
+Nope, not yet, sorry. It's a big chunk of work and we have higher priorities at the moment.
+
+-------------------------
+

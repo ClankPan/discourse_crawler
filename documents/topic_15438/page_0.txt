@@ -1,0 +1,80 @@
+LiveDuo | 2022-09-15 12:46:25 UTC | #1
+
+
+I'm trying to get the account id of a user and getting different things with rust and dfx.
+The use case is to get the user's subaccount of canister to transfer ICP. 
+
+But I'm getting different account ids and I'm not sure why.
+
+This is using dfx:
+```sh
+dfx ledger balance --ledger-canister-id $(dfx canister id ledger) $(dfx ledger account-id --of-principal $(dfx canister id backend) --subaccount $(dfx ledger account-id --of-principal $(dfx identity get-principal)))
+```
+
+This is the rust implementation:
+```rust
+use ic_cdk::export::candid::{candid_method};
+
+use ic_ledger_types::{AccountIdentifier, Subaccount};
+
+use candid::{Principal};
+
+use std::convert::TryInto;
+
+fn principal_to_subaccount(principal_id: &Principal) -> Subaccount {
+    let mut subaccount = [0; std::mem::size_of::<Subaccount>()];
+    let principal_id = principal_id.as_slice();
+    subaccount[0] = principal_id.len().try_into().unwrap();
+    subaccount[1..1 + principal_id.len()].copy_from_slice(principal_id);
+
+    Subaccount(subaccount)
+}
+
+#[ic_cdk_macros::query]
+#[candid_method(query)]
+async fn caller_account_id() -> Result<String, String> {
+	let account = AccountIdentifier::new(&ic_cdk::api::id(), &principal_to_subaccount(&ic_cdk::api::caller()));
+	return Ok(account.to_string());
+}
+```
+
+-------------------------
+
+LiveDuo | 2022-09-15 13:12:38 UTC | #2
+
+Figured it out. It seems `dfx` uses a different method to calculate the subaccount that the one I used.
+
+More info here: https://github.com/dfinity/sdk/blob/master/src/dfx/src/commands/ledger/account_id.rs
+
+-------------------------
+
+AdamS | 2022-09-15 18:24:16 UTC | #3
+
+It is not that dfx uses a different implementation than yours to calculate subaccounts, it's that `dfx ledger account-id` is the wrong command to *produce* that subaccount. You want `account-id(principal1, principal2)`; that command generates `account-id(principal1, account-id(principal2, 0))`. The difference is that an account ID has been sha224 hashed already, so `account-id(principal2, 0)` consists of completely different bytes than `principal2` does.
+
+If you want to compute principal subaccounts on the command line, use `icx principal-convert --to-hex $your_principal` to turn them into hex (or you can just decode them yourself - the format is just base32).
+
+-------------------------
+
+LiveDuo | 2022-09-15 21:10:25 UTC | #4
+
+Thanks for looking into it.
+
+I stumbled upon more problems with that `dfx` command indeed.
+‎
+‎
+As you correctly guessed I'm looking for something like the following in the command line:
+```
+AccountIdentifier::new(&principal1, &principal_to_subaccount(&principal2));
+```
+
+
+‎
+Working with `icx` and `principal-convert` I got the following:
+```
+X=$(icx principal-convert --to-hex $(dfx identity get-principal) 2>&1  | cut -d ' ' -f 2); echo $(printf '%x\n' $(echo $X | wc -c | xargs -I{} expr {} / 2))$(echo $X | xargs printf "%-62s\n" | tr ' ' 0)
+```
+It seems a bit messy though. Any chance it might get better?
+
+-------------------------
+

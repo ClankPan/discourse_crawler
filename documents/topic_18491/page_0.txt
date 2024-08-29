@@ -1,0 +1,290 @@
+saikatdas0790 | 2023-02-15 05:43:25 UTC | #1
+
+Here is a minimal reproduction:
+https://github.com/saikatdas0790/test_addition_removal_stable_memory/blob/main/src/backend/src/lib.rs
+
+Here try running the `install.sh` script with the current code and then try uncommenting the `counter_2` code on line 12. The post_upgrade panics as the data layout specified in the upgrade doesn't match the earlier shape that was serialized to stable memory
+
+What's the prescribed way of laying out data so that we don't run into this? How do you do additions and removals to data stored using `thread_local` in your Rust canisters?
+
+-------------------------
+
+dsarlis | 2023-02-15 08:38:18 UTC | #2
+
+I believe you will need to make `counter_2` an `Option<u64>` for this to work. Btw, this has nothing to do with `thread_local` or whatever else you might use. This is purely a matter of making changes that are compatible from a `Candid` point of view.
+
+-------------------------
+
+saikatdas0790 | 2023-02-15 09:23:41 UTC | #3
+
+Is there any other way for adding to an existing struct that doesn't involve using an Option because that will eventually lead to my functions everywhere being littered with `unwrap`s or `None` checks which would not be required if I could represent the underlying data structure in the way it actually is.
+
+I'm happy to even migrate between two separate structs in my `post_upgrade`. I'm just stuck how to save from a struct V1 and restore to V2
+
+-------------------------
+
+dsarlis | 2023-02-15 09:38:07 UTC | #4
+
+Well, if you're willing to have a V1 and V2 version of the struct then there's another path. Here's the sketch of the solution:
+
+```
+thread_local! {
+    static CANISTER_DATA: RefCell<CanisterData> = RefCell::default();
+    static CANISTER_DATA_V2: RefCell<CanisterDataV2> = RefCell::default();
+}
+
+pub struct CanisterData {
+    pub counter_1: u64,
+}
+
+pub struct CanisterDataV2 {
+    pub counter_1: u64,
+    pub counter_2: u64,
+}
+
+#[ic_cdk::pre_upgrade]
+fn pre_upgrade() {
+    CANISTER_DATA_V2.with(|canister_data_ref_cell| {
+        let canister_data = canister_data_ref_cell.take();
+
+        storage::stable_save((canister_data,)).ok();
+    });
+}
+
+#[ic_cdk::post_upgrade]
+fn post_upgrade() {
+    match storage::stable_restore::<(CanisterDataV2,)>() {
+        Ok((canister_data,)) => ...,
+        Err(e) => match storage::stable_restore::<(CanisterData,)>() {
+              Ok((canister_data,)) => {
+                   let canister_data_v2 = CanisterDataV2 {
+                        counter_1: canister_data.counter_1,
+                        counter_2: default_value,
+                   };
+                   put_canister_data_v2_in_a_thread_local();
+              },
+              Err(e) => panic!("Failed to decode with both V1 and V2"),
+        }
+    }
+}
+```
+
+So in words: you define a V2 of your struct with the fields you want, then in your post upgrade you attempt to decode with V2, if that succeeds all good. If it fails (expected in the first upgrade), decode with V1 use counter_1 that you decoded and fill in counter_2 with some default value that makes sense. The next upgrade should hit the success path of decoding with V2 (since your pre_upgrade will be encoding the state using V2 already), so you can in a later upgrade even remove the code handling V1 altogether.
+
+-------------------------
+
+saikatdas0790 | 2023-02-15 09:42:45 UTC | #5
+
+Thank you for this solution. I believe this should work for now.
+
+As a follow up to this
+
+[quote="dsarlis, post:2, topic:18491"]
+This is purely a matter of making changes that are compatible from a `Candid` point of view
+[/quote]
+
+Is there a different serialization/deserialization format/mechanism that allows adding arbitrary fields to an existing struct/enum that could be used in place of Candid?
+
+-------------------------
+
+hpeebles | 2023-02-15 10:04:00 UTC | #6
+
+We kept running into this issue in OpenChat so eventually we moved away from Candid to using [Serde](https://serde.rs/) which allows us to use the really powerful and flexible [Serde attributes](https://serde.rs/attributes.html).
+
+We opted to use the MessagePack serializer with Serde but that isn't really too important, you can use any serializer you like, the benefits come from using the Serde framework.
+
+Here's how we'd do it -
+
+```
+#[derive(Serialize, Deserialize)]
+struct CanisterData {
+    counter_1: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CanisterDataV2 {
+    #[serde(alias = "counter_1")]
+    counter_2: u64,
+}
+```
+
+For more complex scenarios you can do this -
+
+```
+#[derive(Serialize, Deserialize)]
+struct CanisterData {
+    ...
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(from = "CanisterData")]
+struct CanisterDataV2 {
+    ...
+}
+
+impl From<CanisterData> for CanisterDataV2 {
+    fn from(value: CanisterData) -> Self {
+        ...
+    }
+}
+```
+
+Simples!
+
+-------------------------
+
+dsarlis | 2023-02-15 10:51:04 UTC | #7
+
+The Rust implementation of Candid actually uses serde under the hood, so you might even be able to do something like
+
+```
+#[derive(Default, CandidType, Deserialize)]
+pub struct CanisterData {
+    pub counter_1: u64,
+    #[serde(default)]
+    pub counter_2: u64,
+}
+```
+but I haven't tested this. It might be worth a shot. Or even combine parts of Hamish's solution in your case where you use Candid (example the `#[serde(from = "CanisterData")]`). For example we use some `serde` renames in the replica code base for enums serialized with Candid (because variants in Rust enums are (de-)serialized CamelCase by default instead of snake_case that Candid uses).
+
+-------------------------
+
+saikatdas0790 | 2023-02-15 10:43:54 UTC | #8
+
+@dsarlis This would be the cleanest and easiest solution if this works.
+
+I updated the repo from above to add this but this doesn't seem to be working. Would be grateful if you'd take a look. Something I'm missing?
+https://github.com/saikatdas0790/test_addition_removal_stable_memory/blob/main/src/backend/src/lib.rs
+
+-------------------------
+
+dsarlis | 2023-02-15 10:50:42 UTC | #9
+
+I don't see anything missing so I guess it doesn't work after all.
+
+-------------------------
+
+peterparker | 2023-02-15 12:00:39 UTC | #10
+
+I might try the serde approach of @hpeebles, looks pretty neat. Thanks for the share!
+
+Of course not a comparable to the experience as above examples, I'm a Rust newbie and it's probably slower but, for what is worth, with candid, what I do, if interesting, is having a dedicated module (https://github.com/buildwithjuno/juno/tree/main/src/satellite/src/upgrade) and types for the migration.
+
+In my post_upgrade I do
+
+```
+#[post_upgrade]
+fn post_upgrade() {
+    let (upgrade_stable,): (UpgradeStableState,) = stable_restore().unwrap();
+
+    let stable = StableState::from(&upgrade_stable);
+```
+
+I deserialize to a type that represent previous types and that is only use for the migration (`UpgradeStableState`) and afterwards I parse it to the effective new types of the memory (`StableState`).
+
+In that particular "upgrade" module I got a type and the implementation.
+
+e.g. here I modified a type of my stable memory from `String` to `Option<String>` so I had to map.
+
+```
+impl From<&UpgradeStableState> for StableState {
+    fn from(state: &UpgradeStableState) -> Self {
+        let mut custom_domains = HashMap::new();
+
+        for (domain_name, custom_domain) in state.storage.custom_domains.clone().into_iter() {
+            custom_domains.insert(
+                domain_name,
+                CustomDomain {
+                    updated_at: custom_domain.updated_at,
+                    created_at: custom_domain.created_at,
+                    bn_id: Some(custom_domain.bn_id), // <---- this one changed 
+                },
+            );
+        }
+
+        StableState {
+            controllers: state.controllers.clone(),
+            db: state.db.clone(),
+            storage: StorageStableState {
+                assets: state.storage.assets.clone(),
+                rules: state.storage.rules.clone(),
+                config: StorageConfig::default(),
+                custom_domains,
+            },
+        }
+    }
+}
+```
+
+Again, just sharing in case interesting.
+
+-------------------------
+
+saikatdas0790 | 2023-02-15 12:25:14 UTC | #11
+
+What would it take to make this just work with Candid? I am hoping it's something simple since Candid already uses serde as you pointed out
+
+[quote="dsarlis, post:7, topic:18491"]
+The Rust implementation of Candid actually uses serde under the hood
+[/quote]
+
+If you could point me to what needs to be done, I can take a stab at sending you a PR to enable this. Would be an elegant and simple solution as opposed to doing any of the other approaches discussed here
+
+-------------------------
+
+dsarlis | 2023-02-15 12:37:24 UTC | #12
+
+I think @chenyan would be a better person for what it would take for Candid to support something like what I said. I'm not an expert in Candid internals myself (mostly an end user, maybe a bit above average but that's about it).
+
+-------------------------
+
+saikatdas0790 | 2023-02-15 12:42:24 UTC | #13
+
+@chenyan Thoughts on supporting this?
+
+-------------------------
+
+domwoe | 2023-02-15 13:44:51 UTC | #14
+
+What are the reasons to use Candid for (de-) serializing (from/) to stable memory?
+
+-------------------------
+
+chenyan | 2023-02-15 17:01:53 UTC | #15
+
+We only support limited serde attributes in Candid, which is implemented here: https://github.com/dfinity/candid/blob/master/rust/candid_derive/src/derive.rs#L283. Certainly welcome PRs to extend it.
+
+Echoing what others said, Candid is mainly designed for supporting API backward compatibility, it may not be a perfect fit for stable format, and feel free to use your own serialization format that is available in the Rust ecosystem.
+
+The CDK's use of Candid as stable format is mostly accidental, as we don't want to pull in an extra dependency of a serialization library and don't want to dictate the stable wire format. Candid as a stable format is usable, but not ideal.
+
+-------------------------
+
+saikatdas0790 | 2023-02-15 18:15:39 UTC | #16
+
+Thank you for the response, @chenyan 
+
+What would it take for Candid serialized struct fields to support the `#[serde(default)]` attributes?
+
+-------------------------
+
+chenyan | 2023-02-15 19:23:17 UTC | #17
+
+It's mostly about porting the relevant code from serde-derive: https://github.com/serde-rs/serde/blob/master/serde_derive/src/internals/attr.rs#L377 to https://github.com/dfinity/candid/blob/master/rust/candid_derive/src/derive.rs#L283
+
+-------------------------
+
+saikatdas0790 | 2023-02-16 05:20:19 UTC | #18
+
+I tried to but I'm out of my depth here. Please consider adding support for the default attribute to Candid. Thank you :slight_smile:
+
+-------------------------
+
+dsarlis | 2023-02-16 08:48:44 UTC | #19
+
+As Yan said, I don't think there's a strong reason to use Candid for (de-)serializing from/to stable memory. I think it's mostly the "obvious" choice since it's already used in the interface specification of the canister and then using the same for your data storage is a reasonable choice.
+
+Of course, I know of some teams that use other serialization formats that they found more efficient or easier to use in the face of adding/removing fields and certainly you're not tied to Candid, at least not when you're using Rust and you have a large ecosystem with many serialization formats to choose from.
+
+-------------------------
+

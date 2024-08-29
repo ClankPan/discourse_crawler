@@ -1,0 +1,114 @@
+Hazel | 2021-07-08 19:34:31 UTC | #1
+
+Setting `compute_allocation` and / or `memory_allocation` appears to make a canister reject calls in some instances
+
+The following is an example from @Gabriel, but I had similar issues when doing some load testing - led to the formation of this question 
+https://forum.dfinity.org/t/clarity-on-compute-allocation/5700
+
+```
+ Uncaught (in promise) Error: Call was rejected:
+  Request ID: 0c5fea98eaba6428e8579a7b265e5809f8b087cc223149650090777665a8c3aa
+  Reject code: 
+  Reject text: Canister dhmvn-faaaa-aaaae-aaayq-cai is out of cycles: Canister dhmvn-faaaa-aaaae-aaayq-cai has currently 0 available cycles, but 2148073648 was requested 
+```
+I'm not quite sure if 1. The settings update call is being rejected or 2. Calls to the canister after the settings are applied are being rejected. I believe the latter.
+
+-------------------------
+
+dsarlis | 2021-07-09 13:00:01 UTC | #2
+
+Hi Hazel,
+
+As Roman replied to the other question about compute allocation, it accumulates over time like storage cost. Therefore, if you set a higher value for compute allocation, it's expected that your canister will run out of cycles sooner than if you use the default 0 (which means best effort scheduling for your canister). Even more so if you're doing some load test where you also presumably burn a bunch of cycles.
+
+Similar things can be said if you set a high memory allocation. Even if you don't use all the memory you've set as your allocation, the system will charge your canister for it (because we've reserved it on your behalf and will not be taken by anyone else). 
+
+If no memory allocation is set, then we fall back to best effort, meaning that if your canister attempts to increase its memory usage, it'll succeed if there's enough memory capacity left in the subnet. Your canister will be charged for the memory it's using at any given time, with the risk that if the subnet is quite full, you might not be able to claim the memory you need at some later point.
+
+-------------------------
+
+Gabriel | 2021-07-09 15:18:18 UTC | #3
+
+Hi @dsarlis 
+
+Claudio replied to me with this:` The error message is misleading in the sense that it doesn’t necessarily mean your canister’s balance is 0 but likely it’s not higher enough than its freeze threshold (same result though, messages can’t be executed until the canister is refilled) .My best guess at this point is that due to the high memory allocation set for the canister, it eats up relatively quickly through enough cycles that bring it close to the freeze threshold resulting in no more messages being executed until it’s refilled with cycles.`
+
+I get it now. So basically a canister memory upon creation is tiny and it will increase in time if there's enough available in the subnet. If I manually allocate the max ie: 4GB or any number bigger than the initial allocated memory it will automatically reserve the memory and thus I need to pay for it when requested. 
+
+Yeah that error is misleading in the sense I had 1T cycles in my canister but in order to reserve the memory I needed 2.1T.
+
+The reason I wanted to allocate the max canister capacity is because the canister purpose is storage only. But now I realise I end up paying a lot until the canister is filled. 
+
+Is there a way to calculate how much you need to pay extra upon reservation and after? 
+
+How high is the probability that a canister won't find enough memory in a subnet? 
+
+Also is there a time difference when say I add more data(eg: a 40mb file split in blob chunks) to a canister and needs to increase than a canister with memory already increased? 
+
+Thank you,
+Gabriel
+
+-------------------------
+
+claudio | 2021-07-09 15:32:10 UTC | #4
+
+Funnily enough, that's exactly what @dsarlis said to me ;->
+
+-------------------------
+
+dsarlis | 2021-07-09 15:51:56 UTC | #5
+
+Hi Gabriel,
+
+> I get it now. So basically a canister memory upon creation is tiny and it will increase in time if there’s enough available in the subnet. If I manually allocate the max ie: 4GB or any number bigger than the initial allocated memory it will automatically reserve the memory and thus I need to pay for it when requested.
+
+Yes, precisely.
+
+> Yeah that error is misleading in the sense I had 1T cycles in my canister but in order to reserve the memory I needed 2.1T.
+
+I believe what you see here is that you need 1T (which is what you want to seed your canister initially with) + 1T (which is the [canister creation cost on application subnets](https://github.com/dfinity/ic/blob/master/rs/config/src/subnet_config.rs#L147)) + some change. The creation cost is flat and the amount you specify when you make the call to create the canister is essentially the extra that your canister will be left with.
+
+> Is there a way to calculate how much you need to pay extra upon reservation and after?
+
+The cost per GB per second is listed [here](https://github.com/dfinity/ic/blob/master/rs/config/src/subnet_config.rs#L160) (if you're on a verified subnet, please use the corresponding value in the same file). The comment above mentions what you need per GB per year, so you can extrapolate.
+
+> How high is the probability that a canister won’t find enough memory in a subnet?
+
+It's difficult for me to provide a clear-cut answer. It depends on a couple of factors, including how many canisters are running, how many have attempted to reserve memory or use a lot of memory etc. I expect that subnets still have enough capacity since the usage is just now starting to ramp up, so if I had to guess, I'd say low now but probably higher in the future.
+
+This is basically a trade-off that I think is up to the developer to choose. From my side, the advice I'd give you is to make a back of the envelope calculation and if your budget affords it, then set the max you want to be safe. Otherwise, you'll have to program your canister defensively and handle situations where it might not be able to reach the max you'd want.
+
+> Also is there a time difference when say I add more data(eg: a 40mb file split in blob chunks) to a canister and needs to increase than a canister with memory already increased?
+
+Not sure I understand exactly what you mean here. Note that reserving memory by setting the memory allocation does not mean that your canister has already increased its size to all this memory. It means that the system keeps it aside for you, for when you need it. But you're sure you can grow up to and including your memory allocation at any time. So, it'll be the same if you want to add a 40mb file to a canister with a memory allocation and a canister without (if they need to increase their current memory footprint to support this request) with the additional potential failure to increase for the canister that hasn't reserved that memory upfront.
+
+Let me know if this captures the intent of your question or otherwise please follow up with a clarification and I'll get back to you.
+
+-------------------------
+
+Gabriel | 2021-07-09 16:10:14 UTC | #6
+
+Hi Dimitris, 
+
+Sorry about my poor formulated question. In my mind I thought that if I pay for the extra memory it will be automatically added but now I understand.
+
+Basically if I pay for it it will just be set aside for me in a priority queue or some sort of reservation system (I assume) and I don't have to worry if the current subnet has enough for my canister. 
+
+Thank you very much for your answers. Really helpful.
+
+-------------------------
+
+dsarlis | 2021-07-12 10:29:07 UTC | #7
+
+Hi Gabriel,
+
+> Basically if I pay for it it will just be set aside for me in a priority queue or some sort of reservation system (I assume) and I don’t have to worry if the current subnet has enough for my canister.
+
+It's a reservation system indeed. If you request some memory allocation, that will result in the system reserving that resource for your canister and cannot be used by any other canister.
+
+> Thank you very much for your answers. Really helpful.
+
+Thank you for raising this. Your questions were very reasonable and I think they highlighted that we can do a better job at capturing what the compute/memory allocation mean in our documentation, so these interactions are more clear for someone who's starting to develop on the IC.
+
+-------------------------
+

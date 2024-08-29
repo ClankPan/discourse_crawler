@@ -1,0 +1,717 @@
+peterparker | 2022-03-20 08:08:50 UTC | #1
+
+Has anyone else experiencing issues recently trying to delete canisters?
+
+I am not able to delete canister anymore, I get following error when I try to do so:
+
+> Error: Call was rejected:
+  Request ID: 6c6d2f761b741....9866dcd61e900cb
+  Reject code: 4
+  Reject text: IC0501: Canister jjmme-aqaaa-aaaai-ab5ya-cai is out of cycles: requested 893853709998 cycles but the available balance is 893857809998 cycles and the freezing threshold 2057103111 cycles
+
+I did not change my code nor faced the error previously.
+
+Not later than a week ago I even used the function multiple times to determine what are the minimal cycles to retain upon deleting a canister (see [post](https://forum.dfinity.org/t/where-to-call-deposit-cycles/6622/17?u=peterparker)). Therefore quite surprise it does not work anymore out of the blue.
+
+I also get the error when I create a fresh canister (create -> do nothing else -> delete -> error).
+
+So anyone having issues? Any idea what's the issue?
+
+My delete function:
+
+```
+let deckBucket = actor(Principal.toText(canisterId)): actor { transferCycles: () -> async () };
+
+await deckBucket.transferCycles();
+
+await ic.stop_canister({ canister_id = canisterId });
+
+await ic.delete_canister({ canister_id = canisterId });
+```
+
+The transfer cycles:
+
+```
+public func transferCycles(caller: Principal): async () {
+            let balance: Nat = Cycles.balance();
+
+            let cycles: Nat = balance - 4_100_000;
+
+            if (cycles > 0) {
+                Cycles.add(cycles);
+                await ic.deposit_cycles({ canister_id = caller });
+            };
+        };
+```
+
+-------------------------
+
+peterparker | 2022-03-21 17:34:01 UTC | #2
+
+Alright I can reproduce the exact same issue on mainnet with a [sample repo](https://github.com/peterpeterparker/delcan).
+
+To deploy my canister on mainnet, I create a canister in nns-dapp, link my controller, add a `canister_ids.json` to the project and then deploy with the command `dfx deploy --network=ic --no-wallet`
+
+Can it be the root cause of the problem or there is indeed an issue elsewhere?
+
+Note: it works just fine on the local simulated network - it does not on mainnet
+
+![Capture d’écran 2022-03-21 à 18.30.33|690x450](upload://5tETaX9Vr0lmGnXlsDyNAZqzCUX.jpeg)
+
+-------------------------
+
+claudio | 2022-03-22 07:33:46 UTC | #3
+
+Thanks for the report and repro!
+
+Can you confirm that the version that worked recently and the failing version were compiled with the same moc or dfx version? That's to rule out a bug in Motoko. 
+
+I've also raised the issue internally with the execution team in case they can explain it.
+
+-------------------------
+
+peterparker | 2022-03-22 07:41:37 UTC | #4
+
+Thanks Claudio.
+
+Cannot be 100% sure but it might have stopped to work after I upgraded dfx indeed. I used to used v0.8.4 if I remember correctly.
+
+-------------------------
+
+claudio | 2022-03-22 07:53:10 UTC | #5
+
+An internal user reports:
+
+IIRC, I once ran into a similar error when I didn’t upgrade my wallet after updating dfx.
+I just created an account on the forum and can’t reply yet. Can you  them if they have upgraded their wallet? dfx wallet upgrade
+
+-------------------------
+
+peterparker | 2022-03-22 07:54:52 UTC | #6
+
+> ❯ dfx wallet --network ic upgrade
+Error: Could not find wallet for "default" on "ic" network.
+
+I create the canister in nns-dapp, link my controller and then deploy with `--no-wallet` therefore I guess there isn't a wallet locally?
+
+-------------------------
+
+Severin | 2022-03-22 08:12:42 UTC | #7
+
+[quote="claudio, post:5, topic:11594"]
+internal user
+[/quote]
+
+That's me.
+
+`--no-wallet` (which isn’t needed after the latest dfx upgrade anymore, it’s implicit now) means that the wallet is not used to sign/send/? the commands. Your identity’s principal is the origin of your request.
+It is still necessary to have a wallet to withdraw the cycles (unless you want to use `--no-withdrawal` and lose the cycles).
+According to the error message you get, it looks like you don’t have a cycles wallet configured with your identity ‘default’. If you already have a cycles wallet, you can set it with `dfx identity set-wallet <wallet-id> ` so that any command you perform with the selected identity will use that wallet to take cycles from/put cycles into. If you do not have one already, go to https://smartcontracts.org/docs/quickstart/how-to-deploy-hello-world-smart-contract.html and follow 4.4.2.
+If you don’t want to link the cycles wallet by default, look at the output of `dfx canister delete --help` , especially the `--withdraw-cycles-to-canister` flag
+
+-------------------------
+
+peterparker | 2022-03-22 08:26:22 UTC | #8
+
+[quote="Severin, post:7, topic:11594"]
+If you already have a cycles wallet, you can set it with `dfx identity set-wallet <wallet-id> `
+[/quote]
+
+Thanks for the answer. I create the canisters with nns-dapp and transfer the ICP to the canisters' cycles as well - i.e. I don't use dfx to create canister or handle cycles, I do this in nns-dapp.
+
+My local identity is added as controllers of the canisters.
+
+Therefore not sure chapter 4.4.2 of the documentation apply to this case?
+
+-------------------------
+
+ulan | 2022-03-22 08:38:16 UTC | #9
+
+For each cycle transfer IC checks that the remaining cycles are above the freezing threshold. The freezing threshold depends on the memory usage and compute allocation of the canister, so it can increase over time.
+
+The  `transferCycles` function hardcodes `4_100_000` as the freezing threshold, but the returned error says that the freezing threshold is much higher now: `the freezing threshold 2057103111 cycles`.
+Updating the number to something larger than `2057103111` should fix the error.
+
+We are working on exposing `freezing_threshold_in_cycles` via `ic.canister_status()`, so in the future there will be no need to hardcode the number in `transferCycles`.
+
+-------------------------
+
+peterparker | 2022-03-22 17:11:43 UTC | #10
+
+Indeed @ulan you are right. There is no issue on the network. The problem is that I cannot know the exact freezing threshold in cycles that should be retained and `4_100_ 00` which worked a week ago does not anymore. I set a high value `100_000_000_000` as I had for a long time and I was able to delete the canisters. Thx!
+
+-------------------------
+
+icme | 2022-06-18 22:53:54 UTC | #11
+
+One hiccup I ran into while testing this out, that might save others some time.
+
+Because a canister cannot be its own controller, this means that any calls to query the `canister_status` endpoint must come from that canister's controller, and then passed to the canister that will be transferring cycles with `deposit_cycles`.
+
+I did however try in my local environment to incorporate the `freezing_threshold` field from the [ic management canister's `canister_status` endpoint](https://github.com/dfinity/interface-spec/blob/master/spec/ic.did#L103) and my local environment ended up hanging (stopped). Even trying to stop it returns the following error, which makes me think that either there's a huge bug in my code or some funky type mismatch occurred with the management canister
+```
+Error: The request timed out.
+```
+This is a new error for me - I haven't seen this time out error while developing yet :slight_smile: 
+
+In fact, I haven't seen the case where the canister is unstoppable (hangs on `Status: Stopping`)
+```
+byronbecker@Byrons-MacBook-Pro simpleMultiCanister % dfx canister status index
+Canister status call result for index.
+Status: Stopping
+...
+```
+
+Have you or @peterparker been able to get a working example retrieving the management canister's `freezing_threshold`?
+
+Also, for reference, my freezing threshold somehow became `148_202_450_254` (much larger than `100_000_000_000`)
+
+```
+"IC0501: Canister <canister_id> is out of cycles: requested 311288157983 cycles but the available balance is 411288157983 cycles and the freezing threshold 148202450254 cycles"
+```
+
+-------------------------
+
+paulyoung | 2022-06-19 04:12:09 UTC | #12
+
+[quote="icme, post:11, topic:11594"]
+Also, for reference, my freezing threshold somehow became `148_202_450_254` (much larger than `100_000_000_000`)
+[/quote]
+
+Maybe because of this?
+
+https://forum.dfinity.org/t/queue-failing-heartbeat-stopping-canister-death-spiral/13328/29?u=paulyoung
+
+-------------------------
+
+peterparker | 2022-06-19 07:12:02 UTC | #13
+
+[quote="icme, post:11, topic:11594"]
+Have you or @peterparker been able to get a working example retrieving the management canister’s `freezing_threshold`?
+[/quote]
+
+I actually never tried. I followed discussion on "[Canister status - Add Freezing threshold in cycles](https://github.com/dfinity/interface-spec/pull/18)" on the IC spec and waited for the implementation  of `freezing_threshold_in_cycles` which should gives the information we need I think. Did not had time to try it out yet.
+
+-------------------------
+
+icme | 2022-06-19 07:37:39 UTC | #14
+
+[quote="paulyoung, post:12, topic:11594"]
+Maybe because of this?
+[/quote]
+
+Got it, makes sense why it would be that high atm - thanks for the link.
+
+@peterparker 
+
+Yep, I gave grabbing the freezing_threshold a brief go, but pivoted to a hacky try/catch solution of bumping up the cycles to leave with the canister (for stop/delete) by 100 billion if the first try fails.
+
+Somewhere in the process of trying to grab the freezing_threshold of canister A through canister A’s controller from ic.canister_status and then feeding it to canister A left my local dfx hung in such a bad state I had to uninstall and kill it, then reinstall. (At least what the code I wrote was testing out, probably a bug on my end).
+
+Was enough of an error to scare me away for the time being, until I have more free time 😅
+
+-------------------------
+
+simpson | 2022-11-19 11:53:53 UTC | #15
+
+Does anyone know what the cause of this error is?
+```` admin motoko % dfx canister --network ic delete Main 
+Beginning withdrawal of cycles to canister [xxxx]; on failure try --no-wallet --no-withdrawal.
+Setting the controller to identity princpal.
+Installing temporary wallet in canister Main to enable transfer of cycles.
+Transfering 1487618274934 cycles to canister [xxxx].
+Error: Failed to delete canister 'Main'.
+Caused by: Failed to delete canister 'Main'.
+  Failed to deposit 1487618274934 cycles into [xxxx].
+    Failed to call update function 'deposit_cycles' regarding canister '[xxxx]'.
+      Update call using wallet failed.
+        The invocation to the wallet call forward method failed with the error: An error happened during the call: 2: Couldn't send message ````
+
+-------------------------
+
+Severin | 2022-11-21 08:26:54 UTC | #16
+
+I've never seen such an error.
+
+[quote="simpson, post:15, topic:11594"]
+`2: Couldn't send message ```` `
+[/quote]
+
+Is that the actual error message or something edited?
+
+-------------------------
+
+christian | 2022-11-24 12:34:45 UTC | #17
+
+I'm having exact the same issue with one of my canisters.
+
+@Severin this is just formatting. Here's how it looks like for me (I removed the cansiter id for privacy reasons):
+
+```
+$ dfx --identity christian canister --network ic delete <XXX>
+Beginning withdrawal of cycles to canister <YYY>; on failure try --no-wallet --no-withdrawal.
+Setting the controller to identity princpal.
+Installing temporary wallet in canister <XXX> to enable transfer of cycles.
+Transfering <ZZZ> cycles to canister <XXX>.
+Error: Failed to delete canister '<XXX>'.
+Caused by: Failed to delete canister '<XXX>'.
+  Failed to deposit <ZZZ> cycles into <YYY>.
+    Failed to call update function 'deposit_cycles' regarding canister '<XXX>'.
+      Update call using wallet failed.
+        The invocation to the wallet call forward method failed with the error: An error happened during the call: 2: Couldn't send message
+```
+
+An upgrade of the wallet canister didn't help.
+
+-------------------------
+
+Severin | 2022-11-24 13:45:57 UTC | #18
+
+This issue will be fixed in https://github.com/dfinity/sdk/pull/2784
+
+-------------------------
+
+timo | 2022-12-13 11:35:53 UTC | #19
+
+Is this fix in a release yet? 
+
+When it says "the wallet does not have enough cycles left in the wallet when deleting a canister" then does "the wallet" refer to the wallet that gets temporarily installed in the canister that is to be deleted?
+
+I compiled dfx from the current main branch and still get the same error.
+
+-------------------------
+
+Severin | 2022-12-13 11:55:32 UTC | #20
+
+[quote="timo, post:19, topic:11594"]
+Is this fix in a release yet?
+[/quote]
+
+It'll be in 0.12.2-beta.0 that will release today or tomorrow.
+
+[quote="timo, post:19, topic:11594"]
+When it says “the wallet does not have enough cycles left in the wallet when deleting a canister” then does “the wallet” refer to the wallet that gets temporarily installed in the canister that is to be deleted?
+[/quote]
+
+Yes, that is the temporary wallet.
+
+[quote="timo, post:19, topic:11594"]
+I compiled dfx from the current main branch and still get the same error.
+[/quote]
+That's a problem then... Are you by chance in a high-replication subnet? The threshold is too low for those network economics. I'll have to come up with a solution for that
+
+-------------------------
+
+neeboo | 2022-12-13 12:10:34 UTC | #21
+
+[quote="Severin, post:18, topic:11594"]
+fix: give more cycles margin when deleting canisters by sesi200 · Pull Request #2784 · dfinity/sdk · GitHub
+[/quote]
+
+Ah...just came up with these problem, a lot of canisters that are needed to delete
+
+-------------------------
+
+Severin | 2022-12-13 13:09:56 UTC | #22
+
+Okay, how about retry logic that slowly gives more margin? It's not ideal as I'd rather calculate this directly from parameters, but the interface doesn't expose enough information, especially not for subnets of different types. [PR here](https://github.com/dfinity/sdk/pull/2818)
+
+-------------------------
+
+timo | 2022-12-13 14:06:10 UTC | #23
+
+What exactly is the margin needed for? There need to be cycles so that the canister can call the management canister to delete itself? Or which call is the margin for?
+
+-------------------------
+
+peterparker | 2022-12-13 14:30:21 UTC | #24
+
+Crossposting one of the recent answer of @Severin when I started a new thread about this https://forum.dfinity.org/t/minimal-cycles-to-delete-canister/15926/3?u=peterparker since the thread I originally started is active today.
+
+If I can share my two cents as a developer of dapps on the IC again about this topic: anything else that a single clear data provided by IC that tells me how much cycles I should retain before deleting a canister is development pain.
+
+Don't misunderstand me, I don't say it is faisable nor easy to implement such thing on the IC, definitely not, but once again as a developer, anything else is a hussle.
+
+-------------------------
+
+Severin | 2022-12-13 17:13:47 UTC | #25
+
+The margin is there because a canister may not actively perform any operation that would leave it in a frozen state - if you transfer out all cycles it won't have any left, therefore it'll be frozen. So you have to transfer `cycles balance - some delta`, which is hard to exactly pin-point.
+
+-------------------------
+
+timo | 2022-12-13 19:45:30 UTC | #26
+
+So the problem doesn't come from the freezing threshold because even if freezing threshold was 0 we would still have the problem of predicting the cycle balance in the future. A first call can determine the cycle balance but that is only a snapshot in time. To make the second call that sends cycles out we have to estimate the balance at the time of the second call. So the calculation of the difference depends on the size of the wallet canister (memory) and the time between the first and second call.
+
+-------------------------
+
+neeboo | 2022-12-14 01:21:31 UTC | #27
+
+tried this version 0.12.2-beta.0 but failed anyway
+
+-------------------------
+
+Severin | 2022-12-14 07:47:21 UTC | #28
+
+The retry logic is not in any beta release yet because the PR is still in review.
+
+-------------------------
+
+manue1 | 2022-12-14 08:50:20 UTC | #29
+
+[quote="neeboo, post:27, topic:11594, full:true"]
+tried this version 0.12.2-beta.0 but failed anyway
+[/quote]
+
+me too 
+
+......why
+......why
+......why
+
+-------------------------
+
+manue1 | 2022-12-14 09:08:52 UTC | #30
+
+// "Couldn't send message" when deleting a canister: increase WITHDRAWAL_COST
+const WITHDRAWAL_COST: u128 = 10_303_000_000; /
+
+
+Why can't dynamic modification？
+
+-------------------------
+
+Severin | 2022-12-14 09:49:39 UTC | #31
+
+[quote="manue1, post:30, topic:11594"]
+Why can’t dynamic modification？
+[/quote]
+
+That's what I just implemented:
+
+[quote="Severin, post:22, topic:11594, full:true"]
+Okay, how about retry logic that slowly gives more margin? It’s not ideal as I’d rather calculate this directly from parameters, but the interface doesn’t expose enough information, especially not for subnets of different types. [PR here ](https://github.com/dfinity/sdk/pull/2818)
+[/quote]
+
+-------------------------
+
+simpson | 2022-12-15 02:36:34 UTC | #32
+
+Thanks for reply Severin.That is the actual error message , the dfx command response.
+
+-------------------------
+
+neeboo | 2022-12-27 03:04:03 UTC | #33
+
+While using
+`dfx canister --network=ic stop {CANISTER_ID}`
+and 
+`dfx canister --network=ic delete {CANISTER_ID}`
+
+The error still:
+
+```
+Error: Failed to delete canister '{CANISTER_ID}'.
+Caused by: Failed to delete canister '{CANISTER_ID}'.
+  Failed to deposit {CYCLES_NUMBER} cycles into {CANISTER_ID}.
+    Failed to call update function 'deposit_cycles' regarding canister '{CANISTER_ID}'.
+      Update call using wallet failed.
+        The invocation to the wallet call forward method failed with the error: An error happened during the call: 2: Couldn't send message
+```
+
+-------------------------
+
+Severin | 2023-01-04 09:19:54 UTC | #34
+
+@neeboo have you tried with a version from master? It looks like this error is from a version before the fix  got merged
+
+-------------------------
+
+chrisrambo | 2023-01-05 07:38:15 UTC | #35
+
+@Severin 
+hello, i have upgrade the version to  0.12.2-beta.0 , but still has the same error with  version 0.9.0.
+```
+dfx canister --network ic delete ${myCanisterId} --withdraw-cycles-to-dank-principal   ${myPrincipal}
+```
+error message:
+
+```
+WARN: The default identity is not stored securely. Do not use it to control a lot of cycles/ICP. Create a new identity with `dfx identity new` and use it in mainnet-facing commands with the `--identity` flag
+Beginning withdrawal of cycles to canister aanaa-xaaaa-aaaah-aaeiq-cai; on failure try --no-wallet --no-withdrawal.
+Setting the controller to identity princpal.
+Installing temporary wallet in canister ${myCanisterId} to enable transfer of cycles.
+Transfering 108924991440 cycles to dank principal ${myPrincipal} 
+Error: Failed to delete canister '${myCanisterId} '.
+Caused by: Failed to delete canister '${myCanisterId} '.
+  Failed mint call.
+    The invocation to the wallet call forward method failed with the error: An error happened during the call: 2: Couldn't send message
+```
+
+-------------------------
+
+Severin | 2023-01-05 08:24:36 UTC | #36
+
+As I said, the fix didn't make it into a beta version yet. Have you tried with a version from `master`?
+
+-------------------------
+
+chrisrambo | 2023-01-06 02:44:02 UTC | #37
+
+How can I get the latest version from the master branch. 
+
+ I update the dfx version using this command：
+```
+DFX_VERSION=${curVersion} sh -ci "$(curl -fsSL https://smartcontracts.org/install.sh)"
+```
+
+it seems the last release version is  0.12.2-beta.0
+
+-------------------------
+
+Severin | 2023-01-06 09:41:17 UTC | #38
+
+For master you have to `git clone` and `cargo build`. Instructions are [here](https://github.com/dfinity/sdk/blob/master/.github/CONTRIBUTING.md#developing-dfx)
+
+-------------------------
+
+neeboo | 2023-01-07 04:43:01 UTC | #39
+
+I use `master` branch code and it gives me
+
+```
+Attempting to transfer {AMOUNT} cycles to canister {CANISTER_ID}
+Not enough margin. Trying again with more margin.
+
+<REPEATING ABOVE>
+
+```
+It seems to find correct amount of cycles, and after a few tries.
+```
+Successfully withdrew {AMOUNT} cycles.
+Deleting canister {CANISTER_ID}, with canister_id {CANISTER_ID}
+```
+
+It's a bit slow and dumb because it retries about 8 times when deleting one canister
+But at least the problem is fixed.
+Can we make it smarter to calculate the "margin" better?
+
+-------------------------
+
+Severin | 2023-01-09 07:35:36 UTC | #40
+
+[quote="neeboo, post:39, topic:11594"]
+Can we make it smarter to calculate the “margin” better?
+[/quote]
+
+I wish we could, but I don't have any good ideas. If anyone has a good idea, I'm all ears!
+
+-------------------------
+
+aljager1983 | 2023-01-17 10:53:40 UTC | #41
+
+for the cargo build, do we need to install it as an extension? because im using vs code in windows OS
+
+-------------------------
+
+Severin | 2023-01-17 13:01:37 UTC | #42
+
+extensions should(!) not be necessary, but if you run into problems please let me know
+
+-------------------------
+
+aljager1983 | 2023-01-18 03:51:28 UTC | #43
+
+![image|690x403](upload://kgtISoroXCmWP56fstCqAEIfJPA.png)
+after i run *cargo build* , i got the following results(attached the screenshot).
+i tried to rerun it but its showing the same error messages.
+
+-------------------------
+
+Severin | 2023-01-18 07:14:41 UTC | #44
+
+Yes, there's some dependencies you have to install. As the error message says, it can't find `cmake`. Can you try installing that?
+
+-------------------------
+
+aljager1983 | 2023-01-18 07:58:10 UTC | #45
+
+done installing `cmake`, but after i rerun `cargo build` another error appeared
+![image|690x455](upload://qX9Navfa3JcDN4MwdjQ847bQdxn.png)
+
+-------------------------
+
+Severin | 2023-01-18 08:11:06 UTC | #46
+
+Wow, that's pretty ugly. We should definitely make this a better error message.
+
+This happened because some network request timed out. I'd check the network connection and try again.
+
+-------------------------
+
+aljager1983 | 2023-01-18 08:11:45 UTC | #47
+
+or could it be on my side? atm i have 9MBps internet speed
+
+-------------------------
+
+Severin | 2023-01-18 08:13:28 UTC | #48
+
+Could be your side, could also be a problem with Github. Best I can recommend: try 10 times, and if it doesn't work try again in an hour
+
+-------------------------
+
+aljager1983 | 2023-01-18 08:14:53 UTC | #49
+
+I will, gonna inform you after 24 hours,, i could easily buy some ICP to convert to cycles, but that would be the easy road, i want to know the exact solution to this exact problem so in future i can tackle it with ease...
+
+-------------------------
+
+aljager1983 | 2023-01-19 10:43:02 UTC | #50
+
+hi,, its me again,, i tried `cargo build` whole day but still showing the same errors
+![image|690x360](upload://sddK0f6QtzxMKRFmdgiFmYmF8Se.png)
+
+also during build, just after i press enter, build progress is stuck in 501/503
+![image|589x49](upload://3lmoA5H4qGP7bPhd37wevhDlBzj.png)
+
+-------------------------
+
+Severin | 2023-01-19 11:08:40 UTC | #51
+
+It's still a network error, but this time a different one... Another idea is to use a VPN. Not sure this will help, but why not.
+
+If you really only want to use it to delete canisters, you could replace the download function to not make any network requests. Other than that I'm really running out of ideas.
+
+-------------------------
+
+aljager1983 | 2023-01-19 11:31:38 UTC | #52
+
+how can i identity that its a network issue? and secondly how can i replace the download function?
+
+-------------------------
+
+Severin | 2023-01-19 11:40:31 UTC | #53
+
+[quote="aljager1983, post:52, topic:11594"]
+how can i identity that its a network issue?
+[/quote]
+
+In the error message you can see `message: "Connection reset by peer"`
+
+[quote="aljager1983, post:52, topic:11594"]
+and secondly how can i replace the download function?
+[/quote]
+the error message points you to `src/dfx/assets/prepare_assets.rs:151`, meaning it ran into the problem at line 151 in that file.
+
+I'd try to replace the entire function body with just `HashMap::new()`. No idea if that is enough, but it could work
+
+-------------------------
+
+aljager1983 | 2023-01-19 12:07:56 UTC | #54
+
+thanks for the tip, gonna try those things...
+
+-------------------------
+
+aljager1983 | 2023-02-25 01:09:18 UTC | #55
+
+hi its been a while,, i returned to this post because im lacking cycles already for my tutorials. i would want to buy ICP and convert it to cycles but i taught to try to solve this issue first of deleting canister in the network ic to free up cycles. PLEASE TAKE THIS AS A GRAIN OF SALT, not sure if it works for other, but its worth a try. I'll be listing the steps i did base on previous threads on this forum, basically the combine information i get from this forum helped me solve my issue of deleting canister and recycling my cycles.
+
+Firstly you need to remove you dfx using the below commands:
+`~/.cache/dfinity/uninstall.sh && sh -ci "$(curl -sSL https://internetcomputer.org/install.sh)"`
+
+1. Go to your working folder for the canister that you deployed in network ic which you want to delete.
+2. Just like from the instruction of @Severin , git clone the master branch for dfx --> (https://github.com/dfinity/sdk) this will create an sdk folder which you need to cd into
+3. When cloning done, install cargo using npm (i.e. if its not installed yet)
+4. run `cargo build` (if you run into error just like me, try rerunning again)
+5. run `cargo test`
+
+6. run `cargo run`
+7. run `alias dfx=$(pwd)/target/debug/dfx`
+8. run `dfx --version`
+9. you need to copy the new version of your new dfx build to your dfx.json in you json tab then save
+![image|260x79](upload://soLQRF3MX44YVLXJgvUht9EycQK.png)
+10. now initiate stopping canister using below commands:
+    `dfx canister --network ic stop --all`
+11. delete the canister 
+    `dfx canister --network ic delete --all`
+
+Notes:
+* try running delete couple of times if you encounter error since, for me i tried like 3 times
+* above steps applied on my environment, i have windows 10 and internet of 8mbps
+* feels great to finally solve this issue. buying ICP would be easy, but the struggle and finally getting to solve it is worth it. additionally i have learned a lot of things here though it might just be a scratch. KEEP LEARNING GUYS
+
+-------------------------
+
+Severin | 2023-02-27 10:57:31 UTC | #56
+
+Thanks for following up, @aljager1983. These functional, but quite elaborate steps work but can finally be simplified a bit:
+
+dfx `0.13.1` has been released since my last message and includes the retrying logic. Once 0.13.1 is promoted, a simple `dfx upgrade` will download it. Until then, manually installing 0.13.1 will also work:
+```
+DFX_VERSION="0.13.1" sh -ci "$(curl -sSL https://internetcomputer.org/install.sh)"
+```
+
+-------------------------
+
+honopu | 2024-05-27 06:39:52 UTC | #57
+
+This error occurring again, the dfx version is 0.19.0.
+The canister deleted succesullfy, but throw "Failed to call update function 'deposit_cycles' regarding canister xxxx", and the controller of canister is changed.
+Is there any way to get the lost cycles?
+
+-------------------------
+
+Severin | 2024-05-27 11:13:03 UTC | #58
+
+If the canister is already deleted then the cycles are gone. If the delete call failed with `out of cycles` or `failed to send` then you can withdraw cycles like this:
+
+```
+dfx canister --ic deposit-cycles --wallet <canister you want deleted> $(dfx identity get-wallet) <amount, e.g 2T>
+```
+
+and then `dfx canister delete --no-withdrawal`
+
+Alternatively, I just merged [a workaround](https://github.com/dfinity/sdk/pull/3769/) (nice solution is in the works, but will take a while) so if you build dfx from master you should be able to work with `dfx canister delete --initial-margin`
+
+-------------------------
+
+vmr | 2024-07-13 20:56:43 UTC | #59
+
+I get the following error when I try to withdraw cycles from a canister where the dfx created folder had already been deleted.
+```
+Error: Failed to deposit 2790000000000 cycles into wnbpw-hygaa-aaaag-alcqa-cai.
+Caused by: Failed to call update function 'deposit_cycles' regarding canister 'wnbpw-hygaa-aaaag-alcqa-cai'.
+Caused by: Update call using wallet failed.
+Caused by: The replica returned a rejection error: reject code CanisterError, reject message Error from Canister wwett-ptnaa-aaaag-alcsq-cai: Canister has no update method 'wallet_call'..
+Check that the method being called is exported by the target canister. See documentation: http://internetcomputer.org/docs/current/references/execution-errors#method-not-found, error code None
+
+```
+I have been able to successfully recover cycles from other canisters. Any idea why its failing for this one?
+
+-------------------------
+
+neeboo | 2024-07-15 11:56:40 UTC | #60
+
+do this as following:
+
+1. `dfx canister --ic status {canister_id}` // get cycles balance, say 1_400_000_000_000
+
+2. `dfx canister --ic stop  {canister_id} && dfx canister --ic delete  {canister_id}` // stop and try deleting the canister, meanwhile upgrade the canister with new deposit function
+
+3. `dfx canister --ic start  {canister_id}` // start the canister again
+
+4. `dfx canister --ic deposit-cycles --wallet={canister_id} 1_300_000_000_000 {wallet_canister_id}` // less than current cycles balance
+
+5. `dfx canister --ic stop {canister_id} && dfx canister --ic delete {canister_id} --no-withdrawal` // stop and delete again
+
+-------------------------
+
+vmr | 2024-07-16 01:55:36 UTC | #61
+
+This worked well. Thank you for the explanation.
+
+-------------------------
+

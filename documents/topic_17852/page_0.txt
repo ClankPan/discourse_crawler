@@ -1,0 +1,518 @@
+rabbithole | 2023-01-07 23:26:03 UTC | #1
+
+Hi! Please help, I don't know why, but my canister stopped consuming cycles. With what it can be connected?
+
+![Снимок экрана 2023-01-08 в 04.03.13|690x293](upload://1xbeQnnwpHDXbqLvm4rhZRwgAus.png)
+
+
+```
+let status = await ic.canister_status({ canister_id = canisterId });
+let freezingThresholdInCycles = status.memory_size * status.settings.freezing_threshold * 127000 / 1073741824;
+let availableCycles = Nat.sub(status.cycles, freezingThresholdInCycles);
+```
+
+`cycles` is created with 0.5T. When `availableCycles` is less than 0.25T, the canister is topped up. I don’t understand at what point everything broke, I recently installed nns.
+
+![Снимок экрана 2023-01-08 в 04.24.49|689x401](upload://tOXnMgBoSQUKpr2aVua1E8gWBFL.png)
+
+-------------------------
+
+rabbithole | 2023-01-08 23:33:33 UTC | #2
+
+**Update:**
+
+When I installed nns I had to change networks.json in part local.replica.subnet_type to "system", so according to [the documentation](https://internetcomputer.org/docs/current/developer-docs/deploy/subnet-types) canisters in the local subnet no longer consume cycles for calculations. 
+
+I found [post from Severin](https://forum.dfinity.org/t/how-to-deploy-canister-to-nns-subnet/14391/2?u=rabbithole). @Severin does this mean that in order for my canisters to consume cycles for calculating and using CMC and Ledger canisters, I have to abandon nns and deploy wasm modules of the necessary canisters myself? And the second question, how can I set the canisterIds myself so that the canisterIds for the canisters from nns match the canisterIds from the mainnet?
+
+-------------------------
+
+Severin | 2023-01-09 07:23:15 UTC | #3
+
+[quote="rabbithole, post:2, topic:17852"]
+does this mean that in order for my canisters to consume cycles for calculating and using CMC and Ledger canisters, I have to abandon nns and deploy wasm modules of the necessary canisters myself?
+[/quote]
+
+Yes, that is right. I wish we had a better way, but it's the best we have right now.
+
+[quote="rabbithole, post:2, topic:17852"]
+And the second question, how can I set the canisterIds myself so that the canisterIds for the canisters from nns match the canisterIds from the mainnet?
+[/quote]
+
+You can define canisters as 'remote'. It's probably easiest if you do `dfx nns import`, which will add the NNS canister definitions with the right `remote` field to your dfx.json.
+
+-------------------------
+
+rabbithole | 2023-01-24 17:20:02 UTC | #4
+
+i have problems with deploying NNS canisters and I realized that I was wasting my time.. How can I get 2 subnets locally - application and system? Can I proxy requests for certain canisters to external addresses? For example, install NNS on another computer and send requests to NNS canisters to another host.
+
+-------------------------
+
+Severin | 2023-01-24 17:25:16 UTC | #5
+
+[quote="rabbithole, post:4, topic:17852"]
+How can I get 2 subnets locally - application and system?
+[/quote]
+
+That is not possible for now, and would be a huge effort. It's probably easiest to use a [staging environment](https://internetcomputer.org/docs/current/developer-docs/deploy/staging-environment) for multi-subnet tests.
+
+[quote="rabbithole, post:4, topic:17852"]
+Can I proxy requests for certain canisters to external addresses?
+[/quote]
+No, if you run a separate IC instance then their root keys won't match and they do not accept each other's signatures.
+
+-------------------------
+
+rabbithole | 2023-01-24 17:37:31 UTC | #6
+
+[quote="Severin, post:5, topic:17852"]
+It’s probably easiest to use a [staging environment](https://internetcomputer.org/docs/current/developer-docs/deploy/staging-environment) for multi-subnet tests.
+[/quote]
+Will my canisters become available to everyone? I will spend the real cycles and can not fabricate them, since this is not the local environment?
+
+-------------------------
+
+Severin | 2023-01-24 17:58:21 UTC | #7
+
+Yes, they will be public, but discoverability is so bad for random canisters, I (personally) wouldn't worry about it as long as you don't supply it with more than 2-3T cycles
+
+-------------------------
+
+rabbithole | 2023-09-15 14:37:46 UTC | #8
+
+Since I'm going to implement important functionality related to cycles, I'll have to give up `subnet_type="system"` and a very convenient set of nns canisters. Directly from the application I use 3 types of canisters - `ledger`, `cmc` and `internet identity`. I replaced the lines in my [`deploy.sh`](https://github.com/rabbithole-app/rabbithole/blob/main/scripts/deploy.sh#L8:L9) script
+
+```sh
+dfx extension install nns
+dfx nns install
+```
+with
+```sh
+source ./scripts/ledger.sh
+source ./scripts/cmc.sh
+```
+
+[details="ledger.sh"]
+```sh
+#!/usr/bin/env bash
+
+SRC_DIR="src/backend/ledger"
+
+# Install ledger locally as documented in:
+# https://internetcomputer.org/docs/current/developer-docs/integrations/ledger/ledger-local-setup
+
+IC_VERSION=a17247bd86c7aa4e87742bf74d108614580f216d
+mkdir -p $SRC_DIR
+curl -kLo $SRC_DIR/ledger.wasm.gz https://download.dfinity.systems/ic/$IC_VERSION/canisters/ledger-canister.wasm.gzhttps://raw.githubusercontent.com/dfinity/ic/$IC_VERSION/rs/rosetta-api/ledger.did
+curl -kLo $SRC_DIR/ledger.did https://raw.githubusercontent.com/dfinity/ic/$IC_VERSION/rs/rosetta-api/icp_ledger/ledger.did
+mkdir .dfx/local/canisters/ledger
+cp $SRC_DIR/ledger.wasm.gz .dfx/local/canisters/ledger/ledger.wasm.gz
+dfx identity new --storage-mode=plaintext minter
+dfx identity use minter
+MINT_ACC=$(dfx identity get-principal)
+
+dfx identity use default
+ARCHIVE_CONTROLLER=$(dfx identity get-principal)
+LEDGER_ACC=$(dfx identity get-principal)
+ACCOUNT_ID=$(dfx ledger account-id)
+
+dfx deploy ledger --specified-id ryjl3-tyaaa-aaaaa-aaaba-cai --argument "(variant {
+    Init = record {
+        send_whitelist = vec {
+            principal \"$LEDGER_ACC\";
+        };
+        token_symbol = opt \"ICP\";
+        transfer_fee = opt record { e8s = 10000 : nat64 };
+        minting_account = \"$ACCOUNT_ID\";
+        transaction_window = opt record {
+            secs = 10 : nat64;
+            nanos = 0 : nat32;
+        };
+        max_message_size_bytes = opt(2560000 : nat64);
+        icrc1_minting_account = opt record {
+            owner = principal \"$MINT_ACC\";
+            subaccount = null;
+        };
+        archive_options = opt record {
+            num_blocks_to_archive = 1000000 : nat64;
+            max_transactions_per_response = null;
+            trigger_threshold = 1000000 : nat64;
+            max_message_size_bytes = null;
+            cycles_for_archive_creation = null;
+            node_max_memory_size_bytes = null;
+            controller_id = principal \"$ARCHIVE_CONTROLLER\";
+        };
+        initial_values = vec {
+            record {
+                \"$ACCOUNT_ID\";
+                record {
+                    e8s = 10000000000 : nat64;
+                };
+            };
+        };
+        token_name = opt \"Internet Computer\";
+    }
+})" --yes -qq --upgrade-unchanged
+```
+[/details]
+[details="cmc.sh"]
+```sh
+#!/usr/bin/env bash
+
+SRC_DIR="src/backend/cmc"
+IC_VERSION=a17247bd86c7aa4e87742bf74d108614580f216d
+mkdir -p $SRC_DIR
+curl -kLo $SRC_DIR/cmc.wasm.gz https://download.dfinity.systems/ic/$IC_VERSION/canisters/cycles-minting-canister.wasm.gz
+mkdir .dfx/local/canisters/cmc
+cp $SRC_DIR/cmc.wasm .dfx/local/canisters/cmc/cmc.wasm.gz
+curl -kLo $SRC_DIR/cmc.did https://raw.githubusercontent.com/dfinity/ic/$IC_VERSION/rs/nns/cmc/cmc.did
+
+didc bind $SRC_DIR/cmc.did -t mo > $SRC_DIR/cmc.mo
+
+dfx identity new --storage-mode=plaintext minter
+dfx identity use minter
+MINT_ACC=$(dfx identity get-principal)
+MINT_ACC_ID=$(node ./scripts/ledger.account-id.mjs --to did --principal $MINT_ACC)
+# MINT_ACC_ID=record { bytes = vec { ... } };
+dfx identity use default
+LEDGER_ID=$(dfx canister id ledger)
+
+dfx deploy cmc --specified-id rkp4c-7iaaa-aaaaa-aaaca-cai --argument "(opt record {
+    minting_account_id = opt ${MINT_ACC_ID};
+    ledger_canister_id = opt principal \"${LEDGER_ID}\";
+    governance_canister_id = opt principal \"aaaaa-aa\";
+    last_purged_notification = opt 0;
+    exchange_rate_canister = null;
+})" --yes -qq --upgrade-unchanged
+```
+[/details]
+[details="dfx.json canisters section"]
+
+```json
+"ledger": {
+    "type": "custom",
+    "candid": "src/backend/ledger/ledger.did",
+    "wasm": "src/backend/ledger/ledger.wasm.gz",
+    "remote": {
+        "id": {
+            "ic": "ryjl3-tyaaa-aaaaa-aaaba-cai"
+        }
+    },
+    "declarations": {
+        "node_compatibility": true
+    }
+},
+"cmc": {
+    "type": "custom",
+    "candid": "src/backend/cmc/cmc.did",
+    "wasm": "src/backend/cmc/cmc.wasm.gz",
+    "remote": {
+        "id": {
+            "ic": "rkp4c-7iaaa-aaaaa-aaaca-cai"
+        }
+    },
+    "declarations": {
+        "node_compatibility": true
+    }
+}
+```
+[/details]
+Ledger seems to work correctly at first glance, I initialize it with 100 ICP on balance. In an actor I'm trying to create a canister
+```
+let result = await Ledger.transfer({
+    to = account;
+    fee = { e8s = FEE };
+    memo = MEMO_CREATE_CANISTER;
+    from_subaccount = ?fromSubaccount;
+    amount;
+    created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(Time.now())) };
+});
+```
+and after that I notify CMC
+```
+let notifyResult = await CMC.notify_create_canister({ block_index = height; controller = self; subnet_type = null });
+```
+And at this step I get an error
+```
+Refunded({block_index = ?3; reason = "No subnets in which to create a canister."})
+```
+@Severin what am I doing wrong? How to create a subnet?
+
+-------------------------
+
+Severin | 2023-09-14 07:23:36 UTC | #9
+
+Honestly: no clue. For the last couple weeks I've encountered the same error in one of the tests I wanted to write and I couldn't find anyone who knows how to fix that.
+
+-------------------------
+
+rabbithole | 2023-09-14 09:13:48 UTC | #10
+
+It turns out that developers do not have the ability to work with cycles locally and dynamically create canisters using Ledger and CMC :thinking:
+
+Perhaps @peterparker can help, I found part of the code for deploying canisters in [Juno](https://github.com/buildwithjuno/juno). You created a [topic](https://forum.dfinity.org/t/cannot-download-cmc-canister-wasm-anymore/22387) on the forum, were you able to deploy a WORKING `Cycles Minting Canister` locally?
+
+@mbeekman can your product [ICPipeline](https://forum.dfinity.org/t/nns-updates-may-12-cmc-hotfix/19943) help?
+
+-------------------------
+
+peterparker | 2023-09-14 09:35:22 UTC | #11
+
+Thanks for pinging me @rabbithole, I forgot to answe and close the topic your are mentionning.
+
+To answer your question, yes I'm able to deploy the Cycles Minting Canister. It was pain to figure out how, but, yes I managed to do so.
+
+1. It needs an entry in `dfx.json`
+
+```
+"cmc": {
+			"type": "custom",
+			"candid": "candid/cmc.did",
+			"wasm": "cmc.wasm",
+			"remote": {
+				"id": {
+					"ic": "rkp4c-7iaaa-aaaaa-aaaca-cai"
+				}
+			}
+		}
+```
+
+2. It might not need necessary anymore but, at least in my setup, I use a custom build and custom did file because the cmc need some init parameters. Maybe it was fixed in the IC repo but, anyway I use a custom did file:
+
+[https://github.com/buildwithjuno/juno/blob/main/candid/cmc.did](https://github.com/buildwithjuno/juno/blob/main/candid/cmc.did)
+
+3. Finally, to effectivelly deploy the Cmc, it requires a ledger and minting account so I automated the deployment process with a script. It gather these information and proceed to execute `dfx deploy` with the appropriate parameters.
+
+[https://github.com/buildwithjuno/juno/blob/main/scripts/cmc.sh](https://github.com/buildwithjuno/juno/blob/main/scripts/cmc.sh)
+
+Everything is available in Juno's [GitHub repo](https://github.com/buildwithjuno/juno). ⭐️ starring it is greatly appreciated.
+
+-------------------------
+
+rabbithole | 2023-09-14 09:46:09 UTC | #12
+
+[quote="peterparker, post:11, topic:17852"]
+yes I’m able to deploy the Cycles Minting Canister. It was pain to figure out how, but, yes I managed to do so.
+[/quote]
+I did it too, but the problem is that it doesn't function as expected. I can't create a canister dynamically and notify the `CMC` about it. Please look at the description of the problem here at the end of the [post](https://forum.dfinity.org/t/canister-does-not-consume-cycles-local/17852/8?u=rabbithole).
+
+[quote="peterparker, post:11, topic:17852"]
+starring it is greatly appreciated
+[/quote]
+Done :slightly_smiling_face:
+
+-------------------------
+
+peterparker | 2023-09-14 10:05:08 UTC | #13
+
+Gotcha! I "only" use the CMC for topup, I don't use it to create canister, that's probably the difference and why I cannot answer. I'll forward your question to the team!
+
+P.S.: thx 😃
+
+-------------------------
+
+bitdivine | 2023-09-14 11:50:06 UTC | #14
+
+[quote="rabbithole, post:8, topic:17852"]
+How to create a subnet?
+[/quote]
+
+I believe I am right in saying that a local `dfx start` replica does not support multiple subnets.  You get just one to test on.
+
+In particular, that means that if you configure that one subnet to be say an app subnet, you can deploy only canisters that can run on an app subnet.
+
+-------------------------
+
+rabbithole | 2023-09-14 11:59:07 UTC | #15
+
+[quote="bitdivine, post:14, topic:17852"]
+that means that if you configure that one subnet to be say an app subnet, you can deploy only canisters that can run on an app subnet.
+[/quote]
+I understood this point and therefore decided to change my subnet from a `system` subnet to an `application` subnet. In this subnet I deployed the canisters I needed - `ledger`, `cmc` and `internet identity`. But when creating a canister via `CMC` I get [an error](https://forum.dfinity.org/t/canister-does-not-consume-cycles-local/17852/8?u=rabbithole).
+
+-------------------------
+
+bitdivine | 2023-09-14 12:04:08 UTC | #16
+
+I am still digging through the logic.  :-) 
+
+The error message comes from the cmc create_canister function, here: https://github.com/dfinity/ic/blob/master/rs/nns/cmc/src/main.rs#L1661
+
+According to your command above, you do not specify subet type (you set it to null).  So according to this line, any subnet that the controller may use is fine.  https://github.com/dfinity/ic/blob/master/rs/nns/cmc/src/main.rs#L1606
+
+So the question is who is the controller and how can we authorize the controller to use the one and only subnet?
+
+-------------------------
+
+bitdivine | 2023-09-14 12:19:08 UTC | #17
+
+Looking back at the one place where I set up the CMC, I configure the CMC by proposal, like this:
+
+```
+NNS_URL="$(http://localhost:$(dfx info replica-port))"
+
+ic-admin --nns-url "$NNS_URL" \
+  propose-to-set-authorized-subnetworks \
+  --test-neuron-proposer \
+  --proposal-title "Authorize CMC to create canisters in subnets" \
+  --proposal-url https://forum.dfinity.org/somepost \
+  --summary "Some summary" \
+  --subnets $(ic-admin --nns-url "$NNS_URL" get-subnet-list | jq -r '. | join(" --subnets ")')
+```
+
+But in your case there is no governance canister, so we need to whitelist without a proposal.  So, whatever function call that proposal makes, you presumably need to make directly.
+
+Looking through that code, I also had to set the sdr exchange rate.  Not that it is relevant to the canister whitelisting but it might become relevant later.
+
+```
+ic-admin --nns-url "$NNS_URL" propose-xdr-icp-conversion-rate --test-neuron-proposer --summary "Please set the conversion rate between ICP and cycles" --xdr-permyriad-per-icp 123456789
+```
+
+-------------------------
+
+bitdivine | 2023-09-14 12:23:55 UTC | #18
+
+The CMC has an `set_authorized_subnetwork_list` method that you would have to call to authorize a given principal to create canisters on a given subnet:
+
+https://github.com/dfinity/ic/blob/master/rs/nns/cmc/src/main.rs#L323
+
+So it looks as if now we just need to make sure we know what principal is trying to create that canister and get the subnet ID.  Then call that method and then everything should work.
+
+-------------------------
+
+Severin | 2023-09-14 12:29:08 UTC | #19
+
+It's only an internal method. You can't call it from the outside :frowning_face:
+
+-------------------------
+
+bitdivine | 2023-09-14 12:39:45 UTC | #20
+
+Given that this is a test environment, I feel rather tempted to add whatever methods are needed to whitelist this call to the CMC canister and call the result a test build. :-D
+
+Or delete checks, if that is what it takes.
+
+-------------------------
+
+bitdivine | 2023-09-14 12:41:13 UTC | #21
+
+is it really internal, though?  This looks like a normal candid wrapper, exposing it as an external method:
+
+https://github.com/dfinity/ic/blob/master/rs/nns/cmc/src/main.rs#L310
+
+-------------------------
+
+bitdivine | 2023-09-14 12:49:57 UTC | #22
+
+I rather see a problem here, in that only the governance canister may call the method:
+
+https://github.com/dfinity/ic/blob/master/rs/nns/cmc/src/main.rs#L328
+
+I would change that line in prod to also allow the controller to call the method.   That is secure in prod, I think, and it would allow developers to call it if they deploy a CMC canister themselves.  For this particular case I would just comment out the check and rebuild the CMC canister, if that is OK, @rabbithole .  Great handle, by the way, especially when asking questions that take us down rabbit holes! :-D
+
+Alternatively you could deploy the CMC canister specifying yourself as the governance canister.  Avoids recompiling.  But seems somehow wrong.  Let's just whitelist controllers and be done with it.
+
+-------------------------
+
+bitdivine | 2023-09-14 12:53:33 UTC | #23
+
+I am sorry, I am out of time for now.  Please try to get this to work and if it still doesn't work, please ping back and I/we can have another look when we get the chance.  I'm disappointed to have got only part of the way through the puzzle.
+
+-------------------------
+
+rabbithole | 2023-09-14 20:55:12 UTC | #24
+
+[quote="bitdivine, post:22, topic:17852"]
+For this particular case I would just comment out the check and rebuild the CMC canister, if that is OK
+[/quote]
+It would be great to get a custom `cmc.wasm` to work in a local environment, after all, internet identity also has a build for developers.
+
+[quote="bitdivine, post:23, topic:17852"]
+Please try to get this to work and if it still doesn’t work, please ping back and I/we can have another look when we get the chance.
+[/quote]
+I'm trying to build `cmc.wasm`, I can come back with the result later, thank you very much!
+
+-------------------------
+
+rabbithole | 2023-09-14 12:57:14 UTC | #25
+
+One more question - how can I find out the subnet id that is deployed on my computer? The `get_subnet_types_to_subnets` method returns an empty array.
+
+-------------------------
+
+bitdivine | 2023-09-14 13:03:07 UTC | #26
+
+The subnet ID is the same as the root key, for local dfx.  In Rust I wrote the conversion as:
+
+```
+/// Gets the subnet ID
+#[context("Failed to determine subnet ID.")]
+async fn get_subnet_id(agent: &Agent) -> anyhow::Result<Principal> {
+    let root_key = agent
+        .status()
+        .await
+        .with_context(|| "Could not get agent status")?
+        .root_key
+        .with_context(|| "Agent should have fetched the root key.")?;
+    Ok(Principal::self_authenticating(root_key))
+}
+```
+
+-------------------------
+
+rabbithole | 2023-09-14 15:13:23 UTC | #27
+
+Since I am not very familiar with the Rust language, I wrote a node script to get `subnet_id`:
+```js
+import { Principal } from '@dfinity/principal';
+import { getLocalHttpAgent } from './utils/agent.utils.mjs';
+
+async function getSubnetId() {
+    const agent = await getLocalHttpAgent();
+    const status = await agent.status();
+    return Principal.selfAuthenticating(status.root_key).toText();
+}
+
+const subnetId = await getSubnetId();
+console.log(subnetId);
+```
+I received a ~~suspiciously long~~ value:
+```
+jz726-l5fnc-4y635-dnhxc-fugxd-snmg6-q455t-h4zlv-2bqrn-qijin-hqe
+```
+~~I hope there is still no error...~~
+
+-------------------------
+
+rabbithole | 2023-09-14 14:48:01 UTC | #28
+
+[quote="rabbithole, post:27, topic:17852"]
+I hope there is still no error…
+[/quote]
+
+![Снимок экрана 2023-09-14 в 19.47.19|690x144](upload://tJ5s6KlNvIbKKGEZO9HvUPPXhHt.png)
+
+It seems that I'm getting the `subnet_id` incorrectly :thinking:
+
+-------------------------
+
+bitdivine | 2023-09-14 14:56:05 UTC | #29
+
+I am not too familiar with the JS API but hopefully we can find the problem. :-) Just by the name, though, I guess that the JS is taking the raw bytes.  `Principal::self_authenticating(X)` is `sha224(x)` (28 bytes) followed by the byte "2" to yield 29 bytes in total: https://github.com/dfinity/candid/blob/a1eb218c4777d7a1be263f061d499dfc428136a2/rust/candid/src/types/principal.rs#L122
+
+-------------------------
+
+rabbithole | 2023-09-14 23:27:49 UTC | #30
+
+Nice! I found a similar method in `@dfinity/principal` lib, now I get a short `subnet_id`:
+
+```
+Principal.selfAuthenticating(status.root_key).toText()
+```
+I was able to apply the settings for `CMC`! The canister is now created! Many thanks to everyone who tried to help and special thanks @bitdivine, ~~later I will add all the code examples to the repository and edit this message.~~
+
+**Update:** I pushed the changes to the project repository with a small [readme](https://github.com/rabbithole-app/rabbithole/tree/main/src/backend/cmc) for developers. I hope this will be useful to someone.
+
+-------------------------
+

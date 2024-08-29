@@ -1,0 +1,117 @@
+senior.joinu | 2022-11-09 14:22:24 UTC | #1
+
+Hello there!
+
+I'm working on authenticated data structures for `ic-stable-memory` library and I want to make my Merkle proofs compatible with the IC's service worker by default. 
+
+So, I went through [the documentation](https://internetcomputer.org/docs/current/references/ic-interface-spec/#certificate) and it seems like I have to use `ic_types::HashTree` as an interface in order to achieve this compatibility feature. But I kinda struggle to understand it:
+
+1. It seems like values for `HashTree` have to be byte arrays. I understand that this is because right now this data structure is only used for frontend chunks and other hashes, but if I want to generate a Merkle proof for some rich data (for example, for token balances) what encoding should I use? Wouldn't it be more useful, if values would be `CandidType`'s instead?
+
+2. What is exactly the process of forming a `HashTree`? My Merkle tree seems to have the same structure than your Red-Black tree where `node_hash = h(value + left_child_hash + right_child_hash)` and I was thinking initially that I will make Merkle proofs of this form:
+```
+// vh - (pruned) hash of the value stored inside the node
+// l_ch - hash of the left child
+// r_ch - hash of the right child
+// <empty> - empty slot that will be filled with the valid child hash during reconstruction
+// <value> - the value we're claiming to be in the set
+
+[vh, l_ch, <empty>]
+              \
+             [vh, l_ch, <empty>]
+                           \
+                          [vh, <empty>, r_ch]
+                                /
+               [vh, l_ch, <empty>]
+                             \
+                            [<value>, l_ch, r_ch]
+```
+but I don't understand if I can achieve the same kind of shape with the provided API of `HashTree`. Can you please help me to understand the basic usage of this API? Maybe you have an internal "for dummies" documentation of this crate - this would be very helpful.
+
+3.  Also, does this API provide a way to include more hashes into a single node? I have some ideas of improving the overall performance for my authenticated data structure, but it requires storing additional data in some nodes (not necessarily forks) and this data should also be accounted in reconstruction phase. Can I do that with `HashTree`?
+
+4. It seems like `HashTree` supports aggregated proofs (proofs which prove set membership of multiple keys at the same time) in some form. How do you form one?
+
+Thanks in advance and have a nice day!
+
+-------------------------
+
+roman-kashitsyn | 2022-11-15 21:23:01 UTC | #2
+
+[quote="senior.joinu, post:1, topic:16462"]
+It seems like values for `HashTree` have to be byte arrays. I understand that this is because right now this data structure is only used for frontend chunks and other hashes, but if I want to generate a Merkle proof for some rich data (for example, for token balances) what encoding should I use? Wouldn’t it be more useful, if values would be `CandidType`’s instead?
+[/quote]
+
+The _leaves_ contain byte arrays. The _path_ to the leaf determines the meaning of the data at the leaf. For example, the leaf at path `["time"]` is a LEB128-encoded natural number. A leaf at path `["canister", <canister_id>, "controllers"]` is a CBOR-encoded array of byte arrays. A leaf at path `["request_status", <request_id>, "reply"]` is the raw canister response as is (usually some Candid message, but not always).
+
+Conceptually, a HashTree allows you to represent anything that looks like a JSON object (though you have to replace arrays with explicit maps: `[a, b] => {"1": a, "2": b}`). For example, if you have a balance map `{"user1": 123, "user2": 456, "user3": 789}`, the hash tree representation will look like
+```
+Fork(Fork(Labeled("user1", Leaf(leb128(123))),
+          Labeled("user2", Leaf(leb128(456)))),
+     Labeled("user3", Leaf(leb128(789))))
+```
+(`leb128` encoding is not essential, you can use u64 little or big endian, as you wish. It's up to the protocol between you and your clients.).
+
+Note that the hash tree is _binary_ (and balanced) to ensure that the proofs sizes are logarithmic.
+To construct a proof for the value of `"user2"` without revealing the entire data structure:
+```
+Fork(Fork(Pruned('<hash of the Labeled("user1", Leaf(leb128(123))) node>'),
+          Labeled("key2", Leaf(leb128(456)))),
+     Pruned('<hash of the Labeled("user3", Leaf(leb128(789))) node>'))
+```
+Note that the pruned tree contains both the _data_ and the _witness_. The client must navigate the tree to locate the value of the "user2" node (see the `lookup` algorithm in the spec). This proof structure is easier to work with in practice because the clients don't need to locate holes and fill them to recompute the root hash. 
+
+[quote="senior.joinu, post:1, topic:16462"]
+3. It seems like `HashTree` supports aggregated proofs (proofs which prove set membership of multiple keys at the same time) in some form. How do you form one?
+[/quote]
+
+Sure, that's relatively easy. For example, let's say you want to prove that keys "user1" and "user3" are in the tree, but you don't want to reveal their values. You can construct the following proof:
+
+```
+Fork(Fork(Labeled("user1", Pruned('<hash of the Leaf(leb128(123))>'),
+          Pruned('<hash of the Labeled("user2", Leaf(leb128(456)))>')),
+     Labeled("user3", Pruned('<hash of the Leaf(leb128(789))>'))
+```
+
+The client can compute and validate the root hash and lookup keys "user1" and "user3" in that tree, verifying their existence.
+
+> vh - (pruned) hash of the value stored inside the node
+
+The HashTree does not allow values in the internal nodes; all values live at the leaves.
+
+> Also, does this API provide a way to include more hashes into a single node? 
+
+No.
+
+[quote="senior.joinu, post:1, topic:16462"]
+I have to use `ic_types::HashTree` as an interface
+[/quote]
+
+I don't think you have to use `ic_types` specifically; all you need is to have a compatible tree structure encode the tree to CBOR appropriately (https://github.com/dfinity/interface-spec/blob/df98d627330aa8eadeb3a697ed028897e81635dc/spec/certificates.cddl). For example, `ic-certified-map` has its implementation of HashTrees (https://github.com/dfinity/cdk-rs/blob/c6bab2f144bd7f344df7662f14aedd4479606fec/library/ic-certified-map/src/hashtree.rs) for historical reasons (`ic_types::HashTree` didn't support borrowed data at the time).
+
+I hope that helps.
+
+-------------------------
+
+senior.joinu | 2022-11-16 11:12:29 UTC | #3
+
+Oh, this comparison to JSON was very helpful. Now I understand.
+
+So, is it correct to say, that `HashTree` has nothing to do with the `RBTree` and should also work with any other data structure, if I'm able to represent it in a JSON-compatible way?
+
+Thanks a lot!
+
+-------------------------
+
+roman-kashitsyn | 2022-11-16 15:40:04 UTC | #4
+
+[quote="senior.joinu, post:3, topic:16462"]
+that `HashTree` has nothing to do with the `RBTree` and should also work with any other data structure, if I’m able to represent it in a JSON-compatible way?
+[/quote]
+
+Yes. I believe you mean the [RbTree](https://docs.rs/ic-certified-map/0.3.2/ic_certified_map/struct.RbTree.html) type from the [ic-certified-map](https://crates.io/crates/ic-certified-map) library.
+
+The RbTree is a helper library that helps you manage certified K->V maps, such as the user balance map I described earlier, and extract proofs for the existence (or absence) of keys and key ranges. It maintains an internal mapping from the red-black tree structure to a HashTree structure, optimizing the number of hash computations required to update the map (log N where N is the number of keys).
+
+-------------------------
+

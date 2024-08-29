@@ -1,0 +1,188 @@
+ic_axb | 2023-04-03 10:16:54 UTC | #1
+
+**Problem Description**
+
+When I read the dfinity/ic source code, I found that I can initiate a request from one container to another container,
+
+The address of the ic source code is: rs\tests\src\consensus\request_auth_malicious_replica_test.rs
+
+I want to simulate this flow in jar
+
+The signature method used is tecdsa
+
+I observed that there is a piece of code like this in the source code
+
+```
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "request_type")]
+pub enum HttpCallContent {
+    Call {
+        #[serde(flatten)]
+        update: HttpCanisterUpdate,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct HttpCanisterUpdate {
+    pub canister_id: Blob,
+    pub method_name: String,
+    pub arg: Blob,
+    pub sender: Blob,
+    pub ingress_expiry: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<Blob>,
+}
+```
+It is necessary to sign the HttpCallContent structure after splicing **b"\x0Aic-request".** The code is
+The location is: **rs\tests\src\execution\request_signature_test.rs**
+
+```
+pub fn sign_update(content: &HttpCallContent, identity: &impl Identity) -> Signature {
+    let mut msg = b"\x0Aic-request".to_vec();
+    msg.extend(content.representation_independent_hash());
+    identity.sign(&msg).unwrap()  // 这里我该用了 tecdsa 签名
+}
+```
+Then use tecdsa signature to return
+
+```
+Error
+(veriant Err-Failed to call sign_with_ecdsa Unable to route maragemant canister rquest sign_with_ecdsa: CandidError (Custom(Trailing value after finishing deserialization
+```
+The post-test can be signed without splicing b"\x0Aic-request"
+
+The inspection found that the field length needs to be = Vec 32 to pass when signing? Is the "aaaaa-aa" jar signature restricted here or is my application wrong? My signature function is the following way
+
+```
+#[ic_cdk_macros::update]
+async fn sign(message: Vec<u8>) -> Result<SignatureReply, String> {
+    // assert!(message.len() == 32);
+    let key_id = EcdsaKeyId {
+        curve: EcdsaCurve::Secp256k1,
+        name: "dfx_test_key".to_string(),
+    };
+    let ic_canister_id = "aaaaa-aa";
+    let ic = CanisterId::from_str(&ic_canister_id).unwrap();
+
+    let signature: Vec<u8> = {
+        let request = SignWithECDSA {
+            message_hash: message.clone(),
+            derivation_path: vec![],
+            key_id,
+        };
+        let (res,): (SignWithECDSAReply,) =
+            ic_cdk::api::call::call_with_payment(ic, "sign_with_ecdsa", (request,), 10_000_000_000)
+                .await
+                .map_err(|e| format!("Failed to call sign_with_ecdsa {}", e.1))?;
+
+        res.signature
+    };
+
+    Ok(SignatureReply { signature })
+}
+
+```
+
+I build the return structure after signing without the b"\x0Aic-request" prefix as
+```
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpRequestEnvelope<C> {
+    pub content: C,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_pubkey: Option<Blob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_sig: Option<Blob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    // pub sender_delegation: Option<Vec<SignedDelegation>>,
+    pub sender_delegation: Option<Vec<u8>>,
+}
+```
+This structure conforms to the **CBOR** structure
+
+After converting the secondary structure to Vec<u8> type, use the http_request method in ic_cdk to send a request
+Returned **[Cannot find field hash _3456837_]** error I don't know what I'm doing wrong
+
+In addition, I also carried in the headers header when making the request
+
+```
+let request_headers = vec![
+        HttpHeader {
+            name: "Content-Type".to_string(),
+            value: "application/cbor".to_string(),
+        }
+    ];
+```
+this request header
+
+The following is the main logic about initiating a request from one container to another
+
+```
+#[ic_cdk::update]
+async fn test_req(sender_canister_id:Principal) -> Result<Vec<u8>, String> {
+    let canister_id = ic_cdk::api::id();
+
+    let sendervec8 = public_key(canister_id).await.unwrap().public_key;  // Obtain a public key using tecdsa
+
+    let sender = Principal::self_authenticating(sendervec8.clone());
+
+    let content = HttpCallContent::Call {
+        update: HttpCanisterUpdate {
+            canister_id: Blob(canister_id.as_slice().to_vec()),
+            method_name: "add_user".to_string(),
+            arg: Blob(vec![]),
+            sender: Blob(sender.as_slice().to_vec()),
+            ingress_expiry: gren_duration().await, 
+            nonce: Some(Blob(gren_raw().await)), 
+        },
+    };
+
+
+    let signature2 = sign_update(&content).await;
+
+    let envelope = HttpRequestEnvelope {
+        content: content.clone(),
+        sender_delegation: None,
+        sender_pubkey: Some(Blob(sendervec8)),
+        sender_sig: Some(Blob(signature2.signature)),
+    };
+    let body = serde_cbor::ser::to_vec(&envelope).unwrap();
+
+    let request_headers = vec![
+        HttpHeader {
+            name: "Content-Type".to_string(),
+            value: "application/cbor".to_string(),
+        }
+    ];
+
+    let url = format!("http://127.0.0.1:4943/api/v2/canister/{}/call", canister_id);
+    let request = CanisterHttpRequestArgument {
+        url: url,
+        method: HttpMethod::POST,
+        body: Some(body),
+        max_response_bytes: Some(MAX_RESPONSE_BYTES),
+        transform: None,
+        headers: request_headers,
+    };
+    match http_request(request).await {
+        Ok((response,)) => {
+            Ok(response.body)
+        }
+        Err((r, m)) => {
+            let message =
+                format!("The http_request resulted into error. RejectionCode: {r:?}, Error: {m}");
+            Err(message)
+            
+        }
+    }
+}
+```
+
+-------------------------
+
+Severin | 2023-04-03 12:02:41 UTC | #2
+
+It looks to me like you're making this more complicated than it needs to be. Have you tried using `ic_cdk::api::call(canister_id, "add_user", payload)`? Is there any reason why you can't use this function?
+
+-------------------------
+

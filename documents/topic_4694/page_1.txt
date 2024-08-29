@@ -1,0 +1,1286 @@
+senior.joinu | 2021-11-02 12:29:05 UTC | #102
+
+This is basically a technical design. I don't mind anyone implementing it :rofl:
+
+-------------------------
+
+jzxchiang | 2021-11-03 07:08:53 UTC | #103
+
+Thanks for writing this up!
+
+A couple points:
+
+1. Your example is only about one type of DEX: the order book DEX. From my understanding, order book DEXs do not take custody of users' funds while their orders are being matched (e.g. Dexalot). Doing so would be a big step backwards. In your example, the DEX canister takes custody. What if a user's order never gets fulfilled? When will the DEX refund the user's deposit?
+
+2. IMO having a separate deposit and withdraw step for using a DEX is poor UX, since this would be on top of the deposit and withdraw step that's needed for the underlying wallet.
+
+3. Let's take the more common DEX model: the Uniswap-style AMM. (That was what my previous code [snippet](https://forum.dfinity.org/t/thoughts-on-the-token-standard/4694/93?u=jzxchiang) was trying to model.) In this case, a user can instantly swap one token for another from a liquidity pool, all in a single atomic transaction. If any part of that fails (e.g. insufficient liquidity), then the entire transaction should fail and the user should have lost nothing. That is what seems difficult to implement on the IC. Splitting that one logical transaction into multiple doesn't seem to have the security (or UX) requirements that DeFi users are used to and will tolerate.
+
+4. Syncing balances between the token canister and the DEX canister isn't great. What if the DEX canister is out of cycles or, worse, offline when the token canister tries to call it? How do you re-sync?
+
+-------------------------
+
+jzxchiang | 2021-11-03 07:08:39 UTC | #104
+
+Thanks for sharing.
+
+Here are my initial thoughts:
+
+* The standard is quite big... I feel like a smaller standard would be more user-friendly, easier to reason about, and less prone to bugs.
+
+* I'm not sure why you kept `approve` and `transferFrom` if the token canister can `notify` recipients. In my mind, you either need one or the other. Not really quite sure what this explanation means:
+
+> Approve is often accompanied by the possibility of simultaneous operation of two tokens. Approve can avoid the repeated payment problem which transaction brought about, has a good supplementary use scenario for transfer.
+
+* I took a look at the Motoko [implementation](https://github.com/Deland-Labs/dfinity-fungible-token-standard/blob/main/motoko/dft/main.mo), but can't find which part of that code actually implements sagas. Could you link me?
+
+-------------------------
+
+witter | 2021-11-04 06:02:17 UTC | #105
+
+Due to https://github.com/dfinity/motoko/issues/2703, Motoko's implementation is incomplete, and approveAndCall & transferAndCall cannot implement call  as well as rust.
+
+Yes, it is bigger than ERC20.  I have the same idea as you:`it would be better if it could be smaller` ,but after careful consideration, we still feel that adding these interfaces is necessary.
+
+Let's compare it to ERC20
+
+**ERC20**
+```
+service: {
+  name: () -> (text) query;
+  symbol: () -> (text) query;
+  decimals: () -> (nat8) query;
+  totalSupply: () -> (nat) query;
+
+  balanceOf: (owner: principal) -> (nat) query;
+  allowance: (owner: principal, spender: principal) -> (nat) query;
+  approve: (spender: principal, value: nat) -> (bool);
+  transferFrom: (sender: principal, receiver: principal, value: nat) -> (bool);
+  transfer: (receiver: principal, value: nat, args:opt vec nat8) -> (bool);
+}
+```
+**These are the interfaces added to the DFT standard**
+**The reason why these interfaces are designed is in the interface notes**
+```
+service : {
+   // Fee is necessary because the reverse Gas model prevents DDos
+  fee : () -> (Fee) query;  
+  setFee : (Fee) -> (bool);
+  setFeeTo : (feeHolder: text) -> (bool);
+
+  //Readonly interface（Will not cause token security issues）
+  // return the metadata of a token (fee setting,decimals,name,totalSupply,symbol)
+  meta: () -> (MetaData) query;
+  // Extend information about token, I explain it at  [Information self-describing]  at https://dft.delandlabs.com/#what-other-functions-does-the-dfinity-fungible-token-standard-need-to-implement
+  // It just get/set token's socail media information, will not cause token security issues
+  extend: () -> (vec KeyValuePair) query;
+  setExtend : (vec KeyValuePair) -> (bool);
+
+  //Same as the extend information
+  logo : () -> (vec nat8) query;
+  setLogo : (logo : vec nat8) -> (bool);
+  // Owner is necessary,  the only operation who can update token's information
+  // This is only used to control the permission to update the token information (to call setFee, setLogo, setExtend) 
+  owner : () -> (principal);
+  setOwner : (owner: principal) -> (bool);
+
+  //Readonly interface（Will not cause token security issues）
+  tokenInfo : () -> (TokenInfo) query;
+  //Readonly interface（Will not cause token security issues）
+  allowancesOf : (holder: text) -> (vec record { TokenHolder; nat }) query; 
+
+  //Readonly interface（Will not cause token security issues）
+  lastTransactions : (size: nat64) -> (TxRecordsResult) query;
+  //Readonly interface（Will not cause token security issues）
+  transactionById : (transactionId: text) -> (TxRecordResult) query;
+  //Readonly interface（Will not cause token security issues）
+  transactionByIndex : (nat) -> (TxRecordResult) query;
+}
+```
+**Feel free to discuss it , any your comments will help us to improve it**
+> * The standard is quite big… I feel like a smaller standard would be more user-friendly, easier to reason about, and less prone to bugs.
+
+`notify` means to let the receiver be notified, which triggers the receiver to execute its own logic. The important role of `notify` is to replace ERC20 event emit
+
+`Approve` means authorization. In the DEX scenario, the authorization of two different tokens is required. When the next step of transfer notify cannot be executed internally, but the transfer has been successful, it is necessary to consider how to process the refund, but approve does not have these troubles
+
+The two are used to meet different scenarios, that is why we chose to retain them.
+ 
+>* I’m not sure why you kept `approve` and `transferFrom` if the token canister can `notify` recipients. In my mind, you either need one or the other. Not really quite sure what this explanation means:
+
+-------------------------
+
+jzxchiang | 2021-11-04 21:29:12 UTC | #106
+
+Hmm, my understanding is that `notify` is the name of the callback for `transferAndCall`, and that `transferAndCall` is a replacement for `approve` and `transferFrom`.
+
+`approve` and `transferFrom`: token canister gets called by DEX (or other) canister
+`transferAndCall`: token canister calls DEX (or other) canister
+
+-----
+
+Regardless, the main issue with `notify` is still cross-canister atomicity. If `notify` fails, the balance update made in the token canister needs to be rolled back in the same atomic transaction. I don't think we should expect or rely on the DEX canister to refund the user.
+
+-------------------------
+
+jzxchiang | 2021-11-12 21:10:16 UTC | #107
+
+I also wanted to flag that token standard implementations should use certified variables for query functions (e.g. what's my balance? what transactions do I have?) for maximum security.
+
+This is what the ICP Ledger Canister is doing, as I discovered [here](https://forum.dfinity.org/t/enable-canisters-to-hold-icp/6153/176?u=jzxchiang).
+
+-------------------------
+
+Maxfinity | 2021-11-15 14:09:20 UTC | #108
+
+I think rather than transferAndCall a better name could be TransferAndNotify - you want to transfer monies and have the canister be aware that monies have a secondary canister be aware that monies have been transferred. 
+This is still an inter canister call, so care should be taken to ensure that this operation would succeed atomically.
+
+-------------------------
+
+Maxfinity | 2021-11-15 14:20:27 UTC | #109
+
+This is actually a similar pattern to what we are using at InfinitySwap https://app.infinityswap.one/. 
+
+**How can we do this?**
+
+→ represents a transmute operation - either a transfer from or a transfer and call. Care must be taken to ensure atomicity of this operation as it requires two canister calls.
+
+**Mint**
+
+```
+t1 -> t1'
+t2 -> t2'
+-------------------
+//synchronous
+t2'.transfer()
+t1'.transfer()
+** mint(address to)
+```
+
+**Burn**
+
+```
+//synchronous
+** burn(address to)
+-------------------
+t1' -> t1
+t2' -> t2 
+```
+
+**Swap**
+
+```
+t1 -> t1' 
+---------------------
+//synchronous
+t1'. approve()
+swap(uint amount0Out, uint amount1Out, address to, bytes calldata data)
+---------------------
+t2' -> t2
+```
+
+May actually be better to separate TransferAndNotify as is done with the IC's transfer and then notify because this would be a non-atomic operation and not make assumptions about whether a cross-canister call has succeeded.
+
+-------------------------
+
+senior.joinu | 2021-11-15 14:18:05 UTC | #110
+
+Yea, that makes sense to me.
+
+-------------------------
+
+jzxchiang | 2021-11-16 07:33:37 UTC | #111
+
+I'm not sure the ICP ledger canister model is developer-friendly or safe.
+
+Having two separate methods `transfer` and `notify` just pushes the burden of cross-canister atomicity to the client. (Actually, `notify` is being [deprecated](https://forum.dfinity.org/t/enable-canisters-to-hold-icp/6153/174?u=jzxchiang), and the sender will need to call the recipient directly.)
+
+For example, let's say a user wants to convert ICP to some other token using some DEX canister running on the IC.
+
+1. The user calls `transfer` on the ICP ledger canister to send ICP to a DEX canister.
+2. The user calls some custom function on the DEX canister to notify it that some ICP was sent to it.
+3. The DEX canister then does some stuff with the ICP (i.e. swapping it for another token), which will require at least two inter-canister calls.
+
+What if the DEX canister is out of cycles, or even worse, malicious? Then, after step 1 nothing else would happen, and the user just lost their ICP. Basically, we're back to the Dark Ages of DeFi when only ERC-20 existed. This is the problem that ERC-223 and ERC-677 tried to solve.
+
+I feel like a good token standard should take care of cross-canister atomicity, and clients shouldn't have to care. Trusting clients to implement two-phase commits and saga transactions correctly is a recipe for disaster IMO. I would rather have the community implement that here in this token standard and save future developers/users a lot of pain.
+
+-------------------------
+
+Maxfinity | 2021-11-16 11:01:49 UTC | #112
+
+[quote="jzxchiang, post:111, topic:4694"]
+What if the DEX canister is out of cycles, or even worse, malicious? Then, after step 1 nothing else would happen, and the user just lost their ICP. Basically, we’re back to the Dark Ages of DeFi when only ERC-20 existed. This is the problem that ERC-223 and ERC-677 tried to solve.
+[/quote]
+
+I think that would work if transfer also reverts the transfer if the notify fails. Yep, that makes sense.
+
+-------------------------
+
+kpeacock | 2021-11-16 16:39:37 UTC | #113
+
+I agree. I'm starting an initiative to create a ledger abstraction that will work across ICP, BTC, ETH, and any SNS tokens. The design goals are atomicity and to make it trivial for canisters to transparently accept and make payments with an API that is more like the Stripe payment API than a ledger
+
+-------------------------
+
+lastmjs | 2021-11-16 18:58:12 UTC | #114
+
+Basically trying to be the best fungible token standard all things considered?
+
+-------------------------
+
+lastmjs | 2021-11-16 19:05:20 UTC | #115
+
+For all involved in creating a token standard, I encourage you to consider adding some kind of "transferSafe" function as described in this tweet thread: https://twitter.com/lastmjs/status/1460379362142863364
+
+The basic idea is to allow each party in a transfer to verify and confirm the intent to send and receive a certain amount of cryptocurrency, hopefully drastically reducing the risk of sending to the wrong address.
+
+If we can start off with this kind of functionality in our Internet Computer tokens, perhaps we can reduce a lot of lost funds.
+
+Transferring large amounts of crypto with just a copy-paste of addresses is terrifying.
+
+-------------------------
+
+kpeacock | 2021-11-16 20:13:34 UTC | #116
+
+Absolutely agree with you on that! There are a lot of details to hash out for how we will design it, but safe transfers, plus simple ways to check your token balances and transaction history, are my top priorities in this design
+
+-------------------------
+
+Hazel | 2021-11-19 15:29:31 UTC | #117
+
+Random thought - this could also leverage the ICs private state.
+
+When staging a transaction the sender includes a "key". The recipient is required to input that key when accepting the transaction, else the transaction rolls back.
+
+-------------------------
+
+jzxchiang | 2021-11-19 22:18:32 UTC | #118
+
+Maybe this is a dumb question, but can't recipients just verify all incoming transactions? After all, if things go wrong, they benefit from some extra tokens.
+
+Also, I'd imagine that safe transfers would only be useful if a) the sender is a human (and not a smart contract), and b) whatever UI the sender is using requires them to type in an opaque address.
+
+I think  b) will slowly be solved with better UXs like ENS.
+
+-------------------------
+
+lastmjs | 2021-11-20 01:13:56 UTC | #119
+
+Correct, I don't think safe transfers are always required, that's why it should be in addition to the more bare-bones transfers.
+
+Recipients could just confirm everything, though I kind of feel it would be rare to mistype an actual address with a recipient just waiting to approve. So, some kind of shared code might be necessary to mitigate that...could be optional.
+
+I don't think ENS fully solves it, since there are very similar ENS names and you could still misstype them.
+
+-------------------------
+
+bitbruce | 2021-11-23 08:54:34 UTC | #120
+
+I don't think it's necessary to add safeTransfer()
+(1) This method can only avoid incorrectly transferring to a container that cannot handle the token. There are many situations where incorrect transfers occur, and avoiding errors relies mainly on the sender doing correctly.
+(2) Wallets and dapp containers have multiple more ways to avoid errors, either by UI experience improvement or by the receiver canister providing a function.
+
+-------------------------
+
+bitbruce | 2021-11-23 08:56:36 UTC | #121
+
+[https://github.com/iclighthouse/DRC_standards/issues/1](https://github.com/iclighthouse/DRC_standards/issues/1)
+This is the Token standard drafted by our team, and an example of the implementation.
+
+**Improvements**
+
+* Compatible with Principal and Account-id as Address
+* Using the pub/sub model for message notifications
+* Improving transaction atomicity with a lock/execute two-phase commit structure
+* Scalability of transaction records storage, temporary storage in token canister and permanent storage in external canisters
+
+-------------------------
+
+jzxchiang | 2021-11-25 20:21:46 UTC | #122
+
+Thanks for sharing this. I just took a look, and there's a lot of stuff in there.
+
+I'm gonna focus on transaction atomicity and try to figure out whether this proposed interface can solve the standard DEX user journey.
+
+In this user journey, we have the following entities:
+
+* Alice, who wants to swap Token A for Token B
+* Token A canister
+* Token B canister
+* DEX canister (assume there's only one  canister for simplicity)
+
+Now, this is the typical ERC-20 flow that would work on Ethereum:
+
+1. Alice calls `approve` on Token A canister to let DEX canister transfer some number of Token As on her behalf
+2. Alice calls some custom function (e.g. `swap`) on DEX canister to initiate the swap, which does the following:
+a. DEX canister calls `transferFrom` on Token A canister to transfer Token As from Alice's address to the DEX canister's address (to add to its Token A reserves)
+b. DEX canister internally calculates how many Token Bs Alice should get based on some formula like x * y = k
+c. DEX canister calls `transfer` on Token B canister to transfer Token Bs from DEX canister's address to Alice's address (which subtracts from its Token B reserves)
+d. DEX canister returns `true` on Alice's `swap` call if steps 2a, 2b, and 2c were successful; otherwise, it returns `false` and the whole transaction is atomically rolled back
+
+Note that:
+
+* The DEX canister makes 2 inter-canister calls: `transferFrom` and `transfer`. This example assumes that inter-canister calls are atomic because they are in Ethereum. On IC, they are not.
+* `transferFrom` is used for Token A but `transfer` is used for Token B. This is intentional because the only 3rd party transfer (i.e. Alice authorizing DEX canister to transfer on her behalf) happens for Token A. For Token B, the entity that owns the tokens and who initiates the transaction is one and the same, i.e. DEX canister.
+
+-------------------------
+
+jzxchiang | 2021-11-25 20:21:15 UTC | #123
+
+OK, so how would we use this new DRC20 interface to implement this same flow?
+
+Based off what I read, here is my guess (please correct me if I'm wrong):
+
+1. Alice calls `approve` on Token A canister, same as before
+2. Alice calls some custom function (e.g. `swap`) on DEX canister to initiate the swap, which does the following:
+a. DEX canister calls `lockTransferFrom` on Token A canister to **prepare to transfer** Token As from Alice to DEX canister, with itself as the "decider"
+b. DEX canister internally calculates how many Token Bs Alice should get, same as before
+c. DEX canister calls `lockTransfer` on Token B canister to **prepare to transfer** Token Bs from DEX canister to Alice, with itself as the "decider"
+d. Now, depending on whether  if steps 2a, 2b, and 2c were successful, DEX canister does different things...
+    - If all were successful, DEX canister calls `executeTransfer` on both Token A canister and Token B canister to **complete the transfers** (using `sendAll` as the execute type). Once both `executeTransfer` calls complete successfully, DEX canister returns `true` to Alice
+    - If at least one step failed, DEX canister calls `executeTransfer` on both Token A canister and Token B canister to **rollback the transfers** (using `fallback` as the execute type). Once both `executeTransfer` calls complete successfully, DEX canister returns `false` to Alice
+
+This assumes that `executeTransfer` must succeed if `lockTransfer` (or `lockTransferFrom`) succeeds.
+
+^ Does this flow sound right to you? @bitbruce
+
+-------------------------
+
+bitbruce | 2021-11-30 02:27:36 UTC | #124
+
+You are right in your understanding.
+
+lockTransfer/executeTransfer is an abstract base function for improving the atomicity of Tokens on the IC.  It can be applied to many scenarios. SWAP is one of them.
+
+[quote="jzxchiang, post:123, topic:4694"]
+This assumes that `executeTransfer` must succeed if `lockTransfer` (or `lockTransferFrom` ) succeeds.
+[/quote]
+`executeTransfer` may fail. Dex canister can remedy this. It can execute `executeTransfer` again. ~~To be safe, Dex canister should execute Token A canister's `executeTransfer` first.~~
+
+-------------------------
+
+jzxchiang | 2021-11-27 04:38:54 UTC | #125
+
+I thought the whole point of `lockTransfer` returning true is so that `executeTransfer` doesn't fail. In a two-phase commit protocol, isn't the [point](https://stackoverflow.com/questions/171876/how-do-two-phase-commits-prevent-last-second-failure) of phase 1 so that phase 2 won't fail?
+
+Also, I'm curious why DEX canister should execute Token A canister's `executeTransfer` first.
+
+If you could provide a bit more documentation on how you expect clients to use this standard, I think it would be very helpful to the community.
+
+-----
+
+General observations about the standard:
+
+* The standard is a little bloated. Is it necessary to continue to support the `approve` /  `transferFrom` flow? ERC-20 has it for historical reasons, but since we are developing a new standard in IC, we don't have to follow in their footsteps. And my understanding is that callback-based approaches like `transferAndCall` (or in this case, pub/sub) is the next-gen replacement for `approve` / `transferFrom`.
+* I'm not sure I understand how `gas` works. Why do you let users pick between paying gas in tokens or cycles? If they choose to pay in tokens, how will the token canister convert those tokens to cycles, since it can only burn cycles to continue running? Why is there a distinction between `gas` and `setGas` to begin with?
+* We might need certified variables to ensure that query methods (e.g. `balanceOf`) return the correct content, without resorting to slow updates. This is what the ICP ledger canister does, and it's not a trivial implementation. For example, they store ICP transactions in some sort of Merkle tree as  an internal data structure in the canister.
+
+Also, I'm curious what you plan on doing with this standard. Are you also implementing a wallet or DEX? Thanks for the great work.
+
+-------------------------
+
+bitbruce | 2021-11-27 07:38:01 UTC | #126
+
+[quote="jzxchiang, post:125, topic:4694"]
+I thought the whole point of `lockTransfer` returning true is so that `executeTransfer` doesn’t fail. In a two-phase commit protocol, isn’t the [point](https://stackoverflow.com/questions/171876/how-do-two-phase-commits-prevent-last-second-failure) of phase 1 so that phase 2 won’t fail?
+
+Also, I’m curious why DEX canister should execute Token A canister’s `executeTransfer` first.
+[/quote]
+
+You are right, it was my misunderstanding of your example.
+
+I talked about another scenario: if Dex has token pool (with Token A and Token B), and if Aice wants to exchange Token A for Token B (transfer Token A to Dex pool and get Token B from Dex pool), then Dex should first execute Token A canister’s `executeTransfer` before executing Token B canister’s `transfer`.
+
+approve / transferFrom, transferAndCall, pub/sub are not interchangeable and can be satisfied with different scenarios, which can expose different problems in atomicity. As transferAndCall has difficulty handling Callback failures, which is bad for IC‘s without atomicity support, we drop transferAndCall in favor of approve / transferFrom, pub/sub.
+
+Let sender pay for gas, the purpose is to prevent ddos attack. The charging method is cycles, token, if token is charged as gas, it will be destroyed (default) or sent to FEE_TO, canister's cycles need to be provided by someone else; if cycles are charged as gas, it will be used as canister's cycles (default) or sent to FEE_TO.
+
+We will provide some use cases at a subsequent time.
+You guessed right! ICLighthouse is working on a wallet and will provide Defi Dapps later.
+
+-------------------------
+
+jzxchiang | 2021-11-30 05:21:52 UTC | #127
+
+> approve / transferFrom, transferAndCall, pub/sub are not interchangeable and can be satisfied with different scenarios, which can expose different problems in atomicity. As transferAndCall has difficulty handling Callback failures, which is bad for IC‘s without atomicity support, we drop transferAndCall in favor of approve / transferFrom, pub/sub.
+
+Hm... but pub/sub also involves a token canister calling external canisters (i.e. subscribers). How does pub/sub avoid the atomicity problems that `transferAndCall` suffers from? From my perspective, it seems like pub/sub would be even harder to make atomic, since there can be an arbitrary number of subscribers who need to be notified.
+
+> We will provide some use cases at a subsequent time.
+You guessed right! ICLighthouse is working on a wallet and will provide Defi Dapps later.
+
+Awesome—looking forward to it!
+
+-------------------------
+
+bitbruce | 2021-11-30 07:35:51 UTC | #128
+
+[quote="jzxchiang, post:127, topic:4694"]
+Hm… but pub/sub also involves a token canister calling external canisters (i.e. subscribers). How does pub/sub avoid the atomicity problems that `transferAndCall` suffers from? From my perspective, it seems like pub/sub would be even harder to make atomic, since there can be an arbitrary number of subscribers who need to be notified.
+[/quote]
+
+transferAndCall is often used in synchronous calls.
+pub/sub is often used for asynchronous message consumption.
+In the IC development environment, pub/sub is more friendly to programmers.
+In terms of functionality pub/sub can override transferAndCall.
+
+-------------------------
+
+jzxchiang | 2021-12-01 07:27:25 UTC | #129
+
+Why is pub/sub more friendly to programmers if it's not done atomically?
+
+What type of use case were you envisioning developers using pub/sub for instead of approve / transferFrom?
+
+-------------------------
+
+bitbruce | 2021-12-02 06:04:43 UTC | #130
+
+[quote="jzxchiang, post:129, topic:4694"]
+What type of use case were you envisioning developers using pub/sub for instead of approve / transferFrom?
+[/quote]
+
+It supports both pub/sub and approve/transferFrom
+
+-------------------------
+
+witter | 2022-01-18 02:36:53 UTC | #131
+
+# Dfinity Fungible Token Standard v0.1.3 Released
+
+https://medium.com/@DelandLabs/dfinity-fungible-token-standard-v0-1-3-released-6f8c9da85ec3
+
+-------------------------
+
+witter | 2022-01-26 13:52:19 UTC | #132
+
+# Dfinity Fungible Token Standard Change Logs
+## v0.1.4 Changes
+
+* Optimize the size of wasm package
+* Add metrics to http interface [@varik1770](https://github.com/varik1770) ([#30](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/30))
+* More unit test for tx storage [@varik1770](https://github.com/varik1770) ([#26](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/26))
+* Improve unit test with rstest [#22](https://github.com/Deland-Labs/dfinity-fungible-token-standard/issues/22) [@varik1770](https://github.com/varik1770) ([#23](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/23))
+
+## v0.2.0
+
+* Feature: support nonce [@varik1770](https://github.com/varik1770) ([#36](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/36))
+* Remove call support [@varik1770](https://github.com/varik1770) ([#35](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/35))
+* Remove notify after transfer [@varik1770](https://github.com/varik1770) ([#34](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/34))
+* Refactor: add rate_decimals to fee struct [@varik1770](https://github.com/varik1770) ([#32](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/32))
+
+## v0.2.1
+* Improve: privacy protection [@varik1770](https://github.com/varik1770) ([#38](https://github.com/Deland-Labs/dfinity-fungible-token-standard/pull/38))
+
+## Let me introduce the major change in v0.2
+**Nonce**: approve/transfer/transferFrom/burn/mint support optional nonce to avoid submitting the same transaction repeatedly 
+**Remove notify & call** : why remove?
+
+> Talking to untrustworthy canisters can be risky, for the following (likely incomplete) reasons:
+
+> The other canister can withhold a response. Although the bidirectional   messaging paradigm of the Internet Computer was designed to guarantee a   response eventually, the other party can busy-loop for as long as they are   willing to pay for before responding. Worse, there are ways to deadlock a   canister.
+The other canister can respond with invalidly encoded Candid. This will cause   a Motoko-implemented canister to trap in the reply handler, with no easy way   to recover. Other CDKs may give you better ways to handle invalid Candid, but even then you will have to worry about Candid cycle bombs that will cause your reply handler to trap.
+
+
+**Fee struct** : [the old logic](https://forum.dfinity.org/t/thoughts-on-the-token-standard/4694/69?u=witter)
+
+The fee rate has a default decimals 8, this one is undocumented, just a default setting that confuses developers. Now rate_decimals is added to Fee Struct to clearly identify the decimal places of rate, which is more clear
+```
+type Fee = record { rate : nat; rate_decimals : nat8; minimum : nat };
+```
+
+**Tx Record**: DFT Standard compatible with AccountId and Principal, if the `caller` in the `TxRecord` use principal, the original Principal of the accountid will be exposed. For privacy reasons, the caller of the tx record is changed from Principal to TokenHolder to avoid privacy leakage.
+
+-------------------------
+
+witter | 2022-03-29 15:21:13 UTC | #133
+
+v0.4.0 is released, this release contains a large number of automated integration test cases to verify the reliability of the code. As the infrastructure of DEFI, reliability and security are the most important things
+https://github.com/Deland-Labs/dfinity-fungible-token-standard/releases/tag/v0.4.0
+
+-------------------------
+
+GLdev | 2022-03-29 16:14:47 UTC | #134
+
+> v0.4.0 is released
+
+Is this standard supported / maintained by Dfinity the org?
+
+-------------------------
+
+mariop | 2022-04-05 15:55:20 UTC | #135
+
+[quote="GLdev, post:134, topic:4694"]
+Is this standard supported / maintained by Dfinity the org?
+[/quote]
+
+No, the Dfinity Foundation is not involved with Deland-Labs's project.
+
+-------------------------
+
+GLdev | 2022-04-05 18:06:39 UTC | #136
+
+[quote="mariop, post:135, topic:4694"]
+No, the Dfinity Foundation is not involved with Deland-Labs’s project.
+[/quote]
+
+Hmmmm. Perhaps there should be at least some talk about how to guide teams in using the dfinity brand name in their projects. I understand that a lot of projects would benefit from the exposure, and we're still early in ecosystem adoption, but at some point having dfinity in their name will start back-firing. At least ask the teams to clearly differentiate between IC / dfinity and state their affiliation or lack thereof ...
+
+-------------------------
+
+witter | 2022-04-19 12:01:59 UTC | #137
+
+The name has been changed to fungible-token-standard :)
+**v0.5.0 is released**
+Major Updates.
+
+1. Blockchain support for Token, integration of the ledger design, interface optimization design
+2. TokenHolder type changed to AccountIdentifier to ensure that Principal receipts and default AccountIdentifier are consistent
+3. Use bincode serialization to optimize the size of stored data
+4. Auto-scaling failure and archiving failure of the fallback policy optimization
+5. Remove nonce, use transaction hash to do better anti-duplication
+6. Auto-scaling storage optimization
+
+https://github.com/Deland-Labs/fungible-token-standard/releases/tag/v0.5.0
+
+[quote="GLdev, post:136, topic:4694"]
+Hmmmm. Perhaps there should be at least some talk about how to guide teams in using the dfinity brand name in their projects. I understand that a lot of projects would benefit from the exposure, and we’re still early in ecosystem adoption, but at some point having dfinity in their name will start back-firing. At least ask the teams to clearly differentiate between IC / dfinity and state their affiliation or lack thereof …
+[/quote]
+
+-------------------------
+
+RmbRT | 2022-04-27 18:50:11 UTC | #138
+
+I had some issues with the ICP ledger interface and with your design, too, which I outlined in a reply to this thread:
+https://forum.dfinity.org/t/enable-canisters-to-hold-icp/6153/273?u=rmbrt
+Maybe you could incorporate something like this into your design?
+
+-------------------------
+
+witter | 2022-04-28 10:20:21 UTC | #139
+
+Please read Question 8 and Question 9 that were considered when designing https://dft.delandlabs.com/
+ ```
+8. TransferAndCall vs Receiver Notify
+
+* Question: which option is more suitable
+* Consideration:
+  * Notify can meet the basic notification needs. Although it cannot support better flexibility, it is sufficient to meet the transfer scenario
+  * TransferAndCall provides better flexibility, but it depends on the transfer caller to fully understand the method and parameters corresponding to the call, which is not needed for most transfer scenarios
+  * For security reasons, For security reasons, do not call the canister of the location inside the canister,[why?Inter-canister calls](https://www.joachim-breitner.de/blog/788-How_to_audit_an_Internet_Computer_canister)
+* Solution:
+  * Neither is supported
+
+9. ApproveAndCall VS TransferAndCall
+
+* Question: We compare ApproveAndCall and TransferAndCall. ApproveAndCall and TransferAndCall are two sets of non-atomic operations, there is no difference essentially. Which one should be retained?
+* Consideration: In some scenarios, when multiple Tokens need to be transferred at the same time, TransferAndCall can not meet such needs. After approval, execute transferFrom in the final call to pay multiple tokens at once
+* For security reasons like Q8
+* Solution: call is not supported
+```
+We are very familiar with ERC20 and its optimized version. In the initial DFT Standard design, we also referred to these (in the v0.1.0 version, there was a design of notify), and for security reasons, all these designs were finally deleted.
+
+Why we remove it? please check it here [ Inter-canister calls](https://www.joachim-breitner.de/blog/788-How_to_audit_an_Internet_Computer_canister) 
+
+
+[quote="RmbRT, post:138, topic:4694"]
+Maybe you could incorporate something like this into your design?
+[/quote]
+
+-------------------------
+
+RmbRT | 2022-04-28 13:10:44 UTC | #140
+
+I get that it's hard to correctly handle inter-canister calls, but in some instances, they just have to be made, if you want to have any functionality that doesn't rely on users issuing multiple transactions to achieve a single task. Especially if you want a service-side guarantee that a multi-step process will finish once it started, you need inter-canister calls. But if you really don't want to support those, then your token standard is not appropriate for our purposes.
+
+-------------------------
+
+mariop | 2022-04-28 14:11:32 UTC | #141
+
+Hi RmbRT,
+
+I'm leading the team responsible for the ICP Ledger and I can explain to you why there is a notification mechanism. Before I start though, I want to emphasise that most standards on the IC don’t have a notification mechanism. That is for a *very good reason*.
+
+Let me explain why this is the case. There are several ways to notify a Principal about a transaction on the IC. The approach you propose is the more automatic one, which requires the Ledger to notify when a transaction has been successful. With this approach, the Ledger must be sure that the notification arrives at the receiver canister. On the IC, this requires the receiver to answer to the on_ft_received call with either a simple ack in case the handler is implemented on the receiver side, or with an error in case the handler is not implemented. What is the problem then? Well, there are two problems with this: 1) the Ledger could not get any answer from the receiver canister when it calls on_ft_received and 2) the Ledger receives a different error than the one saying the receiver canister misses the on_ft_received endpoint. Let's talk about each one of these.
+
+If on_ft_received doesn't return then the Ledger canister is effectively stuck. Remember that the workflow relies on the fact that the message is received. The Ledger theoretically could not even stop the call to the receiver canister because then the payment would be lost. Note that it’s very problematic to upgrade a canister when there is an in-flight message and there is no way for the Ledger to do anything about it.
+
+The situation is not better if the ledger receives a different error from the call, e.g. if the canister doesn’t exist or the canister exists but its queue is full. The Ledger doesn’t know and cannot know whether the canister will exist in future and even if it did, there would be no way to tell when the canister will be available and when it will be able to receive messages. The Ledger could retry indefinitely but then we have another issue: the more notification pending, the more space and time the Ledger would need.
+
+Consequently, I believe that a notification mechanism that involves the ledger (directly), inevitably leads to issues at some point.
+
+Needless to say, no safe standard should support notify without a well defined and tested approach.
+
+The Ledger notify method is another approach. It is more secure than the one you proposed because it gives the responsibility to deliver the notification to the sender. Despite this, the notify method is still problematic and less convenient and we are deprecating it.
+
+A final approach to the issues pertaining to notify is the so called fire and forget mechanism where the ledger sends the event to the canister and doesn’t wait for a response. This is possible and theoretically safer but then you end up with the same issue you have without notify. The caller must be able to call this mechanism multiple times in case the first notify doesn’t reach the receiver canister and that means that the client will need to track double-spending related information.
+
+Note that most of the canisters on the IC work with the ICP Ledger. For instance, the CMC canister and the governance canister work just fine.
+
+-------------------------
+
+witter | 2022-04-28 15:53:22 UTC | #142
+
+I have explained above, we want to support, but due to security concerns, we have to give up support.
+And the explanation of @mariop  also allows us to see why it needs to be dropped.
+
+-------------------------
+
+RmbRT | 2022-04-28 20:09:40 UTC | #143
+
+Oh, wow, I didn't know the IC architecture had such hard limitations. Especially the stuck calls. In that case, can any canister ever safely call another canister? Because I assume this is a problem for all inter-canister interactions.
+
+-------------------------
+
+AnonymousCoder | 2022-04-28 22:52:54 UTC | #144
+
+Not sure if I am right or wrong here but...
+The way I see it - if the canisters you wrote have correct code in them which will always work and has no bugs, then that kind of eliminates any possibility of an async method getting stuck, even though possibility exists ? Or are there any caveats that might happen in the canister that I am not aware of and cause a stuck method, breaking functionality? @mariop 
+
+I think Mario possibly gave this example about ledger canister getting stuck if we are "awaiting" execution of a callback method defined in a separate canister to which ledger canister should automatically make a call after each transaction to notify it, because some people might not know they must implement that callback method in their canister if they want to work with ledger canister that has that kind of functionality, which would undoubtedly happen.
+
+But if YOU are writing your own canisters and making inter-canister calls that are async, code works etc, I don't see how this might happen.
+
+-------------------------
+
+bogwar | 2022-04-29 10:21:28 UTC | #145
+
+The scenario that @mariop has in mind is not that of a canister which does not implement the callback (in this case the IC will return an error message to the caller) but a malicious canister which never returns an answer to the call of the ledger.
+So (as @AnonymousCoder says) notifying trusted canisters should be ok (provided that they are not buggy) but notifying arbitrary canisters (as I'm guessing @RmbRT suggests) is quite problematic.
+
+-------------------------
+
+RmbRT | 2022-04-29 16:31:14 UTC | #146
+
+Correct, this is what I suggested. But extrapolating from that fact, we now can't have any open composable systems of canisters that can interact with other canisters. The only way to safely implement such an interaction is to output something that the user then has to pass to another canister in another transaction.
+However, there are two problems with this:
+
+* The user is not guaranteed to issue this transaction, so the initial canister cannot possibly rely on an issued action being executed (not even guaranteed to happen *eventually*).
+* The recipient canister might have to verify that data, and for that, would have to query the source canister for verification. However, as I understand it, if the receiving canister does not explicitly trust the source canister, it cannot even contact it for verification.
+
+Thus, the IC is extremely limited in what kinds of ecosystem you can design in it. You can only create closed groups of canisters that trust each other, but cannot really extend them. Unless you create a developer-authorised dynamic web of trust for canisters, which to me smells like attacking the problem from the wrong side. You have this one issue in the protocol of the IC regarding inter-canister calls, and that hinders all attempts to make a powerful, simple and safe to use token standard. This one technical limitation has now led to limited composability of canisters, needlessly complex transaction workflows, complex logic within canisters, and forced developers to maintain some form of whitelist for canisters to interact with.
+
+Is it impossible to force a canister call to definitely return *eventually* at the protocol level, or to support making a call that does not expect a return message on the IC (therefore, does not wait for a reply)? If so, why? The second option seems trivially possible to me and I think it would solve a lot of problems regarding inter-canister event propagation. It would allow generic handling and issuing of events without having to make both canisters whitelist each other or forcing users to make multi-step transactions.
+I know there is still the problem of a call being rejected or never being executed because of issues with the destination canister's message queue, but at least a call would no longer have the ability to completely incapacitate the caller canister.
+
+-------------------------
+
+Maxfinity | 2022-04-29 18:33:10 UTC | #147
+
+Please also see my thread here, glad you agree:
+https://forum.dfinity.org/t/the-biggest-problem-with-the-ic-intercanister-calls/11598
+
+-------------------------
+
+Maxfinity | 2022-04-29 18:35:50 UTC | #148
+
+[quote="RmbRT, post:146, topic:4694"]
+or to support making a call **that does not expect a return message on the IC (therefore, does not wait for a reply)? If so, why? The second option seems trivially possible to me** and I think it would solve a lot of problems regarding inter-canister event propagation. It would allow generic handling and issuing of events without having to make both canisters whitelist each other or forcing users to make multi-step transactions.
+[/quote]
+
+Completely agree, I think it makes much more sense for the IC to implement some form of time-out.
+
+-------------------------
+
+RmbRT | 2022-04-29 19:26:43 UTC | #149
+
+Good thread. It'd definitely be something we need sooner rather than later, as the IC is still fairly fresh and the roads towards different design choices aren't completely blocked yet.
+
+-------------------------
+
+jzxchiang | 2022-05-02 05:31:21 UTC | #150
+
+> The Ledger notify method is another approach. It is more secure than the one you proposed because it gives the responsibility to deliver the notification to the sender.
+
+I'm not sure I understand. Isn't the "Ledger notify method" the first approach, where the sender calls the notify method of the ledger canister, which then calls some predefined method of a receiver canister? Do you mind sending a link to the Candid for this method?
+
+-------------------------
+
+jzxchiang | 2022-05-02 05:33:14 UTC | #151
+
+Agreed with your concern. FWIW, I think the "one-shot messaging" solution [proposed](https://forum.dfinity.org/t/the-biggest-problem-with-the-ic-intercanister-calls/11598/10?u=jzxchiang) by @JensGroth would be a great-to-have option for canister developers. A developer can elect to send a "one-shot message" to an untrusted canister if they'd like.
+
+-------------------------
+
+mariop | 2022-05-02 07:24:05 UTC | #152
+
+[quote="jzxchiang, post:150, topic:4694, full:true"]
+> The Ledger notify method is another approach. It is more secure than the one you proposed because it gives the responsibility to deliver the notification to the sender.
+
+I’m not sure I understand. Isn’t the “Ledger notify method” the first approach, where the sender calls the notify method of the ledger canister, which then calls some predefined method of a receiver canister? Do you mind sending a link to the Candid for this method?
+[/quote]
+
+The method is [here](https://github.com/dfinity/ic/blob/6372b95584a922f6cb99f5d6aeac8f1592032222/rs/rosetta-api/ledger.did#L101). `notify` is separate from `send`  and must be triggered by the caller after `send` succeeded.
+
+-------------------------
+
+jzxchiang | 2022-05-03 00:39:41 UTC | #153
+
+Ah I see. I'm not familiar with the Rosetta interface.
+
+If a user calls this method, will the Rosetta node forward it directly to the receiver canister, or does it still go through the ICP ledger canister?
+
+-------------------------
+
+mariop | 2022-05-03 12:58:44 UTC | #154
+
+[quote="jzxchiang, post:153, topic:4694"]
+Ah I see. I’m not familiar with the Rosetta interface.
+[/quote]
+
+This isn't the rosetta interface though. This is the old Ledger API that will be deprecated soon.
+
+[quote="jzxchiang, post:153, topic:4694"]
+If a user calls this method, will the Rosetta node forward it directly to the receiver canister, or does it still go through the ICP ledger canister?
+[/quote]
+
+The method is in the ICP ledger canister so it will go through the Ledger canister and that's unsafe.
+
+-------------------------
+
+RmbRT | 2022-05-09 19:56:18 UTC | #155
+
+[quote="mariop, post:154, topic:4694"]
+This isn’t the rosetta interface though.
+[/quote]
+It's confusing because the URL's directory structure implies otherwise at first glance.
+
+[quote="mariop, post:154, topic:4694"]
+This is the old Ledger API that will be deprecated soon.
+[/quote]
+Does this mean my application and canister is going to break? Is there a newer API I should be targeting instead?
+
+-------------------------
+
+mariop | 2022-05-10 09:14:42 UTC | #156
+
+[quote="RmbRT, post:155, topic:4694"]
+[quote="mariop, post:154, topic:4694"]
+This isn’t the rosetta interface though.
+[/quote]
+
+It’s confusing because the URL’s directory structure implies otherwise at first glance.
+[/quote]
+
+Agreed and naming doesn't help too. The structure was set in place before I joined and it's hard to change it right now because of a lot of workflow, inside and outside Dfinity, that use that url.
+
+[quote="RmbRT, post:155, topic:4694"]
+[quote="mariop, post:154, topic:4694"]
+This is the old Ledger API that will be deprecated soon.
+[/quote]
+
+Does this mean my application and canister is going to break? Is there a newer API I should be targeting instead?
+[/quote]
+
+At some point we would like applications to not use `notify` from the ledger because of the problems it has. The plan is to eventually remove `notify`, at least in the current form. New dapps should use only the [public interface of the ledger](https://github.com/dfinity/ic/blob/c52034a2840fa5e15acd7f9215bbd7930f4f2203/rs/rosetta-api/ledger_canister/ledger.did#L223).
+
+-------------------------
+
+RmbRT | 2022-05-10 09:11:51 UTC | #157
+
+I'm sorry, this link is guarded by an "dfinity account" login wall, but I can't find any such saved login in my browser.
+
+-------------------------
+
+mariop | 2022-05-10 09:14:59 UTC | #158
+
+It should be fixed now.
+
+-------------------------
+
+RmbRT | 2022-05-10 09:19:36 UTC | #159
+
+Thanks. So the new flow is:
+1. User sends ICP to canister via ICP ledger, and receives the block index as a result.
+2. User sends information about where to find the TX to the canister.
+3. Canister calls ICP ledger's query_blocks() with the block ID, and receives back the block containing the TX.
+
+I take it the returned block does not have to be verified any further, and can be trusted, since it came from the ICP ledger?
+
+-------------------------
+
+mariop | 2022-05-10 10:03:55 UTC | #160
+
+Yes. For additional security I suggest to call `query_blocks` as an `update` instead of a `query`. In this way the IC will guarantee that the response can be trusted.
+
+-------------------------
+
+domwoe | 2022-05-10 10:46:03 UTC | #161
+
+Since @RmbRT wants to call `query_blocks` from another canister it has to be an `update` call anyway. There's no way to do inter-canister query calls, in particular not across subnets.
+
+-------------------------
+
+mariop | 2022-05-10 11:00:27 UTC | #162
+
+I got confused on the third point. If it's a canister then use an update call and all is fine. If it's not a canister, do one of 1) make an update call 2) do multiple queries 3) use the answer certification to check the result.
+
+I realised now that my answer was more confusing than helpful.
+
+-------------------------
+
+witter | 2022-05-18 15:34:29 UTC | #163
+
+Hi, @RmbRT CDK0.5.1 supports notify, [DFT standard](https://github.com/Deland-Labs/fungible-token-standard) will bring back notify support
+https://forum.dfinity.org/t/rust-cdk-v0-5-1-is-out/13086
+[quote="Enable Canisters to Hold ICP, post:273, topic:6153"]
+I just want to have a consumer-side abstraction for receiving tokens,
+[/quote]
+
+-------------------------
+
+mariop | 2022-05-18 15:40:05 UTC | #164
+
+[quote="witter, post:163, topic:4694"]
+Hi, @RmbRT CDK0.5.1 supports notify, [DFT standard](https://github.com/Deland-Labs/fungible-token-standard) will bring back notify support
+[/quote]
+
+@witter just to be sure, have you read https://docs.rs/ic-cdk/0.5.1/ic_cdk/api/call/fn.notify_with_payment128.html and particularly the point :
+* It is safe to upgrade a canister without stopping it first if it sends out *only* one-way messages.
+
+Are you going to replace all calls with one-way messages?
+
+-------------------------
+
+witter | 2022-05-18 16:14:12 UTC | #165
+
+Yes, i saw the message but still thanks for the kind reminder @mariop.
+[quote="mariop, post:164, topic:4694"]
+It is safe to upgrade a canister without stopping it first if it sends out *only* one-way messages.
+[/quote]
+
+We have two things to optimize
+1.Please take a look at [the question 8](https://dft.delandlabs.com/#problems-to-be-solved) that we have thought about, we want to let the payee canister be notified, so as to know in time that the payment has occurred. We removed notify for security reasons, now we're bringing it back :slight_smile: 
+2. In the token standard, there is only three external update call:
+   - auto-scaling-storage archives historical transaction records, we will replace it with one-way message
+  - create auto-scaling-storage canister (management create_canister),This cannot be replaced for the time being, maybe the management canister can support the one-way method in the future, we will replace
+  - install auto-scaling-storage canister code (management install_code) ,the same as above.
+
+[quote="mariop, post:164, topic:4694"]
+Are you going to replace all calls with one-way messages?
+[/quote]
+
+-------------------------
+
+RmbRT | 2022-05-18 17:14:10 UTC | #166
+
+Great. That went much quicker than I anticipated. I'm glad about your choice to reintroduce notifications into the DFT standard.
+
+-------------------------
+
+Maxfinity | 2022-05-18 17:36:43 UTC | #167
+
+[quote="mariop, post:160, topic:4694"]
+EDIT: @rmbRT I realised my answer is wrong. You can call `query_blocks` as a `query` from a canister safely as we use certified variables that guarantee the answer can be trusted. If you call it from a custom client then you may want to call the method in replicated mode so that you don’t have to deal with certificates.
+[/quote]
+
+[quote="witter, post:165, topic:4694"]
+* auto-scaling-storage archives historical transaction records, we will replace it with one-way message
+[/quote]
+
+Also in is20. We will this week have the PR reintroducing a similar flow.
+
+-------------------------
+
+witter | 2022-05-18 18:14:11 UTC | #168
+
+Here is the PR,https://github.com/Deland-Labs/fungible-token-standard/pull/130, more test is comming.  :slight_smile: 
+After the test is over, it will be merged into the master branch. This feature will be released in the next version.
+[quote="RmbRT, post:166, topic:4694, full:true"]
+Great. That went much quicker than I anticipated. I’m glad about your choice to reintroduce notifications into the DFT standard.
+[/quote]
+
+-------------------------
+
+lastmjs | 2022-05-19 13:30:50 UTC | #169
+
+To all of those interested in token standards, please help us as a community to coalesce around a minimum viable standard that we can all build off of.
+
+Today we have the Ledger & Tokenization Technical Working Group: https://dfinity.zoom.us/j/94765742644?pwd=d3pFRjFnUy91MncxSnN3ajdCdkRDZz09
+
+We are also currently collaborating on a Google Doc to discuss the minimum viable standard. 
+Please leave comments so that we can discuss during the working group an hour and a half from now: https://docs.google.com/document/d/1Um3Z2uUgWVyhUvQEjtrSxMG7puTpXRGPT9cvPQ_qroo/edit
+
+-------------------------
+
+witter | 2022-05-26 13:55:48 UTC | #170
+
+Hi,**DFT (fungible-token-standard) v0.6.0** released:
+Major Updates:
+1. Code refactoring & optimization for easier expansion
+2. Built-in implementation of mineable & burnable & batchTransfer & batchMint configurable extensions
+3. More unit tests (coverage 85%)
+4. Re-support notify @RmbRT 
+5. Auto-scaling storage optimization & unit tests
+
+full changes:
+https://github.com/Deland-Labs/fungible-token-standard/releases/tag/v0.6.0
+
+document:
+  https://dft.delandlabs.com
+
+-------------------------
+
+goose | 2022-05-27 01:24:20 UTC | #171
+
+I personally support the addition of batchtransfer and batchmint. In IC ecology, cross canister calls often occur, and batch processing interfaces should be the basic requirements of IC. This can reduce many cross canister calls. Increase TPS per unit time of DAPP
+
+-------------------------
+
+witter | 2022-05-27 03:25:54 UTC | #172
+
+This is an optional feature, if you need it, [here](https://dft.delandlabs.com/FrequentAskedQuestions#dft-has-built-in-extensions-for-mint-and-burn-how-do-i-choose-these-extensions) is the configuration documentation.
+If you just want to test it, this package [dft_all_features.wasm](https://github.com/Deland-Labs/fungible-token-standard/releases/download/v0.6.0/local-0.6.0.zip) is the package that contains all the optional features 
+
+[quote="goose, post:171, topic:4694"]
+batchtransfer and batchmint
+[/quote]
+
+-------------------------
+
+avi | 2022-05-31 08:18:16 UTC | #173
+
+I saw the DFT standard, and I am very confused as to why there is an interface such as setFee. The existence of Fee will make all businesses confused in the processing of the amount.
+
+-------------------------
+
+witter | 2022-05-31 09:11:28 UTC | #174
+
+https://dft.delandlabs.com/#problems-to-be-solved Q4
+> 4. Reverse gas model
+>* Question: How to prevent ddos attacks
+>* Consideration: The call of the canister does not require the caller to pay gas fees(canister pay the gas fees)
+>* Solution: Any update call to canister should be charged to the caller
+[quote="avi, post:173, topic:4694"]
+why there is an interface such as setFee
+[/quote]
+
+-------------------------
+
+avi | 2022-05-31 09:22:36 UTC | #175
+
+ddos attack? ? ? I can attack the container without calling transfer
+
+-------------------------
+
+avi | 2022-05-31 09:23:58 UTC | #176
+
+I think that a mature project party will not consider the issue of handling fees, because a successful project does not need to rely on handling fees to survive.
+
+-------------------------
+
+avi | 2022-05-31 09:31:46 UTC | #177
+
+Malicious consumption of cycles is also a DDOS attack.
+But the query method also consumes cycles
+If the call consumes 500w cycles at a time
+query consumes 50w cycles at a time
+I don't need to call the call method, the robot can call query.
+
+-------------------------
+
+avi | 2022-05-31 09:33:57 UTC | #178
+
+I don't think using a fee will prevent it. It should be promoted to let ICP officials deal with this problem of malicious consumption of cycles
+
+-------------------------
+
+avi | 2022-05-31 12:05:15 UTC | #179
+
+I just looked at other standards, yes, those based on homogenized tokens have the ```fee``` field, and I went to look at non-fungible tokens. I was surprised to find out. I can't find the ```fee``` field, what is the so-called ```How to prevent ddos attacks``` in the end.
+
+-------------------------
+
+ShortBabyface | 2022-06-03 07:18:59 UTC | #180
+
+Hey guys
+Im a new developer. Currently im creating a dapp on icp and I havd few questions:
+Why do you need to launch your own projects token on ic instead of using icp token?
+Im building a dapp tgat requires community to vote on decisions.
+If i build my own dapps token how do i even set it up? Does IC has any "dex" like uniswap? Do i create the token based on any token standart projects around, then create a icp/mytoken pair on "icpdex". How to set up an icon for my token? So many questions...
+
+-------------------------
+
+diegop | 2022-06-05 05:34:04 UTC | #182
+
+@808mafia This post (like others you have posted recently) are not productive or helpful to advancement of the ecosystem so I’m closing it down. If you would like to help, you can actually join the token working groups not post trolling comments. 
+
+
+I know it can be seen as harsh, but it’s my role to help the community have a healthy forum for deep discussions.
+
+-------------------------
+
+mparikh | 2022-06-05 07:16:20 UTC | #183
+
+Typically you would want a DAO to manage whatever service that you are thinking about from a Dapp perspective. This DAO is presumably unique to your Dapp. So how would you form a DAO? Fair launch of a token to manage the DAO would be one way.
+
+How do you get the community rallying around the DAO? Well by building on a already existing platform with re-usable code & minimizing the chance of a "naked" rug pull. Enter SNS.
+
+Ok ; so you buy the koolaid(SNS). How do you get investors. Enter community funds. 1.2 M ICP are already on community funds. Depending how this feature turns out, you should be able to pitch to the community to fund your project.
+
+Sonic and infinityswap are DEXs on IC. I used Sonic to provide liquidity for OGY/WICP pair. The experience was f... awesome; with near zero gas fees (0.001ICP).
+
+-------------------------
+
+dieter.sommer | 2022-06-21 13:59:13 UTC | #184
+
+**Cryptographic verifiability of ledgers**
+
+Let me (re)start a discussion that is orthogonal to the current topics handled in the working group: Cryptographic verifiability of ledgers on the Internet Computer. In a recent call with @witter, he mentioned that cryptographic verifiability is his prime concern for ledgers. He asked me to bring this up in the Working Group again for a more thorough discussion.
+
+Going through my notes of the Working Group discussions, I saw that @witter has voiced his opinion on the importance of this already in (one of) the first Working Group meetings on May 10 where he has flagged this as his primary concern. In a later meeting, this was coming up again and we discussed this issue within DFINITY and briefly presented the challenges in the follow-up meeting. The outcome was, that it is quite challenging and thus do not want to take any action now, but we did not give the discussion any further attention.
+
+Following up on @witter's request, let me now bring this up again with this forum post for discussion among the participants of the Working Group. This is indeed a very important topic and full transparency of what has been discussed is important.
+
+The technical discussions in DFINITY are summarized next: Having cryptographic proof of integrity of the ledger can be achieved by having all blocks of the ledger cryptographically signed. Signatures could be obtained through the subnet signatures that are used for state certification. Those are BLS threshold signatures generated after every round for the purpose of state certification where parts of the state are getting certified via Merkle proofs.
+
+The execution of messages by canisters is performed in a highly-optimized concurrent fashion and at the end of each round we obtain a deterministic state in each replica that can be certified via Merkle proofs. However, after the execution of each individual message during the round, we do not have an explicit deterministic state on which certification could act analogous to how it is done currently at the end of the round. Retrofitting execution to accomplish this would be a major task and could increase message execution latency by a constant factor (a factor of 2 or 3 seems realistic).
+
+The essence here is that in theory it is possible to get the ledger blocks cryptographically signed, however, there are many practical obstacles and it would be a huge project in the execution layer that would lead to a significantly increased message execution latency to achieve this.
+
+Hope this explains a bit better what the results of the technical investigations so far on the topic of certified ledger blocks have been. Further comments and ideas by the community on other ways of solving this are of course welcome.
+
+-------------------------
+
+witter | 2022-06-21 14:36:24 UTC | #185
+
+It was a pleasure to have a meeting with dieter and discuss the very in-depth issues of the token standard, this summary is very detailed and appreciated dieter’s work. Currently DFT standard solves the problem of cryptographic proof by a built-in blockchain, DEFI also needs sufficient cryptographic proof to gain the trust of users (this distrust is not due to distrust of IC, it is the lack of cryptographic proof provided to users by DEFI applications)
+
+-------------------------
+
+jzxchiang | 2022-06-22 00:55:19 UTC | #186
+
+Perhaps can someone explain why we want cryptographic verifiability in a ledger to begin with? Are the security guarantees of the IC insufficient?
+
+Is this more of a UX feature so that users feel that their funds are safe, or is there a legitimate security concern with the current ledger design?
+
+-------------------------
+
+blockpunk | 2022-06-22 09:59:15 UTC | #187
+
+Does this mean that the proof of DeFi and token transactions needs to be implemented at the application level by the developers themselves?
+
+-------------------------
+
+witter | 2022-06-22 14:13:01 UTC | #188
+
+User can not trust a DEFI application if they cannot provide cryptographic proof that does not rely on a third party. 
+If IC DEFI DAPPs cannot provide cryptographic proof that does not rely on a third party. Who can trust such DEFI DAPPs if there is a risk that the DEFI applications are tampered with by third parties? How can users dare to use these DEFI DAPPs to exchange their assets? This is why I keep insisting on providing cryptographic proofs
+
+-------------------------
+
+witter | 2022-06-22 10:43:52 UTC | #189
+
+Regarding SNS, I also told @dieter.sommer  about my considerations.
+I think SNS is a governance model that is more like a DAO for governance. DAO is great, it is valuable and has its own quadrant of problems that can be solved, but I don't think it solves, nor is it for the underlying cryptographic proofs needed for Token standards and DEFI.
+
+For example, while DAO can be good for resolution by voting, the underlying cryptographic proof needed for token is a tamper-evident proof, but DAO, very clearly, makes the token [modifiable] regardless of which form of resolution it produces. token underlying tamper-evidence is broken by DAO, so I don't think DAO can replace token the underlying cryptographic proof.
+
+Finally, to summarize, I think SNS is valuable, but I also think the underlying cryptographic proof of the token standard is very important, and the two are not contradictory or conflicting.
+
+-------------------------
+
+dieter.sommer | 2022-06-22 12:33:50 UTC | #190
+
+Let me clarify and answer some of the questions that have come up. There are different ways on how we can obtain verifiability of the ledger.
+
+**Integrity protected record of transfers:**
+
+This can be achieved through different means. The one outlined above ?? is by means of cryptographic signatures issued by the subnet (threshold BLS signatures and Merkle proofs). There is another, simpler, approach of having a "blockchain within a blockchain," i.e., the blocks of the ledger forming a blockchain. There's possibly further ways one could achieve integrity protection, but let's remain with those for the discussion.
+
+According to (second-hand) information, not everybody like the idea of having a blockchain within a blockchain. People in this camp think we should use a conceptually nicer mechanism to protect the integrity of the ledger entries. That's why the approach based on signatures came up.
+
+DelandLab's token standard as well as the ledger use the blockchain-within-a-blockchain approach to protect the integrity of the ledger. It works well and gets the job done, but there seems to be critical comments from some sides, that's why we wanted to have this discussion here openly to get everyone on the same page.
+
+Having an integrity protection mechanism like this in place still does not allow for full verifiability as the ledgers as we do not have the transfer requests of users and canisters available in integrity-protected form. That is, a dishonest developer or DAO governing a ledger can still mount an attack and change token balances without a corresponding transaction, but they cannot change anything in the past any more, but only do transfers without a request at the current point in time and add integrity-protected blocks accordingly. Anything in the past is perfectly integrity protected, however.
+
+**Availability of users' and canisters' certified transfer requests**
+
+Full ex-post verifiability of everything regarding a ledger would require that all user's transfer requests (ingress messages including the signatures) be retained in addition as well as all transfer requests from other canisters. Such requests from canisters on other subnets could be managed as we could use subnet signatures certified the XNet transfers already, but for requests from canisters on the same subnet it is very hard to obtain certified requests that can be later verified with a signature. This is exactly the same problem as discussed in the previous post. So full ex-post verifiability by including all signed transfer requests by both users and canisters is currently not possible. This is something that we could look at in the future.
+
+Hope that this explains the motivation for this discussion better.
+
+-------------------------
+
+Astrapolis-peasant | 2022-06-23 12:39:24 UTC | #191
+
+transfer signitures！Tho txn signitures maybe not essential for non-defi DApps, txn signitures are key for defi verifibility. Hope IC researchers came up the best mechanics to resolve it on IC. That means everything for developers and investors
+
+-------------------------
+
+timo | 2022-07-14 18:48:55 UTC | #192
+
+I had some thoughts on the token standard. Several payment flows have been discussed in this thread and other threads and interfaces have been proposed for the flows. Among them were, for example, 1) a 1-step push transfer initiated by the sender, 2) a pull transfer following a pre-approval by the sender (2-steps in total), etc. I thought about how to generalize the different flows into one concept with a single interface. The way to unify the flows is to create symmetry between sender and receiver. Here is what sender and receiver have in common in my model:
+
+1. Both have to approve of the transfer (i.e. no direct deposit into a receiver’s account without approval of the receiver).
+2. Both have a certain balance differential as a result of the transfer, positive for one, negative for the other.
+3. Both can initiate the transfer, leaving the other to accept.
+
+I will discuss the reasons why 1. is acceptable in a subsequent post, as to not interrupt the exposition here, but briefly summarized they are as follows:
+
+1. A token transfer is in general an exchange in which the receiver of the transfer also delivers something to the sender at the same time when the transfer is made. It is therefore intuitive if the receiver also approves.
+2. Direct deposits into arbitrary accounts are problematic. There are reasons to disable them, at least by default.
+3. Direct deposits can be re-introduced as a special case, if desired.
+
+**Specification**
+
+
+```
+type Transfer = vec Part;
+type Part = record {
+    of : principal;
+    tokens : opt record { subaccount : Subaccount; amount : int };
+    memo : opt blob
+};
+type Subaccount = blob;
+type TransferId = nat64;
+
+service : {
+    request: (Transfer) -> (variant { Ok: TransferId ; Err });
+    accept: (TransferId) -> (variant { Ok; Err });
+    reject: (TransferId) -> (variant { Ok; Err });
+
+    // queries
+    transfer_details: (TransferId) -> (variant { Ok: Transfer; Err });
+}
+```
+A simple transfer from principal A to B has two “parts”, one of A with a negative amount and one of B with a positive amount. The general flow is like this:
+1. Both parties negotiate out-of-band the transfer details 
+2. Either party calls request to propose and initiate the transfer, providing all transfer details in the call.
+3. The party who called request transmits the TransferId to the other party out-of-band
+4. The other party calls accept with the TransferId
+5. The ledger executes the transfer
+
+The rules are:
+
+* if any principal who is party to the transfer calls reject then the pending transfer is immediately deleted
+* accept calls get recorded, the transfer is executed as soon as all principals who are party to the transfer have accepted
+* calling request implicitly counts as accepting, so the initiating party does not need to also call accept
+
+Further points:
+
+* transfers can have more than two parties, the generalization is straight-forward, only requirement is that all token differentials sum up to 0
+
+* any party who has already accepted, including the requester, can call reject if they changed their mind while the transfer is still pending
+* the principal who calls request does not necessarily have to be a party to the transfer, (however the requester should pay fees, see “Fees” below)
+
+* the tokens field in the record is optional. If it is omitted this means that the principal has the role of a third-party “committer” as in the “approveTransfer” proposal that came up in the ICRC-1 thread
+
+Fees:
+
+* it is expected that the implementation stores the details of a pending transfer under the principal who calls request
+* that principal should pay the fees associated with the resource consumption of storing a pending transfer
+* it is up to the implementation to design fee structure and DoS prevention
+
+Extensions:
+
+* a principal can set a flag called auto-accept for itself. If this flag is set then any transfer with a positive balance differential for the principal is counted as accepted without further interaction. This enables direct deposits as an opt-in feature on a per-principal basis
+
+Payment flows:
+
+* 2-step push: sender requests, receiver accepts. similar to a check deposit
+* 2-step pull: receiver requests, sender accepts. similar to an e-bill or credit card payment with push notification and in-app approval
+
+* the previous “approveTransfer” proposal: a third-party, different from the receiver, is listed as a principal without amount, i.e. acts as a “committer”.
+* 1-step push: requires the auto-accept extension, sender deposits directly into the receiver account
+* atomic multi-party payments: A pays C but only if B also pays C
+
+What do you think about this interface?
+
+-------------------------
+
+timo | 2022-07-14 18:53:29 UTC | #193
+
+**Question**: Why are direct deposits without receiver approval not needed?
+
+In the typical scenario where a customer orders from a merchant we look at the flow where the sender creates the transfer, submits it, it gets executed without receiver approval, and the receiver looks for or is notified of the incoming payment. This flow is undesirable for the merchant because of the multiple edge cases it has. The sender can pay late, to a wrong (sub)account, the wrong amount, use the wrong memo, etc. There is indeed the historical example of bitcoin payments. Exactly these kind of problems led to the development of the BIP70 payment protocol. A merchant wants to fully control the transfer details because edge cases (and the resulting refunds) can be eliminated. In Bitcoin’s case this meant that the sender sends the signed transaction to the receiver and the receiver then submits it to the Bitcoin network after double-checking it.
+
+**Question**: Aren’t direct deposits without receiver approval common in traditional finance?
+
+Not really. There is almost always an approval, even if given indirectly. For example, in the case of a bank wire the receiver has provided the account details to the sender. This can be seen as an approval to receive funds from the sender. Not an approval on a per-transfer basis but at least it is an approval on a per-sender basis.
+
+**Question**: Why are unsolicited deposits bad?
+
+There are a number of risks associated with them:
+
+1. They can create tax issues for the receiver. People have been criticizing Airdrops for this reason.
+2. They can create compliance issues for the receiver if an attacker intentionally sends tainted funds to the receiver.
+3. They can lead to spam attacks on the receiver.
+
+And the problem with allowing unsolicited deposits in the standard is that they must be then be allowed by all tokens. It is not possible for a token to opt-out anymore. However, as the previous post has shown, the other way around opting in is possible: Unsolicited deposits can be disallowed in the standard but still a token can opt-in to them via the auto-accept flag.
+
+-------------------------
+
+timo | 2022-07-15 05:58:34 UTC | #194
+
+The interface above easily extends to multi-coin ledgers with a modification like this:
+```
+type Part = record {
+    of : principal;
+    tokens : opt record { tokenid: nat64; subaccount : Subaccount; amount : int };
+    memo : opt blob
+};
+
+```
+Now different tokens can be mixed in one transfer, enabling atomic swaps. Some people have already been asking about multi-coin ledgers and atomic swaps. What is nice here is that the flow and interface is the same. It is not required to learn any new concepts for the multi-coin scenario.
+
+-------------------------
+
+cryptoschindler | 2022-08-21 08:04:37 UTC | #195
+
+Really thoughtful, thanks for writing this up. The only thing I've been wondering about is that it seems like I always need a principal to create a Part. Why is there no direct support for acount identifiers if the receiver doesnt want to share her principal?
+
+-------------------------
+
+timo | 2022-08-21 10:47:16 UTC | #196
+
+What is the motivation? Is it a question of privacy? Like as if the account identifier could hide the principal behind it?
+
+-------------------------
+
+cryptoschindler | 2022-08-21 11:30:35 UTC | #197
+
+Yes, this is the motivation.
+
+-------------------------
+
+timo | 2022-08-21 19:21:39 UTC | #198
+
+Account identifiers provide only superficial privacy. Anyone who sees the raw IC blocks of the subnet, i.e. all node providers, boundary nodes or anyone else observing traffic over the internet, can see which principal is spending from a given account identifier when it is used.
+
+Real privacy is much harder to achieve than simply introducing account identifiers.
+
+As a user you can create a new keypair for every transfer you receive. Just like you would with Bitcoin according to Bitcoin best practices. If you do that here then you use a new principal for every transfer.
+
+-------------------------
+
+hpeebles | 2022-08-21 20:41:29 UTC | #199
+
+This is such a simple and elegant interface and yet it solves pretty much every use case :ok_hand: :ok_hand: :ok_hand:
+
+-------------------------
+
+cryptoschindler | 2022-08-22 07:01:56 UTC | #200
+
+This is news to me, but makes total sense. Thanks for sharing! I somehow always assumed privacy is preserved using Account Identifiers, probably because of how they are generated.
+
+-------------------------
+
+jorgenbuilder | 2022-11-11 05:41:14 UTC | #201
+
+[quote="timo, post:192, topic:4694"]
+What do you think about this interface?
+[/quote]
+
+I'm very late to this particular party, but this is so elegant! Big fan of how the interface covers multiple payment models (push/pull/etc,) how it uses a double-entry-like paradigm, and how it supports atomic multi-party transactions.
+
+-------------------------
+
+blabagastered | 2022-12-26 06:27:31 UTC | #202
+
+Has this interface been considered by the working group?
+
+-------------------------
+

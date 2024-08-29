@@ -1,0 +1,176 @@
+Jesse | 2021-11-29 00:05:51 UTC | #1
+
+I'm trying to make a request to my Motoko canister. The frontend is written in JS and I'm calling a function within my motoko canister that is expecting a Blob. When Make the call, I'm getting an error message saying that the Blob is formatted wrong. below, is a screenshot of the error message that I'm getting. Any insight would be helpful. 
+
+![Screen Shot 2021-11-28 at 4.19.52 PM|690x15](upload://jB8Mi9DxQyK0LPoIdtHC38uYn4j.png)
+
+-------------------------
+
+peterparker | 2021-11-29 13:27:05 UTC | #2
+
+The source is a JSON object? You can convert it as following:
+
+```
+export const toArray = 
+       async <T>(data: T): Promise<Array<number>> => {
+  const blob: Blob = new Blob([JSON.stringify(data)], 
+                         {type: 'application/json; charset=utf-8'});
+  return [...new Uint8Array(await blob.arrayBuffer())];
+};
+```
+
+(got some other utilities in that blog post https://dev.to/daviddalbusco/typescript-utilities-for-candid-caj)
+
+-------------------------
+
+Gabriel | 2021-11-29 14:24:59 UTC | #3
+
+I have a full example here including front-end and backend. 
+https://github.com/gabrielnic/motoko-cdn
+
+-------------------------
+
+Jesse | 2021-12-01 01:25:17 UTC | #4
+
+Is there anywhere I can go to get detailed documentation on what's coded in your example? The whole concept of sending files in chunks is still new to me. I'm also coding in Javascript as opposed to typescript, which adds another layer of complexity when reverse engineering the example you sited. 
+
+Thanks in advance.
+
+-------------------------
+
+Gabriel | 2021-12-01 16:29:56 UTC | #5
+
+Hi, so in JS you can can convert any file in Blob's https://developer.mozilla.org/en-US/docs/Web/API/Blob/Blob and then that blob can be split in smaller chunks due to motoko's upload size restrictions. 
+https://stackoverflow.com/questions/32898082/splitting-a-file-into-chunks-with-javascript 
+
+In canister you can keep everything in 1 canister if you wish so but in my example due to the fact we upload a lot of files so I've created a way to keep track of multiple files in multiple canisters. 
+
+To keep this simple you can create a hashmap to keep track of the files you upload and then in a different hashmap/triemap you can upload the chunks with the file id . The function that received the chunks should accept the Blob type in motoko. https://smartcontracts.org/docs/base-libraries/Blob.html
+
+Hope this is helpful.
+
+-------------------------
+
+Jesse | 2021-12-02 17:41:43 UTC | #6
+
+This does help. I'll give it another try. Thanks!
+
+-------------------------
+
+Jesse | 2021-12-04 01:32:48 UTC | #7
+
+what i've done here is take the file (as a Blob). from that Blob, I get the arrayBuffer. I immediately use the arrayBuffer to construct a `new Unit8Array()` (not entirely sure what a `unit8Array` ism so if you have any insight, please do share :slight_smile: ). I take the `unit8Array` of the file, and break it into chunks. I construct a Blob out of each chunk, then i send the Blob chunk to the motoko backend where the file upload function in the motoko backend will be  expecting an argument of type Blob. How'd I do? am I close? should the file chunks be sent to the motoko backend as a different data type? 
+
+![Screen Shot 2021-12-03 at 7.22.24 PM|690x474](upload://yaaOwQhwuKq7e6tyvaJLmpFHAIu.png)
+
+-------------------------
+
+peterparker | 2021-12-04 09:40:46 UTC | #8
+
+There might be some quirks in your code to make it work I would say.
+
+One regarding promises handling on line 43 and another regarding the chunking approach itself.
+
+Assuming `file` in your code is already a `Blob`,  you should chunk this variable first and then do the `arrayBuffer` conversion on each chunks before uploading to the IC.
+
+For example, I do the following:
+
+```
+const chunkSize = 700000;
+
+  for (let start = 0; start < data.size; start += chunkSize) {
+    const chunk: Blob = data.slice(start, start + chunkSize);
+
+    promises.push(
+      uploadChunk({
+        batchId,
+        chunk,
+        storageActor
+      })
+    );
+  }
+
+  const chunkIds: {chunkId: bigint}[] = await Promise.all(promises);
+```
+
+In above snippet, `data` is your `file`. I construct a list of promises that perform the upload to the IC with chunks of the original blob, the file.
+
+Blob has a buil-tin slice (doc: https://developer.mozilla.org/en-US/docs/Web/API/Blob/slice) function.
+
+Then, in the upload function itself, I do the conversion of the chunk to array buffer
+
+```
+const uploadChunk = async ({chunk, batchId}) => { 
+  ....
+
+  storageActor.uploadChunk({
+    batchId,
+    content: [...new Uint8Array(await chunk.arrayBuffer())]
+  });
+
+  ...
+});
+```
+
+To summarize:
+
+1. Iterate on the file to create the chunks with `slice`
+2. Upload each chunk to the IC as array of integer
+
+My upload function starts there 👉 https://github.com/deckgo/deckdeckgo/blob/f4699f386d0ab9f474272cfaec3026b20ee604eb/providers/ic/src/utils/storage.utils.ts#L11
+
+-------------------------
+
+Jesse | 2021-12-04 20:42:53 UTC | #9
+
+ok. I made the changes to my code to align more similarly with what you have @peterparker.
+I get the sense that I'm close, but still not quite there yet. I'm getting a console error. here is my code and below that is the console error that I'm getting. do you see any obvious cause for the console error? 
+
+![Screen Shot 2021-12-04 at 2.39.56 PM|690x315](upload://iwJ9qPzq9f8y4ncGc2wfFwNoUGo.png)
+
+uploadChunk function:
+
+![Screen Shot 2021-12-04 at 2.40.48 PM|690x100](upload://kjtejcOllhNFDSGtSzIlpCHe5wh.png)
+
+console error:
+
+
+
+![Screen Shot 2021-12-04 at 2.36.04 PM|690x82](upload://1m6PyObDqrjsNrc1KPsFksoN2Jr.jpeg)
+
+-------------------------
+
+peterparker | 2021-12-04 20:56:49 UTC | #10
+
+On line 65, can you either try to use `await` without `then` or the contrary? does that help?
+
+```
+const result = await Promise.all(promises);
+console.log("result from....
+```
+
+or
+
+```
+Promise.all(promises).then((result) => console.log("result...
+```
+
+-------------------------
+
+peterparker | 2021-12-04 20:59:39 UTC | #11
+
+Another thing, on line 34, isn't `actor.createHournalEntryFile` async maybe?
+
+```
+const uploadChunk = async (fileId, chunkId, fileChunk) => {
+   await actor.createJournalEntryFile(....
+```
+
+-------------------------
+
+Jesse | 2021-12-04 23:20:13 UTC | #12
+
+gave it a try. Still getting the errors. Gonna keep at it tho. Thanks for the help thus far! I'm definitely close.
+
+-------------------------
+

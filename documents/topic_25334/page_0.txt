@@ -1,0 +1,424 @@
+rosarp | 2023-12-08 05:58:42 UTC | #1
+
+I am trying to make requests on behalf of the user from the server and from the user's browser using the same principal..
+To achieve this I'm trying following steps.
+
+I have generated Identity on server (axum) for incoming user.
+Using that identity and server's own 'Identity',
+I'm trying to create delegated identity, on the server. 
+And I want to use this Delegated Identity from browser, for the user to connect to a canister.
+
+Below is the code for `Axum server` : [Server side code](https://github.com/go-bazzinga/hot-or-not-auth/blob/12c50f06dbb016f5b79ce1bf07a7f9a27a4c64de/src/main.rs#L24)
+
+
+`Client Identity` Code:
+```
+    let (client_secret, _client_pem) = generate_key("oauth_identity").unwrap();
+    let client_identity = Secp256k1Identity::from_private_key(client_secret.clone());
+```
+`Server Identity` Code:
+```
+    let path = Path::new(SERVER_PEM_FILEPATH);
+    let server_identity = Secp256k1Identity::from_pem_file(path).unwrap();
+```
+Creating `Delegated Identity`:
+```
+....
+    let delegation = Delegation {
+        pubkey: server_identity.public_key().unwrap(),
+        expiration,
+        targets: None,
+    };
+....
+    let signature = client_identity.sign_delegation(&delegation).unwrap();
+    let signed_delegation = SignedDelegation {
+        delegation,
+        signature: signature.signature.unwrap(),
+    };
+....
+    let delegated_identity = DelegatedIdentity::new(
+        signature.public_key.unwrap(),
+        server_identity,
+        vec![signed_delegation.clone()],
+    );
+```
+
+Here I can send to browser, serialized `signed_delegation`. However `delegated_identity` is not serializable.
+-> Which means, using the signed_delegation, I need to create identity on the browser again. Need help with this, as I see either the approach is not feasible or I'm missing something.
+
+Code on `browser` side: [Frontend code](https://github.com/go-bazzinga/hot-or-not-auth/blob/12c50f06dbb016f5b79ce1bf07a7f9a27a4c64de/verify_principal/src/verify_principal_frontend/src/index.js#L40)
+```
+import { verify_principal_backend } from "../../declarations/verify_principal_backend";
+import { DelegationIdentity, DelegationChain } from "@dfinity/identity";
+....
+const delegationChain = DelegationChain.fromJSON(signed_delegation);
+// below method needs a identity, will it be newly generated identity?
+const clientIdentity = Secp256k1KeyIdentity.generate();                                                                  
+const delegatedIdentity = DelegationIdentity.fromDelegation(clientIdentity, delegationChain);
+// call to canister
+await verify_principal_backend.get_principal_id();
+```
+
+With above code, there is error: `Invalid delegations. ` on below line:
+```
+const delegationChain = DelegationChain.fromJSON(signed_delegation);
+```
+Here above, as there is no identity coming from server, clientIdentity needs to be creatd on browser side to create delegated identity. Will this work? Or there is another way?
+
+Is there any way to create delegated identity on server and pass it for usage to browser?
+
+-------------------------
+
+saikatdas0790 | 2023-12-11 05:32:28 UTC | #2
+
+@frederikrothenberger @nmattia 
+
+Any thoughts on this? Happy to clarify our use case further.
+
+The main point where we are stuck is to figure out if delegation identities can be generated on the server where the private keys reside and share with different client devices for making calls to the IC network with the expectation that the IC canister sees the same principal from calls from different client devices.
+
+-------------------------
+
+frederikrothenberger | 2023-12-11 09:47:06 UTC | #3
+
+Hi @rosarp & @saikatdas0790
+
+The point of using delegations is that you can *delegate* from one key to another.
+
+I.e. the flow should always be:
+1. Generate key pair on the client
+2. Send public key to server
+3. Create signed delegation on public key
+4. Send delegation back to client
+5. Use identity on client
+
+If you were to create the complete identity on the server, this would mean transferring also the private key. This is **not recommended** because it is less secure than the above protocol.
+
+Is there a reason why the above flow is not suitable in your case?
+
+Btw. I just noticed, when glancing at the code, that you named the identity "oauth identity". Just FYI, we have a design for how to authenticate against the IC using OAuth that does not entail storing private keys in a trusted Web2 server (only works if the IC part is the *client*).
+Let me know, if this would be interesting for you.
+
+-------------------------
+
+saikatdas0790 | 2023-12-11 10:35:14 UTC | #4
+
+Yeah, we'd love to talk about what that design enables and how we could utilize it. Our main needs are twofold:
+- being able to integrate any identity provider be it Web2 like Google, Apple, FB, etc. or Web3 like Metamask or Internet Identity as a user authentication mechanism
+- generate tokens/delegations that can be used to make requests on the user's behalf both from any client devices that the user might be using (webapp, native mobile app) or from the server for SSR
+
+Tie this all to a single unique user identity that uniquely identifies a user across the entire Hot or Not network
+
+Let me know if that clarifies. We are happy to jump on a call to discuss this further or ping you on Slack to discuss more.
+
+Let us know :slight_smile:
+
+-------------------------
+
+saikatdas0790 | 2023-12-11 10:40:43 UTC | #5
+
+Quick question, 
+For Step 1, would it to be possible to generate the key pair on the server for the client and share it with the client for further usage and storage?
+
+That way, on first request, the server could also fetch required data on the user's behalf, generate HTML and serve the client all the data it needs for a faster initial render
+
+-------------------------
+
+frederikrothenberger | 2023-12-11 12:26:21 UTC | #6
+
+To make SSR work, you do not need to send a private key to the client.
+
+Given the backend / canister controls an identity that can be used to sign delegations, the same identity can also be used to call other resources (simply without a delegation).
+
+-------------------------
+
+ilbert | 2024-03-20 12:27:19 UTC | #7
+
+[quote="frederikrothenberger, post:3, topic:25334"]
+we have a design for how to authenticate against the IC using OAuth that does not entail storing private keys in a trusted Web2 server (only works if the IC part is the *client*).
+[/quote]
+
+I would be interested in this. I was evaluating https://web3auth.io/ as an alternative.
+
+-------------------------
+
+frederikrothenberger | 2024-03-20 13:32:04 UTC | #8
+
+@ilbert: Find below a very concise summary of the design. Let me know if you need more information. Ideally we would build a reference implementation of that flow, but currently we do not have one.
+
+1. The dapp front-end generates a session public/private key pair
+2. The dapp initiates an OpenID Connect authentation flow with response_type=id_token and the `nonce` set to the public key generate in step 1.
+3. When the OpenID Connect flow completes (i.e. the user is redirected back to the dapp) it then makes a canister call to the back-end with the `id_token` received from the authorization server to complete authentication. The authentication succeeds if:
+   * The `sub` claim must match the subject registered on the canister (or otherwise this must be considered a new user)
+   * The `iat` claim must not be too old (e.g. 10 minutes)
+   * The `aud` & `azp` claims must match the application id as registered with the OpenID Connect authorization server
+   * The signature on the ID token must be valid and signed with a well known authorization server public key. Can most likely be fetched using HTTP outcalls from the JSON Web Key Set (JWKS) endpoint.
+   * The `nonce` claim must correspond to the public key used to make the call, i.e the self authenticating principal of the key included in `nonce` is equal to the `caller`
+
+If step 3 succeeds, the canister should associate the `caller` principal with the user matching the `sub` claim for the duration of a reasonable session. Alternatively, the canister can also issue a delegation to a principal associated with the user profile on the public key. The delegation has has an `expiration` and hence relieves the canister from checking session expiry itself.
+
+I hope this helps.
+
+-------------------------
+
+ilbert | 2024-03-20 13:02:09 UTC | #9
+
+[quote="frederikrothenberger, post:8, topic:25334"]
+The `sub` claim must match the subject registered on Internet Identity (or otherwise this must be considered a new user)
+[/quote]
+Does this mean that the session key pair generated at step 1. must be delegated by the II of the user?
+
+[quote="frederikrothenberger, post:8, topic:25334"]
+Alternatively, the canister can also issue a delegation to a principal associated with the user profile on the public key.
+[/quote]
+How can the canister issue a delegation in this case?
+
+-------------------------
+
+ilbert | 2024-03-20 13:12:55 UTC | #10
+
+My objective is to give my web2 users (which likely don't want to deal with II and will interact via a React Native mobile application with my platform) the login experience they're used to (email/password, social providers, phone number, etc.), while also authenticating and identifying them on the backend canister.
+
+-------------------------
+
+frederikrothenberger | 2024-03-20 13:29:26 UTC | #11
+
+>> The `sub` claim must match the subject registered on Internet Identity (or otherwise this must be considered a new user)
+>
+>  Does this mean that the session key pair generated at step 1. must be delegated by the II of the user?
+
+Sorry, this was a copy / paste error from an internal (II specific) document. The design is completely independent of Internet Identity. I have edited my post above.
+
+>> Alternatively, the canister can also issue a delegation to a principal associated with the user profile on the public key.
+>
+> How can the canister issue a delegation in this case?
+
+For that to work, your canister needs to assign each new user a principal derived from a [canister signature](https://internetcomputer.org/docs/current/references/ic-interface-spec/#canister-signatures) public key of your canister. The canister then needs to associate the `sub` claim from the `id_token` to that principal.
+
+Then, the canister can issue delegations on the session public key (supplied by the client as `nonce` in the `id_token`), by creating a canister signature. This is very similar to how II works, see code [here](https://github.com/dfinity/internet-identity/blob/90c8902a2aae5b2a6ba1047ca2032f793f82378f/src/internet_identity/src/delegation.rs#L23).
+
+> My objective is to give my web2 users (which likely don’t want to deal with II and will interact via a React Native mobile application with my platform) the login experience they’re used to (email/password, social providers, phone number, etc.), while also authenticating and identifying them on the backend canister.
+
+Yes, this is exactly what the above design achieves. Sorry for the confusion caused by the  copy / paste error.
+
+-------------------------
+
+ilbert | 2024-03-20 14:37:47 UTC | #12
+
+[quote="frederikrothenberger, post:11, topic:25334"]
+For that to work, your canister needs to assign each new user a principal derived from a [canister signature](https://internetcomputer.org/docs/current/references/ic-interface-spec/#canister-signatures) public key of your canister. The canister then needs to associate the `sub` claim from the `id_token` to that principal.
+[/quote]
+So basically, as you said, the logic is almost the same as on the II, but in this case we use the `sub` claim instead of the user anchor to identify the user and issue the delegation accordingly, right?
+
+[quote="frederikrothenberger, post:11, topic:25334"]
+Yes, this is exactly what the above design achieves. Sorry for the confusion caused by the copy / paste error.
+[/quote]
+Amazing! I'll give it some tries and eventually post updates here ;)
+
+-------------------------
+
+frederikrothenberger | 2024-03-20 14:56:05 UTC | #13
+
+[quote="ilbert, post:12, topic:25334"]
+So basically, as you said, the logic is almost the same as on the II, but in this case we use the `sub` claim instead of the user anchor to identify the user and issue the delegation accordingly, right?
+[/quote]
+
+Yes, exactly.
+
+[quote="ilbert, post:12, topic:25334"]
+Amazing! I’ll give it some tries and eventually post updates here :wink:
+[/quote]
+
+Looking forward to that! :slightly_smiling_face:
+
+-------------------------
+
+ilbert | 2024-03-22 14:55:06 UTC | #14
+
+@frederikrothenberger is there a more generic example or guide out there on how to issue delegations from canister signatures?
+I feel like I have to copy&paste the relevant parts of the II source code and adapt them to my canister, which is something that can likely introduce bugs and debts...
+
+-------------------------
+
+frederikrothenberger | 2024-03-22 15:00:39 UTC | #15
+
+@ilbert: You can also take a look at https://github.com/kristoferlund/ic-siwe, which has the same implementation as well. Maybe it has less II specific clutter around it...
+
+But I don't know of an example that has the delegation logic _only_. It might be worth creating a library for that. :wink:
+
+-------------------------
+
+ilbert | 2024-03-28 09:33:47 UTC | #16
+
+https://github.com/ilbertt/ic-react-native-jwt-auth
+
+I've published a demo repository that has the following components:
+
+- React Native mobile app (with [Expo](https://expo.dev/)): [src/app](https://github.com/ilbertt/ic-react-native-jwt-auth/tree/main/src/app)
+- off-chain backend (JS): [src/app_backend](https://github.com/ilbertt/ic-react-native-jwt-auth/tree/main/src/app_backend)
+- IC Rust backend canister: [src/ic_backend](https://github.com/ilbertt/ic-react-native-jwt-auth/tree/main/src/ic_backend)
+- [Auth0](https://auth0.com/) authentication provider
+
+I'll update the README to include more details.
+
+The backend canister can successfully verify the `id_token` and issue delegations.
+
+I've used the [canister_sig_util](https://github.com/dfinity/internet-identity/tree/release-2024-03-22/src/canister_sig_util) crate from the Internet Identity repo, which helps me with the signatures map.
+
+@frederikrothenberger I have a question: how should the **salt** be handled across upgrades? I've tried upgrading the canister, which triggers fetching the salt again from the `raw_rand` api and this results in different delegations for the same user `sub`.
+
+-------------------------
+
+frederikrothenberger | 2024-03-28 09:42:10 UTC | #17
+
+@ilbert: Very nice! Did you deploy this somewhere as a demo?
+
+Store the `salt` in stable memory, that way it is persisted across upgrades.
+
+-------------------------
+
+ilbert | 2024-03-28 10:51:07 UTC | #18
+
+[quote="frederikrothenberger, post:17, topic:25334"]
+Did you deploy this somewhere as a demo?
+[/quote]
+Still not and not sure if I ever will, since the JWT validation on the canister depends on my Auth0 tenant and the mobile app is not easily publishable. I anyway still have to implement some things like the JSON Web Key Set fetching via HTTPS Outcall.
+
+I thought it could be more like a template for anyone who wants to implement something similar.
+
+[quote="frederikrothenberger, post:17, topic:25334"]
+Store the `salt` in stable memory, that way it is persisted across upgrades.
+[/quote]
+I guess the II canister is doing the same, right?
+
+---
+
+Another question: is it ok to authorize the user based on the `id_token` in both the [prepare_delegation](https://github.com/ilbertt/ic-react-native-jwt-auth/blob/882539addd4e0e35fe1f1756701296f1ff085239/src/ic_backend/src/lib.rs#L77) and [get_delegation](https://github.com/ilbertt/ic-react-native-jwt-auth/blob/882539addd4e0e35fe1f1756701296f1ff085239/src/ic_backend/src/lib.rs#L101) endpoints? Both endpoints use the [check_authorization](https://github.com/ilbertt/ic-react-native-jwt-auth/blob/882539addd4e0e35fe1f1756701296f1ff085239/src/ic_backend/src/lib.rs#L59) function.
+
+-------------------------
+
+frederikrothenberger | 2024-03-28 13:09:18 UTC | #19
+
+>> [quote="frederikrothenberger, post:17, topic:25334"]
+Did you deploy this somewhere as a demo?
+[/quote]
+>
+> Still not and not sure if I ever will, since the JWT validation on the canister depends on my Auth0 tenant and the mobile app is not easily publishable. I anyway still have to implement some things like the JSON Web Key Set fetching via HTTPS Outcall.
+
+Yes, I understand. But I think we should definitely give this project some visibility as it is a very useful piece of code for other projects. @domwoe maybe include it in [awesome ICP](https://github.com/dfinity/awesome-internet-computer)?
+
+> Another question: is it ok to authorize the user based on the `id_token` in both the [prepare_delegation](https://github.com/ilbertt/ic-react-native-jwt-auth/blob/882539addd4e0e35fe1f1756701296f1ff085239/src/ic_backend/src/lib.rs#L77) and [get_delegation](https://github.com/ilbertt/ic-react-native-jwt-auth/blob/882539addd4e0e35fe1f1756701296f1ff085239/src/ic_backend/src/lib.rs#L101) endpoints? Both endpoints use the [check_authorization](https://github.com/ilbertt/ic-react-native-jwt-auth/blob/882539addd4e0e35fe1f1756701296f1ff085239/src/ic_backend/src/lib.rs#L59) function.
+
+It is enough to just do that in the `prepare_delegation` call. The prepare delegation call creates a link between the `sub` claim and the `session_key`. At this point the canister creates the canister signature.
+
+For `get_delegation` it is sufficient simply check that the `caller` is `session_principal` (corresponding to `session_key`). For any other `caller` the `delegation` is useless anyway as it delegates to the `session_key` specifically.
+
+-------------------------
+
+domwoe | 2024-03-28 20:39:47 UTC | #20
+
+[quote="frederikrothenberger, post:19, topic:25334"]
+@domwoe maybe include it in [awesome ICP ](https://github.com/dfinity/awesome-internet-computer)?
+[/quote]
+
+yep, we should at least add it there, but I asked @ilbert to add a bit more information and a sequence diagram to the readme first.
+
+-------------------------
+
+ilbert | 2024-03-29 06:53:14 UTC | #21
+
+[quote="frederikrothenberger, post:19, topic:25334"]
+The prepare delegation call creates a link between the `sub` claim and the `session_key`
+[/quote]
+
+In the current implementation, I'm already creating the link between `sub` and the user principal derived from the canister signature, because I didn't want to deal with the expiration of the `sub` -> `session_key` association. For this reason, I need to pass the `id_token` again to the `get_delegation`. Does it make sense security-wise or should I go with the `session_key` solution?
+
+-------------------------
+
+frederikrothenberger | 2024-04-02 08:44:18 UTC | #22
+
+So you are trading computation for state. That is a sound tradeoff to make, yes. :+1:
+
+-------------------------
+
+ilbert | 2024-04-02 09:42:13 UTC | #23
+
+[quote="domwoe, post:20, topic:25334"]
+I asked @ilbert to add a bit more information and a sequence diagram to the readme first.
+[/quote]
+
+I've updated the [README](https://github.com/ilbertt/ic-react-native-jwt-auth#readme) to include more details and a sequence diagram of the authentication flow. Any feedback is really appreciated ;)
+
+-------------------------
+
+ilbert | 2024-04-04 07:24:26 UTC | #24
+
+I've updated the example to fetch the [JSON Web Key Set](https://auth0.com/docs/secure/tokens/json-web-tokens/json-web-key-sets) from the authentication provider using HTTPS outcalls. Here's the commit:
+https://github.com/ilbertt/ic-react-native-jwt-auth/commit/43bd8d1a868e58ccf7805ed988ac412bf387f976
+
+-------------------------
+
+frederikrothenberger | 2024-04-04 09:38:49 UTC | #25
+
+Thanks @ilbert! That's great. :-) 
+
+I'm now just wondering, whether @kristofer and you would like to join forces. Both of you have written code to generate delegations / session handling.
+There might be room for a `ic-sessions-util` library that does the delegation handling. We might also want to improve on that further to then also handle dynamic session lifetimes (i.e. refresh session), and start using that in Internet Identity.
+
+What do you think about that?
+
+-------------------------
+
+ilbert | 2024-04-05 08:39:42 UTC | #26
+
+From the in-person discussion that we had yesterday: if the three of us (and any other potential contributor) manage to find bandwidth to work on this, it would be really nice to collaborate.
+
+-------------------------
+
+ilbert | 2024-04-05 09:03:39 UTC | #27
+
+@frederikrothenberger do you have any suggestions, references and/or guidelines on how I should implement tests for my demo?
+
+-------------------------
+
+frederikrothenberger | 2024-04-05 09:16:01 UTC | #28
+
+I would start using [PocketIC](https://github.com/dfinity/pocketic). The only thing that is missing is the ability to stub HTTP outcalls (so you would need to make the canister use some pre-configured keys to validate the JWTs).
+
+@michael-weigelt: Are there any plans to support HTTP outcalls in PocketIC anytime soon?
+
+-------------------------
+
+michael-weigelt | 2024-04-05 10:04:09 UTC | #29
+
+Yes. The timeline is not set in stone, but I expect it is possible in Q2.
+
+-------------------------
+
+ilbert | 2024-04-12 10:28:27 UTC | #30
+
+I've added some integration tests together with a GitHub Action!
+Integration tests are available at: https://github.com/ilbertt/ic-react-native-jwt-auth/tree/main/src/ic_backend/tests
+
+@frederikrothenberger should I also test the validity of the canister signature? If yes, is there some code I can look into that does this using PocketIc?
+
+Looking forward to any feedback!
+
+-------------------------
+
+frederikrothenberger | 2024-04-12 10:35:29 UTC | #31
+
+[quote="ilbert, post:30, topic:25334"]
+@frederikrothenberger should I also test the validity of the canister signature? If yes, is there some code I can look into that does this using PocketIc?
+[/quote]
+
+Yes! I would just use the `verify_canister_signature` function offered by PocketIC: https://docs.rs/pocket-ic/2.2.0/pocket_ic/struct.PocketIc.html#method.verify_canister_signature :wink:
+
+-------------------------
+
+ilbert | 2024-04-12 13:02:02 UTC | #32
+
+Done in https://github.com/ilbertt/ic-react-native-jwt-auth/pull/3
+
+-------------------------
+

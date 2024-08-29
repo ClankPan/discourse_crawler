@@ -1,0 +1,138 @@
+Gekctek | 2022-12-17 21:23:29 UTC | #1
+
+In Motoko are actors allowed to have constructors like actor classes?
+If not what is the best way to allow an initialization process to happen for the actor. 
+For example, if I want to 'whitelist' user(s) to have access to do certain actions, the options I see are
+1) Create a single actor class instance, initialized with the data I want
+2) Hard code in the principal Id(s) into the code
+3) Allow the 'controller' of the canister access to update the user(s) with a custom function (but as far as I can tell the only way to get the controllers is an async call to `ic.canister_status(..)`
+
+Any thoughts on best practices/missing information would be wonderful
+
+-------------------------
+
+skilesare | 2022-12-17 21:24:51 UTC | #2
+
+Why not just do an actor class?
+
+-------------------------
+
+Gekctek | 2022-12-17 21:43:47 UTC | #3
+
+No specific reason, just felt weird about having a single canister be an actor class. So far I've found it more tedious to manage via dfx
+
+-------------------------
+
+paulyoung | 2022-12-18 00:50:07 UTC | #4
+
+The `class` keyword in Motoko is basically just convenience for manually defining a type and a function that returns a value of that type. The function plays the role of the class constructor.
+
+https://github.com/dfinity/motoko/issues/67#issuecomment-437650178
+
+In your case you could do something like this:
+
+```
+import Buffer "mo:base/Buffer";
+import Debug "mo:base/Debug";
+import Principal "mo:base/Principal";
+```
+
+```
+type MyClassType = {
+  // static members
+  new : MyClassConstructorArgs -> MyClass;
+};
+```
+
+```
+type MyClassConstructorArgs = {
+  controllers : [Principal];
+};
+```
+
+```
+type MyClass = {
+  // instance members
+  addController : Principal -> ();
+  getControllers : () -> [Principal];
+};
+```
+
+```
+let MyClass : MyClassType = object This {
+  public func new(args : MyClassConstructorArgs) : MyClass {
+    // private instance members
+    let controllers = Buffer.fromArray<Principal>(args.controllers);
+    
+    // public instance members
+    return object this {
+      public func addController(controller : Principal) {
+        controllers.add(controller);
+      };
+      
+      public func getControllers() : [Principal] {
+        return controllers.toArray();
+      };
+    };
+  };
+};
+```
+
+```
+let myClassInstance = MyClass.new({
+  controllers = [];
+});
+
+// prints []
+Debug.print(debug_show(myClassInstance.getControllers()));
+```
+
+```
+myClassInstance.addController(Principal.fromText("aaaaa-aa"));
+
+// prints [aaaaa-aa]
+Debug.print(debug_show(myClassInstance.getControllers()));
+```
+
+I tried to port this to `return actor this` and made the return types `async` but that ended up in a cryptic `type error [M0038], misplaced await` error despite not even using `await` anywhere (FYI @claudio)
+
+@Gekctek it’s probably simpler to use an actor class 🙂
+
+-------------------------
+
+icme | 2022-12-18 01:02:45 UTC | #5
+
+
+You can do something like
+
+```
+shared ({ caller = owner }) actor class Clazz({
+  authorizedUsers: [Principal]
+}) {
+  ...
+}
+```
+
+Then just upgrade the canister with the arguments passed to the constructor if you want to make a change. 
+
+If you're doing this canister wasm upgrade through another canister the arguments field (`args`) expects a candid encoded `Blob`, so you can encode the new constructor arguments (new authorized users) with `to_candid`.
+
+
+As a rule of thumb I generally try not to hold the access control list or any frequently updated settings in the canister's constructor since that requires a full state serialization/de-serialization (expensive).
+
+Better to hold arguments that will change very infrequently
+
+-------------------------
+
+Gekctek | 2022-12-18 01:09:31 UTC | #6
+
+Thanks @skilesare, @paulyoung and @icme 
+Not sure why I was so against the `actor class`'s, my mental model was that they were just dynamic actors created from a 'normal' actor. But its seems that they are more similar than I thought. Ill go this route and see if I have any issues
+
+[quote="icme, post:5, topic:17525"]
+As a rule of thumb I generally try not to hold the access control list or any frequently updated settings in the canister’s constructor since that requires a full state serialization/de-serialization (expensive).
+[/quote]
+Ya, I agree. Im trying to do a temporary `oracle` like setup from an outside source, then converting to an http outcall method. Just was trying to avoid complexity to get a proof of concept going
+
+-------------------------
+

@@ -1,0 +1,222 @@
+lastmjs | 2024-03-06 23:20:00 UTC | #1
+
+HTTP outcalls are a necessary feature for becoming a world computer, and have opened up the possibilities of many use cases.
+
+Unfortunately HTTP outcalls are too slow and costly for many use cases. Doing a simple Ethereum transaction (albeit this might not be the most optimized way of doing things) may require a handful of HTTP requests to obtain an appropriate priority fee, base fee, nonce, and finally to send the transaction. The latency and cost will not allow certain features to scale.
+
+We are not on par with a Web2 developer or user experience. Hopefully this is self-evident to most who are familiar with the feature. On the ground with devs and in conversations with potential users of the IC, the latency of HTTP requests is always a top drawback that I feel compelled to explain.
+
+This post has two main purposes:
+
+1. Attempt to focus DFINITY's and the community's efforts on fixing the latency and cost issues of HTTP outcalls (and other networking/threshold protocols)
+2. Brainstorm ways to accomplish this
+
+On point number 2, I need some help understanding something about how HTTP outcalls and IC consensus work. Why can't replicas just perform HTTP outcalls at regular OS/network speeds? Why can't a canister make a Wasm host function call that will perform a request and return a response ASAP? If the output of an update call that includes an HTTP request ends up differing from the other replicas, can the replicas not simply end that call in an error and move on?
+
+It would be so amazing to be able to perform HTTP outcalls at Web2 speeds and cost, and I would love for us to figure out how to do this.
+
+-------------------------
+
+Manu | 2024-03-07 14:27:19 UTC | #2
+
+Thanks for kicking off this discussion @lastmjs, I absolutely agree we should strive for great user experience.
+
+>On point number 2, I need some help understanding something about how HTTP outcalls and IC consensus work. Why can’t replicas just perform HTTP outcalls at regular OS/network speeds? Why can’t a canister make a Wasm host function call that will perform a request and return a response ASAP? If the output of an update call that includes an HTTP request ends up differing from the other replicas, can the replicas not simply end that call in an error and move on?
+
+The main challenge comes from the fact that execution in blockchains has to be deterministic, such that many nodes can do the same computation and reach the same result. This is tricky for HTTP outcalls, because if two nodes make the same HTTP outcall, they may get different answers. So to answer your question concretely: if nodes would just independently make HTTP outcalls that the canister wants and deliver the result back, the states would diverge. To work around this, ICP does the following:
+1. a canister tells the management canister that it wants to make an HTTP request, and the mgmt canister stores this in the state
+2. the nodes of the subnet see that outstanding request, and all individually make the corresponding HTTP call
+3. all nodes sign the request+response and gossip this to other nodes in the subnet 
+4. once sufficiently many nodes agree on a result, the signatures are aggregated and placed in a block as part of consensus
+5. after finality, we now have agreement on the result of the HTTP request, and as part of execution of that block, the response is delivered to the canister 
+
+Clearly this is quite involved, which might explain why it isn't as fast or cheap as making an HTTP request in the web2 world. I don't see a way to make this radically faster, because I believe we need consensus on the HTTP outcall answer. But ideas are definitely welcome!
+
+> 1. Attempt to focus DFINITY’s and the community’s efforts on fixing the latency and cost issues of HTTP outcalls (and other networking/threshold protocols)
+
+On the positive side, we are working on some changes that should slightly reduce the latency of HTTP outcalls and ECDSA signature requests. There are currently some extra round delays in the management canister that are not strictly necessary, so i believe we may be able to reduce the latency by 2 rounds or so.
+
+-------------------------
+
+lastmjs | 2024-03-07 15:27:15 UTC | #3
+
+[quote="Manu, post:2, topic:28181"]
+The main challenge comes from the fact that execution in blockchains has to be deterministic, such that many nodes can do the same computation and reach the same result
+[/quote]
+
+This I understand, what I don't understand is why the next long list of steps are necessary.
+
+Let me try to explain how I envision this working, and perhaps you can point out the flaw:
+
+1. An ingress message comes in for an update call
+2. The message is ordered and all plumbing done to begin execution by the canister
+3. The canister begins executing the update call
+4. As part of the update call, the message performs an HTTP GET request to an endpoint
+5. The HTTP GET request is executed with a call to a host import function, that function executes a traditional HTTP request from the replica OS
+6. The response comes back and the canister continues its execution with that response
+7. If any persisted state is changed based on the result of the response, all other replicas must have the same state change of course. If not, the call simply traps or otherwise ends in an error
+
+What I'm trying to get at it is this: can't we just check determinism on the outputs while still executing these requests (or other side effecty things) at normal OS speeds? If the results are different then they're different. If the dev changes state that ends up being in the output that consensus must be achieved on, then the dev needs to make sure that will be the same across all replicas. There will be an error if not.
+
+I don't understand why you can't call a host function and get whatever data you'd like back into the canister, and only have an issue if the output, the persisted heap, whatever all of that is is different.
+
+Imagine if a request is made, OS speeds, and the canister doesn't actually do anything with the response. As in the response is just kept in a local function variable that goes out of scope and gets garbage collected by the end of the function call. Would there be a problem here? Isn't it only a problem if the result of the call somehow changes the output that must go through consensus? And if that is the case, can't we just detect that easily once the output is done?
+
+-------------------------
+
+lastmjs | 2024-03-07 15:25:25 UTC | #4
+
+[quote="Manu, post:2, topic:28181"]
+On the positive side, we are working on some changes that should slightly reduce the latency of HTTP outcalls and ECDSA signature requests. There are currently some extra round delays in the management canister that are not strictly necessary, so i believe we may be able to reduce the latency by 2 rounds or so.
+[/quote]
+
+This is good news! Need more characters
+
+-------------------------
+
+lastmjs | 2024-03-07 15:28:59 UTC | #5
+
+Also could we do something similar with query calls? Just allow query calls to make traditional HTTP requests on the host at OS speeds?
+
+-------------------------
+
+Manu | 2024-03-07 17:02:48 UTC | #6
+
+I think step 7 is where I don't see how we could make it work. Every replica talks to other replicas of the subnet to agree on the input, and then independently executes the messages. Replicas on their own can't know whether other replicas have different state, so we would need to introduce new communication here to figure out if they actually agreed or not, and if not, how we pinpoint the cause for disagreement within thousands of processed messages & 100s of GBs of state.
+
+I think your idea could perhaps be slightly simpler in a system where message ordering & execution are tied together, then we could eg reach consensus on <message, resulting state changes> with your idea of simply using "native" HTTP outcalls.
+
+ > Also could we do something similar with query calls? Just allow query calls to make traditional HTTP requests on the host at OS speeds?
+
+That's an interesting idea, let me check with the relevant teams. One challenge is that we still need to agree on the result of a replicated query call, so even if the method does not change the canister state, it does change the subnet state (to include the result of the call).
+
+-------------------------
+
+lastmjs | 2024-03-07 17:34:29 UTC | #7
+
+[quote="Manu, post:6, topic:28181"]
+I think step 7 is where I don’t see how we could make it work. Every replica talks to other replicas of the subnet to agree on the input, and then independently executes the messages. Replicas on their own can’t know whether other replicas have different state, so we would need to introduce new communication here to figure out if they actually agreed or not, and if not, how we pinpoint the cause for disagreement within thousands of processed messages & 100s of GBs of state.
+[/quote]
+
+So there is no agreement on the output? Once the inputs are agreed upon, you're saying that the canisters just execute? So...where is the consensus on the outputs? What if a canister decides not to execute the same as the other canisters? I thought there was detection for the most minimal deviation from deterministic execution?
+
+I might just have to go read the papers more in-depth.
+
+-------------------------
+
+berestovskyy | 2024-03-07 20:33:20 UTC | #8
+
+Hey Jordan,
+> Also could we do something similar with query calls? Just allow query calls to make traditional HTTP requests on the host at OS speeds?
+
+Do you have some specific use case in mind?
+
+Since the queries are free, wouldn't this essentially allow someone to create a free service that relays requests through the IC?
+
+-------------------------
+
+lastmjs | 2024-03-07 20:55:20 UTC | #9
+
+My way of thinking is that we need all of this to work eventually, we need to be able to make http requests from query calls just like we need them from update calls. I deal with the general-purpose CDks so I would just like to push this forward, I don't have a use case that I would need right now, but I am maybe 100% sure there are multiple use cases for this.
+
+-------------------------
+
+free | 2024-03-07 21:45:37 UTC | #10
+
+[quote="lastmjs, post:7, topic:28181"]
+What if a canister decides not to execute the same as the other canisters? I thought there was detection for the most minimal deviation from deterministic execution?
+[/quote]
+
+I guess you mean "a replica decides not to execute the same as the other replicas". The protocol tries very hard to make that impossible, by ensuring that everything that happens above Consensus is fully deterministic. Sure, you can have bugs or bit flips due to cosmic rays or faulty hardware. But if anything like that happens, the only way to "fix" it is for the replica to state sync the last checkpoint and re-execute the couple hundred blocks since. While someone investigates why this replica diverged.
+
+Leaving aside the fact that the outcome of a message execution can and often does have effects on the outcome of later message executions on the same canister; even considering 1k entirely independent messages executing in a given round, what are you going to do if a couple of them made HTTP outcalls and had very different outcomes across all (or just enough) replicas? Compare the full canister heap after execution and run another round of consensus to decide what stays and what gets rolled back before you can even begin certifying the state or executing the next round? That's a couple of seconds of extra latency per round, even before you start considering the fact that these are, more often than not, not completely independent message executions.
+
+Also, if you have 13 replicas; execute 13 messages that make HTTP outcalls; and for each HTTP outcall 12 replicas agree and a (different for each HTTP outcall) 13th replica gets a different result; What's the outcome of that? Each of the 13 replicas has a different state from any of the other 12. Do all of them restart from the last checkpoint?
+
+-------------------------
+
+skilesare | 2024-03-08 02:18:59 UTC | #11
+
+If you want to pull non-consensus agreed data from the web and you are ok with it possibly being wrong(sometimes this is harmless) you may want to search the forums for the project that was doing something with the websockets api. (Found it https://forum.dfinity.org/t/non-replicated-https-outcalls/26627 looks like you've already seen it.) They were relaying the request outside of the ic via a websocket and getting it back via the socket. 
+
+The speed of light plus consensus just makes some things hard.
+
+https://forum.dfinity.org/t/the-double-edged-sword-of-http-outcalls-in-internet-computer-smart-contracts/19196
+
+I'll guess I'll add some color for the casual observer as to WHY you can't just send a call from one replica and continue on. When you use this web socket solution the intercanister call captures the request data in state and the remote canister sends it back as an IC message so that it is in state. Therefore, it can be played back. You wouldn't be playing back the actual request(the data may have changed...or the device shut down). You are playing back the canisters commitment to an input and output. That data is only as good as the trust you give that service.
+
+The internet and web2 are just inherently non-deterministic. The http outcalls feature layers on a "pretty good" system for eliminating that non-determinism, but every time you make one you are injecting inbound and unknown trust assumptions into your code. You may think that checking Binance and Coinbase eliminates the possibility of getting a wrong ETH price, but it does not. There is a non 0 chance that they both screw up at the same time(maybe some commonly relied on software has a freak bug one day) and then poof you just sent a couple orders of magnitude more tokens than you should have.  So check six services....you can get the chance really low, but the only way to really eliminate it completely is for there to be more at stake for the service provides for being wrong then you have on the line. It is a tough nut to crack.
+
+-------------------------
+
+BHare1985 | 2024-03-12 15:28:02 UTC | #12
+
+One compromise is that you get a response as soon as possible without going through consensus in real-time. For example, 1 canister makes HTTP call and gets a response in 250ms, this potentially untrusted response is available right away to the developer but it will be another 1-3 seconds until its fully validated and confirmed by consensus. While this is non-ideal, it opens up a bunch of use-cases where the delayed validation is expected and the consumer can toss out results after the fact. Honestly though, if there is proper loose constraints (such as ignore timestamps on API replies, etc) then it should be super rare for there not to be a consensus, in fact I would want block a node that gives me a fraudulent response to an API call and never use them again.  Having a huge delay in the case of something that is 0.001% likely to happen has to compromise in some way.
+
+Such an example of how a delayed validation could be used is getting ETH information as mentioned above. The consumer of the data can assume that the request is valid, and displaying pricing but disable the button until all HTTP requests have been verified such that it does not act upon pre-validated information. Depending on UX, this could happen seamless and unbeknownst to the user and forces the delay for validation to happen at the very last moment needed.
+
+-------------------------
+
+lastmjs | 2024-03-12 15:33:35 UTC | #13
+
+But how would this affect the client, the initiator of the update call that made the http outcall? Would they get an optimistic response, and then a verified response?
+
+In fact, could we do this generally? Could we have an unsigned part of the state tree and a signed part? For the canister outputs?
+
+Also...do we really need BLS on the outputs? What if we just wait for a number of signatures? So then the client can wait for any number of signatures, it can get a single-signed response as fast as the leader, and then it can keep polling for as many responses as it wants.
+
+Could we somehow use chainkey still to verify the individual replica signatures?
+
+-------------------------
+
+BHare1985 | 2024-03-12 16:04:34 UTC | #14
+
+> But how would this affect the client, the initiator of the update call that made the http outcall? Would they get an optimistic response, and then a verified response?
+
+Effectively yes. The way I would want it done is that you get an unsecure response and then at some later time wait/look at the result of a promise to confirm that consensus validated the unsecure response and it effectively becomes secure. This is done at a later time, normally before an action relies on the response, so you are never acting on unsecure information, just choosing to display it potentially (unlikely).
+
+I dont know enough about the IC to comment on the rest so leave that to others, but this idea would work best if it was built into how the IC worked, but you could hack it up with the [Non replicated HTTPS outcalls](https://forum.dfinity.org/t/non-replicated-https-outcalls/26627):
+You send a non-replicated call along with a normal HTTP call asynchronously. You use the non replicated call output and run it through the same transformers as the standard calls, when you need a response quick but rely on the normal call when you need security.  You would need a way to tie the two responses together but that doesn't seem too hard, the real unknown would be getting the outputs from both calls to diff in a way that tells you consensus failed and it wasn't a timing issue between the proxy and the IC nodes.
+
+This can solve the speed issue but actually makes the http calls more expensive since you do 2 requests at a high level. I believe this could be solved eloquently if built into the IC
+
+-------------------------
+
+free | 2024-03-12 18:22:16 UTC | #15
+
+[quote="BHare1985, post:12, topic:28181"]
+For example, 1 canister makes HTTP call and gets a response in 250ms, this potentially untrusted response is available right away to the developer but it will be another 1-3 seconds until its fully validated and confirmed by consensus.
+[/quote]
+
+That is not how it works, though. Certification happens on the full subnet state after each round. If you now have a handful of such HTTP calls across a handful of canisters, you will be highly unlikely to get the exact same responses from each and every replica. It does not require malicious behavior, only network issues; or rate limiting at the other end; or a transform function that doesn't always get rid of all the noise.
+
+If a replica ends up with a divergent state, it persists it for later investigation and panics. After which it restarts from the last checkpoint and may take a couple of attempts (i.e. 10-20 minutes) to catch up.
+
+You could conceivably create an HTTP outcall type that e.g. only requires the block maker to make the HTTP call and then trusts the answer (maybe implicitly, maybe because it's an HTTP response signed by Google or whoever; maybe because it's actually a block signed by another blockchain). It would still need to be included in the block, so if you had a bunch of these going out concurrently and they all produced relatively large responses, you'd still get head-of-line blocking and extra latency. Regardless, this is orthogonal to what we're discussing here: a side-channel for replicas to acquire pieces of data and then agree on which of them should be part of the next block without including the actual data into the block.
+
+-------------------------
+
+hawk | 2024-07-09 10:56:52 UTC | #16
+
+This is a very interesting topic, and I am eager to see if this debate continues. 
+
+[quote="Manu, post:2, topic:28181"]
+On the positive side, we are working on some changes that should slightly reduce the latency of HTTP outcalls and ECDSA signature requests. There are currently some extra round delays in the management canister that are not strictly necessary, so i believe we may be able to reduce the latency by 2 rounds or so.
+[/quote]
+
+Has the removal of extra rounds in the management canisters mentioned here been completed? I would be glad to hear about the progress.
+
+-------------------------
+
+0xkookoo | 2024-07-17 15:50:09 UTC | #17
+
+Let me provide a more detailed explanation of the scenario you described with @Manu .
+
+If there are 13 nodes, and each node first makes an HTTP call to retrieve an HTTP response R, then each node immediately starts executing the subsequent computation E based on the HTTP response R it received. Meanwhile, the 13 nodes also need to reach a consensus RR on the HTTP responses R they each obtained. If any node discovers that its HTTP response R does not match the consensus RR reached by the 13 nodes, then the subsequent execution E for that node needs to be rolled back.
+
+@Manu 's point is that designing and implementing this rollback process can be quite challenging.
+
+Hope I understand correct.
+
+-------------------------
+

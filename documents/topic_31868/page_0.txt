@@ -1,0 +1,181 @@
+amschel99 | 2024-06-12 19:09:14 UTC | #1
+
+I'm trying to programmatically convert ICP tokens into cycles in order to build canisters programmatically for my users. However, I can't seem to find any rust code to do this. So far what I have is this but it doesn't work still.
+```
+pub async fn mint_cycles(amount: Tokens) -> Result<candid::Nat, std::string::String> {
+    ic_cdk::print(&MAINNET_CYCLES_MINTING_CANISTER_ID.to_string());
+    let transfer_args = TransferArgs {
+        memo: MEMO_TOP_UP_CANISTER,
+        amount,
+        fee: ICP_TRANSACTION_FEE,
+        from_subaccount: Some(Subaccount::from(
+            Principal::from_text("owu57-ix3tx-4pgh7-pmu7n-dzlor-tqljq-wui5j-g5b2g-mtnfa-yklry-mae")
+                .unwrap(),
+        )),
+        to: AccountIdentifier::new(
+            &Principal::from_text("rkp4c-7iaaa-aaaaa-aaaca-cai").unwrap(),
+            &Subaccount::from(id()),
+        ),
+        created_at_time: None,
+    };
+
+    match Ledger::transfer_icp(transfer_args).await {
+        // If the transaction is successfull, return the block index of the transaction
+        Ok(cmc_block_index) => match CMC::top_up_self(cmc_block_index).await {
+            Ok(cycles) => Ok(cycles),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+```
+The Ledger struct is 
+```
+use candid::Principal;
+use ic_cdk::id;
+use ic_ledger_types::{
+    query_archived_blocks, query_blocks, transfer, AccountIdentifier, Block, BlockIndex,
+    GetBlocksArgs, Tokens, TransferArgs, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,
+};
+
+pub struct Ledger {}
+
+impl Ledger {
+    pub async fn transfer_icp(args: TransferArgs) -> Result<u64, String> {
+        match transfer(MAINNET_LEDGER_CANISTER_ID, args).await {
+            Ok(result) => match result {
+                Ok(block_index) => Ok(block_index),
+                Err(err) => Err(err.to_string()),
+            },
+            Err((_, err)) => Err(err),
+        }
+    }
+
+    // This method checks if the transaction is send and received from the given principal
+    pub async fn validate_transaction(
+        principal: Principal,
+        block_index: BlockIndex,
+    ) -> Result<Tokens, String> {
+        // Get the block
+        let block = Self::get_block(block_index).await;
+        match block {
+            Some(block) => {
+                // Check if the block has a transaction
+                if let Some(operation) = block.transaction.operation {
+                    if let ic_ledger_types::Operation::Transfer {
+                        from,
+                        to,
+                        amount,
+                        fee: _, // Ignore fee
+                    } = operation
+                    {
+                        if from != Self::principal_to_account_identifier(principal) {
+                            return Err("Transaction not from the given principal".to_string());
+                        }
+                        if to != Self::principal_to_account_identifier(id()) {
+                            return Err("Transaction not to the given principal".to_string());
+                        }
+                        return Ok(amount);
+                    } else {
+                        // Not a transfer
+                        return Err("Not a transfer".to_string());
+                    }
+                } else {
+                    // No operation
+                    return Err("No operation".to_string());
+                }
+            }
+            // No block
+            None => return Err("No block".to_string()),
+        }
+    }
+
+    async fn get_block(block_index: BlockIndex) -> Option<Block> {
+        let args = GetBlocksArgs {
+            start: block_index,
+            length: 1,
+        };
+
+        match query_blocks(MAINNET_LEDGER_CANISTER_ID, args.clone()).await {
+            Ok(blocks_result) => {
+                if blocks_result.blocks.len() >= 1 {
+                    debug_assert_eq!(blocks_result.first_block_index, block_index);
+                    return blocks_result.blocks.into_iter().next();
+                }
+
+                if let Some(func) = blocks_result.archived_blocks.into_iter().find_map(|b| {
+                    (b.start <= block_index && (block_index - b.start) < b.length)
+                        .then(|| b.callback)
+                }) {
+                    match query_archived_blocks(&func, args).await {
+                        Ok(range) => match range {
+                            Ok(_range) => return _range.blocks.into_iter().next(),
+                            Err(_) => return None,
+                        },
+                        _ => (),
+                    }
+                }
+            }
+            Err(_) => (),
+        }
+
+        None
+    }
+
+    fn principal_to_account_identifier(principal: Principal) -> AccountIdentifier {
+        AccountIdentifier::new(&principal, &DEFAULT_SUBACCOUNT)
+    }
+}
+
+```
+and the code for cycles minting canister is 
+```
+use candid::Nat;
+use ic_cdk::id;
+use ic_ledger_types::MAINNET_CYCLES_MINTING_CANISTER_ID;
+
+use crate::rust_declarations::cmc_service::{CmcService, NotifyTopUpArg, NotifyTopUpResult};
+
+pub struct CMC {}
+
+impl CMC {
+    pub async fn top_up_self(block_index: u64) -> Result<Nat, String> {
+        match CmcService(MAINNET_CYCLES_MINTING_CANISTER_ID)
+            .notify_top_up(NotifyTopUpArg {
+                block_index,
+                canister_id: id(),
+            })
+            .await
+        {
+            Ok((result,)) => match result {
+                NotifyTopUpResult::Ok(cycles) => Ok(cycles),
+                NotifyTopUpResult::Err(err) => Err(format!("{:?}", err)),
+            },
+            Err((_, err)) => Err(err),
+        }
+    }
+}
+```
+I'm getting an error "Canister ryjl3-tyaaa-aaaaa-aaaba-cai not found"  and that's the id of the main ledger canister if I'm not wrong
+
+-------------------------
+
+Severin | 2024-06-13 09:59:01 UTC | #2
+
+[Here](https://github.com/dfinity/sdk/blob/1e2a3f17c3dff0c66522e5c61e89d7a89489d82b/src/dfx/src/commands/ledger/top_up.rs#L74-L86) is how dfx does it. Basically it transfer ICP to the CMC's account with the user principal as the subaccount, then it calls `notify_mint_cycles` on the CMC. Important: use the right memo, you can get it from a few lines further up.
+
+[quote="amschel99, post:1, topic:31868"]
+I’m getting an error “Canister ryjl3-tyaaa-aaaaa-aaaba-cai not found” and that’s the id of the main ledger canister if I’m not wrong
+[/quote]
+
+I suppose you are doing this locally, right? In that case you need to e.g. `dfx nns install` after `dfx start`, otherwise you don't have a ledger or CMC canister
+
+-------------------------
+
+amschel99 | 2024-06-14 07:48:55 UTC | #3
+
+Thank you @Severin .
+
+-------------------------
+

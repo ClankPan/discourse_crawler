@@ -1,0 +1,146 @@
+nomeata | 2022-03-30 09:12:20 UTC | #1
+
+# TL;DR
+
+The simple [@InternetComputerBot](https://t.me/InternetComputerBot) telegram bot is hosted by a normal canister, without any external supporting infrastructure. This was made possible by a patch by @paulyoung to the HTTP Gateway component of the Boundary Node, and is something that (to the best of my knowledge) isn’t possible on competing platforms.
+
+# Test it out!
+
+If you talk to [@InternetComputerBot](https://t.me/InternetComputerBot) you get to hear a random joke (by saying `/joke`), or add a joke (by saying `/telljoke …`). The latter is important here because it changes the canister state. With `/info` you get to see some information about the canister; the same you can also see on <https://edrd5-rqaaa-aaaab-qaafq-cai.raw.ic0.app/>.
+
+BTW, if you want to help keeping this running, consider adding canister `edrd5-rqaaa-aaaab-qaafq-cai.raw` to your [Cycle Tipjar](https://k25co-pqaaa-aaaab-aaakq-cai.ic0.app/).
+
+# Technical significance
+
+This is a significant step because we can now run HTTP _services_ on the Internet Computer that can be talked by other, conventional HTTP services (e.g. the Telegram servers) that don’t know anything about the Internet Computer. There are many many protocols like this – Webhook notifications from Github, calendar and contacts via DA, the git protocol – so this drastically increases the number of use cases that can run on the Internet Computer.
+
+Before, we were limited to serving mostly static data, and using JS-based custom clients to interact with the backend canisters in via an _IC- and application specific_ protocol.
+
+# Community significance
+
+This is also significant because it is the first (or one of the first) contributions of a non-DFINITY-employee to a core IC component, and shows that the Internet Computer project is really becoming a community project. 
+
+I wonder if it would make sense to keep a list of non-DFINITY contributions, at least until they become too abundant to count. This gives the contributors extra motivation due to the bragging right and at the same time demonstrates that community contributions are indeed possible. WDYT, @diego?
+
+# How does it work?
+
+How does this work technically? What happens when I send `/telljoke …` via Telegram to the bot?
+
+I have configured the Telegram bot to use `https://edrd5-rqaaa-aaaab-qaafq-cai.raw.ic0.app/webhook/$token`, where `$token` is some arbitrary text, as the webhook. This means that when a message to the bot comes in, the Telegram servers send a HTTP POST request to that URL, with a JSON-encoded [“Update” object](https://core.telegram.org/bots/api#update) in the body.
+
+The IC’s Boundary receives that request. More precisely, an nginx proxy terminates the SSL connection and the [`icx-proxy`](https://github.com/dfinity/icx-proxy) process running on these nodes takes the HTTP headers and body, and sends them as an IC _query_ to the canister id found in the Host, calling the query method named `http_request`.
+
+https://github.com/nomeata/ic-telegram-bot/
+
+My telegram canister, https://github.com/nomeata/ic-telegram-bot/, [handles this request](https://github.com/nomeata/ic-telegram-bot/blob/f441471bad01110b5e4af00279fb005ee70be18e/telegram/src/lib.rs#L76-L92), and decodes the JSON using [an existing Telegram Rust library](http://crates.io/crates/telegram-bot-raw) (big :heavy_plus_sign:  for using existing programming languages on-chain here) to peek inside. It looks in the message text for `/telljoke`, extracts the jokes, remembers it, and [replies a response with `upgrade`](https://github.com/nomeata/ic-telegram-bot/blob/f441471bad01110b5e4af00279fb005ee70be18e/telegram/src/lib.rs#L201-L207).
+
+NB: This was a query method, so even though the code looks like the bot has now stored the new joke, it actually hasn’t.
+
+The reply is an IC-style reply, and is received by the `icx-proxy`. It notices that `upgrade = true`, and instead of simply producing a HTTP response like usual, this flag causes it to issue _another_ call to the canister, but this time an _update_ call to the [`http_request_update` method](https://github.com/nomeata/ic-telegram-bot/blob/f441471bad01110b5e4af00279fb005ee70be18e/telegram/src/lib.rs#L70-L73). This is the new feature added by @paulyoung.
+
+My telegram bot actually uses exactly the same code as before to handle the request. This is a bit redundant – I could have replied to the first query with a mostly empty response and _just_ the flag set to true – but I was lazy and it doesn’t make much of a difference. It also doesn’t matter that `upgrade = true` is now set _again_ in the response; it’s simply ignored. What matters is that this is now an update method, so the state change _is_ preserved by the Internet Computer.
+
+This time the reply, which carries a Candid-encoded HTTP response, is turned into a proper HTTP response by `icx-proxy` and returned to the Telegram server, causing a Telegram message to be sent to you. Here I am using a very nifty feature of the Telegram bot API: It allows me to send my bot’s response directly in the HTTP response to the Telegram’s server request. This is crucial to make this work, as discussed below.
+
+# Caveats
+
+It’s great that we can do this now! But nothing is every completely easy, and there are some caveats to keep in mind as you start using or providing HTTP services in this way.
+
+## Security of tokens
+
+Many HTTP protocols involve some token-based authentication. For example, to use the GitHub API, you can generate a token in your account settings, and then use that in your code that talks to GitHub via HTTP. In general this is fine – thanks to end-to-end encryption via HTTPS, the token is only visible to your code and to the service on the other side.
+
+If you do this on the Internet Computer, though, you have to remember that the TLS encryption only protects the data between the sender and the boundary node. There, the TLS is terminated, and requests and responses are visible to the boundary node and the replica(s) on the subnet (at least – I am unsure about the connection between the nodes).
+
+Depending on your threat model, this may rule out using the Internet Computer for now.
+
+## Only `raw` URLs
+
+Canister can be reached via HTTP on two kinds of URLS:
+
+*  `<canister-id>.raw.ic0.app` goes via `icx-proxy` as explained above; it gives the canister _raw_ access to HTTP. But because this is handled by the Boundary node and (initially) a single node of the canister’s subnet, the response can easily be modified or forged if one of these two components are compromised. This, too, can be a deal breaker for certain use-cases.
+
+*  `<canister-id>.ic0.app` is meant for certified access, to remedy that problem. Here, upon first access by a browser, a service worker is installed that teaches the browser to check special _certificates_ returned by the canister that prove that the response body is correct. Unfortunately, this only works with browsers, and is of no help at all when you want to provide a HTTP API to other servers. At least not until they all learn about the IC (but then they could do IC-level calls directly anyways).
+
+BTW, there is work under way to allow other URLs as well, but we are not there yet. You can have a custom URL if you host your own HTTP Gateway, e.g. on Firebase, [as described @jplevyak ](https://github.com/dfinity/icfront).
+
+##  `upgrade` not supported by service worker
+
+Speaking about the service worker: At the time of writing, the service worker does _not_ support the `upgrade` flag yet. This means that you can’t yet use the upgrade-to-update-call feature when talking to browsers in the certified way yet (e.g. to handle POST requests from normal forms).
+
+It would be hard to use anyways, because Canisters can only create certification in query calls … so when talking to browsers via the certified URL, you’ll have to stick to using IC-native calls via the JS agent for a while.
+
+##  No outgoing HTTP POST calls yet
+
+In my use case I was lucky that the Telegram API allowed me to send a message by piggy-backing on the HTTP response to _their_ HTTP request. This way, I don’t have to start any HTTP connections. Of course, this also means that I can’t initiate a conversation from the bot (e.g. it cannot send a regular reminder), it can only ever respond. This is good enough for many applications (e.g. a git server), but not for all (e.g. a GitHub App that sets commit statuses).
+
+The [ongoing work for HTTP requests from canister](https://github.com/dfinity/interface-spec/commit/700213318abb873c4db891da06cb3c28ced73638) will improve the situation here, although it seems initially only `GET` requests will be supported.
+
+## Peeking is possible
+
+You have to keep in mind that the Canister first receives a query call, and it then kindly _asks_ the Boundary Node to re-send it as an upgrade. The Boundary node will probably do that, but the `http_request` could come from any other client (for example `dfx`), and whoever issued that might ignore the `upgrade = true` flags. This breaks certain applications where you really really need to know that a certain request was made – e.g. in a card game where the player may choose to peek under a card. There may be ways to work around this (e.g. first a request stating the intent to look under the card, and a subsequent query to actually look), but it’s worth keeping in mind.
+
+# Historical note
+
+If you have been around for a while you might remember [a similar post of mine](https://forum.dfinity.org/t/can-we-somehow-achieve-or-build-a-canister-with-a-interface-bahaving-like-a-classic-web-server/1257/13?u=nomeata), and in fact the Telegram bot has been running since December 2020! But back then I was running my won little HTTP Gateway (on AWS…) that could translate between HTTP and IC, and supported upgrade-to-update-call, as proof of concept and inspiration for what later became the official HTTP Gateway component on the boundary node. I should also note that the upgrade-flag-idea was conceived by (at least) David MD and @hansl. 
+
+It felt good deleting that AWS Lambda function now :slight_smile:
+
+-------------------------
+
+Fulco | 2022-03-30 09:33:46 UTC | #2
+
+Thanks for the writeup! This part confused me a bit:
+
+> The Boundary node will probably do that, but the `http_request` could come from any other client (for example `dfx` ),
+
+Don't all requests to the IC go through the boundary nodes? Or do mean during local development?
+
+-------------------------
+
+GLdev | 2022-03-30 09:42:03 UTC | #3
+
+I think there might be a difference between "curl https://some-canister.raw.ic0.app" and "dfx canister call http_request", one would be handled by the icx-proxy, the other would not?
+
+-------------------------
+
+nomeata | 2022-03-30 10:50:12 UTC | #4
+
+[quote="Fulco, post:2, topic:11795"]
+Don’t all requests to the IC go through the boundary nodes? Or do mean during local development?
+[/quote]
+
+It's a bit confusing that the boundary node is playing two roles that are conceptually technically independent:
+
+* the HTTP Gateway turning HTTP requests to normal IC calls, and
+* the request router, forwarding IC calls to a suitable replica on the right subnet (and doing things like DOS protection).
+
+As @GLdev says, I can externally call `http_request` via an IC call, in which case only the request router on the boundary node is involved, but not the HTTP Gateway.
+
+-------------------------
+
+skilesare | 2022-03-30 15:39:28 UTC | #5
+
+In my opinion, one of the largest hurdles to adoption by the classic Web 2.0 dev has been the agent and the opacity of the networking layer.
+
+This looks like it enables the possibility of routing around that and implementing icSwagger. It may seem dumb that app devs want to see the traffic going across the network, but they do. And it makes debugging and testing easier.
+
+There are a number of items that would be necessary here, and I’ll try to outline them:
+
+1. An http body parser that converts a body to a manageable/extensible candid type like CandyLibrary.
+2. A system for blocking replayability of requests.
+3. A system for putting an auth signature in the header and a function for verifying the signature so msg.caller can be simulated.
+4. A pre-parser of a swagger file that produces the  mapping between private motoko functions that http_request_upgrade can call based on the path used; and also a mapper between the extensible json types and the candid types taken by the functions.
+
+With these you’d be able to submit standard http post messages to your canister with a signature and nonce to call update functions in your motoko canister.
+
+I’ve considered a bounty on this for ICDevs, but I’m guessing there were reasons this wasn’t a chosen path and I’d love to know why before pouring too much time into it.
+
+-------------------------
+
+neeboo | 2022-03-31 16:15:48 UTC | #6
+
+Really inspiring me to build something interesting, let the fun continues here
+
+-------------------------
+

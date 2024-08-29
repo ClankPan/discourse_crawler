@@ -1,0 +1,108 @@
+cs2022 | 2022-08-31 00:45:45 UTC | #1
+
+Reject text: Canister ryjl3-tyaaa-aaaaa-abbba-cai trapped explicitly: Panicked at 'could not initialize thread_rng: getrandom: this target is not supported', /Users/xxxx/.cargo/registry/src/github.com-1ecc6299db9ec823/rand-0.7.3/src/rngs/thread.rs:65:17
+
+dependencies:
+rand = "0.7.3"
+getrandom = { version = "0.2.6", features = ["js"]}
+
+"dfx": "0.9.3",
+
+I refered to previous solution, it doesn't work. Does anyone know how to solve it?
+
+-------------------------
+
+AdamS | 2022-09-01 15:05:48 UTC | #2
+
+features = ["js"] works in a JS environment; it does not work in a freestanding WASM environment. What you instead do is use the `register_custom_getrandom!` macro to register a CSPRNG you seeded through `ic0.raw_rand`. (I am curious what previous solution you refer to, that wasn't that.)
+
+-------------------------
+
+cs2022 | 2022-09-13 01:46:03 UTC | #3
+
+I tried higher rand version
+
+-------------------------
+
+paulyoung | 2022-09-13 05:43:31 UTC | #4
+
+[quote="AdamS, post:2, topic:15198"]
+What you instead do is use the `register_custom_getrandom!` macro to register a CSPRNG you seeded through `ic0.raw_rand`
+[/quote]
+
+I briefly looked into this at some point and assumed it wouldn’t work because the [docs for `register_custom_getrandom`](https://docs.rs/getrandom/latest/getrandom/macro.register_custom_getrandom.html) said:
+
+> The function to register must have the same signature as [`getrandom::getrandom`](https://docs.rs/getrandom/latest/getrandom/fn.getrandom.html)
+
+and that function isn’t `async` so I don’t understand how `raw_rand` can be called.
+
+@AdamS if you have advice on how to make this work it would be really helpful.
+
+-------------------------
+
+AdamS | 2022-09-13 16:49:18 UTC | #5
+
+Right, like I said you'd *seed* an RNG of your choice with raw_rand. Once created and stored in a static, this RNG can be used synchronously.
+
+-------------------------
+
+apotheosis | 2023-01-30 02:02:47 UTC | #6
+
+Does anyone have an example of this working?
+
+```
+use getrandom::register_custom_getrandom;
+fn custom_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    // What goes here?
+    return Ok(());
+}
+
+register_custom_getrandom!(custom_getrandom);
+```
+
+-------------------------
+
+apotheosis | 2023-01-30 04:46:59 UTC | #7
+
+I did this:
+
+```
+use getrandom::register_custom_getrandom;
+fn custom_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    let mut rng = StdRng::seed_from_u64(123);
+    rng.fill_bytes(buf);
+    return Ok(());
+}
+```
+
+-------------------------
+
+AdamS | 2023-02-01 16:46:32 UTC | #8
+
+This will return the same numbers every time. What you can do instead is *seed* an RNG of your choice with raw_rand. Once created and stored in a static, this RNG can be used synchronously. For example:
+
+```rust
+thread_local! {
+    static RNG: RefCell<Option<StdRng>> = RefCell::new(None);
+}
+#[init]
+fn init() {
+    ic_cdk::timer::set_timer(Duration::ZERO, || ic_cdk::spawn(async {
+        let (seed,): ([u8; 32],) = ic_cdk::call(Principal::management_canister(), "raw_rand", ()).await.unwrap();
+        RNG.with(|rng| *rng.borrow_mut() = Some(StdRng::from_seed(seed)));
+    }));
+}
+fn custom_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    RNG.with(|rng| rng.borrow_mut().as_mut().unwrap().fill_bytes(buf));
+    Ok(())
+}
+```
+
+-------------------------
+
+apotheosis | 2023-02-02 03:38:59 UTC | #9
+
+Thank you, this is what I was looking for! 🙏
+
+-------------------------
+

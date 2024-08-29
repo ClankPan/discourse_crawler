@@ -1,0 +1,182 @@
+hackape | 2021-05-26 10:04:23 UTC | #1
+
+I read about CertifiedData in the https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-certified-data 
+
+The spec doesn't talk about actual usage of this piece of info. I don't see much in the doc either. Is there a recommended usage case / reference implementation somewhere?
+
+My takeaway is that CertifiedData is meant to be the source of verifiability at canister level. It could be a merkle root I guess? Or maybe the hash of latest "block" of a canister owned blockchain?
+
+Hope some light shed on the topic. I'd like to add that, I'm most interested in the recommended implementation of such mechanism in the most cycle-efficient way. Currently I don't see any material about estimating cycle consumption.
+
+-------------------------
+
+nomeata | 2021-05-26 10:34:42 UTC | #2
+
+Yes, documentation and best practice is a bit scarce on this. We’ll have more eventually (also talks etc).
+
+You can see some existing applications of certified data:
+ * The Internet Identity canister uses Canister Signatures (also explained in the Interface Spec) using this code: <https://github.com/dfinity/internet-identity/blob/main/src/internet_identity/src/signature_map.rs>
+ * Similarly, there is code in the Internet Identity related to HTTP certification: <https://github.com/dfinity/internet-identity/blob/0f1620b712c1a23f7d70580852d99d72366c6c76/src/internet_identity>/src/main.rs#L789
+ * The registry canister certifies it’s responses: <https://github.com/dfinity/ic/blob/024de2fc73d7f6f5df5a92edf9675851f9ebbf59/rs/registry/canister/canister/canister.rs#L482>
+ * As does the ledger, which simply puts the hash of the latest block into it: <https://github.com/dfinity/ic/blob/779549eccfcf61ac702dfc2ee6d76ffdc2db1f7f/rs/rosetta-api/ledger_canister/src/main.rs#L77>
+ * Not published yet, but a new asset canister is shipped with latest `dfx` that certifies its assets.
+ * Related: A motoko library for such a hash tree: <https://github.com/nomeata/motoko-merkle-tree>
+
+> My takeaway is that CertifiedData is meant to be the source of verifiability at canister level. It could be a merkle root I guess? Or maybe the hash of latest “block” of a canister owned blockchain?
+
+Yes! The canister can choose, and as you see in the examples above, both are valid approaches.
+
+>  I’d like to add that, I’m most interested in the recommended implementation of such mechanism in the most cycle-efficient way. Currently I don’t see any material about estimating cycle consumption.
+
+I don’t know if I know the most cycle-efficient way; at this point I am already happy when it works :slight_smile: 
+
+Unless you have very special needs, I’d recommend to use the same hash tree representation as the system itself (see Interface Space). This is also used by all the above applications, except the ledger, and you get to re-use some libraries, e.g. https://github.com/dfinity/agent-rs/blob/next/ic-types/src/hash_tree.rs and https://github.com/dfinity/internet-identity/tree/main/src/certified_map (which I personally hope will eventually be available separately, with a more liberal license, and on crates.io). 
+
+Using the rbtree, or a similar datastructure (e.g. a patricia trie as in the case of the Motoko library) will only recompute few hashes as you change the data structure, and give you decent cycle consumption. There can always be more optimizations, of course.
+
+-------------------------
+
+paulyoung | 2021-06-13 20:31:33 UTC | #3
+
+Can anyone speak to the motivation for providing a certified response?
+
+I understand that verifiability is good, but I’m trying to understand its relevance on a tamperproof platform. Is this a “trust but verify” mechanism?
+
+I’m interested in understanding more about why it’s optional and not always necessary or required, or at least the default via some provided boilerplate code.
+
+-------------------------
+
+dpdp | 2021-06-13 21:41:21 UTC | #4
+
+My guess is that:
+-  the Chain Key is tamperproof;
+- The historical states are not stored (for scaling reasons) so we can't verify all state changes from "genesis" natively.
+- Outbound nodes are hosted by independent datacenters (afaik) -- to maintain privacy on the data (compared to ethereum & co that allows you to run your own node -- and verify)
+- So the connection **"Chain Key Nodes" <=> Outbounds nodes <=> Users** is protected by (Mutual) TLS -- and this key is (likely emitted by a central authority ie.) not connected to the Chain Key (which is decentralized and tamperproof); so the chain of trust is broken here; that's why you'd need to verify the chain key to verify you retrieve trusted data.
+
+
+I think in the ethereum world, if you use some remote JSON-RPC servers (eg. Infura or co), the providers could start acting maliciously and give you some tampered on-chain data.
+
+-------------------------
+
+nomeata | 2021-06-14 09:54:56 UTC | #5
+
+[quote="paulyoung, post:3, topic:4370"]
+Can anyone speak to the motivation for providing a certified response?
+[/quote]
+As opposed to an uncertified one?
+
+Query calls are executed by a single replica. Our trust model for the IC is that _some_ replicas may be compromised, but not many. So a query call may hit a malicious replica, and could fake any response to you. Certification protects against that. If you trust all replicas, or have other ways to verify the data, you don’t need to bother with certification.
+
+[quote="paulyoung, post:3, topic:4370"]
+I’m interested in understanding more about why it’s optional and not always necessary or required, or at least the default via some provided boilerplate code.
+[/quote]
+
+It’s optional because there is no “uniform” way to provide certification. For every application, and eveyr set of possible queries, you have to hand-craft your certification logic on both ends.
+
+Once could imagine a way to certify query calls on a lower level of the stack (e.g. ask more replicas and aggregate signatures), but it would come at a performance cost. I expect that we’ll get that feature eventually (because the current certification scheme is just too inaccessible and also fundamentally can’t handle all use cases), but it’s non-trivial tech and there is always so many different things to do.
+
+I have written up some documents on the limitations on certified variables and on certified queries, but I am not sure if I am allowed to share those.
+
+-------------------------
+
+paulyoung | 2021-06-15 04:35:22 UTC | #6
+
+[quote="nomeata, post:5, topic:4370"]
+a query call may hit a malicious replica, and could fake any response to you. Certification protects against that.
+[/quote]
+
+I think this is the key thing I was missing. I was thinking that if you couldn’t trust a replica to begin with you wouldn’t trust it telling you that a response was certified.
+
+-------------------------
+
+nomeata | 2021-06-15 07:53:21 UTC | #7
+
+Ah, right! A certificate is equivalent to a signature of the whole subnet. Not the single node certifies, but the subnet certifies, and the node just passes the certificate through.
+
+-------------------------
+
+skilesare | 2021-07-30 15:17:38 UTC | #8
+
+@nomeata 
+
+I probably can deduce this from the code myself, but in an effort to save myself some time, do you have an example of how to 'prove' the cert is valid using the MerkleTree class?
+
+I'm guessing in my query function I need to return CertifiedData.getCertificate and MerkleTree.reveal(myTree, myKey).  If I return both of these then the calling function calls what?  I have a root and a witness...1) how do I prove the witness points to the tree and 2) how do I prove that the canister didn't just make up the certified data and key?  Do I need to retrieve the certified data from elsewhere? Maybe the NNS?
+
+-------------------------
+
+hackape | 2021-08-01 18:02:53 UTC | #9
+
+Guess you miss one point. The key that signs the certificate doesn’t belong to the canister itself, it is a multi-part threshold key that collectively belongs to the subnet. No single replica/canister can get hold to it. 
+
+However, subnet will blindly certify whatever data the canister provides. Your canister just say "hey I wanna save this bullshit blob in the CertifiedData area, subnet please sign on it" that’ll do. 
+
+User can then query the state tree at path `/canister/<canister_id>/certified_data` to get both the data and certificate. This doesn’t go through canister, it’s handled directly by the system and is guaranteed by the IC protocol, canister cannot tamper it, nothing to “make up”. 
+
+As of how to make sense of that 32 bytes of blob, it’s an application level thing. It’s your job, as the owner/developer of the canister, to educate your users about the technical details.
+
+You’re technically capable of cheating, if you manage to come up with an application protocol with back door, yet successfully fool everyone.
+
+-------------------------
+
+skilesare | 2021-08-01 18:33:34 UTC | #10
+
+Hmmm…ok. So let’s talk about a real world technical implementation. @nomeata was proposing that the witness from his merkle tree class would work. So if I have that witness and it reveals the data, I’m guessing that the “top” of the witness is the root that is certified. I need to check that the certified data from an IC query matches this root of the witness.  What does that code look like?
+
+-------------------------
+
+kpeacock | 2021-08-01 18:36:03 UTC | #11
+
+https://github.com/dfinity/agent-js/blob/main/apps/sw-cert/src/sw/validation.ts
+
+-------------------------
+
+skilesare | 2021-08-01 19:12:35 UTC | #12
+
+Thanks @kpeacock ! I'm guessing I can follow this for the general flow of what I want to do.  Do you know of anyone that has implemented a comparable flow in Motoko?
+
+-------------------------
+
+kpeacock | 2021-08-01 19:15:06 UTC | #13
+
+Not to my knowledge yet. We still don't have a certified variable example in Motoko yet, either
+
+-------------------------
+
+skilesare | 2021-08-02 03:56:04 UTC | #14
+
+Looks like there is a bunch of interesting conversation about this at https://github.com/dfinity/motoko/issues/1814
+
+-------------------------
+
+skilesare | 2021-08-03 00:54:22 UTC | #15
+
+Moved the conversation to https://forum.dfinity.org/t/tackling-certifieddata-in-motoko/6272 because this thread has been "solved".
+
+-------------------------
+
+cryptoschindler | 2021-08-13 11:18:29 UTC | #16
+
+Excellent explanation, anyone else interested in the matter is encouraged to watch this talk:
+
+https://youtu.be/3mZHEfICi_U
+
+-------------------------
+
+nomeata | 2021-08-13 18:00:50 UTC | #17
+
+Thanks for the praise!
+
+Unfortunately, some of the carefully crafted slides were edited afterwards in ways that, well, miss the point. Also they seem to be a slide or two ahead…
+
+So when something looks confusing, pay attention to what you hear, not see.
+
+-------------------------
+
+nomeata | 2021-09-15 16:36:53 UTC | #18
+
+Also see https://forum.dfinity.org/t/certified-assets-from-motoko-poc-tutorial/7263
+
+-------------------------
+

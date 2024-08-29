@@ -1,0 +1,95 @@
+Mathias | 2023-05-01 16:07:56 UTC | #1
+
+I'd like to get a better understanding of stable memory. How do keep track of how much stable memory is used (and for what)? And how do you generally interact with it and ensure you understand what's going on?
+
+Do you recommend to use the [stable hash-map](https://github.com/ZhenyaUsenko/motoko-hash-map) data structure?
+
+Besides that, I'm just curious to learn more about how you all structure your data structures, do data migrations, and back up all your state. 
+
+Thanks in advance for pointing me toward any useful information.
+
+-------------------------
+
+ielashi | 2023-05-02 17:22:43 UTC | #2
+
+Hey @Mathias,
+
+The topic of stable memory is quite broad. I can provide some high-level points:
+
+* Stable memory is memory that persists across upgrades. In contrast to the heap, which gets deleted when a canister is upgraded. See the [interface specification](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-stable-memory) for more details.
+* Developers have typically been using stable memory as a scratchpad during upgrades. Using the `pre_upgrade` and `post_upgrade` hooks, the canister can save a serialized version of its data in stable memory, and after the upgrade it can load this data from stable memory back into its heap.
+* Motoko has built-in support for "stable variables" that aim to abstract away the concept of stable memory from you and applies the approach above of serializing/deserializing the heap for you automatically. You can read more about those [here](https://internetcomputer.org/docs/current/motoko/main/upgrades).
+* The approach above has its limitations - it doesn't scale well and bugs can cause the canister to be non-upgradable. Motoko is planning to address some of these limitations in the language level (@claudio, maybe you can point us to more information?). On the Rust side, libraries have been developed to store data directly in stable memory such as `ic-stable-structures` and `ic-stable-memory`.
+
+-------------------------
+
+Mathias | 2023-05-03 10:32:20 UTC | #3
+
+Hi @ielashi thank you for your answer. Sorry, I should have been more specific probably. 
+
+I have a reasonable understanding of the pre and post-upgrade hook. I think I'll use the [stable hash map](https://github.com/ZhenyaUsenko/motoko-hash-map) to get around that. I'm thinking about how exactly I should be doing migrations. I have a number of questions on these topics: 
+
+1. I'd like to understand how much stable memory (and wasm) my canister is even using. How can I do that? 
+Yesterday I played with the [Prim.rts_heap_size, Prim.rts_memory_size](https://forum.dfinity.org/t/prim-rts-heap-size-and-prim-rts-memory-size/18429), and with the ExperimentalStableMemory library and I ran "dfx canister status". But I'm still not quite sure which function is telling me what. What does "rts" mean? Do I understand correctly that the functions in the ExperimentalStableMemory library are just calling the ones in Prim? But not all functions are exposed in the ExperimentalStableMemory library?
+
+2. Concerning migrations, [this pattern](https://github.com/ZhenyaUsenko/motoko-migrations) does not seem too bad but I still think I could screw this up easily. Business logic, data, schema, and migration logic all being on the same thing feels tricky. If I use that pattern I think I'd really want to be able to have my state backed up before I do anything. Is there progress on the ability to copy/clone canisters? Or are there other simple ways to dump all my state to somewhere else (can be off-chain)? If I just use a getter function is there an example of how I should chunk the calls to get around the message size limit? And in what format do people store the backed-up state off-chain?
+
+
+Thanks again for the help.
+
+-------------------------
+
+ielashi | 2023-05-04 13:34:39 UTC | #4
+
+Hey @Mathias, I'm not a Motoko developer so I won't be able to address the Motoko-specific questions. @claudio or @Severin would know perhaps?
+
+[quote="Mathias, post:3, topic:19703"]
+I’d like to understand how much stable memory (and wasm) my canister is even using. How can I do that?
+[/quote]
+
+At the WebAssembly level, we expose the [stable64_size](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-stable-memory) system API, which I'm sure Motoko exposes somehow.
+
+[quote="Mathias, post:3, topic:19703"]
+Concerning migrations, [this pattern ](https://github.com/ZhenyaUsenko/motoko-migrations) does not seem too bad but I still think I could screw this up easily. Business logic, data, schema, and migration logic all being on the same thing feels tricky. If I use that pattern I think I’d really want to be able to have my state backed up before I do anything. Is there progress on the ability to copy/clone canisters? Or are there other simple ways to dump all my state to somewhere else (can be off-chain)? If I just use a getter function is there an example of how I should chunk the calls to get around the message size limit? And in what format do people store the backed-up state off-chain?
+[/quote]
+
+Yes, this is the conventional pattern for upgrading state, and I'd agree it's rather error prone. I know the Motoko team is doing some work on making upgrades easier and more robust, but I'll let them speak to that.
+
+The ability to clone and backup a canister is a feature that's currently being scoped, so at the moment the protocol doesn't provide that functionality. You can, as you said, implement some getter method that returns a serialized copy of the state. The way I'd chunk is I'd first serialize the state and store it in a vector, then in the getter return them in 2MiB chunks. I don't think there's a standard format for how this is done.
+
+-------------------------
+
+claudio | 2023-05-05 14:14:22 UTC | #5
+
+Hi Matthias,
+
+Sorry about the delay - hadn't checked the forum due to travel.
+
+I'll keep it brief because I've got covid.
+
+The ExperimentalStableMemory library has `size : () -> Nat64` function that tells you the logical number of 64KiB IC stable memory pages allocated to ExperimentalStableMemory.
+
+https://github.com/dfinity/motoko/blob/master/doc/md/base/ExperimentalStableMemory.md#value-stablevarquery
+
+Because Motoko stable variables are also serialized to IC stable memory, after an upgrade, your canister may actually use more pages than the logical page count. I don't think we expose the real page count at the moment, but could.
+
+You can calculate the bytes of stable memory occupied by stable variables using function:
+
+https://github.com/dfinity/motoko/blob/master/doc/md/base/ExperimentalStableMemory.md#value-stablevarquery
+
+When called, it returns a query, that, when called, does the first part of an upgrade to determine how many bytes of stable memory are required for the upgrade, without actually doing the upgrade or serializing the data. Since it's a query, the state changes are discarded so executing the query has no effect but tells you much data would be required.
+
+The actual number of physical stable memory pages used may be 1 page more than the sum of `ExperimentalMemory.size()` and `stable variables bytes + 65535 / 65536`. The additional page may be needed to store some small, finite size metadata describing the layout of this data so it can be restored on upgrade.
+
+-------------------------
+
+Mathias | 2023-05-06 11:53:40 UTC | #6
+
+@claudio & @ielashi sorry for my late reply, thank you very much for the answers. 
+
+That is really helpful! I'll play around with that on Monday to see if I fully understand. 
+
+I Hope you recover quickly @claudio (and thanks for answering while sick).
+
+-------------------------
+

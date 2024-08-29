@@ -1,0 +1,285 @@
+frederico02 | 2024-04-12 09:22:42 UTC | #1
+
+I have a separate canister that pulls neuron data from our sns governance canister. As part of testing we want to do some integration testing. To do this, we require to either simulate or mock the sns_goverenance canister and so in turn simulate neurons with accuring maturity.
+
+I downloaded the sns goverenance wasm file using `dfx sns` extension and are now using pocket-ic to create a sns subnet with the governance canister. During this process of installing the canister I have to provide the init args.
+
+I use encode_one to encode the init args and i always get an error `"Canister lxzze-o7777-77777-aaaaa-cai trapped explicitly: Panicked at 'Deserialization Failed: \"Fail to decode argument 0\"'`
+
+Am I doing this correctly? 
+
+Here is what the code looks like.
+
+```rust
+let pic = PocketIcBuilder::new().with_sns_subnet().build();
+
+        let sns_subnet = pic.topology().get_sns().unwrap();
+
+        let sns_gov_id = pic.create_canister_on_subnet(None, None, sns_subnet);
+        pic.add_cycles(sns_gov_id, INIT_CYCLES);
+
+        let sns_controller = Principal::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).to_string();
+
+        let sns_gov_init_args = SnsInitPayload {
+            confirmation_text: Some("Welcome to the jungle baby".to_string()),
+            transaction_fee_e8s: Some(10000u64),
+            token_name: Some("Simulation Governance".to_string()),
+            token_symbol: Some("SIMG".to_string()),
+            proposal_reject_cost_e8s: Some(10000u64),
+            neuron_minimum_stake_e8s: Some(10000u64),
+            fallback_controller_principal_ids: vec![sns_controller.clone()],
+            logo: Some("data:image/png;base64,iVBORw0".to_string()),
+            url: Some("https://google.com".to_string()),
+            name: Some("Simulation Gov".to_string()),
+            description: Some("Simulation gov desc".to_string()),
+            neuron_minimum_dissolve_delay_to_vote_seconds: Some(1),
+            initial_reward_rate_basis_points: Some(10u64),
+            final_reward_rate_basis_points: Some(20u64),
+            reward_rate_transition_duration_seconds: Some(1u64),
+            max_dissolve_delay_seconds: Some(1u64),
+            max_neuron_age_seconds_for_age_bonus: Some(1u64),
+            max_dissolve_delay_bonus_percentage: Some(10u64),
+            max_age_bonus_percentage: Some(10u64),
+            initial_voting_period_seconds: Some(1u64),
+            wait_for_quiet_deadline_increase_seconds: Some(1u64),
+            restricted_countries: None,
+            dapp_canisters: None,
+            min_participants: Some(1),
+            min_icp_e8s: Some(1u64),
+            max_icp_e8s: Some(10_000_000_000u64),
+            min_direct_participation_icp_e8s: Some(10000u64),
+            min_participant_icp_e8s: Some(10000u64),
+            max_direct_participation_icp_e8s: Some(100_000u64),
+            max_participant_icp_e8s: Some(10000u64),
+            swap_start_timestamp_seconds: None,
+            swap_due_timestamp_seconds: Some(32512438014000u64), // year 3000 - hopefully we'll all be gone by then,
+            neuron_basket_construction_parameters: None,
+            nns_proposal_id: Some(1),
+            neurons_fund_participation: None,
+            neurons_fund_participants: None,
+            token_logo: Some("data:image/png;base64,iVBORw0".to_string()),
+            neurons_fund_participation_constraints: None,
+            initial_token_distribution: Some(
+                crate::sns_init_payload::InitialTokenDistribution::FractionalDeveloperVotingPower(
+                    FractionalDeveloperVotingPower {
+                        airdrop_distribution: None,
+                        developer_distribution: None,
+                        treasury_distribution: None,
+                        swap_distribution: None,
+                    }
+                )
+            ),
+        };
+        let init_args_two = SnsInitArg { sns_initialization_parameters: sns_gov_init_args };
+
+        pic.install_canister(
+            sns_gov_id,
+            get_governance_canister_wasm(),
+            encode_one(init_args_two).unwrap(),
+            None
+        );
+
+```
+
+-------------------------
+
+mraszyk | 2024-04-12 11:32:28 UTC | #2
+
+The code looks good to me. Are you sure you're using up-to-date canister WASM with respect to the SNS payload you're sending?
+
+-------------------------
+
+mraszyk | 2024-04-12 11:54:35 UTC | #3
+
+Taking one more look, I see what the problem see: you're passing a wrong payload, instead of `SnsInitArg` you should use `Governance` from [here](https://github.com/dfinity/ic/blob/f9de69f460cced38e02afc614b5daed0a82a469b/rs/sns/governance/src/gen/ic_sns_governance.pb.v1.rs#L1386).
+
+-------------------------
+
+mraszyk | 2024-04-12 12:00:19 UTC | #4
+
+A potentially better approach could be to deploy the SNS-W canister with the following init args:
+```
+type SnsWasmCanisterInitPayload = record {
+  allowed_principals : vec principal;
+  access_controls_enabled : bool;
+  sns_subnet_ids : vec principal;
+};
+```
+where allowed_principals would be your principal, access_controls_enabled set to false, and sns_subnet_ids would be `pic.topology().get_sns().unwrap()`.
+
+Then you can call `deploy_new_sns` on that SNS-W canister providing
+```
+type DeployNewSnsRequest = record { sns_init_payload : opt SnsInitPayload };
+```
+as argument where
+```
+type SnsInitPayload = record {
+  url : opt text;
+  max_dissolve_delay_seconds : opt nat64;
+  max_dissolve_delay_bonus_percentage : opt nat64;
+  nns_proposal_id : opt nat64;
+  neurons_fund_participation : opt bool;
+  min_participant_icp_e8s : opt nat64;
+  neuron_basket_construction_parameters : opt NeuronBasketConstructionParameters;
+  fallback_controller_principal_ids : vec text;
+  token_symbol : opt text;
+  final_reward_rate_basis_points : opt nat64;
+  max_icp_e8s : opt nat64;
+  neuron_minimum_stake_e8s : opt nat64;
+  confirmation_text : opt text;
+  logo : opt text;
+  name : opt text;
+  swap_start_timestamp_seconds : opt nat64;
+  swap_due_timestamp_seconds : opt nat64;
+  initial_voting_period_seconds : opt nat64;
+  neuron_minimum_dissolve_delay_to_vote_seconds : opt nat64;
+  description : opt text;
+  max_neuron_age_seconds_for_age_bonus : opt nat64;
+  min_participants : opt nat64;
+  initial_reward_rate_basis_points : opt nat64;
+  wait_for_quiet_deadline_increase_seconds : opt nat64;
+  transaction_fee_e8s : opt nat64;
+  dapp_canisters : opt DappCanisters;
+  neurons_fund_participation_constraints : opt NeuronsFundParticipationConstraints;
+  neurons_fund_participants : opt NeuronsFundParticipants;
+  max_age_bonus_percentage : opt nat64;
+  initial_token_distribution : opt InitialTokenDistribution;
+  reward_rate_transition_duration_seconds : opt nat64;
+  token_logo : opt text;
+  token_name : opt text;
+  max_participant_icp_e8s : opt nat64;
+  min_direct_participation_icp_e8s : opt nat64;
+  proposal_reject_cost_e8s : opt nat64;
+  restricted_countries : opt Countries;
+  min_icp_e8s : opt nat64;
+  max_direct_participation_icp_e8s : opt nat64;
+};
+```
+
+-------------------------
+
+frederico02 | 2024-04-12 12:24:21 UTC | #5
+
+Wow, thanks so much. that was a big help :slight_smile: You're a star :star:
+
+-------------------------
+
+frederico02 | 2024-04-12 13:18:11 UTC | #6
+
+hmm, seems i get the same error
+
+```
+UserError(UserError { code: CanisterCalledTrap, description: "Canister lxzze-o7777-77777-aaaaa-cai trapped explicitly: Panicked at 'Deserialization Failed: \"Fail to decode argument 0\"', rs/rust_canisters/dfn_core/src/endpoint.rs:49:41" })
+```
+
+```rust
+#[derive(CandidType, Deserialize, Serialize)]
+pub struct SnsWasmCanisterInitPayload {
+    pub allowed_principals: Vec<Principal>,
+    pub access_controls_enabled: bool,
+    pub sns_subnet_ids: Vec<Principal>,
+}
+
+let pic = PocketIcBuilder::new().with_sns_subnet().build();
+
+        let sns_subnet = pic.topology().get_sns().unwrap();
+
+        let sns_gov_id = pic.create_canister_on_subnet(None, None, sns_subnet);
+        pic.add_cycles(sns_gov_id, INIT_CYCLES);
+        let sns_controller = Principal::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let init_args = SnsWasmCanisterInitPayload {
+            allowed_principals: vec![sns_controller.clone()],
+            access_controls_enabled: false,
+            sns_subnet_ids: vec![sns_subnet.clone()],
+        };
+
+        pic.install_canister(
+            sns_gov_id,
+            get_governance_canister_wasm(),
+            encode_one(init_args).unwrap(),
+            None
+        );
+
+```
+
+-------------------------
+
+frederico02 | 2024-04-12 13:21:43 UTC | #7
+
+also, i got the wasm by doing 
+
+```bash
+dfx extension install sns
+dfx sns download
+```
+
+elsewhere in the code
+
+```rust
+fn get_governance_canister_wasm() -> Vec<u8> {
+        let wasm_path: OsString = "./sns-governance-canister.wasm".into();
+        std::fs::read(wasm_path).unwrap()
+    }
+```
+
+-------------------------
+
+mraszyk | 2024-04-12 13:29:15 UTC | #8
+
+`SnsWasmCanisterInitPayload` should be used with the NNS canister called SNS-W (not with the SNS governance canister). You should add `with_nns_subnet()` to your `PocketIcBuilder` and install SNS-W canister on the NNS subnet. Then call `deploy_new_sns` and you'll get the canister IDs of the SNS governance in the response.
+
+-------------------------
+
+mraszyk | 2024-04-12 13:33:37 UTC | #9
+
+It's called `sns-wasm-canister.wasm` in the DFX cache (`dfx cache show` gives you the directory).
+
+-------------------------
+
+frederico02 | 2024-04-12 13:50:33 UTC | #10
+
+guessing it's the file named sns as I dont see one called sns-wasm-canister.wasm
+
+![image|578x300](upload://jORskPbsp2r9yjx8JC3L2suOLp.png)
+
+-------------------------
+
+mraszyk | 2024-04-12 14:26:40 UTC | #11
+
+The wasm should appear under `wasms/` after you run `dfx nns install`.
+
+-------------------------
+
+frederico02 | 2024-04-12 14:48:15 UTC | #12
+
+weird, even after running that command I still don't get a wasms folder.
+
+It would be ideal to setup the topology like you suggested but your first recomendation is working ( using the correct args i.e. `Governance` ). I do wonder though if I will run into difficulties because I haven't also setup the nns.
+
+any way you can upload the wasm for me :laughing:  ?
+
+-------------------------
+
+mraszyk | 2024-04-12 15:02:17 UTC | #13
+
+You can download the WASM from here: https://download.dfinity.systems/ic/{ic_commit}/canisters/{wasm_name}.gz
+
+you can get `ic_commit` by running
+```
+./gitlab-ci/src/artifacts/newest_sha_with_disk_image.sh origin/master
+```
+in the `dfinity/ic` repository
+
+-------------------------
+
+mraszyk | 2024-04-12 15:05:03 UTC | #14
+
+[quote="frederico02, post:12, topic:29614"]
+I do wonder though if I will run into difficulties because I haven’t also setup the nns.
+[/quote]
+
+as long as you don't try to upgrade the SNS canisters themselves (I'm not sure about the swap), it should work without NNS
+
+-------------------------
+

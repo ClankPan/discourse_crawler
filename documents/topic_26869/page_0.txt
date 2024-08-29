@@ -1,0 +1,132 @@
+Jesse | 2024-01-21 20:04:54 UTC | #1
+
+I'm currently attempting to send an HTTPS request that has been ECDSA signed. Upon doing so, I get a `403` status returned along with the following error message:
+```
+Failed to authenticate request 0x9b8...3baa due to: 
+Invalid signature: 
+Invalid public key: 
+Malformed Placeholder public key: 030...4aa, 
+error: Error in DER encoding: Invalid length of bit string: -74"
+```
+
+I'm using a CBOR encoder to encode the request's envelope. The envelope consists of the evelope's content, the public key and the signature. 
+
+the public key is derived using the `ecdsa_public_key` function within the IC's manager canister interface and the signature is derived using `sign_with_ecdsa` function from the manager canister interface as well. 
+
+I'm wondering if the CBOR encoding that I perform on entire envelope is altering the public key that is stored as a `DER encoded Blob` within the envelope as one of its properties. 
+
+Does anyone know why I might be encountering this issue?
+
+-------------------------
+
+Jesse | 2024-01-22 15:52:12 UTC | #2
+
+@Gekctek might you have any ideas as to why I'd be encountering this error? I'm using the CBOR encoder that you created to encoded the envelope.
+
+-------------------------
+
+JackLloyd | 2024-01-22 16:28:47 UTC | #3
+
+Hi Jesse,
+
+The public key returned by `ecdsa_public_key` is simply the encoding of the elliptic curve point that acts as the public key, without any metadata that specifies the type of key, the elliptic curve in use, etc. In contrast when sending a request to the IC the public key must be encoded using the format specified by [the interface spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#ecdsa) namely (in the case of ECDSA) using the format specified in RFC 5480, which does contain this information. Most common crypto libraries that support ECDSA will contain the necessary functionality to perform such format conversions.
+
+-------------------------
+
+franzstefan | 2024-01-22 16:48:52 UTC | #4
+
+Did you convert the public key from `ecdsa_public_key` before including it in the envelope? I'm asking because the public key returned by `ecdsa_public_key` cannot directly be used in the envelope's `sender_pubkey`:
+
+* The public keys obtained from the management canister's [ecdsa_public_key](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-ecdsa_public_key) method, which currently only supports curve _secp256k1_, are encoded in SEC1 compressed form.
+
+* If a request to the Internet Computer's [HTTPS interface](https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-interface) is authenticated with an secp256k1 public key, according to [the IC interface specirfication](https://internetcomputer.org/docs/current/references/ic-interface-spec/#ecdsa), it must be encoded as DER according to [RFC 5480](https://datatracker.ietf.org/doc/html/rfc5480) with OID 1.3.132.0.10, and the points must be specified in uncompressed form (i.e. `0x04` followed by the big-endian 32-byte encodings of `x` and `y` ).
+
+UPDATE: it seems that @JackLloyd came to the same conclusion and posted the answer a few minutes earlier while I was still drafting my post. Thanks, @JackLloyd.
+
+-------------------------
+
+Jesse | 2024-01-22 17:43:05 UTC | #5
+
+Thank you @franzstefan and @JackLloyd. That explains the error. Is there any tooling on the IC for decoding from SEC1 format and Encoding in DER format? More specifically, is there a repository from which SEC1 and DER formatting implementations can be studied? my project has limitation that the backend cannot have any external dependancies that aren't controlled by the NNS. I'll need to study the SEC and DER formatting code and replicate the code in Motoko in order to resolve this issue.
+
+-------------------------
+
+Gekctek | 2024-01-22 19:07:32 UTC | #6
+
+Im not aware of any DER encoding libraries in Motoko currently. 
+
+I had to do some DER encoding work for my C# client, but I was building on top of the already existing ASN reader/writer libraries, so you might have to write something yourself from scratch
+Here is the code Im referencing: https://github.com/BoomDAO/ICP.NET/blob/main/src/Agent/SubjectPublicKeyInfo.cs
+
+Either that or you can try to have ICDevs (@skilesare) or Dfinity try to create a bounty to create one
+
+Welcome to the world of Motoko, where libraries are scarce but you can be the creator of one
+
+-------------------------
+
+Jesse | 2024-01-22 19:25:39 UTC | #7
+
+Thanks for the response @Gekctek. I'll see what I can come up with. All this stuff is a steep learning curve for me. Its sounding like I'll be doing a lot of reading in the coming weeks
+
+-------------------------
+
+LightningLad91 | 2024-01-23 00:27:49 UTC | #8
+
+I had to figure out how to encode ECDSA keys a couple years ago for work and what I found is that it's relatively easy if your key size stays the same. (when compared to something like encoding RSA keys).
+
+I modified IC-Py to write the encoded public to a file so I could deconstruct it. Here is what I got:
+
+30 Sequence
+56 Sequence Length (86b)
+30 Sequence 
+10 Sequence Length (16b)
+06 Object Identifier
+07 OID Length (7b) 
+2a 86 48 ce 3d 02 01 (id-ecPublicKey)
+06 Object Identifier
+05 OID Length (5b)
+2b 81 04 00 0a (Dfinity-registered OID?)
+03 Bit String
+42 Bit String Length (66b)
+00 Padding
+
+Remaining bytes are the raw key value
+
+04: Compression (0x04 indicates an uncompressed key (both x & y coordinates))
+
+dd 51 8d 76 6b 79 cb e1 7f 96 a4 b1
+6e 79 74 19 c2 82 2f 96 f9 1c fe 95
+39 73 f4 8c 77 f5 08 72 19 f6 61 05
+fe 24 7d a5 95 01 f6 b6 4b 00 74 4d
+a0 5e 95 1f 8a be 0f 2e 38 a4 11 97
+05 52 bd 5e
+
+So the prestring for all ECDSA 256 public keys included in requests to the IC's HTTPS interface would be:
+
+```
+let pre_string : Blob = "\30\56\30\10\06\07\2a\86\48\ce\3d\02\01\06\05\2b\81\04\00\0a\03\42\00";
+```
+
+then you would append you raw key value to that and it would be encoded.
+
+Edit:
+
+Just saw an earlier comment saying the tECDSA interface provides a compressed key. Here is post i just found on converting from a compressed key to an uncompressed one.
+
+https://stackoverflow.com/questions/43629265/deriving-an-ecdsa-uncompressed-public-key-from-a-compressed-one
+
+-------------------------
+
+franzstefan | 2024-01-23 10:53:06 UTC | #9
+
+@Jesse, if you are familiar with Rust, you can study the following code:
+* For deserialization from SEC1
+  * [k256::ecdsa::VerifyingKey::from_sec1_bytes](https://docs.rs/k256/0.13.3/k256/ecdsa/type.VerifyingKey.html#method.from_sec1_bytes)
+* For serialization to DER
+  * [k256::ecdsa::VerifyingKey::to_public_key_der](https://docs.rs/ecdsa/0.16.9/ecdsa/struct.VerifyingKey.html#method.to_public_key_der)
+  * [ic_crypto_ecdsa_secp256k1::PublicKey::serialize_der](https://github.com/dfinity/ic/blob/master/rs/crypto/ecdsa_secp256k1/src/lib.rs#L382)
+
+Unfortunately, I'm currently not aware of any Motoko code that does that.
+
+-------------------------
+

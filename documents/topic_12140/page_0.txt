@@ -1,0 +1,201 @@
+skilesare | 2022-04-14 06:28:36 UTC | #1
+
+Use case:
+
+I have a "pass-through" canister that has a function on it that according to a standard is usually a query. 
+
+In this instance, I need to pass through the call to another canister to get the return value.  I know this will take a bit longer, but it is the use case I need. The issue is that the tools expecting the standard are calling the expected query and the function they find is an update function because it awaits.  Things fail and fall apart spectacularly.  Is there any way to tell either the agent to try to upgrade if the query fails or to annotate the function so that it tells the agent that it wants to be a query, but it needs to update? 
+
+I'm not talking about the HTTP upgrade...I'm hoping I can upgrade a standard call through the agent...specifically the plug agent.
+
+And yes this problem is due to not having namespace standards. :face_with_head_bandage:
+
+-------------------------
+
+paulyoung | 2022-04-14 06:51:10 UTC | #2
+
+I thought it was possible to call a query method as if it were an update method.
+
+In the JS agent I think that means using `call` instead of `query`, but that might be driven by candid in your case.
+
+Can you modify a `.did` file somewhere to remove `query` on the relevant method?
+
+-------------------------
+
+rossberg | 2022-04-14 07:20:40 UTC | #3
+
+Because of the substantial differences between both mechanisms, and the constraints applying to queries, I don't think switching a canister interface between both modes would be possible without breaking clients.
+
+If you need something as both update or query, I'd suggest to provide two separate functions in the interface. Similarly, if you need to "upgrade" one to the other: introduce a new function. I'm afraid that's the price for having the query mechanism.
+
+@paulyoung, it might seem like it ought to be possible and "safe" to run a query function as an update. But the canister's implementation of that function might depend on the assumption that all state changes made during the call are discarded, as they are for queries. If running as update, they would persist and might screw up the canister's state.
+
+-------------------------
+
+skilesare | 2022-04-14 13:04:14 UTC | #4
+
+Thanks for the detailed reply. I had assumed as much, but it is great to have a clear answer.
+
+@bogwar This makes passthrough canisters much more difficult.  Back to the drawing board.
+
+-------------------------
+
+AdamS | 2022-04-14 14:12:11 UTC | #5
+
+You can indeed call any query method as an update method, but that has to be done explicitly; if the outside tools are expecting a query method then you're SOL.
+
+IMO you shouldn't assume canisters might be written not to 'understand' update procedure - it is part of how query calls are defined and if they break when a query call is actually an update call then that's a security hole.
+
+-------------------------
+
+rossberg | 2022-04-14 16:01:59 UTC | #6
+
+That is a possible viewpoint, but honestly, I think it's a design bug of the platform that it even allows this. Various environmental behaviours differ between the two modes, and letting untrusted parties affect the semantics of code they don't own is inviting trouble.
+
+-------------------------
+
+AdamS | 2022-04-14 16:07:13 UTC | #7
+
+The environmental differences boil down to causing a trap in some scenarios, which rolls it back just like a query would. Aside from that, it is very important that any given piece of information you can obtain quickly in an uncertified way, you should be able to eat the slowdown of consensus to obtain it in a certified way. Is it more likely that a user relies on a property of query calls that the docs say doesn't exist, or that they forget to add update `_certified` versions of every query function that might require one?
+
+-------------------------
+
+rossberg | 2022-04-14 19:45:50 UTC | #8
+
+The fact that all state changes are discarded after a query is documented semantics AFAICT. As you said yourself, depending on this (intentionally or unintentionally) is a security hole – but that's only because the platform allows such calls in the first place. Consequently, this "feature" opens an attack vector that would not otherwise exist.
+
+And unlike uncertified queries, it doesn't just put individual replies at risk, it can corrupt the canister state itself, with unpredictable consequences. It may only be a question of time until we see bugs and exploits based on this.
+
+-------------------------
+
+AdamS | 2022-04-14 19:57:29 UTC | #9
+
+That you can perform update calls to a query function is also documented semantics. Doing wrong things wrt security is always a security hole; the platform cannot and should not attempt to save you from yourself. It would not be, for example, a good idea to remove the concept of the anonymous principal just because someone might accidentally build authentication around it; it's important and useful. If you read some but not all of the capabilities and end up with an incorrect understanding of what callers can and can't do, that can be blamed on the docs, but not on the architecture. In fact you must consult the docs to know that query state is rolled back at all.
+
+-------------------------
+
+nomeata | 2022-04-14 21:26:52 UTC | #10
+
+I think there is some confusion here:
+
+A query _method_ always has the semantics of a query: state changes are not persistet.
+This is independent of _how_ the method is called: via a inter-canister call (replicated), via an update call (replicated) or via a query call (non-replicated).
+
+So it is true that you can choose to call a query method via an update call (typically to get the answer in a certified way), but it doesn't break the semantics.
+
+The naming of these things is unfortunate (query/update/inter-canister call on the one hand and query/update method on the other), but when we started wondering if we should use different terminology (replicated/non-replicated; stateful/pure/whatever) it seemed already too late to fix that.
+
+(Or maybe that is not the confusion here, in that case, ignore me :-))
+
+-------------------------
+
+skilesare | 2022-04-15 00:39:33 UTC | #11
+
+In motoko it might be good to have msg.mode that is would be #update; #query.
+
+Edit:  I guess with what @nomeata says we would never need that.
+
+-------------------------
+
+cryptoschindler | 2022-04-17 07:31:34 UTC | #12
+
+[quote="rossberg, post:6, topic:12140, full:true"]
+That is a possible viewpoint, but honestly, I think it’s a design bug of the platform that it even allows this. Various environmental behaviours differ between the two modes, and letting untrusted parties affect the semantics of code they don’t own is inviting trouble.
+[/quote]
+
+So I can really turn any query method in an upgrade method and all state changes are persisted then?
+
+-------------------------
+
+cryptoschindler | 2022-04-17 07:29:30 UTC | #13
+
+[quote="rossberg, post:8, topic:12140"]
+It may only be a question of time until we see bugs and exploits based on this.
+[/quote]
+
+100% agree. Also on the "state changes are discarded after query" semantic
+
+-------------------------
+
+cryptoschindler | 2022-04-17 07:34:59 UTC | #14
+
+[quote="nomeata, post:10, topic:12140"]
+So it is true that you can choose to call a query method via an update call (typically to get the answer in a certified way), but it doesn’t break the semantics.
+[/quote]
+
+That's how I understood it and I hope that's the actual case
+
+-------------------------
+
+nomeata | 2022-04-17 16:53:11 UTC | #15
+
+Sure it is - is anyone claiming or observing the opposite?
+
+-------------------------
+
+cryptoschindler | 2022-04-19 07:33:58 UTC | #16
+
+Maybe a lack of my english skills, but I thought @rossberg implied I can just call a query method with an update call and magically data is persisted:
+
+[quote="rossberg, post:6, topic:12140, full:true"]
+That is a possible viewpoint, but honestly, I think it’s a design bug of the platform that it even allows this. Various environmental behaviours differ between the two modes, and letting untrusted parties affect the semantics of code they don’t own is inviting trouble.
+[/quote]
+
+[quote="rossberg, post:8, topic:12140, full:true"]
+The fact that all state changes are discarded after a query is documented semantics AFAICT. As you said yourself, depending on this (intentionally or unintentionally) is a security hole – but that’s only because the platform allows such calls in the first place. Consequently, this “feature” opens an attack vector that would not otherwise exist.
+
+And unlike uncertified queries, it doesn’t just put individual replies at risk, it can corrupt the canister state itself, with unpredictable consequences. It may only be a question of time until we see bugs and exploits based on this.
+[/quote]
+
+-------------------------
+
+nomeata | 2022-04-23 10:12:48 UTC | #17
+
+Maybe, but luckily it's not the case, and things aren't that broken :slight_smile:
+
+Calling a query method via an update call will _not_ persistent any state changes.
+
+-------------------------
+
+paulyoung | 2022-08-30 23:12:45 UTC | #18
+
+Can anyone help me understand how to call a method that has been annotated with `query` as an `update` call using the Rust CDK?
+
+-------------------------
+
+paulyoung | 2022-08-30 23:40:21 UTC | #19
+
+I think I may have figured this out. Will report back here either way.
+
+-------------------------
+
+paulyoung | 2022-08-31 00:45:06 UTC | #20
+
+It appears that the answer is; making a call from within an update method will make an update call.
+
+-------------------------
+
+nomeata | 2022-08-31 07:14:22 UTC | #21
+
+Correct! The query/update distinction disappears when you do inter-canister calls.
+
+-------------------------
+
+paulyoung | 2022-08-31 13:36:31 UTC | #22
+
+[quote="nomeata, post:10, topic:12140"]
+So it is true that you can choose to call a query method via an update call
+[/quote]
+
+It won’t always work though 😕
+
+https://github.com/dfinity/cdk-rs/issues/310
+
+-------------------------
+
+nomeata | 2022-08-31 14:51:24 UTC | #23
+
+Yeah, that interaction with certification is annoying :-(
+
+-------------------------
+

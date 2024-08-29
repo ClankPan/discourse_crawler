@@ -1,0 +1,131 @@
+rckprtr | 2022-08-25 22:01:45 UTC | #1
+
+Token tipping on DSCVR used to be a 3 step process for the user.
+
+1. Create wrapper on tipping canister
+2. Transfer token to wrapper tipping canister
+3. Finalize wrapper on tipping canister by confirming the transaction.
+
+It's probably possible to reduce this to 2 transactions by the user, but why not 1?
+
+Token tipping with the EXT [Memo](https://github.com/Toniq-Labs/extendable-token/blob/1f7ef3e2cff3f95509f607ba022326fe280f7039/motoko/ext/Core.mo#L49) (Blob) field was reduced to a single transaction from the user.
+
+1. Transfer token to tipping canister with metadata
+    1. Metadata is a candid serialized blob
+        1. `ContentId` u64 
+        2. `From` Principal
+        3. `To` Principal
+2. Tipping canister queries transaction history (heartbeat) to token tipping canisters Principal, extracts metadata, sends fee to fee collection wallet and sends the remaining tokens to the `To` principal
+3. Tips are displayed by querying the tipping canister and looking up the `ContentId` that received the tip and aggregates tip amount to display to the user.
+
+Finally, there are infinite amount of use cases for this pattern outside of tipping that will only require the user to perform a single transaction.
+
+Rick
+
+-------------------------
+
+skilesare | 2022-08-25 23:17:25 UTC | #2
+
+
+When the user submits a tip: 
+
+1.  Silent Query an invoice endpoint that takes get_invoice(principal, target_canisterter, content_id, from, to)..hash it to create a sub account.  Return the data with the HTTP_upgrade header.
+2. Use http_request_update to convert it to an update request.  Add the account and info to a processing queue that your heartbeat reads.  (time it out if the tip takes more than 30s so you don't waste too many cycles).
+3. Heartbeat processes the queue and one shots the receiving canister. or timeout the invoice.
+
+You might have to put some rate limiting on your http_query_update so someone doesn't maliciously send you a bunch of requests.
+
+Also, you may want to have a withdraw function that any principal can call to pull their payment back out if an invoice no longer exists and they are the from the principal.
+
+When ICRC-1 adds the notify workflow you can get rid of the canister heartbeat...but may need to add a renotify.
+
+-------------------------
+
+rckprtr | 2022-08-31 16:03:04 UTC | #3
+
+This is a completely valid approach and thank you for the response, but we need a single transaction.
+
+DSCVR is a consumer facing app where speed and message integrity is of the utmost importance.  Users are often performing multiple requests on DSCVR and are quickly moving around the platform, which introduces many possibilities for a two step process to fail us.  We experienced this with our original multi-step NFT gifting process.
+
+ We see more daily active users than almost [all other DeSo apps](https://dappradar.com/rankings/category/social) on other networks combined.  This speaks to the overwhelming power of the Internet Computer and the quality of work the DFINITY foundation as produced.
+
+A memo field that allows up to 256 bytes (more is always better) will allow us to maintain our speed and provide users a native web3 experience.
+
+Tipping is just one use case for a larger memo field; complex patterns can be created that leverage rich data being stored in this field to open the door for new types of services that have yet to be envisioned or disclosed publicly.
+
+After creating this post I received quite a bit of out reach by developers wanting to explore more ways a memo field can be used for their application and its important we don't limit ourselves and continue to push the boundaries on what is possible when building a web3 app based off standards by other protocols.
+
+Finally, when the notify pattern has worked out its issues, even more complex patterns can be created that provide an immersive experience for IC users that compliments rich data being stored in a memo field without the need to perform unnecessary queries to other services.
+
+-------------------------
+
+victorshoup | 2022-08-31 19:00:11 UTC | #4
+
+I clicked through the link to Top Social Media Dapps. I didn't see any mention of DSCVR or IC for that matter. Am I missing something?
+
+-------------------------
+
+domwoe | 2022-08-31 19:26:31 UTC | #5
+
+DappRadar works by analyzing transactions on public blockchains. On the IC, transactions are not public and hence can't be indexed and analyzed by a service like DappRadar.
+
+-------------------------
+
+JaMarco | 2022-08-31 19:53:58 UTC | #6
+
+Is it ok that ICs transactions arent public?
+
+-------------------------
+
+victorshoup | 2022-08-31 21:09:13 UTC | #7
+
+[quote="rckprtr, post:3, topic:15095"]
+We see more daily active users than almost [all other DeSo apps ](https://dappradar.com/rankings/category/social) on other networks combined
+[/quote]
+
+OK. But then @rckprtr 's citation in " We see more daily active users than almost [all other DeSo apps ](https://dappradar.com/rankings/category/social) on other networks combined" was a bit confusing to me.
+
+-------------------------
+
+rckprtr | 2022-08-31 22:45:53 UTC | #8
+
+Getting on DappRadar has been a mission of ours, we have some early strategy to do this but will take time.
+
+-------------------------
+
+skilesare | 2022-08-31 23:01:34 UTC | #9
+
+[quote="rckprtr, post:3, topic:15095"]
+DSCVR is a consumer facing app where speed and message integrity is of the utmost importance.
+[/quote]
+
+We’ve had issues with this even when speed and message integrity aren’t of the upmost importance. Users are clicky and do all kinds of things you don’t expect. I 100% agree we need a transaction with the smallest hoop jumping possible. 256 bytes in the memo field just makes too much sense with the ecdsa stuff coming up.
+
+-------------------------
+
+rckprtr | 2022-08-31 23:30:27 UTC | #10
+
+Can you help me understand this?  How does this byte field size increase impact ecdsa?  
+
+The intention of my question is to understand if there is a better field size than 256 bytes.
+
+-------------------------
+
+skilesare | 2022-09-01 01:15:20 UTC | #11
+
+Maybe communication got crossways and I’m getting my bits and bytes mixed up. The original memo was a nat64(8 bytes). During the working group I lobbied for at least 256 bits(32 bytes) so we could hold an eth Keccak hash as a reference in the memo as it seems that having enough space to hold a crypto secure hash would be enough for most applications.
+
+Of course a hash isn’t reversible so it isn’t enough for you to hold what you need(29 byte principal plus 8 byte u64….if you get the from principal from the transaction…if icrc-1 and not encoded in the account Id…lots of ifs here.)
+
+An unbounded blob is just hard because someone can blast the ledger. We talked about letting the size be an implementation detail but that seems like a recipe for someone to shoot themselves in the foot.
+
+Nat is unbounded and blob is unbounded so it is hard to codify 256 bytes.
+
+I still think that with the http_request -> http_upgrade_request pathway you get what feels like a 1 step process for your users even though two things are happening behind the scenes. The query won’t have to go through plug as you can send it from the anon principal.
+
+The system could probably benefit from some bounded blob types above nat 64.
+
+A page type that was 1024 bytes would be interesting.
+
+-------------------------
+

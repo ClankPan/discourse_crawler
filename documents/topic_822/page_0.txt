@@ -1,0 +1,198 @@
+zippoxer | 2020-07-03 19:17:31 UTC | #1
+
+Hi everyone,
+
+I'm new here and have recently learned about DFINITY. I've started toying around with Motoko (already made a [PR](https://github.com/dfinity/docs/pull/133) :stuck_out_tongue:) and the idea of orthogonal persistence (which I've always been a fan of), and I have a few questions in mind.
+
+With these questions, I'm trying to understand how to build the data layer for a Reddit-like platform (which I think is a great use case) on DFINITY and hopefully discover some of the potential best practices for doing so.
+
+# Relational data
+
+Given a Reddit-like platform where we have `users`, `communities` and `posts`, how can we efficiently find a `user`'s `posts` within a `community`?
+
+Iterating over the entire `posts` array for each query would be slow and costly when dealing with a data set as big as Reddit's. Even with NVRAM vs SSDs, we still compute too much for this query.
+
+What I have in my mind now is introducing indexes in the form of hash maps, for example:
+
+- `Map<UserId, List<PostId>>` - A map of user ids to their authored post ids.
+- `Map<Tuple<Community, UserId>, List<PostId>>` - A map of posts ids of a user within a community (solves the querying efficiency problem above).
+
+However, this category of solutions requires developers to manually manage indices with code which brings us back to C-like memory management problems, i.e. developers forgetting to update indices or mistakenly corrupting them.
+
+I imagine a better solution would be to build database-like data structures which abstract index management from the developer, doing it automatically as new elements are inserted/updated/removed.
+
+Does Motoko offer some sort of an array-like data structure that supports indexing on a "per-column" basis?
+Do you think such a data structure can ever be enough to replace the need of a database table with indices (for at least the 80% use case)?
+
+Is there another solution to this problem that I'm not aware of?
+
+# Data migration
+
+How can we handle changes to data structures in canisters?
+
+For example, if I add one field, delete one field and rename another in the `Profile` structure in LinkedUp, what would happen to the existing data?
+
+Is there some sort of standard for doing data migrations?
+
+BTW, I couldn't find sufficient information about how structural types in Motoko work, but if they are anything like structs in statically typed languages, then field names aren't stored in the memory, is that correct?
+
+```
+// Define to-do item properties
+type ToDo = {
+	id: Nat;
+	description: Text;
+	completed: Bool;
+};
+```
+
+-------------------------
+
+Ori | 2020-07-04 13:50:35 UTC | #2
+
+That’s a very well put piece, you’ve essentially described the same thought process I went through, re indexing and abstracting this away. I’d welcome some more input on this from anyone trying similar things. 
+
+There may be room for the team to suggest some approaches too and possibly add library support.
+
+There will be more information and tooling to come for the data migration, it may include separating your data into its own canister.
+
+And welcome to the forum!
+
+-------------------------
+
+everhusk | 2020-07-06 05:12:15 UTC | #3
+
+Great question. Regarding data migration, sounds similar to the problem solidity contracts faced which was to some extent solved with proxy contracts. Take a look at https://blog.indorse.io/a-well-tested-guide-to-upgradeable-proxy-ethereum-smart-contracts-f4b5111c12b0. Curious myself about the relational data, but i'm too new to dfinity to answer that :smile:
+
+-------------------------
+
+zafaransari | 2021-03-12 03:54:38 UTC | #4
+
+Is there any new update on this issue?
+
+-------------------------
+
+Ori | 2021-03-12 09:38:18 UTC | #5
+
+The migration step can be handled in the pre and post upgrade methods, described here:
+
+[https://sdk.dfinity.org/docs/language-guide/upgrades.html](https://sdk.dfinity.org/docs/language-guide/upgrades.html)
+
+Keep in mind that preupgrade will fire from the code that’s *previously installed* and postupgrade will execute your *incoming* code changes.
+
+You can use these to build any steps needed to migrate your old data structures to your new ones.
+
+-------------------------
+
+zafaransari | 2021-03-12 10:30:19 UTC | #6
+
+I am asking about database like data structures.
+
+-------------------------
+
+anthonymq | 2021-07-23 13:46:29 UTC | #7
+
+Hi @Ori 
+I'm trying to figure out how to safely upgrade my canister without losing data when I add a field to my types.
+From what I've tested, the preupgrade doesn't seem to run on the previous code because I lose my data in this hook. In the postupgrade I can see that my array is already empty.
+
+-------------------------
+
+Ori | 2021-07-23 15:02:17 UTC | #8
+
+If you’re changing the structure of your types you’ll need to temporarily add migration code to post-upgrade that takes the original type and converts it to the updated type. Update your canister once with this code. 
+Then remove the migration code from post-upgrade and replace it with the normal post-upgrade code you’d use going forward (ie code that only knows how to handle the new type).
+
+-------------------------
+
+anthonymq | 2021-07-28 15:39:57 UTC | #9
+
+Alright I will test it. Is there no way to fail the deployment if we forget to write this "glue" code ?
+
+-------------------------
+
+anthonymq | 2021-07-28 16:35:14 UTC | #10
+
+From what i've tested the migration code in the postupgrade hook doesn't work, data is already lost in the preupgrade hook. Do I have to declare a new type and make the migration from one another ?
+
+-------------------------
+
+claudio | 2021-07-29 07:45:16 UTC | #11
+
+Have you had a look at the life example in the examples repo? It actually goes through a change of representation.
+
+Otherwise, if you could share (the whole or an abstraction  of) your code we might be able to make concrete suggestions.
+
+-------------------------
+
+anthonymq | 2021-07-29 09:31:44 UTC | #12
+
+Hi @Claudio,
+
+https://gist.github.com/anthonymq/702a43d1258a6810a7f4fcfcd569d55b
+
+Here is a gist showcasing my problem. In the second step I just add a "description" field in the card type.
+I lose the state without warning.
+So I have two problem, how to upgrade and how to be notified if I fail to migrate my data. 
+
+Hope this helps.
+
+-------------------------
+
+claudio | 2021-07-29 12:07:52 UTC | #13
+
+Thanks, I'll take a look!
+
+-------------------------
+
+claudio | 2021-07-29 14:27:38 UTC | #14
+
+So I think we have two issues here:
+
+1) One is that your change to the representation (adding a field in output/covariant position) isn't backwards compatible.
+
+2) I think Motoko should be failing  (i.e. trapping) in the postupgrade method, trying to deserialize the stable variable from a more general array type to a less general array type, but isn't for some reason, quite possibly a bug.
+
+I've tried to rewrite your example in a way that works.
+
+One way to rewrite your step2 file to work, though clumsy, is to introduce a new stable var with the new representation, and initialize it from the original one (adding an empty `description` field). 
+
+In a later step, you can deprecate the original stable var by promoting its type to `Any`.
+
+See https://gist.github.com/anthonymq/702a43d1258a6810a7f4fcfcd569d55b#gistcomment-3835356 for the code.
+
+I'll now investigate whether there is a bug in Motoko that causes your original upgrade to succeed when it should actually fail.
+
+-------------------------
+
+claudio | 2021-07-29 14:37:08 UTC | #15
+
+I should add that we intend to eventually supply a tool that will check whether the types of stable variables are compatible across two versions of code. This essentially boils down to checking that the record of stable variables (identified by name) either introduces new fields or evolves existing fields to supertypes. Your original code fails that second requirement, because 
+
+`[(Nat32,{ title : Text})]` is not a subtype of `[(Nat32, { title : Text; description: Text}]`
+
+but we don't check that for you yet.
+
+You need to be able to initialize a stable variable from its previous value or initializer, so the "old" type must be a subtype of the "new" type.
+
+-------------------------
+
+anthonymq | 2021-07-29 14:50:23 UTC | #16
+
+Thanks @claudio for the investigation. I guess it makes sense that it fails but I was expecting the postupgrade to fail and stop the installation. 
+Let me know what the conclusion is, if it's a bug or not.
+Also I'm really interested by the tool to check stable variables across version :slight_smile: Deployment will be safer if it's run on every installation.
+
+-------------------------
+
+claudio | 2021-07-29 15:05:01 UTC | #17
+
+Actually, I've almost convinced myself that this behaviour is actually expected due to a recent change in the semantics of Candid (an extension of which we use for storing variables in stable memory) 
+
+Because the deserialization from stable memory fails at the richer type, the "optional" stable value is regarded as `null` (entirely new) and the initializer run instead.
+
+A compatibility checking tool should have prevented or at least warned about this behaviour though.
+
+Sorry for the pain.
+
+-------------------------
+

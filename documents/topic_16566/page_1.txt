@@ -1,0 +1,1644 @@
+sea-snake | 2023-11-15 11:17:42 UTC | #102
+
+I get the idea, but doesn't this largely overlap with the minting and burning concepts? (With minting you would set the initial metadata).
+
+I think concepts like minting, updating (metadata) and burning could be seen as CRUD operations on the tokens that probably are things you'd want to standardize in relation to one another.
+
+While the current standard is mainly focused on consumers of the ledger e.g. wallets and marketplaces instead of e.g. minting tooling.
+
+Considering the low costs of creating an NFT collection on the IC including it's metadata and even assets, standardizing this seems like a logical next step to make a large choice of tooling available that's preferably interoperable so e.g. users aren't tied to the minting tools of a given marketplace.
+
+-------------------------
+
+dieter.sommer | 2023-11-15 13:26:01 UTC | #103
+
+Thanks, @sea-snake, for your response!
+
+To some extent I definitely must agree with you with the overlap with creation / destruction of NFTs and that this is all using CRUD operations.
+
+But I had the feeling that an update is something that we could want to specify at the API level because many use cases might want to use it. The update is somewhere in the middle between minting tooling and the consumers of the ledger because an update is an after market operation so to say.
+
+An update could be as simple as replacing the current metadata with new metadata. Having this surfaced at the API level helps create a standard way on how to change this information that can be used by applications. I felt it is different from mint and burn as those can be much more diverse and depending on the use case and thus are harder to standardize cleanly. But a generic update is something that would work for everyone. And specific ledgers could then also have more specific update methods implemented in addition.
+
+Need to think about it more considering your response. Maybe also something to keep for a discussion in the upcoming meeting.
+
+-------------------------
+
+PanIndustrial | 2023-11-15 15:41:49 UTC | #104
+
+We have the following functions in our reference implementation.
+
+We use Candy as the Metadata storage under the hood because:
+
+1. With a Class we can set certain properties in the item as immutable and provide guarantees to the user.
+2. The Class/Maps are held internally as Maps so we can more easily search through them and do not have to iterate over the whole collection.
+
+In this code, the set_nft is used to completely overwrite the object.  update_nft uses the Candy.Properties package(borrowed from @quint) that allows you to specify and update graph to a Class such that you can make deep updates to a nested class and immutable arguments are honored.
+
+When we return icrc7_token_metadata we dump all the Classes to standard Maps according to the Value schema(and other data types...you can see the mapping at the end).  This loses some context for the user, but the application can choose to add another endpoint that provides the object as a full annotated candy value.
+```
+///hard sets an NFT metadata; For incremental updates use update_nft
+    public func set_nft(request: [SetNFTRequest], environment : ?Environment) : [Bool]{
+      
+      //todo: Security at this layer?
+      //todo: where to handle minting and setting data
+
+      let results = Vec.new<Bool>();
+      label proc for(thisItem in request.vals()){
+
+        //does it currently exist?
+        switch(Map.get<Nat, CandyTypes.Candy>(state.nfts, Map.nhash, thisItem.token_id)){
+          case(null){};
+          case(?val){
+            //this nft is being updated and we need to de-index it.
+            switch(get_token_owner_canonical(thisItem.token_id)){
+              case(#err(_)){};
+              case(#ok(val)) ignore unindex_owner(thisItem.token_id, val);
+            };
+            
+          };
+        };
+
+
+        ignore Map.put<Nat, CandyTypes.Candy>(state.nfts, Map.nhash, thisItem.token_id, thisItem.metadata);
+        Vec.add(results, true);
+
+        D.print("about to check canonical owner" # debug_show(thisItem));
+        switch(get_token_owner_canonical(thisItem.token_id)){
+          case(#ok(owner)){
+             D.print("about to index owner" # debug_show(thisItem));
+            ignore index_owner(thisItem.token_id, owner);
+          };
+          case(_){};
+        };
+      };
+      return Vec.toArray(results);
+    };
+
+    ///updates an NFT metadata; 
+    public func update_nft(request: [UpdateNFTRequest], environment : ?Environment) : Result.Result<[Bool], Text>{
+      
+      //todo: Security at this layer?
+      //todo: where to handel minting and setting data
+
+      let results = Vec.new<Bool>();
+      label proc for(thisItem in request.vals()){
+
+        //does it currently exist?
+        switch(Map.get<Nat, CandyTypes.Candy>(state.nfts, Map.nhash, thisItem.token_id)){
+          case(null){};
+          case(?val){
+            var owner_found : ?Account = null;
+            //this nft is being updated and we need to de-index it.
+            switch(get_token_owner_canonical(thisItem.token_id)){
+              case(#err(_)){};
+              case(#ok(val)){
+                //do any of the updates affect the owner
+                for(thisUpdate in thisItem.updates.vals()){
+                  if(thisUpdate.name == token_property_owner_account){
+                    owner_found := ?val;
+                  };
+                };
+                
+              };
+            };
+
+            switch(val){
+              case(#Class(props)){
+                let updatedObject = switch(CandyProperties.updateProperties(props, thisItem.updates)){
+                  case(#ok(val)) val;
+                  case(#err(err)) {
+                    Vec.add(results, false);
+                    continue proc;
+                  };
+                };
+
+                switch(owner_found){
+                  case(?val){
+                    ignore unindex_owner(thisItem.token_id, val);
+                  };
+                  case(null){};
+                };
+
+                ignore Map.put<Nat, CandyTypes.Candy>(state.nfts, Map.nhash, thisItem.token_id, #Class(updatedObject));
+                Vec.add(results, true);
+
+                switch(owner_found){
+                  case(?val){
+                    D.print("about to check canonical owner" # debug_show(thisItem));
+                    switch(get_token_owner_canonical(thisItem.token_id)){
+                      case(#ok(owner)){
+                        D.print("about to index owner" # debug_show(thisItem));
+                        ignore index_owner(thisItem.token_id, owner);
+                      };
+                      case(_){};
+                    };
+                  };
+                  case(null){};
+                };
+              };
+              case(_) return #err("Only Class types supported by update");
+            };
+          };
+        };
+
+        
+      };
+      return #ok(Vec.toArray(results));
+    };
+```
+
+Converting the Internally Stored Candy to Value:
+```
+///converts a candyshared value to the reduced set of ValueShared used in many places like ICRC3.  Some types not recoverable
+  public func CandySharedToValue(x: CandyShared) : ValueShared {
+    switch(x){
+      case(#Text(x)) #Text(x);
+      case(#Map(x)) {
+        let buf = Buffer.Buffer<(Text, ValueShared)>(1);
+        for(thisItem in x.vals()){
+          buf.add((thisItem.0, CandySharedToValue(thisItem.1)));
+        };
+        #Map(Buffer.toArray(buf));
+      };
+      case(#Class(x)) {
+        let buf = Buffer.Buffer<(Text, ValueShared)>(1);
+        for(thisItem in x.vals()){
+          buf.add((thisItem.name, CandySharedToValue(thisItem.value)));
+        };
+        #Map(Buffer.toArray(buf));
+      };
+      case(#Int(x)) #Int(x);
+      case(#Int8(x)) #Int(Int8.toInt(x));
+      case(#Int16(x)) #Int(Int16.toInt(x));
+      case(#Int32(x)) #Int(Int32.toInt(x));
+      case(#Int64(x)) #Int(Int64.toInt(x));
+      case(#Ints(x)){
+         #Array(Array.map<Int,ValueShared>(x, func(x: Int) : ValueShared { #Int(x)}));
+      };
+      case(#Nat(x)) #Nat(x);
+      case(#Nat8(x)) #Nat(Nat8.toNat(x));
+      case(#Nat16(x)) #Nat(Nat16.toNat(x));
+      case(#Nat32(x)) #Nat(Nat32.toNat(x));
+      case(#Nat64(x)) #Nat(Nat64.toNat(x));
+      case(#Nats(x)){
+         #Array(Array.map<Nat,ValueShared>(x, func(x: Nat) : ValueShared { #Nat(x)}));
+      };
+      case(#Bytes(x)){
+         #Blob(Blob.fromArray(x));
+      };
+      case(#Array(x)) {
+        #Array(Array.map<CandyShared, ValueShared>(x, CandySharedToValue));
+      };
+      case(#Blob(x)) #Blob(x);
+      case(#Bool(x)) #Blob(Blob.fromArray([if(x==true){1 : Nat8} else {0: Nat8}]));
+      case(#Float(x)){#Text(Float.format(#exact, x))};
+      case(#Floats(x)){
+        #Array(Array.map<Float,ValueShared>(x, func(x: Float) : ValueShared { CandySharedToValue(#Float(x))}));
+      };
+      case(#Option(x)){ //empty array is null
+        switch(x){
+          case(null) #Array([]);
+          case(?x) #Array([CandySharedToValue(x)]);
+        };
+      };
+      case(#Principal(x)){
+        #Blob(Principal.toBlob(x));
+      };
+      case(#Set(x)) {
+        #Array(Array.map<CandyShared,ValueShared>(x, func(x: CandyShared) : ValueShared { CandySharedToValue(x)}));
+      };
+      case(#ValueMap(x)) {
+        #Array(Array.map<(CandyShared,CandyShared),ValueShared>(x, func(x: (CandyShared,CandyShared)) : ValueShared { #Array([CandySharedToValue(x.0), CandySharedToValue(x.1)])}));
+      };
+      //case(_){assert(false);/*unreachable*/#Nat(0);};
+    };
+  };
+```
+
+Usage from our test:
+
+```
+test("Update immutable and non-immutable NFT properties", func() {
+  //Arrange: Set up the ICRC7 instance and required parameters
+  let icrc7 = ICRC7.ICRC7(?icrc7_migration_state, testCanister, base_environment);
+  let token_id = 12;  // Assuming a token ID for testing
+  let initialMetadata = #Class([
+    {immutable=false; name=ICRC7.token_property_owner_account; value = #Map([(ICRC7.token_property_owner_principal,#Blob(Principal.toBlob(testOwner)))]);},
+    {name="test"; value=#Text("initialTestValue"); immutable = false},
+    {name="test3"; value=#Text("immutableTestValue"); immutable = true}
+  ]);  // Define the initial metadata for testing
+
+
+  let targetMetadata = #Class([
+    {immutable=false; name=ICRC7.token_property_owner_account; value = #Map([(ICRC7.token_property_owner_principal,#Blob(Principal.toBlob(testOwner)))]);},
+    {name="test"; value=#Text("updatedTestValue"); immutable = false},
+    {name="test3"; value=#Text("immutableTestValue"); immutable = true}
+  ]);  // Define the initial metadata for testing
+
+  let updateImmutable = {name="test"; mode=#Set(#Text("updatedTestValue"))};  // Define an update for non-immutable property
+  let updateNonImmutable = {name="test3"; mode=#Set(#Text("updatedImmutableTestValue"));};  // Define an update for immutable property
+  
+  let mintedNftMetadata = CandyTypesLib.unshare(initialMetadata);
+  let nft = icrc7.set_nft([{token_id=token_id;metadata=mintedNftMetadata;}], ?base_environment);
+
+  // Act and Assert: Attempt to update the immutable and non-immutable properties
+  let #ok(resultNonImmutableUpdate) = icrc7.update_nft([{token_id=token_id;updates=[updateImmutable];}], ?base_environment) else return assert(false);
+
+  D.print("resultNonImmutableUpdate" # debug_show(resultNonImmutableUpdate));
+
+  assert(
+    // Ensure the update for the immutable property fails and returns false
+    resultNonImmutableUpdate[0] == true//, "Update for immutable property should fail"
+  );
+
+  let #ok(resultImmutableUpdate) = icrc7.update_nft([{token_id=token_id;updates=[updateNonImmutable];}], ?base_environment) else return assert(false);
+
+  D.print("resultImmutableUpdate" # debug_show(resultImmutableUpdate));
+
+  assert(
+    // Ensure the update for the non-immutable property succeeds and returns true
+    resultImmutableUpdate[0] == false//, "Update for non-immutable property should succeed"
+  );
+
+  // Assert: Check if the updated metadata matches the expectation
+  let ?retrievedMetadata = icrc7.get_token_info(token_id) else return assert(false);
+  assert(
+    // Ensure the updated metadata matches the non-immutable update
+    CandyTypesLib.eq(CandyTypesLib.unshare(targetMetadata), retrievedMetadata)//,
+    //"Updated non-immutable property matches the expectations"
+  );
+});
+```
+
+-------------------------
+
+dieter.sommer | 2023-11-20 16:01:57 UTC | #105
+
+The next meeting of the WG is taking place tomorrow, November 21, 2023, 17:00-18:00 UTC+1 time.
+
+[Current ICRC-7 draft](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md)
+
+The goal is to address the comments on the current draft that have come in since the recent meeting. See the forum discussion above for the topics to cover.
+
+Hope to see you all there to bring ICRC-7 over the finish line!
+
+-------------------------
+
+kayicp | 2023-11-21 13:26:01 UTC | #106
+
+Hi
+
+Thought I post my interface design proposal here, in case I cant make it to the meeting. Anyway, I'm satisfied with the current interface standard except the ones that I redesigned below, standardized to ICRC-1 for naming system, ICRC-4 for batch transfer pattern and scanning (from, take, next) is according to CanScale's RBTree scan interface. I also have removed all *collection* method interface by allowing the caller to set `token_ids` to empty array if the caller wants to approve/revoke all of what he owns... but for transfer operation, the `token_ids` array cannot be empty. Let me know what you think.
+
+1) Token getters
+![image|690x309](upload://fifhxVfueL6IJwTaEWVGD9PCsiU.png)
+
+2) **Approval** argument type, return type, and method interfaces
+![image|384x499](upload://tyvXBm7kmyEBplgujLN9WJX606y.png)
+
+3) **Revoke** argument type, return type, and method interfaces
+![image|463x500](upload://ljMNuzjImSER2MuADKN8SKyG7Si.png)
+
+4) **Transfer** argument type, return type, and method interfaces
+![image|339x500](upload://wtkPMTVkGg1y5WXPXuw8qgQaIZR.png)
+
+-------------------------
+
+sea-snake | 2023-11-21 13:01:44 UTC | #107
+
+[quote="kayicp, post:106, topic:16566"]
+I also have removed all *collection* method interface by allowing the caller to set `token_ids` to empty array if the caller wants to approve/revoke all of what he owns…
+[/quote]
+
+I don't think the added confusion resulting from having two different behaviors behind a single method is worth it compared to having two explicit methods with two clearly defined behaviors :confused:
+
+Previously we had a combined method with a variant argument to choose between collection or token ids but this only added complexity, so we opted to split it into two methods to simplify things and make the behavior more explicit and contained to each individual method.
+
+Also a collection approval is very different from e.g. approving all tokens at once since a collection approval is not per token it's also valid for tokens that the user might receive in the future.
+
+-------------------------
+
+kayicp | 2023-11-21 13:08:01 UTC | #108
+
+[quote="sea-snake, post:107, topic:16566"]
+Also a collection approval is very different from e.g. approving all tokens at once since a collection approval is not per token it’s also valid for tokens that the user might receive in the future.
+[/quote]
+ah i see. then we will need the *collection* methods... which I don't have to propose anything since it's already good as it is.
+
+-------------------------
+
+skilesare | 2023-11-21 16:40:24 UTC | #109
+
+I tried jumping on the meeting, but no one was on. Hopefully we can wrap up the standard soon.  My one issue was with updating the response of a couple of the queries to allow an [Nat, opt Account] instead off just [Nat, account] so that we don't have to trap the whole query for one missing token id.(I believe there is already a fix comment on the line.
+
+-------------------------
+
+sea-snake | 2023-11-21 16:40:47 UTC | #110
+
+We're all on 😅
+I'll DM you a link.
+
+-------------------------
+
+dieter.sommer | 2023-11-29 13:06:00 UTC | #111
+
+Dear colleagues!
+
+Here is a link to the shared Google drive where slides and other material for the Working Group is hosted: https://drive.google.com/drive/folders/1R6lDsLtiF8caYjBmtlVDgcB_my30-b58
+
+You find last week's slide deck and decisions there as well: https://docs.google.com/presentation/d/1Ws2teUtJb8sWemVFk0wzGjKn6TG7ZtSj6vbEqlwM-v4/edit?usp=sharing
+
+-------------------------
+
+dieter.sommer | 2023-11-29 16:16:41 UTC | #112
+
+I have addressed the comments from the recent WG meeting last week. The standard has been split into ICRC-7 and ICRC-30 (the next free number).
+
+[ICRC-7](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md), [ICRC-7 diff to last week's meeting](https://github.com/dfinity/ICRC/compare/30fdde7..da4d10c)
+[ICRC-30](https://github.com/dfinity/ICRC/blob/ICRC-30-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-30/ICRC-30.md)
+
+Furthermore, as ICRC-3 has received its final polishing touches, I took the freedom to already draft the ICRC-3-compliant block schemes for both [ICRC-7](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md#icrc-7-block-schema) and [ICRC-30](https://github.com/dfinity/ICRC/blob/ICRC-30-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-30/ICRC-30.md#icrc-30-block-schema).
+
+Feedback welcome!
+
+-------------------------
+
+skilesare | 2023-11-29 17:10:13 UTC | #113
+
+Discussion point for 7mint:  Since we want transaction logs to be recomputable and verifiable, should mint have something in it pertaining to the hash of metadata/nft content? We kind of kicked mint and burn down the road as there was a discussion about onchain/offchain assets and metadata that we talked about resolving down the line.  Since the IC can compute over and mutate content things get a bit more complicated.
+
+-------------------------
+
+skilesare | 2023-11-29 17:46:07 UTC | #114
+
+Looks like icrc7_max_revoke_approvals needs to make the move to ICRC30 still.
+
+-------------------------
+
+skilesare | 2023-11-29 19:49:22 UTC | #115
+
+```
+`icrc30:max_approvals_per_token_or_collection` of type `nat` (optional): 
+The maximum number of active approvals this ledger implementation allows per token or 
+per principal for the collection. When present, should be the same as the result of the..
+```
+
+@dieter.sommer @sea-snake @benji This is stressing me out during implementation. Everything goes by account, but this says principal...I'm debating keeping a separate index around that keeps track by principal.  But say you have a wallet-service canister of some kind that holds tokens for lots of different people at different subaccounts....limiting by principal would limit this use case.
+
+The counterargument is an attacker could just fill up your approvals with infinite sub-accounts until all other approvals are cleaned out of memory.
+
+Also...having the number be the same for the token_id: Approvals and owner_prinicpal: Approvals seems odd.
+
+At the moment I'm going to do it by Account as opposed to principal unless you all have some pushback.
+
+-------------------------
+
+skilesare | 2023-11-29 21:19:04 UTC | #116
+
+7 has tid for token_id and 30 has token_id.
+
+For 30...do we need separate ops for collection and token...arent they the same except that token Id is optional for collection approvals?
+
+-------------------------
+
+skilesare | 2023-11-29 21:22:09 UTC | #117
+
+For 30 there is a situation where the canister may revoke approvals if the max is reached. In this case, since the memo will be added by the ledger, should it be possible to put at the top level?  Tagging @mariop as I understand they do something like this with the ledgers.  I was tagging these with the following for tracking, but I'm putting it in tx and not at the top.
+
+Vec.add(trx, ("memo", #Blob(Text.encodeUtf8("icrc30_system_clean"))));
+
+-------------------------
+
+mariop | 2023-11-30 09:42:31 UTC | #118
+
+If is possible to put memo at the top level similarly to what we do with the fee. It's not mandatory to follow this best practice but it's nice to have.
+
+-------------------------
+
+kayicp | 2023-11-30 13:33:54 UTC | #119
+
+![image|690x461](upload://rCceQlIux8wlfVsd1cx8IfDORX3.png)
+
+Hi may i know why are we returning the token ids to the caller, instead of returning the token metadata itself directly?
+Is it because of the strengths/weaknesses of ICP (in terms of I/O, cycles, latency, etc.)? 
+
+Also, let's say i have this data structure and it's changing rapidly
+```
+[
+{ key: '',  val: [...] },
+{ key: '',  val: [...] },
+{ key: '',  val: [...] },
+{ key: '',  val: [...] },
+{ key: '',  val: [...] },
+...
+]
+```
+
+... and if i want to do rapid polling on ICP to this array/map to check for its changes, is the practice used by ICRC-7 above would be more suitable for ICP? where I return the array `key`s first, then the caller will query the `val` of each `key` in separate calls?
+
+One more thing, the pagination (`token_ids: [Nat] or prev+take`) is another form of batching right? Why did ICRC-7 uses batching instead of singular calls for each token_id? Is it to reduce the latency/cost of the calls?
+
+-------------------------
+
+skilesare | 2023-11-30 14:32:39 UTC | #120
+
+[quote="kayicp, post:119, topic:16566"]
+Hi may i know why are we returning the token ids to the caller, instead of returning the token metadata itself directly?
+[/quote]
+
+tokens_of_with_metadata might be a nice end point and maybe we should consider it for a future ICRC, but the thought was that you could call 1: tokens_of and then 2 tokens([owned_NFTs]) and get the info you need.  It is more composable and queries are pretty quick, so hopefully it doesn't slow things down too much.
+
+```
+where I return the array keys first, then the caller will query the val of each key in separate calls
+```
+
+a tokens_filter end point where you can provide a list of keys that you want was consider. I don't remember why it was dropped, but probably for simplicity. Again, this would be a great add on for a future ICRC.  You figure out a lot when you try to actually implement one of these, so I'd imagine we'll learn quite a bit as real world use cases are deployed.
+
+```
+One more thing, the pagination (token_ids: [Nat] or prev+take) is another form of batching right? Why did ICRC-7 uses batching instead of singular calls for each token_id? Is it to reduce the latency/cost of the calls?
+```
+The IC can only return about 2MB per call. The places you see prev, take are calls where we could envision a collection growing to a size where the results would need to be paginated.
+
+-------------------------
+
+dieter.sommer | 2023-12-01 10:37:10 UTC | #121
+
+[quote="skilesare, post:113, topic:16566, full:true"]
+Discussion point for 7mint: Since we want transaction logs to be recomputable and verifiable, should mint have something in it pertaining to the hash of metadata/nft content? We kind of kicked mint and burn down the road as there was a discussion about onchain/offchain assets and metadata that we talked about resolving down the line. Since the IC can compute over and mutate content things get a bit more complicated.
+[/quote]
+
+Excellent point, the actual NFT content is in no way reflected in the block as currently defined. Would a representation independent hash of the `Value` element containing the metadata be enough here? I would assume that any kind of metadata change in future standards would then also include the metadata hash in the created block.
+
+[quote="skilesare, post:114, topic:16566, full:true"]
+Looks like icrc7_max_revoke_approvals needs to make the move to ICRC30 still.
+[/quote]
+
+Yes, fixing it in the upcoming iteration!
+
+[quote="skilesare, post:116, topic:16566"]
+7 has tid for token_id and 30 has token_id.
+[/quote]
+
+Right, I have chosen `tid` for it to be shorter in the first standard, but then thought that `token_id` is more in line with best practices from ICRC-1 etc., but haven't changed `tid`. Fixing it.
+
+[quote="skilesare, post:116, topic:16566"]
+For 30…do we need separate ops for collection and token…arent they the same except that token Id is optional for collection approvals?
+[/quote]
+
+This has been discussed and the group has decided to split it into two methods as they are less convoluted in their spec.
+
+-------------------------
+
+skilesare | 2023-12-01 15:06:09 UTC | #122
+
+### icrc30_get_token_approvals
+
+There is a discrepency between this title and the function in the example for the end point...I think "token" is missing.
+
+```
+icrc30_get_approvals : (token_ids : vec nat, prev : opt TokenApproval; take : opt nat)
+    -> (vec TokenApproval) query;
+```
+
+-------------------------
+
+dieter.sommer | 2023-12-04 09:29:27 UTC | #123
+
+[quote="skilesare, post:117, topic:16566"]
+For 30 there is a situation where the canister may revoke approvals if the max is reached. In this case, since the memo will be added by the ledger, should it be possible to put at the top level?
+[/quote]
+
+Good point, it probably makes lots of sense to move the memo to the top level and also have it mandatory in that case in order to be able to differentiate between the transfer-initiated and user-initiated revocation of approvals. A main use case of this is also the implicit revocation of approvals when a transfer happens (I originally read your comment to be related to this).
+
+Doing so also would be in line with the established best practices as also confirmed by Mario. If it were not mandatory, we might not be able to differentiate what happened based on the ledger history.
+
+We might even think of mandating that the memo must contain the height of the block that contains the associated transfer that has lead to this revocation.
+
+What do others in the WG think about this?
+
+-------------------------
+
+dieter.sommer | 2023-12-04 09:36:13 UTC | #124
+
+[quote="dieter.sommer, post:121, topic:16566"]
+[quote="skilesare, post:113, topic:16566"]
+Discussion point for 7mint: Since we want transaction logs to be recomputable and verifiable, should mint have something in it pertaining to the hash of metadata/nft content? We kind of kicked mint and burn down the road as there was a discussion about onchain/offchain assets and metadata that we talked about resolving down the line. Since the IC can compute over and mutate content things get a bit more complicated.
+[/quote]
+
+Excellent point, the actual NFT content is in no way reflected in the block as currently defined. Would a representation independent hash of the `Value` element containing the metadata be enough here? I would assume that any kind of metadata change in future standards would then also include the metadata hash in the created block.
+[/quote]
+
+Thinking further about this, I wonder whether we need to include the metadata in full. In ICRC-1 the governing principle is that the ledger should be reconstructible from the blocks. Applying this principle here would mean to have the **full metadata** in the block log to be able to reconstruct the ledger from the block log. Externally-referenced things we don't care about as they are not part of the ledger. The draft has been modified to represent this proposal.
+
+In terms of size this should not be an issue as there are multiple archive canisters keeping the block log, while there is (currently) one canister that keeps all token state.
+
+What do people think about this?
+
+-------------------------
+
+dieter.sommer | 2023-12-04 09:52:41 UTC | #125
+
+[quote="skilesare, post:115, topic:16566"]
+@dieter.sommer @sea-snake @benji This is stressing me out during implementation. Everything goes by account, but this says principal…I’m debating keeping a separate index around that keeps track by principal. But say you have a wallet-service canister of some kind that holds tokens for lots of different people at different subaccounts…limiting by principal would limit this use case.
+
+The counterargument is an attacker could just fill up your approvals with infinite sub-accounts until all other approvals are cleaned out of memory.
+
+Also…having the number be the same for the token_id: Approvals and owner_prinicpal: Approvals seems odd.
+
+At the moment I’m going to do it by Account as opposed to principal unless you all have some pushback.
+[/quote]
+
+Denial of service protection is really hard, thus we have the problem you mention. If you use the `Account` instead of the principal, you can do unlimited DoS with a single principal and its many subaccounts as you mention above, so we could equally skip the mechanism altogether in that case.
+
+The original idea was to use the principal in order to limit what a single principal can do in terms of DoS. For a single principal one can build more effective DoS protection, e.g., by requiring a principal to own at least one token in order to be able to make collection-level approvals.
+
+Also this DoS protection is optional, so you need not implement it in your ledger.
+
+Seems this is something to come back to in the next meeting. Doing an actual implementation really brings lots of good insights! :-)
+
+-------------------------
+
+dieter.sommer | 2023-12-04 09:57:55 UTC | #126
+
+[quote="skilesare, post:120, topic:16566"]
+[quote="kayicp, post:119, topic:16566"]
+Hi may i know why are we returning the token ids to the caller, instead of returning the token metadata itself directly?
+[/quote]
+
+tokens_of_with_metadata might be a nice end point and maybe we should consider it for a future ICRC, but the thought was that you could call 1: tokens_of and then 2 tokens([owned_NFTs]) and get the info you need. It is more composable and queries are pretty quick, so hopefully it doesn’t slow things down too much.
+[/quote]
+
+You meant to use (1) `icrc7_tokens_of` to get the tokens of an account and (2) `icrc7_token_metadata` as a batch call on the response list of tokens received in 1, correct? `tokens` only gives you a list of token ids, not the corresponding metadata.
+
+-------------------------
+
+skilesare | 2023-12-04 15:31:43 UTC | #127
+
+[quote="dieter.sommer, post:123, topic:16566"]
+A main use case of this is also the implicit revocation of approvals when a transfer happens (I originally read your comment to be related to this).
+[/quote]
+
+I think that we don't need to log post-transfer revocations if the standard says that you "MUST" do this as it can be reproduced by simply looking for transfers, but I'm open to other interpretations.  It could be VERY chatty.
+
+-------------------------
+
+dieter.sommer | 2023-12-04 18:21:17 UTC | #128
+
+[quote="skilesare, post:127, topic:16566"]
+I think that we don’t need to log post-transfer revocations if the standard says that you “MUST” do this as it can be reproduced by simply looking for transfers, but I’m open to other interpretations. It could be VERY chatty.
+[/quote]
+
+Thinking more about it, I must agree. Initially I thought that making it explicit in the log makes the logic easier to determine active approvals, but the additional wasted space is probably not worth the simplifications of the code.
+
+-------------------------
+
+dieter.sommer | 2023-12-04 18:24:42 UTC | #129
+
+The next WG meeting is taking place tomorrow, December 5, 2023.
+
+We will go over the issues that have been raised on the forum on the recent version.
+
+Relevant drafts:
+* [ICRC-7 ](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md)
+* [ICRC-30 ](https://github.com/dfinity/ICRC/blob/ICRC-30-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-30/ICRC-30.md)
+
+-------------------------
+
+dfisher | 2023-12-04 21:43:21 UTC | #130
+
+Has @bob11 posted his thoughts? Between Bioniq and Toniq, seems like he is leading NFT efforts on the IC...
+
+-------------------------
+
+bob11 | 2023-12-04 23:24:50 UTC | #131
+
+While Toniq hasn't really been participating much in the working group, you all have created a fantastic standard. So excellent job everyone!
+
+A few personal opinions that don't actually impact the standard very much:
+
+1. I don't love the Approve/transferFrom model (I think there are better ways). There are massive problems with this approach that we've seen from ETH NFT land, and I'm sad we're building it in as a standard, but I accept that people want it for consistency across chains.
+
+2. I also don't love the final result of the single textual representation of ICRC-1 accounts. I understand why it was done the way it was done, but the result is kind of ugly, with inconsistent length, and not very user friendly. I'm not saying to change it, but I wish it was closer to Ethereum where all addresses are the same length. Feels nice to have that address consistency.
+
+Otherwise, I think this is a great standard created by some of the brightest developers on ICP. So good work everyone.
+
+-------------------------
+
+dieter.sommer | 2023-12-05 13:30:15 UTC | #132
+
+
+**Proposal for agenda for the call on Dec 5:**
+* Has the WG feedback from the recent call been implemented according to WG's liking?
+  * In particular also splitting off ICRC-30 as separate document
+* Block log schema
+  * Draft to be validated by WG
+  * Do we want to mandate what a `memo` should contain in case of a ledger-initiated revocation of an approval? Do we want to mandate to have the `memo` a level up in this case?
+* Do we need to store the complete NFT metadata in the mint block?
+  * If we want to have ledgers reproducible from the log, we need this; Anything else?
+    * Having this property makes the ledger much stronger
+* Storing implicit approval revocation on transfer in the block log?
+  * Rather no, because it can be inferred from the transfer and existing approvals on the token; Is the logic for this simple enough?
+
+**Next steps**
+* Do people need more time for the reference implementations?
+* Addressing any remaining items
+* Formatting fixes
+* WG Voting
+  * Handle ICRC-7 and ICRC-30 in tandem as bundle or separately in voting?
+* NNS voting
+
+-------------------------
+
+dieter.sommer | 2023-12-05 14:29:11 UTC | #133
+
+I am still tweaking the block log schema for NFTs and wondered whether in each block we should strive to express the absolute minimum information: E.g., for a `transfer_from`, we could omit the `from` from the block log as it is implied by the current owner. Modeling it is redundant, and redundancy is not necessary here and just wastes space. What do you think?
+
+@mariop, @skilesare, @benji, @sea-snake, @levifeldman, @kayicp
+
+-------------------------
+
+skilesare | 2023-12-05 15:25:52 UTC | #134
+
+I think shortening the names is fine 30xferfr or something like that 30app, 30appc, 30rvk,30rvkc.  It is better for ledger size.  Text bytes are big.
+
+-------------------------
+
+sea-snake | 2023-12-05 18:21:44 UTC | #135
+
+Though a ledger could internally reduce storage size by creating a mapping for these text values so they're only stored once and each transaction is stored with a reference to a key in the map.
+
+I do agree on the minimum information, the history as a whole should contain all information needed but it's ok to not have contextual/historical information within the history items itself. For easy accessing information you'd want something like an index canister anyway.
+
+-------------------------
+
+levi | 2023-12-06 12:15:23 UTC | #136
+
+As long as someone reading the log will be able to know what operation it is, then it works.
+
+-------------------------
+
+dieter.sommer | 2023-12-06 15:53:58 UTC | #137
+
+[quote="sea-snake, post:135, topic:16566"]
+I do agree on the minimum information, the history as a whole should contain all information needed but it’s ok to not have contextual/historical information within the history items itself. For easy accessing information you’d want something like an index canister anyway.
+[/quote]
+
+Update to this: The group agreed in the meeting to have some redundancy in the block log where it helps to simplify the implementation. We changed the block scheme (back) to contain this redundancy.
+
+-------------------------
+
+dieter.sommer | 2023-12-06 15:55:29 UTC | #138
+
+Do we need an extensions mechanism in ICRC-30 or would the extensions go into the base that ICRC-30 extends, i.e., IRCR-7? Likely, it is the latter, but would like to get some some inputs on this one. Relates to the comment at the very end of ICRC-30.
+
+-------------------------
+
+dieter.sommer | 2023-12-06 15:59:07 UTC | #139
+
+Another open point in ICRC-30:
+
+"Collection-level approvals can be successfully created independently of currently owning tokens of the collection at approval time."
+
+If we want to allow DoS mitigations here, this needs to be relaxed so that collection-level approvals should only be possible in case someone holds at least one token. We could also leave the aspect unspecified whether you need to hold tokens and leave it to an implementation. Spec-wise, it would be cleaner to not require a user to hold tokens to make approvals.
+
+Besides this and the above question, I think the standards are finished.
+
+Looking forward to some input:
+@skilesare, @benji, @sea-snake, @levifeldman, @kayicp
+
+-------------------------
+
+skilesare | 2023-12-06 16:13:32 UTC | #140
+
+In my implementation, I've made this a configuration flag.  To me it makes sense to require someone to have a token in almost all instances, but I'm sure someone could come up with a use case where pre-approving is important.
+
+-------------------------
+
+kayicp | 2023-12-07 10:13:11 UTC | #141
+
+[quote="dieter.sommer, post:139, topic:16566"]
+approvals should only be possible in case someone holds at least one token
+[/quote]
+
+i have been thinking about this. not only for approval but for any update calls that has anything to do with the caller's token, actually. i mean, since the execution of update calls is ~500k cycles.
+
+-------------------------
+
+dieter.sommer | 2023-12-08 08:43:54 UTC | #142
+
+Considering @skilesare and @kayicp's responses above, I think it might make sense to remove the part in the spec that allows people without holding tokens to make approvals. It should be up to the ledger to decide, so we are as non-constraining as possible, but don't hurt DoS protection. I'll change this shortly in the text unless someone here opposes.
+
+[quote="kayicp, post:141, topic:16566"]
+i have been thinking about this. not only for approval but for any update calls that has anything to do with the caller’s token, actually. i mean, since the execution of update calls is ~500k cycles.
+[/quote]
+
+Indeed. I think all other operations do require you to have a token. These are transfers, approvals of tokens, cancelling approvals, and transfer_froms. Meaning that if we remove the spec part that collection-level approvals be possible without holding tokens and leave it open we should be in as good a shape as possible in a reverse-gas context and a ledger without fees.
+
+-------------------------
+
+skilesare | 2023-12-12 18:07:41 UTC | #143
+
+An issue came up in our Token WG meeting today when discussing ICRC-4(Batch Transfers) that we needed to discuss if each transaction needed its own memo.  We realized that the current ICRC7 Implementation only has a top level memo for deduplication and that that memo is inherited by each transaction that goes into the log.
+
+```
+TransferArgs = record {
+    subaccount: opt blob; // the subaccount of the caller (used to identify the spender)
+    to : Account;
+    token_ids : vec nat;
+    // type: leave open for now
+    memo : opt blob;
+    created_at_time : opt nat64;
+};
+```
+
+We'd love feed back on:
+
+1. Would it be convenient to have a memo for each token_id in the transfer:
+
+```
+ token_ids : vec (nat; opt blob);
+
+or
+
+token_ids : vec {record {token_id: nat; memo: opt blob});
+```
+
+For example, this would allow a canister to write a memo into each transaction during a token distribution event.
+
+2. If we do put a memo at the token transaction level, do we want the top level memo to make it into the block as well. Assuming yes for completeness, what name should we use for the field in the transaction?(note, ref, comment?).
+
+-------------------------
+
+infu | 2023-12-12 19:44:19 UTC | #144
+
+You have all done great work with this standard. Can't wait to see the ecosystem grow with it.
+
+-------------------------
+
+wpb | 2023-12-13 01:01:12 UTC | #145
+
+I'm going to tag @hpeebles and @julianjelfs because I believe one of them told me recently that OpenChat plans to add some interesting features when ICRC-7 comes out.  If they don't already know about this conundrum, then perhaps they want to have input.
+
+-------------------------
+
+cryptoschindler | 2023-12-13 08:01:32 UTC | #146
+
+Can we change 
+```
+icrc7_token_metadata : (token_ids : vec nat)
+    -> (vec record { nat; opt vec record { text; Value } }) query;
+``` 
+to 
+```
+icrc7_token_metadata : (token_ids : vec nat)
+    -> (vec record { token_id : nat; metadata: opt vec record { text; Value } }) query;
+```
+to be consistent with the response of `icrc7_balance_of` for example?
+
+Also, for `icrc7_token_metadata` we specify the following
+> In case a token does not exist, its associated metadata vector is `null` . If a token does not have metadata, its associated metadata vector is the empty vector.
+
+For `icrc7_owner_of` the behaviour is different
+> Note that tokens for which an ICRC-1 account cannot be found have a `null` response.
+
+I think it would be nice to consolidate the behaviour of those two methods, so for example let both of them trap if a `token_id` does not exist.
+
+-------------------------
+
+sea-snake | 2023-12-13 11:00:06 UTC | #147
+
+I wouldn't opt for trapping, just leaving out tokens from the record that don't exist seems like a better approach that allows clients to still get the data for the tokens that did exist, without having to handle this error and submitting the request again. The client can simply see if the token exists, by seeing it in the record or not.
+
+-------------------------
+
+cryptoschindler | 2023-12-13 11:50:03 UTC | #148
+
+I think this is a good idea and would also be in accordance with this
+> **Batch Query Methods**
+Duplicate token ids in batch query calls may result in duplicate token ids in the response or may be deduplicated at the discretion of the ledger. The lenght of the response vector may be shorter than that of the input vector in batch query calls, e.g., in case of duplicate token ids in the input and a deduplication being performed by the method's implementation logic.
+
+Maybe we add another sentence like 
+>... or the token_id not existing ...
+
+-------------------------
+
+skilesare | 2023-12-13 23:57:34 UTC | #149
+
+@dieter.sommer @benji In thinking about this more, I think leaving the memo as a top level item is best. It is less data to submit and if you want to use the memo to point off to somewhere else(say an invoice with line items in it) you can do so on an implementation basis.
+
+We can likely apply the same to icrc4...have a created at and memo at the top and then a vec of args without created at and memo.
+
+-------------------------
+
+dieter.sommer | 2023-12-18 08:24:28 UTC | #150
+
+We will skip the January 2nd meeting of the NFT working group due to holidays.
+
+-------------------------
+
+dieter.sommer | 2023-12-18 17:04:18 UTC | #152
+
+The final WG meeting for the year is taking place on December 19, 2023. The proposed agenda is to look at the few remaining discussion points further up and resolve them.
+
+-------------------------
+
+dieter.sommer | 2023-12-19 16:20:07 UTC | #153
+
+Good point, we addressed it in the latest draft, but removed the `opt` from the metadata record as it is not required in this setting. The `opt` was used before to indicate a non-existing token.
+
+-------------------------
+
+dieter.sommer | 2023-12-19 16:21:20 UTC | #154
+
+@skilesare: We left it as is with the `memo` only at the top level as you seem to have reflected about this and come to the conclusion that we don't need memos in the individual txs. Also no one else had a strong opinion that it should be changed.
+
+-------------------------
+
+dieter.sommer | 2023-12-21 18:27:09 UTC | #155
+
+When writing up the minutes of the ICRC-1 WG meeting of 20231212, I found one issue we discussed in the scope of batch transactions: The ICRC-1-style deduplication API, also used in ICRC-7, returns the block index of the already processed tx as response for a duplicate. For a batch transaction, which applies to ICRC-7 interfaces, this does not work as a batch leads to many ICRC-3 blocks being generated. We think the spec should be extended such that the response for a duplicate is the first block index of the blocks that the batch has generated.
+We will add this to the deduping mechanism of ICRC-7 next year.
+
+-------------------------
+
+skilesare | 2024-01-08 15:19:40 UTC | #156
+
+I'd like to invite the NFT members to attend the Ledger and Tokenization Meeting tomorrow. We plan to discuss ICRC4 and we need to have a discussion about deduplication for batch transactions.  With ICRC4 I've tried to follow the same pattern as ICRC7. When there are duplicate function calls they don't match up with a specific block because each transfer gets its own block.  It would be nice to apply the same solution to ICRC4/7/30/X(batch approve for icrc1 if we decide to do that).
+
+https://github.com/skilesare/ICRC/blob/main/ICRCs/ICRC-4/ICRC-4.md
+
+-------------------------
+
+dieter.sommer | 2024-01-12 15:40:10 UTC | #157
+
+During the discussions of ICRC-4 Batch transfers, the group thought that moving both the timestamp `created_at_time` and the `memo` into the individual transactions of a batch instead of keeping them only at the top level. The arguments are the following:
+
+* Simplifies implementation
+* Generalizes better as it uses exactly the same logic for tx deduplication and other processing
+* Conceptually cleaner
+
+The downside is:
+
+* Consumes slightly more storage; however, this has found to be a minor issue
+
+If we do this, it would make perfect sense to also do this change for the ICRC-7 standard. This would imply that the APIs of update batch calls would need to change from
+```
+TransferArgs = record {
+    subaccount: opt blob; // the subaccount of the caller (used to identify the spender)
+    to : Account;
+    token_ids : vec nat;
+    // type: leave open for now
+    memo : opt blob;
+    created_at_time : opt nat64;
+};
+
+type TransferBatchError = variant {
+    InvalidRecipient;
+    TooOld;
+    CreatedInFuture : record { ledger_time: nat64 };
+    GenericError : record { error_code : nat; message : text };
+};
+
+type TransferError = variant {
+    NonExistingTokenId;
+    Unauthorized;
+    Duplicate : record { duplicate_of : nat };
+    GenericError : record { error_code : nat; message : text };
+};
+
+icrc7_transfer : (TransferArgs)
+    -> (variant { Ok : vec record { token_id : nat; transfer_result : variant { Ok : nat; Err : TransferError } };
+                  Err : TransferBatchError });
+```
+to a representation with each transfer arg represented as its own record and also the errors are adjusted accordingly:
+```
+TransferArg = record {
+    token_id: nat;
+    memo : opt blob;
+    created_at_time : opt nat64;
+}
+
+TransferArgs = record {
+    subaccount: opt blob; // the subaccount of the caller (used to identify the spender)
+    to : Account;
+    transferArgs: vec TransferArg;
+    // type: leave open for now
+};
+
+type TransferBatchError = variant {
+    InvalidRecipient;
+    GenericError : record { error_code : nat; message : text };
+};
+
+type TransferError = variant {
+    TooOld;
+    CreatedInFuture : record { ledger_time: nat64 };
+    NonExistingTokenId;
+    Unauthorized;
+    Duplicate : record { duplicate_of : nat };
+    GenericError : record { error_code : nat; message : text };
+};
+
+icrc7_transfer : (TransferArgs)
+    -> (variant { Ok : vec record { token_id : nat; transfer_result : variant { Ok : nat; Err : TransferError } };
+                  Err : TransferBatchError });
+```
+
+-------------------------
+
+shrey | 2024-01-15 03:53:33 UTC | #158
+
+Hi all,
+
+The current metadata standard have the following fields
+
+```
+  icrc7_name : text; 
+  icrc7_symbol : text;
+  icrc7_royalties : opt nat16; 
+  icrc7_royalty_recipient : opt Account;
+  icrc7_description : opt text;
+  icrc7_image : opt text; 
+  icrc7_total_supply : nat;
+  icrc7_supply_cap : opt nat;
+```
+I wanted to add some additional fields in the collection metadata, want to store some documents and collection images, so wanted to know if I can edit the fields of collection metadata record for my NFT Collection following ICRC 7 standard, or if not is there another way to add this additional data along with collection metadata.
+
+-------------------------
+
+skilesare | 2024-01-15 14:17:42 UTC | #159
+
+The collection is a Map( vec {(Text; Value)}, so you should be able to put whatever you want in and it can be returned with icrc7_collection_metadata.  The other functions you mentioned are there for convenience, but the full metadata is returned by icrc7_collection_metadata.  See:
+
+https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md#icrc7_collection_metadata
+
+-------------------------
+
+dieter.sommer | 2024-01-15 18:36:32 UTC | #160
+
+Proposed agenda for the WG meeting tomorrow, January 16, 2024:
+
+* Moving `created_at_time` and the `memo` into the individual items of a batch update call. See [post above](https://forum.dfinity.org/t/call-for-participation-nft-token-standard-working-group-status-updated/16566/157). The reason for this proposal is to have it aligned with ICRC-4 on batch transactions for fungible tokens.
+
+This is hopefully the final change before we can go to voting.
+
+-------------------------
+
+LightningLad91 | 2024-01-18 14:16:11 UTC | #161
+
+Hello WG members :wave:
+
+I’m starting a new NFT project. I have a lot of work from my prior projects (PokedStudio, Vibesters, etc) that I can work from but it’s all based on Toniq’s EXT standard. 
+
+I’d like to transition to a community standard but I’m not sure if ICRC-4 will be formalized in time (next couple months).
+
+Does anyone have an idea for when this might be completed? Thanks in advance.
+
+-------------------------
+
+skilesare | 2024-01-18 16:09:33 UTC | #162
+
+We hope to vote either before or at the next WG meeting in two weeks.  We made a few tweaks last week to better align ICRC7(basic nft) with ICRC4(Batch Fungible Tokens) so that Batch transactions work similarly in both places.
+
+-------------------------
+
+LightningLad91 | 2024-01-18 16:34:59 UTC | #163
+
+That's great news.
+
+Do you know if the WG has plans to discuss marketplace standards in the near future?
+
+-------------------------
+
+skilesare | 2024-01-18 16:46:55 UTC | #164
+
+It is on the agenda.  Actually...a bit on my todo list :grimacing:  What are your priorities?
+
+-------------------------
+
+LightningLad91 | 2024-01-19 13:43:19 UTC | #165
+
+Personally, I would consider it to be a high priority if we want to grow the ecosystem.
+
+Right now, as you know, *most* NFT projects are bound to their FE marketplace provider (Toniq, Yumi, etc). This is because the marketplace address is baked into the canister code at deployment. Independent NFT marketplaces like DGDG are forced to pay a special fee to the controlling marketplace in order to sell those NFTs on their site.  
+
+After working on several EXT-based NFT collections I realized that this was not necessary. A canister interface could just as easily allow a FE to set their fee and payment address without baking it in. That's why for the Gen2 PokedBots I added a `market_lock()` method that allows any registered marketplace address to be passed as an argument to the canister. Now, DGDG can sell Gen2 bots and not have their profits taxed by Toniq. Being able to set their own marketplace fee also allows for competition between FE providers.
+
+Those are my reasons for asking. I hope this doesn't come across as demanding some action from the WG. I appreciate the time you all put into this effort and respect your decisions on what takes priority.
+
+-------------------------
+
+skilesare | 2024-01-19 15:16:19 UTC | #166
+
+It doesn't sound demanding at all.
+
+Those concerns were what was behind the origyn_nft standard to begin with.  We put the marketplace inside the NFT collection with standardized market functions to create a balance between marketplaces that tend to accrue too much power in the classic paradigm and creators who regularly get routed around through crypto shenanigans.  Askers can supply a broker code and bidders can provide a broker code and the broker fee(set by the creator at mint) is split between those two principals.  This creates a bit of game theory where a creator has to balance the fee they charge(and how that will affect holders) and what fee will be attractive to marketplaces(otherwise why would they promote and feature your collection).
+
+A few months ago I took a stab at passing the origyn_nft standard through the ICRC7/3 lense and came up with the following:  https://github.com/skilesare/ICRC/blob/patch-1/ICRCs/ICRC-8/icrc8.mo
+
+It is on my todo list revisit because both 7 and 3 have changed a lot and I want 8 to be compatible and have good symmetry with the work that has been done.  In general, my order of operations on my todo list is:
+
+* ICRCNFTData - better define shown minting, burning, dynamic vs immutable metadata should all work.
+* ICRCFS/ICRCNFTMedia - better define(in conjunction with the work that @NathanosDev has done with certification v2) the generally accepted standards for pushing media/files into a canister.  Origyn_nft has its own schema that I really like(you can upload a whole website or dapp into the canister and serve it out as an inseparable part of your NFT) but it likely needs to come into better sync with how asset canisters work. There is no reason not to use the same mechanism and just have the NFTMedia standard use the underly FS standard so that tooling stays simple.
+* ICRCMarket/ ICRCNFTMarket - A general xFi standard that specifies how token/nft canister can control their own DeFi by putting the markets in the canister and enabling a better flow of market value to all token/collection/network owners.
+
+Fortunately, most of that code is already written(except for certification v2) and once the interface is defined it is just a matter of rearranging the entry and exit points.
+
+And if you just need some form of all of that today, the origyn_nft standard is sitting there and should, in time, support all of those standards as they emerge.  The hurdle is getting Tonic, Yumi/Yuku(they already support the standard with the gold and opie collections), and dgdg to implement the standard.
+
+-------------------------
+
+dieter.sommer | 2024-01-23 14:44:32 UTC | #167
+
+# Full Batch API semantics
+
+In last week's NFT standards WG meeting the group discussed the batch interface again, because this is the current work item of the Ledger and Tokenization WG ([ICRC-4 Batch transfers for fungible tokens](https://github.com/skilesare/ICRC/blob/main/ICRCs/ICRC-4/ICRC-4.md#icrc4_transfer_batch)). The outcome of the discussions was that we should align the NFT batch API with the upcoming ICRC-4 batch API. The current discussions have gone into the following direction:
+* The group thinks that it is beneficial to generalize the currently constrained ICRC-7 (and ICRC-37, formerly ICRC-30) batch APIs to be full batch. The current API is rather a "bulk" API in the sense that the same transfer (same from, to, memo etc.) is performed on multiple token ids. The token id being the only think that may change. This is nice in itself and has been seen as one of the big use cases: Moving multiple NFTs together, in a batch, or bulk, operation. But it seems that the constraint is unnecessary.
+  * The current constrained bulk-style interface of ICRC-7 / -37 would not be compatible with ICRC-4. This would be a big drawback for a series of token standards and would hamper adoption.
+  * The interface is harder to implement, e.g., tracking of past transaction batches for deduplication requires additional code to that of handling individual transactions.
+  * The interface is less powerful and does not allow important use cases such as batch transfers by the creator of a collection to the customers. This is also one very important use case for an NFT standard.
+  * An advantage of the current API clearly is that for the bulk transfers it supports it has a reduced message size as the `to`, `memo` and timestamp fields need not be repeated for each element in the bulk operation. That is the only obvious advantage of this API.
+
+Given that the working group intends to switch to a more generic batch interface that is not constrained to the same token recipient as the current one, the groups (both ICRC-1 WG and ICRC-7 WG) must decide which approach to use. Both standards should be aligned with respect to this. The difference is mainly in how error responses are handled, either (Option 1) through a top-level error response in case of an error related to the whole batch as in the current ICRC-4 and ICRC-7 proposals, or (Option 2) using a "flat" response structure comprising only responses for the contained transactions, but no top-level error response in case of a batch error.
+
+The below proposals have been aligned with the current ICRC-4 proposal as much as possible, including the naming of the records.
+
+## Option 1: Top-level error response
+
+The main change here w.r.t. the current API is to move the from `subaccount`, `to`, `memo`, and `created_at_time` into the individual transfer arg instead of having them at the batch level. This implies also that some errors move from the top-level to the item-level error.
+
+* The hierarchical error modeling has the advantage of more structure, i.e., it is very explicit when a batch-error happens.
+* However, it also means that in case of a top-level error, no transfers may be executed.
+* The processing of a batch requires more thorough checks than Option 2 as it needs to assure certain things *before* starting with processing, e.g., that there's enough space in the response message for all responses (it must send a response for *every* element in the request, so it must not start processing unless it can make sure there is enough space in the response).
+* Even if the implementation performs thorough checks, things can still go wrong while processing the batch elements and it may be hard to return a response for all elements. Returning a respones for each request is a strong guarantee and things may go wrong.
+* The option needs to repeat the requests in the response to be able to associate responses with requests. This wastes space.
+
+```
+TransferArg = record {
+    subaccount: opt blob; // the subaccount of the caller (used to identify the spender)
+    to : Account;
+    token_id: nat;
+    memo : opt blob;
+    created_at_time : opt nat64;
+}
+
+type TransferError = variant {
+    TooOld;
+    CreatedInFuture : record { ledger_time: nat64 };
+    InvalidRecipient;
+    NonExistingTokenId;
+    Unauthorized;
+    Duplicate : record { duplicate_of : nat };
+    GenericError : record { error_code : nat; message : text };
+};
+
+type TransferBatchError = variant {
+    TooManyRequests: record {limit : Nat};
+    GenericError : record { error_code : nat; message : text };
+};
+
+type TransferBatchResult = variant {
+    Ok : vec record {
+        transfer : BatchTransferArg; // do we need this? is token_id sufficient? (it would be slightly constraining that one token cannot be in two transfers in one batch, e.g, move to specific merchant subaccount first, then transfer to recipient)
+        transfer_result : variant {
+            Ok : nat; // Transaction index for successful transfer
+            Err : TransferError
+        };
+    };
+    Err : TransferBatchError
+};
+
+icrc7_transfer : (vec TransferArg) -> TransferBatchResult;
+```
+
+## Option 2: Flat response structure without top-level error response
+
+This option has a flat response only containing a vector of variants, each variant being a transaction index in the success case and a per-item error otherwise. The per-item error can be a batch error in case processing was interrupted while processing this item or a regular per-item error, differentiated by its type. (This has less structure than Option 1) *The`i`-th in the response corresponds to the `i` item in the request, so ordering is crucial.* This also means that the request data does not need to be repeated in the response, which saves quite some space compared to Option 1. The response must contain a contiguous list of items or `null`s up to a point `e` when processing was stopped and may leave out responses for the suffix of the request items following item `e`.
+
+* Less nice than Option 1 in terms of being structured w.r.t. batch errors. A batch-level error that occurs in the context of processing item `e` results in an according error in this place an no responses for items afterwards this item, i.e., a prefix of responses instead of all responses. This may greatly simplify implementation complexity as it relaxes the strong assumption of every request item getting a response item.
+* Although the API hints that processing must be done in the sequence of the elements, the implementation is free in parallelizing. It must only be assured that if a batch-level error happens, there is a final element with index `e` containing the batch error, no subsequent elements with indices larger than `e`, and possibly `null` values for elements up to `e` for which processing has not been attempted. All other elements `0 <= j < e` have a success or error response.
+* Avoids exhaustive checks for certain issues, e.g., response size, before starting with processing. Thus, it is (much) simpler to implement as processing can stop any time with an error and return a prefix of all responses to the caller instead of a response for every request element.
+* Deviates from the principle we set up that every request element requires a response element. But this also simplifies implementation.
+* Results in the "simplest" API of all because of less nesting.
+
+```
+TransferArg = record {
+    subaccount: opt blob; // the subaccount of the caller (used to identify the spender)
+    to : Account;
+    token_id: nat;
+    memo : opt blob;
+    created_at_time : opt nat64;
+}
+
+// both batch-level and item-level errors are contained here
+type TransferError = variant {
+    // batch errors
+    TooManyRequests: record {limit : Nat};
+    GenericBatchError : record { error_code : nat; message : text };
+    // token errors
+    TooOld;
+    CreatedInFuture : record { ledger_time: nat64 };
+    InvalidRecipient;
+    NonExistingTokenId;
+    Unauthorized;
+    Duplicate : record { duplicate_of : nat };
+    GenericError : record { error_code : nat; message : text };
+};
+
+type TransferBatchResult = vec opt record {
+    transfer_result : variant {
+        Ok : nat; // Transaction index for successful transfer
+        Err : TransferError
+    };
+};
+
+icrc7_transfer : (vec TransferArg) -> TransferBatchResult;
+```
+
+**Correction:** added `opt` for the `record` in the response type `TransferBatchResult`, that's how it was meant (Austin's Option 2.1 below refers to this option without this `opt`)
+
+**Variation of Option 2**
+
+A different variant of Option 2 would contain also the transfer argument in the `Ok` part and not rely on ordering of the response. As for Option 1, not all parameters may be required. It is not obvious what the advantage of this would be. It would require duplication of the request information and thus consume some space.
+```
+type TransferBatchResult = vec record {
+    transfer : BatchTransferArg; // do we need this? is token_id sufficient? (it would be slightly constraining that one token cannot be in two transfers in one batch, e.g, move to specific merchant subaccount first, then transfer to recipient)
+    transfer_result : variant {
+        Ok : nat; // Transaction index for successful transfer
+        Err : TransferError
+    };
+};
+```
+
+## Discussion
+
+A move forward with adopting full batch semantics requires us to make a decision on how to define the API, i.e., which style to use. Option 1 and 2 are viable options for achieving a more general batch API, with different API styles and advantages.
+
+Note that all bulk / batch update calls will be chaged accordingly in case we decide to move forward.
+
+Moving to full batch semantics for ICRC-7 / -37 requires also to discuss what this would mean for having a split `transfer` and `transfer_from` as this constrains a batch to contain only `transfer` operations for token one owns or only making `transfer_from` operations in one batch. This is not a large constraint, but needs to be discussed with this move. It seems that leaving the two transfers methods separate is fine and does not have major issues when going for full batch APIs.
+
+This discussion is equally relevant to the ICRC-4 Batch API for fungible tokens as it is for ICRC-7 and ICRC-37 (formerly ICRC-30).
+
+-------------------------
+
+dieter.sommer | 2024-01-22 10:44:35 UTC | #168
+
+The above post lists the reasonable API options for batch APIs so we can move forward with full batch semantics, compared to the more constrained bulk semantics we have now.
+
+My personal preference is one of the variations of Option 2 for the following reasons.
+
+* The discussions on ICRC-4 also have revolved around an Option 2 variant.
+* Option 2 is simpler at the API surface level as it contains fewer nesting levels to match against, while comprising the same information. Granted, it's a little less "structured", but that seems to be a good tradeoff, even the very point of simplifying.
+* My favorite within Option 2 is the plain Option 2 as defined above that relies on ordering of the responses to associate them with request items. It saves some space and allows for partial request processing, but without imposing severe constraints on how the processing of a request should be performed by an implementation. And it's API is just so much simpler than that of the other options, particularly Option 1.
+
+-------------------------
+
+skilesare | 2024-01-22 15:19:52 UTC | #169
+
+I also think that Option 2 works best.
+
+As far as needing to include the request with the result in the response, it puts a constraint on the possible implementation space that you will not be able to optimize the processing of transactions in a scenario where parallelization might improve the performance of the processing.
+
+Silly Example:
+
+An ICRC4 token employs a system where when a user burns a number of tokens, they get issued an NFT out of one of three different NFT Collections in Different ICRC7 Canisters.
+
+If amount % 3 == 0 they get a Warrior NFT
+If amount % 3 == 1 they get a Wizard NFT
+If amount % 3 == 2 they get a Thief NFT.
+
+If a user submits 100 burn transactions of different values, it would make sense to collate the burns such that one icrc7_transfer is called to each canister for a total of three calls(using our batch by default).
+
+If we go with option 2.1 we would not be able to do this. We would need to process them in order in case we hit a batch error after one of them.
+
+The alternatives would be to either do 2.2 or to allow a null at each position which means that "this was not handled". (I think we touched on this on the call).
+
+So this would give us an option 2.3 that had:(note the opt after vec)
+
+```
+type TransferBatchResult = vec opt record {
+    transfer_result : variant {
+        Ok : nat; // Transaction index for successful transfer
+        Err : TransferError
+    };
+};
+```
+
+This is a contrived example, but I thought it was illustrative enough to provide for discussion.  We obviously can't provide for every possible implementation in the universe, but we should consider if this one is close enough to possible that we want to support it.  It would be fine to make it a limitation, but we should not the limitation as such so that developers don't get halfway down an implementation like this only to discover the problem for themselves.
+
+The answer is probably "we are ok excluding these use cases for simplicity."
+
+-------------------------
+
+cryptoschindler | 2024-01-23 10:59:35 UTC | #170
+
+@pramitgaha has a valid question implementing the standard in rust. does anyone have any ideas?
+https://forum.dfinity.org/t/assigned-bnt-5-icrc-7-nft-implementation-rust-or-motoko/19414/65?u=cryptoschindler
+
+-------------------------
+
+dieter.sommer | 2024-01-23 12:52:58 UTC | #171
+
+I responded. We need more input from him in order to be able to discuss in the WG. See my comment on this in the other topic.
+
+-------------------------
+
+dieter.sommer | 2024-01-23 14:51:08 UTC | #172
+
+The Option 2.3 you give, quoted below, is quite neat.
+
+[quote="skilesare, post:169, topic:16566"]
+```
+type TransferBatchResult = vec opt record {
+    transfer_result : variant {
+        Ok : nat; // Transaction index for successful transfer
+        Err : TransferError
+    };
+};
+```
+[/quote]
+
+My understanding is that with this option that allows for `null` responses with the semantics that the request at the corresponding index has not been handled would allow for handling your contrived example with concurrent processing of multiple / all request items in the batch. This is nice! Yes, we briefly touched on this option in the call as well.
+
+(this is the option I meant to express with my Option 2.1 above, but missed the crucial `opt` keyword originally)
+
+This option does feel like it's clean and simple and saves space in addition.
+
+-------------------------
+
+pramitgaha | 2024-01-23 15:14:43 UTC | #173
+
+hello, I've replied in the another thread, can you check?
+
+-------------------------
+
+dieter.sommer | 2024-01-26 15:15:27 UTC | #174
+
+ICRC-30 is now ICRC-37. The reason is that it did not stick to a naming convention initially.
+
+-------------------------
+
+dieter.sommer | 2024-01-26 15:30:16 UTC | #175
+
+In the ICRC-4 discussions in the Ledger and Tokenization Working Group we have made decisions on the batch API and think that it is crucial to align ICRC-7 and ICRC-37 with the batch API standards. I changed ICRC-7 and ICRC-37 accordingly. See the links for the proposals. We would like to discuss those in the upcoming WG meeting on Tuesday, Feb 6, 2024 and then move forward to voting.
+
+It is clear to us that the current API has been implemented already and that it will take a bit of an effort to bring it to the new one. We think most changes should be rather on the surface and not too invasive.
+
+The proposal is a dramatically simplified API that is easier to implement and more expressive as it is a general batch API rather than a bulk API as before. The (rather small) tradeoff is that operations on a list of token ids that used to have the same recipient and other parameters before now need to repeat those parameters. We think it is worth the additional bandwidth used.
+
+**Links**
+
+* Previous drafts: [ICRC-7](https://github.com/dfinity/ICRC/blob/f7412e7e9c40831f15062c733b1ad89e65bbc61b/ICRCs/ICRC-7/ICRC-7.md), [ICRC-37 (formerly ICRC-30)](https://github.com/dfinity/ICRC/blob/37a744e195bd3c761db166be6e3d628ca8019119/ICRCs/ICRC-30/ICRC-30.md)
+* Simplified API proposals: [ICRC-7](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md), [ICRC-37](https://github.com/dfinity/ICRC/blob/ICRC-30-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-37/ICRC-37.md)
+
+-------------------------
+
+dieter.sommer | 2024-01-26 15:33:20 UTC | #176
+
+@skilesare, @sea-snake, @kayicp, @benji, @cryptoschindler
+@ all
+
+Please have a look and let us know what you think!
+
+-------------------------
+
+sea-snake | 2024-01-26 16:09:54 UTC | #177
+
+Looks very good, the batch semantic has been really explained well into detail.
+
+-------------------------
+
+cryptoschindler | 2024-01-29 09:55:11 UTC | #178
+
+I agree, with @sea-snake , very well explained batch semantics.
+
+I left some comments in the respective PRs for [ICRC7](https://github.com/dfinity/ICRC/pull/33) and [ICRC37](https://github.com/dfinity/ICRC/pull/52)
+
+-------------------------
+
+dieter.sommer | 2024-01-29 12:59:32 UTC | #179
+
+[quote="cryptoschindler, post:178, topic:16566"]
+I left some comments in the respective PRs for [ICRC7](https://github.com/dfinity/ICRC/pull/33) and [ICRC37](https://github.com/dfinity/ICRC/pull/52)
+[/quote]
+
+Thank you for the valuable comments, they have been addressed!
+
+-------------------------
+
+dieter.sommer | 2024-01-29 19:39:14 UTC | #181
+
+For the upcoming meeting tomorrow, Jan 30, 2024, 17:00 Swiss time, we would like to propose the following agenda:
+
+* Agreeing on proposal for simplified API for ICRC-7 and ICRC-37
+  * Full batch semantics
+  * Positional API
+  * Relaxed requirements to implementation
+
+**Links**
+
+* Previous drafts: [ICRC-7 ](https://github.com/dfinity/ICRC/blob/f7412e7e9c40831f15062c733b1ad89e65bbc61b/ICRCs/ICRC-7/ICRC-7.md), [ICRC-37 (formerly ICRC-30) ](https://github.com/dfinity/ICRC/blob/37a744e195bd3c761db166be6e3d628ca8019119/ICRCs/ICRC-30/ICRC-30.md)
+* Simplified API proposals: [ICRC-7 ](https://github.com/dfinity/ICRC/blob/icrc7-wg-draft/ICRCs/ICRC-7/ICRC-7.md), [ICRC-37 ](https://github.com/dfinity/ICRC/blob/ICRC-30-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-37/ICRC-37.md)
+
+-------------------------
+
+dieter.sommer | 2024-02-01 18:57:06 UTC | #182
+
+The Working Group has adopted the most recent proposals to ICRC-7 and ICRC-37 and considers both drafts to be ready for voting by the WG.
+
+Please vote on the items through the following GitHub issues:
+* [ICRC-7](https://github.com/dfinity/ICRC/issues/7#issuecomment-1921984593)
+* [ICRC-37](https://github.com/dfinity/ICRC/issues/37#issuecomment-1922012464)
+
+Please vote, as usual, within a week's timeframe.
+
+-------------------------
+
+skilesare | 2024-02-01 19:41:02 UTC | #183
+
+I had a thought on 37 and I think I've talked myself out of it but I wanted to voice it just in case.  As I implement ICRC2 elsewhere, I think there was a small mistake made in that the icrc2_allowance call should have also returned back the current balance of the account.  Currently, I'm having to make two calls to both confirm that I've been approved AND that the user actually has that many tokens. (2 calls instead of 1...not a huge mistake....but annoying in implementation).
+
+Now I think we are OK on 37 here because I think we said that you have to own the token to approve it? If not there might be some benefit to looking at if we should add actual balance info to the response for checking allowances.  I'm only talking about token-level approvals here.  
+
+The collection level is different and maybe we'd want to return tokens_of in that response to save some time? But then we get into pagination of pagination.  Probably simpler here to require two calls.
+
+I'm going to vote for the current proposal assuming my thinking above is correct.  Someone slap me if we should reconsider.
+
+-------------------------
+
+sea-snake | 2024-02-01 20:09:36 UTC | #184
+
+You can indeed not create an approval for a token you don't own. When a token is sent, all token level approvals for that token will also be revoked.
+
+The collection wide approval was intended for approvals that persists even when a token is transferred and for any tokens you haven't yet received.
+
+So yeah, I think we're fine here as is.
+
+-------------------------
+
+dieter.sommer | 2024-02-01 21:49:25 UTC | #185
+
+I'd agree that we should be fine for ICRC-37 as is.
+
+-------------------------
+
+dieter.sommer | 2024-02-07 09:09:51 UTC | #186
+
+Regarding the [comment](https://github.com/dfinity/ICRC/issues/37#issuecomment-1922234287) on ICRC-37 on GitHub, we discussed this again in the ICRC-1 WG meeting and came to the conclusion that we do not need to have a method to expose ICRC-37 metadata in ICRC-37, but that the ICRC-37-specific metadata (e.g., `icrc37:max_approvals_per_token_or_collection` and `icrc37:max_revoke_approvals`) is returned by the metadata method `icrc7_collection_metadata` of the base standard (ICRC-7 here). This makes it easier for implementers as they only need to call one method to get all the metadata. With the prefixes of metadata items (e.g., `icrc37:max_approvals_per_token_or_collection`), it is clear to which standard implemented in a system this metadata item applies. So we don't loose anything from not having the separate method. However, we think that the methods for accessing the individual metadata items should be in ICRC-37, e.g., `icrc37_max_approvals_per_token_or_collection` and `icrc37_max_revoke_approvals` should be there in ICRC-37.
+
+This approach would be suitable to be established as a best practice for ICRC so that not every project needs to rediscuss this.
+
+We also discussed that it makes sense to add the following new metadata as advanced generic ledger implementations can benefit from knowing those metadata attributes:
+* icrc7:tx_window
+* icrc7:permitted_drift
+
+I'll implement those changes this afternoon unless hearing back negative opinions related to those ideas. Those changes are within the scope of what the WG has voted on and do not invalidate the votes.
+
+@sea-snake, @skilesare, @benji, @kayicp
+
+-------------------------
+
+dieter.sommer | 2024-02-12 08:37:27 UTC | #187
+
+**ICRC-7 and ICRC-37 next steps**
+
+As the ICRC-7 and ICRC-37 are considered final now, perhaps modulo some small / editorial changes if we see issues, the next step is to present it in one of the upcoming Global R&D meetings, ideally, the public one, and then go for an NNS vote.
+
+**New topics for the NFT WG**
+
+We also need a new topic to continue work on. This is, most probably, the full NFT standard with integrated marketplace that @skilesare has already made a draft for. Any other suggestions for our next topic?
+
+@skilesare, @benji , @sea-snake, @kayicp, all
+
+-------------------------
+
+kayicp | 2024-02-12 08:51:02 UTC | #188
+
+I'm thinking can we discuss on the transactions/block log/archive? or do we have to wait until ICRC-3 (ICRC-1 transactions log) is finalized?
+
+-------------------------
+
+sea-snake | 2024-02-12 09:27:09 UTC | #189
+
+I would also like to start discussion about metadata, would be nice to see one or multiple standards for concepts like images/media per NFT, attributes etc.
+
+-------------------------
+
+kayicp | 2024-02-12 12:06:52 UTC | #190
+
+oh looks like icrc-3 will take a long time.
+https://forum.dfinity.org/t/icrc-3-draft-v2-and-next-steps/25132/9
+
+-------------------------
+
+dieter.sommer | 2024-02-13 07:26:07 UTC | #191
+
+[quote="kayicp, post:188, topic:16566, full:true"]
+I’m thinking can we discuss on the transactions/block log/archive? or do we have to wait until ICRC-3 (ICRC-1 transactions log) is finalized?
+[/quote]
+
+I think we need to use ICRC-3, otherwise we have too many different standards around. As you mentioned, ICRC-3 will take some more time. Maybe going with a stop-gap solution until ICRC-3 is ready would make most sense.
+
+-------------------------
+
+dieter.sommer | 2024-02-13 07:27:59 UTC | #192
+
+[quote="sea-snake, post:189, topic:16566, full:true"]
+I would also like to start discussion about metadata, would be nice to see one or multiple standards for concepts like images/media per NFT, attributes etc.
+[/quote]
+
+Noted, we are adding this to our work backlog. Currently we have the following on the backlog:
+* Standards related to the full NFT standard
+* Metadata (images, media, attributes etc.) as per your request
+* ICRC-3?
+
+-------------------------
+
+skilesare | 2024-03-05 18:58:08 UTC | #193
+
+Please see below for a possible modification to make things a bit simpler for us all:
+
+https://forum.dfinity.org/t/icrc-61-supported-standard-generalization/28141
+
+Also, looks like ICRC3 will have slight modifications, so we need to update the standard.
+
+-------------------------
+
+dieter.sommer | 2024-03-11 16:41:33 UTC | #194
+
+I have meanwhile updated ICRC-7 and ICRC37 to be compliant with the recent changes to ICRC-3. Another update concerned to already use ICRC-61.
+
+[ICRC-7](https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md)
+[ICRC-37](https://github.com/dfinity/ICRC/blob/ICRC-30-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-37/ICRC-37.md)
+
+-------------------------
+
+dieter.sommer | 2024-03-11 20:23:56 UTC | #195
+
+# Partial metadata queries
+
+In the context of the discussions regarding dynamic NFTs, I would like to bring up the question of reading parts of very large metadata to overcome the message size limit of 2MB for very large metadata. This limitation may currently prevent certain use cases with large metadata or require that certain metadata elements be moved out into an on-chain file system. This has also been discussed earlier and I would like to bring it up again because it may be important for adoption. This is probably a controversial proposal to make now.
+
+In the spirit of a simple, yet powerful ICRC-7, partial metadata queries would allow to overcome the 2MB limits by allowing to query arbitrary parts of a `Value`. The idea is essentially a very lightweight and readily available variant of functionality that is expected to become available in the context of the upcoming standards for metadata and is not thought of a replacement thereof, but rather to give the basic standard enough functionality to be applicable to a wide range of use cases.
+
+## Proposal
+
+The proposal is to either extend ICRC-7 with a simple mechanism to achieve partial metadata queries of define a new ICRC standard that extends ICRC-7 with this functionality. The core part of such extension or proposal is a language for referring to parts of a `Value` and definition of a method for partial metadata queries.
+
+A canonical way to refer to a part of a metadata `Value` is to refer to the sequence of Variants or fields one needs to traverse from the top-level `Value` to the target element.
+
+Canonical solution: Use `/path/to/target/element` to traverse through the tree implied by the `Value` until the target element is reached.
+
+Example:
+
+Consider an NFT for an in-game item that has an `item_info` array of properties that can change during gameplay, assuming the metadata is structured as proposed [here](https://forum.dfinity.org/t/align-token-metadata-in-icrc-7-with-icrc-3-history-blocks/28243/5) for dynamic metadata.
+
+* `/Map/dynamic/Value/Map/item_info/Value/Array[1]` could refer to the second array element contained in the dynamic element `item_info` contained in the `Map` of the `Value` in the `dynamic` part of the NFT metadata. The root `/` corresponds to the `Value` instance being addressed, the following `Map` being the variant thereof.
+
+* `Value/Map/dynamic` would give us the full `dynamic` metadata element in the form of a `Value`.
+
+* `/` is the whole `Value`
+
+* `/Map` would not be valid as it would not return a `Value`, but a `vec record`
+
+## Method specification
+
+The batch interface of the method for querying partial metadata is defined as follow, where a list of `token_id`s is given and for each `token_id` a list of `vpath`s (value paths) to query in its metadata. The interface is positional as usual for ICRC-7 in that the `i`-th response element is the response to the `i`-th request element.
+
+```
+
+icrc7_partial_metadata(vec token_id, vec vec vpath) -> vec vec Value
+
+```
+
+Allowing a vector of queries per request is likely good enough for capturing a large number of use cases and it is still simple. Further extensions to make it more powerful, more towards what XPath offers, is likely not really important for most use cases, but a discussion is required here.
+
+## Rationale
+
+Without this method for accessing parts of the metadata of an NFT, the overall NFT metadata size is constrained to the maximum response size of the ICP, 2 MB. This partial read allows for large metadata `Value`s to be defined and then only parts to be read in one go. Hashing large metadata for ICRC-3 is possible without issues, even if various metadata items are stored in different canisters, as the overall hash is computed by combining hashes of its constituents in a well-defined manner. Thus, adding this method would make the current standard applicable to a wider range of use cases without a big effort.
+
+Having this extension available would allow ledgers to spread their metadata over multiple canisters as they want and allow for arbitrarily large metadata structures. They need to make sure that each "node" of the `Value` of the metadata be smaller than 2MB. This does not impose undue constraints and can be accomplished by a design that puts all large assets in their own nodes that can be retrieved individually.
+
+## Conclusions
+
+This is a strictly additive change and does not invalidate parts that have been implemented already in the various ongoing implementations, thus it should be fine to add in the current late stage to ICRC-7. It would add value in terms of overcoming the 2MB message size limit without adding much complexity. With such extension and solving the dynamic metadata issue, the NFT standard could be considered complete, yet still very simple.
+
+What do others think about this? Any (strong) reason to not add this extension to ICRC-7 or define an extension standard?
+
+-------------------------
+
+dieter.sommer | 2024-03-11 20:26:00 UTC | #196
+
+Let me propose the below agenda for the WG meeting tomorrow, March 12.
+
+**Agenda**
+* ICRC-7 and ICRC-37 updated to support the new ICRC-3 specification
+  * Adapted to requirements of the updated ICRC-3
+  * Using nested `tx` field containing the tx-specific fields (as before)
+* Adopting ICRC-61 (https://forum.dfinity.org/t/icrc-61-supported-standard-generalization/28141)
+  * ICRC-61 defines the `icrc61_supported_standards` method once and for all ICRCs
+  * https://github.com/skilesare/ICRC/tree/icrc61/ICRCs/ICRC-61
+  * Do we want to use it?
+  * Do we support fasttracking it?
+* Potential mistake in ICRC-37
+  * What is `memo` at the top-level used for? Can we remove it? It may be a left over from an older version and not needed any more. There is now a `memo` field defined in the `tx` record.
+* Metadata history
+  * https://forum.dfinity.org/t/align-token-metadata-in-icrc-7-with-icrc-3-history-blocks/28243
+  * Which option do we want to support?
+* Partial metadata queries
+  * Addition to ICRC-7 to allow for querying part of the metadata
+  * Link: https://forum.dfinity.org/t/call-for-participation-nft-token-standard-working-group-status-updated/16566/195
+
+-------------------------
+
+zensh | 2024-03-12 13:32:17 UTC | #197
+
+Very happy to see here, I am working on the SFT (Semi-Fungible Token) for ICPanda Badges system, which will implement the ICRC-7 and ICRC-37 standards.
+
+https://github.com/ldclabs/ic-sft
+
+-------------------------
+
+dieter.sommer | 2024-03-12 14:12:55 UTC | #198
+
+Thanks for your post above, this is great to hear, @zensh! SFTs on ICP is something I am really interested in and I think is in need for many asset tokenization projects in the future. Would be really interested in learning more about your project!
+
+Also, you might want to consider joining the NFT Working Group!
+
+-------------------------
+
+dieter.sommer | 2024-03-12 15:30:12 UTC | #200
+
+Just as a reminder, here is the [calendar link](https://calendar.google.com/calendar/u/0?cid=Y19jZ29lcTkxN3JwZWFwN3ZzZTNpczFobDMxMEBncm91cC5jYWxlbmRhci5nb29nbGUuY29t) with all the working groups. The NFT working group is taking place every other Tuesday 17:00-18:00 UTC+1 (or UTC+2 in summer time).
+
+-------------------------
+
+dieter.sommer | 2024-03-12 17:31:36 UTC | #201
+
+Summarizing the main decisions of the meeting:
+* The group is fine with adopting ICRC-61.
+* ICRC-61 should be extended as follows:
+  * It should mention that if `ICRC-1` is one of the returned supported standards, then the standard implementing ICRC-61 (ICRC-1 in that case) needs to also implement `icrc1_supported_standards`. This is important for making sure that standards that aim to implement ICRC-1 do not accidentally drop support for ICRC-1's own `icrc1_supported_standards` method.
+  * `ICRC-61` must always be returned as one of the supported standards by a standard that implements ICRC-61.  
+* The `memo` in the ICRC-3 block definition of ICRC-37 can be removed.
+* The group supports adding a `7update` field for updates of NFTs / their metadata.
+* The group thinks that we do not want to model static or dynamic metadata in ICRC-7, but leave this to a future standard or implementations.
+* The group thinks that we should not implement a partial metadata query method in a rush as the syntax for this needs more thinking to get right.
+
+These open questions after the WG meeting this afternoon remain:
+* We decided that it would be nice to have a field in the ICRC-3 block schema for `7update` that allows to encode the nature of the update, e.g., what triggered it. This could be done with a separate field ([`transform`](https://github.com/skilesare/ICRC/tree/icrc59and60/ICRCs/ICRC-60#data-structure-1) in ICRC-60) or by using the `memo` that is already defined.
+* The `7update` block needs either the content that has changed or a hash thereof.
+  * Do we want to constrain this to a hash or allow also the full content to go in (then one could reconstruct the ledger from the block log), which is OK for small metadata.
+  * For the hash, would only the metadata go in, or would other fields also go in, e.g., the token id, so that an illegitimate change of the token id would be caught by the hash mismatch. Clearly, the owner field would not go into the hash.
+* Related to the previous question, is the `7update` method essentially a metadata update or a more general update method?
+
+Thanks for your feedback!
+
+-------------------------
+
+dieter.sommer | 2024-03-18 19:29:00 UTC | #202
+
+
+There's one open item to be addressed.
+See [here](https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md#mint-block-schema), and below (emphasis is mine).
+
+### Mint Block Schema
+
+1. the `type` field of the block MUST be set to `"7mint"`
+2. the `tx` field
+    1. MUST contain a field `tid: Nat`
+    2. MAY contain a field `from: Account`
+    3. MUST contain a field `to: Account`
+    4. MUST contain a field `meta: Value`
+
+Note that `tid` refers to the token id. The size of the `meta` field expressing the token metadata must be less than the maximum size permitted for inter-canister calls. *If the metadata is sufficiently small, it is recommended to add the full metadata into the `meta` field, if the metadata is too large, it is recommended to add a hash of the metadata to the `meta` field. // FIX best practices for modeling metadata or hash*
+
+Do we want to recommend that the plaintext metadata be added to the block in case it is small and a hash otherwise? The further may be a bit underspec'd (e.g., how to encode it, the obvious would be the canonical encoding of the `Value`).
+
+Opinions welcome.
+
+@sea-snake, @skilesare, @benji, @kayicp, @ all
+
+-------------------------
+
+dieter.sommer | 2024-03-18 19:40:31 UTC | #203
+
+The NFT standards have been updated to reflect the recent changes to ICRC-3.
+
+[ICRC-7](https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md)
+[ICRC-37](https://github.com/dfinity/ICRC/blob/ICRC-37-Approval_support_for_ICRC-7_NFTs/ICRCs/ICRC-37/ICRC-37.md)
+
+What remains is to copy the Candid definitions into the respective .did files and deciding on the fix mentioned in the above post.
+
+-------------------------
+
+skilesare | 2024-03-18 20:23:38 UTC | #204
+
+Yes to include metadata or hash. Yes to having the hash be the canonical rep-indy-hash of the Value.
+
+If the metadata were a #Blob(image bytes) or something like that it might get confusing to assume that a blob here is a hash or a file.  Maybe different fields with an 'or' requirement.
+
+-------------------------
+

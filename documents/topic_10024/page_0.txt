@@ -1,0 +1,51 @@
+Maxfinity | 2021-12-31 15:57:10 UTC | #1
+
+Hi guys, 
+
+
+**Internal Storage Bug**
+
+There is an [issue](https://github.com/dfinity/cdk-rs/issues/73) in the commonly used `ic_cdk` storage that can lead to memory corruption if special care is not taken when using storage. `ic_cdk` storage internally uses a `static mut` binary tree to store all values. Thus it’s possible to obtain two mutable references to the same value. This is unsafe Rust, and I wonder if it's needed, especially since with heap-allocated types, changing such a value using one reference can invalidate another reference. This is problematic:
+
+1. When accessing the storage from different methods. For example we can load the value from storage, and then call another function which will also load the same value from the storage. In this case, when the execution returns to the first function, the reference to its value can be broken (as demonstrated in the bug report).
+
+
+2. When `await` ing on async calls in update methods. Awaiting switches execution context, so another call can access and modify the stored value while we await the call.
+
+To prevent unintentionally creating dangling references and possible some memory-related vulnerabilities, we wrote own implementation of the canister state storage. It uses `RefCell` to control access to the stored value. This allows us not use `static mut` at all for storage, so we don’t rely on `unsafe` Rust code, taking full advantage of Rust safety guarantees. 
+
+Here is our implementation: https://github.com/infinity-swap/ic-helpers/tree/main/ic-storage
+
+Cheers, 
+ 
+InfinitySwap
+
+
+PS - an example of code with the vulnerability:
+```
+let transactions = ic_cdk::storage::get_mut::<Ledger>();
+transactions.add(from, to, amount);
+charge_fee(from);
+return transactions.len(); // this line can fail with memory corruption
+
+fn charge_fee(from: Principal) {
+  ic_cdk::storage::get_mut::<Ledger>().add(from, owner(), fee());
+}
+```
+
+-------------------------
+
+levi | 2021-12-31 20:04:53 UTC | #2
+
+https://mmapped.blog/posts/01-effective-rust-canisters.html#canister-state
+
+https://forum.dfinity.org/t/get-rid-of-the-unsafe-get-mut-function-in-the-rust-cdk/7266
+
+-------------------------
+
+Maxfinity | 2021-12-31 20:16:18 UTC | #3
+
+Would it not be better to deprecate this in favour of a safer version? People will be using this api without knowledge of the memory safety issues.
+
+-------------------------
+

@@ -1,0 +1,538 @@
+alexeychirkov | 2021-06-18 11:33:18 UTC | #1
+
+Main purpose of my tests is to predict the memory allocation in Motoko.
+
+I am running local replica using following command: `dfx start --no-artificial-delay --clean`
+
+**Array of Nat8's**
+
+I am creating an array of 1_000_000 Nat8 number, so I expect that is it 1_000_000 * 1 byte = 1_000_000 bytes = should be around 1Mb in memory.
+
+[Source code](https://gist.github.com/alexeychirkov/c2bb6663cbb3f7030739511e1276f575)
+
+Main part of the source code: `var store: [var Nat8] = Array.init<Nat8>(initialSize, 0);`
+
+Execution steps:
+1. `dfx deploy`
+2. `dfx canister call test getCanisterMemoryInfo`
+Result:
+```
+(
+  record {
+    rts_max_live_size = 4_000_016;
+    rts_memory_size = 8_192_000;
+    rts_total_allocation = 4_000_140;
+    rts_heap_size = 4_000_052;
+    rts_reclaimed = 88;
+    rts_version = "0.1";
+  },
+)
+```
+3. `dfx canister call test getSize`
+Result:
+```
+(1_000_000)
+```
+4. `dfx canister status test`
+Result:
+```
+Canister status call result for test.
+Status: Running
+Controller: rwlgt-iiaaa-aaaaa-aaaaa-cai
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(BigUint { data: [8364189] })
+Balance: 4_000_000_000_000 Cycles
+Module hash: 0x4ae83d59334f4a4ca501742de29e580e1390a468225fa6db4b53310c80ef21b0
+```
+
+Observations:
+1. `rts_memory_size` is 8_192_000 bytes
+2. `Memory Size` from command line call is 8_364_189 bytes
+
+So the main question is: why Array<Nat8> takes the same amount of memory as Array<Nat64>?
+
+-------------------------
+
+alexeychirkov | 2021-06-18 11:29:13 UTC | #2
+
+Correct question:
+
+1_000_000 big `Array<Nat8>` [(source)](https://gist.github.com/alexeychirkov/c2bb6663cbb3f7030739511e1276f575) and `Array<Nat64>` [(source)](https://gist.github.com/alexeychirkov/bd8a7afe8d4c85e3858efc59e07d5be7) takes the same amount of memory ~8Mb...
+Why `Array<Nat8>` takes so much memory?
+
+-------------------------
+
+rossberg | 2021-06-18 15:42:18 UTC | #3
+
+The array representation has to be uniform to support generics. Hence `[Nat8]` has the same memory layout as other arrays. If you want a compact bytes array (and don't need random access or mutation), you can use type `Blob`.
+
+(We've been discussing specialised array representations, but this hasn't been a priority yet, and they would induce some overhead into array accesses.)
+
+-------------------------
+
+alexeychirkov | 2021-06-18 12:09:46 UTC | #4
+
+Thanks for a quick response.
+
+Follow-up question:
+
+Another test I have is [here](https://gist.github.com/alexeychirkov/1deba9bbfa899538761bd04e7a1dbaa0)
+
+Idea is to:
+1. Initialize the empty array: `var store: [Nat] = [];`
+2. Append a value to it in a loop:
+```
+Iter.iterate<Nat>(Iter.range(1, count), func(x, _index) {
+    store := Array.append<Nat>(store, Array.make(x));
+});
+```
+
+So I want to append 10_000 elements to the array.
+
+Here are results:
+1. `dfx canister call test appendData 10000`
+```
+(
+  10_000,
+  record {
+    rts_max_live_size = 41_212;
+    rts_memory_size = 201_129_984;
+    rts_total_allocation = 200_941_792;
+    rts_heap_size = 41_248;
+    rts_reclaimed = 200_900_544;
+    rts_version = "0.1";
+  },
+)
+```
+2. `dfx canister status test`
+```
+Canister status call result for test.
+Status: Running
+Memory Size: Nat(BigUint { data: [201303567] })
+```
+
+Observations:
+Based on your reply - 10_000 elements should allocate 10_000 * 8 bytes = 80_000 bytes in memory, but what we see that now canister takes ~200_000_000 bytes
+
+1. Please can you shed light on *rts_** values?
+2. Will the canister pay for all those 200_000_000 bytes per second?
+
+Thanks
+
+-------------------------
+
+rossberg | 2021-06-18 15:42:07 UTC | #5
+
+First of all, let me point out that constructing an array by repeated concatenation is not something you should do in production code. Since both operands need to be copied for each append, the cost of doing this is quadratic in the size of the final array.
+
+Assuming you want an immutable array, a more appropriate way is to create the complete array as mutable, initialise it via mutation, and then freeze it.
+
+As for the `rts` values: `memory_size` is the current size of the Wasm memory array (mostly the same as the canister memory size). This can only grow, never shrink in Wasm, even if most of it is unused. However, unused/unmodified canister memory ought to have no cost on the IC.
+
+The other values come from [here](https://github.com/dfinity/motoko/blob/2aa5073364b43769309d4358281ce2dadb66d90e/rts/motoko-rts/src/gc.rs). The two interesting ones are probably `heap_size`, which contains the actual size of the current Motoko heap, i.e., the heap memory in use, and `max_live_size`, which is the largest heap size that has remained so far after a GC. The other numbers are accumulative total bytes allocated and collected so far, which probably is less interesting.
+
+So your program really only uses 40K of live memory in the end. (An immutable array takes up 4 bytes per element.)
+
+Edit: But the 200M intermediate memory size are a consequence of your loop and its quadratic cost. Before Motoko gets to run GC, you are allocating 10_000 arrays, with an average size of 5000 elements, i.e., 20K bytes. So the heap grew to 20K * 10_000 = 200M before GC happened at the end of the message. And of course you are paying for this temporary memory usage, just as for the cycles all the copying costs.
+
+-------------------------
+
+alexeychirkov | 2021-06-18 15:10:34 UTC | #6
+
+Thank you @rossberg
+
+Immutable array - clear.
+
+Lets say I have a mutable array of Nat's.
+I create it:
+````
+var store: [var Nat] = Array.init<Nat>(10_000, 0);
+```` 
+Then fill it with some values.
+Later I would like to increase its size by N and fill with another values.
+
+What would be the most efficient code to do that?
+
+-------------------------
+
+rossberg | 2021-06-18 15:42:18 UTC | #7
+
+Arrays have a fixed size that cannot be increased. If you cannot preallocate an array of suitable size then you'll need to create a new one and copy over.
+
+Growable arrays are a useful abstraction, but you can build them as a data structure on top of primitive arrays, e.g., like vectors in C++. Something like (untested):
+```
+class Table<T>(n : Nat, init : T) {
+  var it : [var T] = Array.init<T>(n, init);
+
+  public func get(i : Nat) : T { it[i] };
+  public func set(i : Nat, x : T) { it[i] := x };
+  public func size() : Nat { it.size() }
+  public func grow(m : Nat) {
+    let n = it.size();
+    let a = Array.init<T>(n + m, func(i) {
+        if (i < n) { it[i] } else { init }
+    });
+    it := a;
+  };
+  public func setAnywhere(i : Nat, x : T) {
+    let n = it.size();
+    if (i >= n) { grow(2 * (i + 1) - n) };
+    it[i] := x;
+  }
+}
+```
+
+-------------------------
+
+claudio | 2021-06-18 15:43:55 UTC | #8
+
+The [Buffer](https://sdk.dfinity.org/docs/base-libraries/buffer) library gives you something similar already, IIRC. [src](https://github.com/dfinity/motoko-base/blob/master/src/Buffer.mo).
+
+-------------------------
+
+skilesare | 2021-06-18 18:22:12 UTC | #9
+
+So if we are sending a big data structure from one canister to another we probably want to convert it to blob first? And the reconstitute it on the other end?
+
+-------------------------
+
+rossberg | 2021-06-18 18:46:39 UTC | #10
+
+No, that's not necessary. When sending a message, the data get's serialised anyway, and the format is different (and generally more compact) than in the heap. Blob and [Nat8] actually get serialised to exactly the same wire format.
+
+-------------------------
+
+skilesare | 2021-06-18 18:57:16 UTC | #11
+
+You have saved me 3 hours. May the karma gods smile upon you today.
+
+-------------------------
+
+Hazel | 2021-07-07 23:21:23 UTC | #12
+
+[quote="rossberg, post:5, topic:5324"]
+As for the `rts` values: `memory_size` is the current size of the Wasm memory array (mostly the same as the canister memory size). This can only grow, never shrink in Wasm, even if most of it is unused. However, unused/unmodified canister memory ought to have no cost on the IC.
+[/quote]
+
+Bit late here - but when a canister is at rest which number is what we're actually paying for on the IC? Heap, Memory Size, something else?
+
+-------------------------
+
+alexeychirkov | 2021-07-08 07:21:50 UTC | #13
+
+as @rossberg said - I guess we are paying for `rts_max_live_size`
+
+-------------------------
+
+Hazel | 2021-07-08 15:43:11 UTC | #14
+
+I interpreted `rts_max_live_size` as the largest size ever recorded. For instance, say we have something like:
+
+```
+func load (n : Nat) {
+  foo := Array.tabulate<Nat8>(n func(_){123});
+}
+
+func delete () {
+ foo := [];
+}
+```
+
+The way I though it works was - Starting from nothing - If we call load(1_000_000) then
+
+`rts_max_live_size` -> 4_000_000
+`rts_heap_size` -> 4_000_000
+
+Next, we call delete() which GCs at the end of the message
+
+`rts_max_live_size` -> 4_000_000
+`rts_heap_size` -> 0 + other memory bits..
+
+Then if we call load(100)
+
+`rts_max_live_size` -> 4_000_000 
+`rts_heap_size` -> 400 + other memory bits..
+
+-------------------------
+
+matthewhammer | 2021-07-08 21:58:30 UTC | #15
+
+[quote="Hazel, post:12, topic:5324"]
+when a canister is at rest which number is what we’re actually paying for on the IC? Heap, Memory Size, something else?
+[/quote]
+
+Borrowing chat text from another engineer here who knows (based on the public replica code):
+
+> We charge for executed instructions and dirtied pages after execution, but there is also storage fee that is taken independently from execution to prevent IC becoming a free permanent replicated storage for someone's backups. The size of the fee is proportional to the total amount of memory occupied by the canister.
+
+(@roman-kashitsyn wrote that in another context; borrowed with permission.)
+
+Additionally, the GC of Motoko is a copying collector (for now, by default).  That collector has its own policy for managing from/to space memory, for which you are paying cycles as well.
+
+Some new things could mitigate that cost, and help control it:
+- Using another GC policy (new `moc` version supports a compacting GC, optionally, but I don't know myself how that would impact that cycle cost.  Certainly more work will continue to focus on improving the GC overhead in various ways with respect to cycle cost).
+- [A new API for stable memory](https://github.com/dfinity/motoko/pull/2626) that permits a Motoko dev to manage memory manually, if they so choose.  That's still a draft idea, but it's related to the larger memory management discussion.
+
+Finally, my interpretation is that [this is the relevant memory usage check](https://github.com/dfinity/motoko/blob/2aa5073364b43769309d4358281ce2dadb66d90e/rts/motoko-rts/src/gc.rs#L56) (modulo what I say above about the copying collector).
+
+-------------------------
+
+Hazel | 2021-07-08 19:35:19 UTC | #16
+
+Thank you so much @matthewhammer !
+
+-------------------------
+
+ComputerInternetMan | 2021-07-08 22:54:07 UTC | #17
+
+Thank you @matthewhammer
+2 /infty & beyond!
+
+-------------------------
+
+rossberg | 2021-07-09 07:56:18 UTC | #18
+
+Thanks Matthew. So to highlight something from his reply, my statement from my own answer earlier,
+[quote="rossberg, post:5, topic:5324"]
+However, unused/unmodified canister memory ought to have no cost on the IC.
+[/quote]
+was not actually correct. The IC will still charge you a storage fee for the _entire_ `memory_size`. I'm sorry for spreading wrong information before!
+
+We have been discussing to extend the IC with some way for an application to signal that a certain part of the memory is "unused" (nulled out) and can hence be eliminated from storage (effectively, providing a sort of shrink through the backdoor). But that does not exist yet.
+
+For Motoko that means that you should be even more careful not to create excessive garbage in a message, since that might temporarily blow up the heap size but Motoko has no way to "return" it.
+
+-------------------------
+
+alexeychirkov | 2021-08-14 06:15:59 UTC | #19
+
+[quote="rossberg, post:18, topic:5324"]
+providing a sort of shrink
+[/quote]
+
+@rossberg any news regarding "providing a sort of shrink for memory"?
+I mean currently we have to pay for `memory_size`.
+Is there a way to shrink this memory size?
+Maybe canister upgrade will help? Like a restart of the PC :slight_smile:
+
+-------------------------
+
+skilesare | 2021-08-14 12:27:38 UTC | #20
+
+[quote="rossberg, post:10, topic:5324, full:true"]
+No, that’s not necessary. When sending a message, the data get’s serialised anyway, and the format is different (and generally more compact) than in the heap. Blob and [Nat8] actually get serialised to exactly the same wire format.
+[/quote]
+
+There has been some recent discussion on discord that uploading a chunked blob is twice as fast as uploading Nat8 arrays. I’m currently writing some code to test this myself, but the theory is that allocating the array in motoko may be slower even if the serialization across the wire is faster. I’m assuming this is the same for xcanister calls but it would be great to get more validation.
+
+-------------------------
+
+rossberg | 2021-08-23 07:31:00 UTC | #21
+
+@alexeychirkov, no news as far as I am aware. But an upgrade would have a memory "reset" effect indeed.
+
+-------------------------
+
+alexeychirkov | 2022-01-31 08:32:46 UTC | #22
+
+@rossberg Please can you share a snippet of code in RUST that gives memory and heap memory size programmatically?
+I mean analogy for `Prim.rts_memory_size()` and `Prim.rts_heap_size()`
+
+-------------------------
+
+rossberg | 2022-01-31 10:35:15 UTC | #23
+
+Sorry, I don't know. Somebody from the Rust CDK team will have to answer that.
+
+-------------------------
+
+alexeychirkov | 2022-01-31 18:39:06 UTC | #24
+
+Can you please mention correct teammates?
+
+-------------------------
+
+paulyoung | 2022-02-01 01:38:26 UTC | #25
+
+Maybe @roman-kashitsyn or @lwshang?
+
+-------------------------
+
+roman-kashitsyn | 2022-02-01 09:21:50 UTC | #26
+
+[quote="alexeychirkov, post:22, topic:5324"]
+Please can you share a snippet of code in RUST that gives memory and heap memory size programmatically?
+[/quote]
+
+[`core::arch::wasm32::memory_size`](
+https://doc.rust-lang.org/core/arch/wasm32/fn.memory_size.html) function will give you the memory size in 64KiB pages.
+
+Heap size is a bit more involved, I don't think there is an API that gives you that directly.
+You can get the size of currently allocated objects by defining a custom global allocator that keeps track of allocations, [`std::alloc::System` docs](https://doc.rust-lang.org/1.50.0/std/alloc/struct.System.html) provide an example.
+
+[quote="alexeychirkov, post:19, topic:5324"]
+Maybe canister upgrade will help?
+[/quote]
+If you serialize/deserialize the whole state on upgrade, this can actually make things worse: https://forum.dfinity.org/t/motoko-canister-memory-size-increased-after-upgrade/6448/6
+
+[quote="skilesare, post:20, topic:5324"]
+There has been some recent discussion on discord that uploading a chunked blob is twice as fast as uploading Nat8 arrays.
+[/quote]
+
+In Rust, Candid encoding for [`serde_bytes::ByteBuf`](https://docs.serde.rs/serde_bytes/struct.ByteBuf.html) is much more efficient compared to `Vec<u8>`.
+In case of `Vec<u8>`, the encoder treats the data as a generic array, encoding each byte as a separate value, one at a time. Same inefficiency affects on the decoding side.
+In case of `ByteBuf`, the encoder records the blob size and then memcopies the contents into the output buffer. This is much more efficient (I observed 3x-10x reduction in cycle consumption for large byte arrays). Note that this is not just Candid issue, the same is true for any `serde` backend.
+
+I assume that Motoko implementation has similar peculiarities when it comes to `Blob` vs `[Nat8]`, but I'm not 100% sure.
+
+-------------------------
+
+claudio | 2022-02-01 11:23:01 UTC | #27
+
+In Motoko, a `vec nat8`:
+
+* consumed as a Motoko `Blob` will deserialize into a compact object using on byte per `nat8`, plus a small, constant size header for the `Blob` object.
+
+* consumed as Motoko `[Nat8]` will deserialize in a Motoko array, using 4-bytes per `nat8`, plus a small, constant size header for the `Blob` object.
+
+`[Nat8]` is thus 4 times larger than the equivalent `Blob`. It also has much higher GC cost as the GC needs to scan every entry of the array, in case it could be a heap allocated object, while it will `know` that a `Blob` contains no further object references and can be skipped.
+
+The array representation could be optimized better to reduce size and GC cost, but that's the situation at the moment, and the optimization won't come soon.
+
+-------------------------
+
+paulyoung | 2022-02-07 06:09:11 UTC | #28
+
+[quote="roman-kashitsyn, post:26, topic:5324"]
+[ `core::arch::wasm32::memory_size` ](https://doc.rust-lang.org/core/arch/wasm32/fn.memory_size.html) function will give you the memory size in 64KiB pages.
+[/quote]
+
+@roman-kashitsyn I tried the above but got an error saying `not found in core::arch::wasm32`
+
+The Stack Overflow comment below suggests that the Rust standard library needs to be recompiled with different flags in order for that to work.
+
+Do you know anything about that?
+
+https://stackoverflow.com/questions/62120638/enabling-target-feature-gated-language-features-when-using-wasm32-simd-intrinsic#comment114845716_62120638
+
+“The rust standard library itself is not by default compiled with these gates enabled and so even when you enable them in your program, they are not present in the standard library binary. You can solve this by getting standard library source with `rustup` and recompiling it with necessary flags.”
+
+-------------------------
+
+paulyoung | 2022-02-07 07:06:10 UTC | #29
+
+Actually, the Stack Overflow post says: `core::arch::wasm32::memory_size(3);  /*<-- this line works since it is stable */`
+
+So perhaps all I’m missing is: `#[cfg(target_arch = "wasm32")]`
+
+-------------------------
+
+cyberowl | 2022-12-28 03:17:48 UTC | #30
+
+[quote="rossberg, post:18, topic:5324"]
+For Motoko that means that you should be even more careful not to create excessive garbage in a message, since that might temporarily blow up the heap size but Motoko has no way to “return” it.
+[/quote]
+
+This might be what I am encountering here. 
+![Screen Shot 2022-12-27 at 7.10.50 PM|642x500](upload://5vBHsPG0QvH3IPPNybtzEtgEPth.jpeg)
+
+The heap keeps increasing and not going down. Right now I am grabbing 2mb chunks from another canister and placing them in  `var asset_data = Buffer<Blob>(0);` After say 15mb I store the object in `	private var assets : HashMap.HashMap<Text, Types.Asset> = HashMap.HashMap<Text, Types.Asset>(
+		0,
+		Text.equal,
+		Text.hash
+	);` I just don't know why heap stays the same even after the main call `public shared ({ caller }) func create_asset_from_chunks` finishes executing. Shouldn't `var asset_data = Buffer<Blob>(0);` be garbage collected? I will spawn a new assets canister when memory reaches 1.8GB so might not be an issue but was wondering why it is happening.
+
+-------------------------
+
+claudio | 2022-12-28 04:47:25 UTC | #31
+
+Unless you manually clear the buffer or assign a new, empty buffer into the var, all the Blob data will be referenced from the var, considered live, and not reclaimed by GC.
+
+-------------------------
+
+cyberowl | 2022-12-28 05:36:09 UTC | #32
+
+Oh thanks. I didn't know that variables inside an actor method are not GC after the method ends. I only thought variables outside the methods are persisted. Good to know. Thank you.
+
+-------------------------
+
+cyberowl | 2022-12-28 06:50:55 UTC | #33
+
+If I convert that buffer to an array in a record do I have to clear that up as well. Example 
+`		let asset : Types.Asset = {
+			canister_id = canister_id;
+			content_type = args.content_type;
+			created = created;
+			data_chunks = toArray(asset_data);
+			data_chunks_size = asset_data.size();
+			file_name = file_name;
+			id = asset_id;
+			is_public = args.is_public;
+			owner = owner;
+		};`
+
+Cleared the buffer with asset_data.clear(); but still seeing heap mem increasing.
+
+-------------------------
+
+claudio | 2022-12-28 10:28:59 UTC | #34
+
+Local variables inside a method should not keep data live once the method returns unless they escape into a closure or object that remains live.
+
+Note that GC does not run after every message. Instead, after every message, the runtime decides whether  GC is required because memory has grown a lot or memory is getting low and only runs the GC if deemed necessary.
+
+-------------------------
+
+claudio | 2022-12-28 10:31:39 UTC | #35
+
+If 'asset_data' remains live, then yes.
+
+
+15MB is not a lot of data so perhaps the GC just hasn't had a chance to run in your example.
+
+-------------------------
+
+cyberowl | 2022-12-28 10:47:10 UTC | #36
+
+![Screen Shot 2022-12-28 at 2.37.38 AM|690x418](upload://D6EZaOeAIjWYJHr4jwsPmqWM2G.jpeg)
+This is how it grows relative to stable memory. This is local env. this is uploading the same size file each time.
+
+-------------------------
+
+cyberowl | 2022-12-28 10:46:20 UTC | #37
+
+![Screen Shot 2022-12-28 at 2.40.20 AM|595x500](upload://ybF265uHJNvjj1a85eGwCwZj5CO.png)
+this is what happens in the method create_asset_from_chunks. Gets chunks from FileAssetChunks and stores them in asset_data. After it is done calling FileAssetChunks with all chunks it then stores it in 
+![Screen Shot 2022-12-28 at 2.41.48 AM|690x194](upload://p7LzjtroRJKlShDDZtRb1R8ySyk.png)
+And also before storying it converts to array. 
+![Screen Shot 2022-12-28 at 2.42.09 AM|690x359](upload://aJNkgjDb6cQoSX51FZMPw9EPuPj.png)
+
+Using `Prim.rts_heap_size();` and `Prim.rts_memory_size();` for heap_in_mb and memory_in_mb (converted to MB of course)
+
+-------------------------
+
+claudio | 2022-12-28 11:57:58 UTC | #38
+
+ I'm not really sure what is going on and on mobile at the moment.
+
+Note that, in general, the 'rts_*' prims reflect the status after the last message, not the current one, since they are updated after a GC.
+
+You can also use moc flag '--force-gc' to force a GC after every message to get more accurate measurements (but don't use the flag in production as it leads to quadratic behaviour)
+
+-------------------------
+
+alexeychirkov | 2022-12-28 15:59:07 UTC | #39
+
+Just curious, is that you custom built UI to monitor canister memory?
+Asking because I'm a developer of Canistergeek tool
+
+-------------------------
+
+cyberowl | 2022-12-29 02:23:09 UTC | #41
+
+Yeah I built the UI to monitor memory
+
+-------------------------
+

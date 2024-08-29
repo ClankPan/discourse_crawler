@@ -1,0 +1,307 @@
+mymikemiller | 2022-08-22 17:03:59 UTC | #1
+
+I'm developing a React application and the login flow works great (thanks for the [great examples](https://www.youtube.com/playlist?list=PLuhDt1vhGcrfQGLWqhUo9-DFD5JaHqCh1), @kpeacock!) especially now that I'm using the [pre-built development-flavor Internet Identity wasm](https://github.com/dfinity/internet-identity#build-features-and-flavors) so I don't need to build and run II locally or enter in captchas all the time.
+
+I'm somewhat new to frontend web development, so some things that are obvious to everyone that comes from that world aren't obvious to me, with primarily mobile and desktop development experience. This is probably one of those instances, so please bear with me.
+
+I now have a logged in user, but when I refresh the page, the actor, which is stored in the React context so it works across my app, gets blown and the user must go through the login process again. It seems the simplest way to persist state through browser refreshes is by using localStorage, but that requires me to be able to stringify everything I want to save.
+
+Is there a way to stringify a logged-in authClient/agent/actor so that when it's pulled back out of localStorage, the user is already logged in and doesn't need to go through that flow again?
+
+-------------------------
+
+icme | 2022-08-22 23:38:35 UTC | #2
+
+Many frontend frameworks have stores with libraries built specifically for persisting data to local storage and rehydrating the store with that data from local storage. Here's a library that provides the Redux equivalent of this tooling.
+
+https://www.npmjs.com/package/redux-persist
+
+-------------------------
+
+mymikemiller | 2022-08-23 00:30:43 UTC | #3
+
+I thought redux-persist could only persist serializable objects. I’ll look further into it, thanks!
+
+-------------------------
+
+paulyoung | 2022-08-23 01:10:41 UTC | #4
+
+@mymikemiller I think what I do is call `authClient.isAuthenticated()` and then `authClient.getIdentity()` if the user is authenticated.
+
+If you do that when you initialize everything then it should work for page refreshes too.
+
+The docs at https://agent-js.icp.xyz should have the info on those methods.
+
+-------------------------
+
+peterparker | 2022-08-23 04:54:28 UTC | #5
+
+Likewise. When a page is rendered - when the app starts - you can check the auth state and save the information - the identity - either in a global variable, a global store if you have one, or in the context, if you have no store.
+
+e.g. in one of my app in Svelte, either on the app scale or in the global layout, I sync the auth status  by calling of function of my store ([source](https://github.com/papyrs/cycles.watch/blob/359d93762c6eec8cbaa5ea6c39281eebbe680c92/src/routes/__layout.svelte#L17)).
+
+```
+const syncAuthStore = async () => await authStore.sync();
+```
+
+in the global store ([source](https://github.com/papyrs/cycles.watch/blob/359d93762c6eec8cbaa5ea6c39281eebbe680c92/src/lib/stores/auth.store.ts#L30)) I initialize agent-js which will - per default - read the information potentially saved in local storage (< v0.12.0) or indexeddb (>= v0.13.0) to initialize the identity - to create a session if these information are present and still valid. I then save the outcome - the identity - in my store.
+
+```
+sync: async () => {
+      const authClient: AuthClient = await createAuthClient();
+      const isAuthenticated: boolean = await authClient.isAuthenticated();
+
+      set({
+        identity: isAuthenticated ? authClient.getIdentity() : null
+      });
+    },
+```
+
+Using above identity, I can then detect if user is already signed in or not. I used a derived store but the idea is that if identity exists in my store, it means that the user is signed in ([source](https://github.com/papyrs/cycles.watch/blob/359d93762c6eec8cbaa5ea6c39281eebbe680c92/src/lib/stores/auth.store.ts#L80))
+
+```
+export const authSignedInStore: Readable<boolean> = derived(
+  authStore,
+  ({identity}) => identity !== null && identity !== undefined
+);
+```
+
+Hope that helps.
+
+-------------------------
+
+mymikemiller | 2022-08-23 14:58:57 UTC | #6
+
+Oh wow, maybe I've been doing this all wrong. I've been storing the authClient and calling getIdentity() whenever I need to use the identity, like to show the principal, or to create the Actor, which I only do once and then cache in my React Context to use throughout the app (I don't use Redux at the moment since App Context suffices). 
+
+I thought I'd need to keep the logged-in Actor around between page refreshes, or at least keep the authClient around. From what you're saying, it sounds like all I need to keep is the identity, and from that I can easily re-create the Actor when I need:
+
+```
+const actor = createActor(canisterId as string, {
+  agentOptions: {
+    identity: myStoredIdentity,
+  },
+});
+```
+
+So does this mean that Identity is serializable? I know that the Identity can be represented by your Principal, which can be displayed as a String, but certainly that string is not all I need to store. Shouldn't I need all the cookie-like stuff that proves I'm logged in?
+
+-------------------------
+
+kpeacock | 2022-08-23 16:53:41 UTC | #7
+
+Your identity can be serialized to JSON - [DelegationChain.toJSON](https://erxue-5aaaa-aaaab-qaagq-cai.ic0.app/identity/classes/DelegationChain.html#toJSON). However, serializing it to and from IndexedDb is already handled for you automatically.
+
+The generic flow applications should use is:
+
+* AuthClient.create
+* Check if authenticated
+  * If so, create actor using identity
+* Login
+  * Create actor using identity
+
+-------------------------
+
+mymikemiller | 2022-08-23 20:45:33 UTC | #8
+
+Goes to show you how little web dev experience I have; this is the first I've heard of IndexedDb. Seems like that's exactly what I'm looking for: a way to store non-serializable objects in [something like] localStorage.
+
+I assume that by "already handled", you mean that, assuming I want to avoid persistence libraries, I can use the standard methods to interact with IndexedDb myself (like I would otherwise interact with localStorage), and just pass it an Identity object, not that there's an easier way to just say "I want this object persisted across refreshes in IndexedDb"?
+
+If I understand correctly, my workflow will be:
+
+* Check if Identity is in IndexedDb
+  * If so, AuthClient.create(identity)
+    * Check if authenticated
+      * If so, create Actor using identity
+      * If not, proceed as though identity wasn't in IndexedDb
+  * If not:
+    * AuthClient.create()
+    * authClient.login(...)
+    * Store authClient.getIdentity() in IndexedDb
+    * create Actor using identity
+
+In writing this post, I noticed that there's a "storage" parameter for AuthClient.create that defaults to localStorage. If AuthClient can be persisted in localStorage, maybe my first step above can be simplified to not even require the identity, and to just use whatever was persisted.
+
+-------------------------
+
+RMCS | 2022-08-23 21:11:33 UTC | #9
+
+This could also be an option
+
+Localstorage
+```
+export async function iiLogin(onSuccess: () => {}) {
+	const authClient = await AuthClient.create({ storage: new LocalStorage() });
+	authClient.login({
+		// 7 days in nanoseconds
+		maxTimeToLive: BigInt(7 * 24 * 60 * 60 * 1000 * 1000 * 1000),
+		identityProvider: process.env.REACT_APP_II_URL,
+		onSuccess
+	});
+}
+```
+
+```
+	async function checkAuthentication() {
+		try {
+			let identity = await getIdentity();
+			setState(prevState => ({ ...prevState, identity }));
+			return true;
+		} catch (error) {
+			setState(prevState => ({ ...prevState, identity: undefined }));
+			return false;
+		}
+	}
+```
+```
+export async function getIdentity() {
+	const storage: LocalStorage = new LocalStorage('ic-');
+
+	const identityKey: string | null = await storage.get('identity');
+	const delegationChain: string | null = await storage.get('delegation');
+
+	const chain: DelegationChain = DelegationChain.fromJSON(delegationChain!);
+	const key: Ed25519KeyIdentity = Ed25519KeyIdentity.fromJSON(identityKey!);
+
+	const identity: Identity = DelegationIdentity.fromDelegation(key, chain);
+	return identity;
+}
+```
+
+indexDB
+```
+export async function iiLogin(onSuccess: () => {}) {
+	const authClient = await AuthClient.create();
+	authClient.login({
+		// 7 days in nanoseconds
+		maxTimeToLive: BigInt(7 * 24 * 60 * 60 * 1000 * 1000 * 1000),
+		identityProvider: process.env.REACT_APP_II_URL,
+		onSuccess
+	});
+}
+```
+
+```
+	async function checkAuthentication() {
+		try {
+			let identity = await getIdentity();
+			setState(prevState => ({ ...prevState, identity }));
+			return true;
+		} catch (error) {
+			setState(prevState => ({ ...prevState, identity: undefined }));
+			return false;
+		}
+	}
+```
+```
+export async function getIdentity() {
+	const storage: IdbStorage = new IdbStorage();
+
+	const identityKey: string | null = await storage.get('identity');
+	const delegationChain: string | null = await storage.get('delegation');
+
+	const chain: DelegationChain = DelegationChain.fromJSON(delegationChain!);
+	const key: Ed25519KeyIdentity = Ed25519KeyIdentity.fromJSON(identityKey!);
+
+	const identity: Identity = DelegationIdentity.fromDelegation(key, chain);
+	return identity;
+}
+```
+
+-------------------------
+
+paulyoung | 2022-08-23 21:10:32 UTC | #10
+
+For what it’s worth, I’m not interacting with local storage or IndexedDB directly. I’m using `agent-js` and whatever it’s doing under the hood.
+
+-------------------------
+
+RMCS | 2022-08-23 21:26:26 UTC | #11
+
+Yes, i guess doing this on a page initialization would also work
+```
+async function checkAuthentication() {
+  const client = authClient.create();
+  client.isAuthenticated();
+}
+```
+
+The reason why i used the `getIdentity` in the earlier post is because `React.Context` isn't available on regular `ts` files. With this method i am able to pass it along to the actor like so;
+
+fooClient.ts
+```
+export default abstract class FooClient {
+	static actor(): _SERVICE {
+		return createActor(process.env.REACT_APP_MASTER_CANISTER_ID!, {
+			agentOptions: { host: 'http://localhost:8000', identity: getIdentity() }
+		});
+	}
+
+	static async sanityCheck() {
+		return await self.actor().sanity_check();
+	}
+}
+```
+
+-------------------------
+
+mymikemiller | 2022-08-23 23:22:38 UTC | #12
+
+Ok, I think I see what's going on here. AuthClient.create() pulls from localStorage (or wherever) and sometimes gets back an already-logged-in authClient that will resolve true for isAuthenticated().
+
+Testing this out, when I try to use an Actor initialized with this AuthClient's identity, I get back 
+
+```
+Failed to authenticate request
+Invalid signature: Invalid basic signature: Ed25519 signature could not be verified: public key
+```
+
+So I must still be doing something wrong. I'm still playing, but at least now I have a better idea of how this should work. Thank you for all your help! If you have any insight on this error, or if I'm way off base, let me know.
+
+-------------------------
+
+GLdev | 2022-08-24 07:09:54 UTC | #13
+
+Are you testing with a local canister but with the online internet identity url? That won't work. You'll need to have a locally running Internet Identity canister for the login flow to work.
+
+-------------------------
+
+mymikemiller | 2022-08-24 07:22:01 UTC | #14
+
+@GLdev All my canisters are local, including my Internet Identity canister which is the [dev build flavor wasm](https://github.com/dfinity/internet-identity#build-features-and-flavors).
+
+-------------------------
+
+peterparker | 2022-08-24 07:39:04 UTC | #15
+
+Your repo is open source?
+
+-------------------------
+
+mymikemiller | 2022-08-24 07:47:07 UTC | #16
+
+I was able to resolve the [error](https://forum.dfinity.org/t/keeping-user-logged-in-between-browser-refreshes-or-how-to-stringify-authclient-agent-actor/15035/12?u=mymikemiller) and everything is working as expected now, with login state automatically persisted across refreshes without me needing to do anything special except follow [Kyle's flow](https://forum.dfinity.org/t/keeping-user-logged-in-between-browser-refreshes-or-how-to-stringify-authclient-agent-actor/15035/7?u=mymikemiller), not [my needlessly overcomplicated one](https://forum.dfinity.org/t/keeping-user-logged-in-between-browser-refreshes-or-how-to-stringify-authclient-agent-actor/15035/8?u=mymikemiller).
+
+My failure to get this to work originally was because I didn't understand that AuthClient.create() is not idempotent. I thought it always returned a new "empty" (non-logged-in) AuthClient. Now I know that it fetches a logged in identity from (by default) local storage if there is one (I didn't even know that it ever put one there in the first place). Pretty slick, if somewhat magical. I guess I missed that part of the explanation (and the code that made it work) when I was following @kpeacock's [IC Avatar videos](https://www.youtube.com/playlist?list=PLuhDt1vhGcrfQGLWqhUo9-DFD5JaHqCh1) when I originally set up my auth flow. Is there documentation that clearly explains this flow, including the magic?
+
+Btw, the resolution to the "failed to authenticate" error [above](https://forum.dfinity.org/t/keeping-user-logged-in-between-browser-refreshes-or-how-to-stringify-authclient-agent-actor/15035/12?u=mymikemiller) was to clear the cache for the page before going through the flow from scratch.
+
+-------------------------
+
+mymikemiller | 2022-08-24 07:49:08 UTC | #17
+
+[quote="peterparker, post:15, topic:15035, full:true"]
+Your repo is open source?
+[/quote]
+
+[Yes](https://github.com/mymikemiller/videate/tree/master/credits), and will soon include my change to properly handle refreshes :slight_smile:
+
+-------------------------
+
+peterparker | 2022-08-24 07:52:05 UTC | #18
+
+Cool! Was about to say I or someone can have a look to the repo but just read you solved your issue. Well played 🤙
+
+-------------------------
+

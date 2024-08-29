@@ -1,0 +1,230 @@
+Mathias | 2022-11-22 14:30:11 UTC | #1
+
+I underestimated this so far. But there does not seem to be so many threads about the topic so far.
+
+How are you all dealing with that?
+
+-------------------------
+
+skilesare | 2022-11-22 22:12:27 UTC | #2
+
+What kind of state?  You want all canisters to share the same state?
+
+-------------------------
+
+Mathias | 2022-11-23 11:30:12 UTC | #3
+
+Sorry, I should’ve given more context but I'm not sure if my thinking around this topic is correct at all. 
+
+In my concrete case, I have 3 canisters: market, db, and invoice. Most of the logic happens on the market. The db canister is separate as we wanted to use Sudograph as a "db" and write Motoko for everything else. That architecture might not have been the best solution. If I could write rust I would have just added logic on the db/sudograph canister directly. 
+
+The main thing the app allows users to do is to ask questions that have financial rewards "attached" to them. To ask a question a user transfers some ICP to the accountId of an invoice. Once paid the question can be opened and others can answer it during some time. After that time there is a process that decides which answer/user wins the reward. 
+
+The most concerning issue I had during testing was regarding payouts. When a winner is selected heartbeat is used to close the question on the db and to transfer the reward to the winner. If the whole app would run on one canister I could just go through all the questions that are eligible to get closed, do the transfers, and if they succeed I could close them. 
+
+Because that is not the case I think I face these issues:
+
+Problem 1: Transfers
+There could be a previously triggered transfer that is still outstanding. Heartbeat could possibly run the function again (and trigger another one) thinking the payment was not done yet. I, therefore, need to be sure that the closing/payout function related to a specific question directly returns unless there are no outstanding calls on the ledger.
+
+Problem 2: Closing
+As my db is a separate canister as well the call to check if the question is still open is also not atomic. Therefore, it could be that the market canister receives a response indicating a specific question is still open while another call is ongoing that will close it. 
+
+I guess the two problems are the same issue but it's not completely intuitive to me. The solution I ended up implementing seems to work but I guess it could be simplified. And I find it generally confusing to think about it.
+
+To answer your question it's not that several canisters should have the same state but each canister manages a part of the state. If it was all happening on one canister my mental model would be that my functions trigger a specific state transition for a given question (ICP balances change, variables of specific invoice change, variables on the question change,  -> all at once). 
+
+In the non-atomic environment, I started to think of it as a sequential multi-step process where each canister does a different step of the entire process. An example of a process would be: verify the invoice -> open the question. 
+I think in my case, it's hard to "roll back" what happens on the invoice canister (haven't thought a lot about this though). 
+
+To complete the process while preventing some steps from being done twice I think I have two options:
+1) Check on each canister which steps have already happened and do not do them again.
+2) Check if the entire process is running right now (any relevant outstanding calls) and wait for that to complete. In that case, I do not have to keep track on the db canister (for example) if a particular state change has occurred already. I can have that logic on the market instead.
+
+Does that make any sense? 
+
+In both cases, I have to keep track of what has already occurred if the process possibly ran before.
+
+One thing I find tricky is that I don't just have to prevent certain functions to be called again but I have to prevent these functions to be called again only for specific parameters (let's say for a specific question_id).
+
+I'm not sure if what I say makes any sense which is why I did not provide too much context before. Am I on the right track? Do you have a mental model that makes it easier to think about this? How do you test that stuff (seems a huge pain to me)? How do you even log state across canisters and understand which change happened due to what calls?
+
+I don't have a formal CS background, so it might already be helpful to know what topics could make me understand this better.
+
+I'm also trying to understand this to decide if the architecture was bad from the beginning. Having a separate db canister might have been a bad decision. I could possibly also make invoice canister a module. What do you think?
+
+Thanks a lot for the help.
+
+-------------------------
+
+skilesare | 2022-11-23 15:04:29 UTC | #4
+
+[quote="Mathias, post:3, topic:16777"]
+Problem 1: Transfers
+There could be a previously triggered transfer that is still outstanding. Heartbeat could possibly run the function again (and trigger another one) thinking the payment was not done yet. I, therefore, need to be sure that the closing/payout function related to a specific question directly returns unless there are no outstanding calls on the ledger.
+[/quote]
+
+Example:
+
+https://github.com/ORIGYN-SA/origyn_nft/blob/90b5522bcc660f3f3ee4f64e3a766dfd4d6e6481/src/origyn_nft_reference/market.mo#L2537
+
+You have to think in a pessimistic way.  In this code, I'm guarded against double spends because I use the ledger as my state and it won't allow you to double spend....but if you aren't using a ledger then you need some kind of "lock" variable or you need to remove the state that allows you make the call.
+
+If you call fails then you need to manually revert your state back to how it was before.  Because Motoko keeps the state in memory this is fairly straightforward with a try/catch.
+
+One caveat to keep in mind is that when you get back from your await call you may want to requery your data from your internal collections to make sure they haven't slipped out from under you while you were not looking.
+
+See the inter-canister call's from @nomeata 's blog post:  https://www.joachim-breitner.de/blog/788-How_to_audit_an_Internet_Computer_canister
+
+So you have 3 options:
+1. For financial transactions use good sub-account hygiene to keep funds separate so that a double spend is impossible
+2. Delete the record before you call the intercanister call and then put it back if it fails(check to make sure it hasn't been readded in the meantime or you may have double records).
+3. Add a Locked variable that you can set to true that will reject any manipulations to your record elsewhere.  Unlock it when your canister call is complete and/or handle the error if it fails.
+
+-------------------------
+
+Mathias | 2022-11-23 16:28:06 UTC | #5
+
+Thank you very much I appreciate the answer. I'll need some time to go through your example and the blog. 
+
+And I should generally read more of your code :).
+
+-------------------------
+
+GLdev | 2022-11-23 18:48:28 UTC | #6
+
+Does Motoko have something like enums? I find it really easy to create state-machines with enum in rust, and I find state machines the safest way to reason about stuff, as long as the entire logic is canister-side. It might not be the most efficient, but it's the easiest to code for, without shooting yourself in the foot, IMO.
+
+For example, for a prototype game that I wrote, I have the following code:
+
+```rust
+#[derive(CandidType, Deserialize, Debug, Clone)]
+pub enum ExpeditionStep {
+    /// This is the default state of an expedition. In this state we wait until the conditions
+    /// are met. Players can join the expedition in this step.
+    Proposed,
+    /// This state indicates tha the conditions for the expedition have been met, and we are ready to
+    /// start the expedition. Players cannot join the expedition at this point.
+    Ready,
+    /// The async process of starting a new expedition has started at "timestamp". We can later implement
+    /// some retry logic based on the timestamp.
+    Starting(TimestampMillis),
+    /// The new expedition was started, a new world has been spawned and we got confirmation that
+    /// the new world is ready.
+    Started(Principal),
+    /// The end of an expedition's lifecycle. We can hold on to the expedition as a log of sorts
+    /// but for all intents and purposes this is a finished task.
+    Done,
+}
+```
+
+I then use a *public, unauthenticated* function that "moves" the expedition step along. It is safe to make it public and unauthenticated, because the main logic happens on the canister. At each step there is only one step that can go right, and possible one step that can go wrong. In general, on the happy path you go downwards into the enum, with the only exception being if Starting fails, then we go back to Ready, and try again when someone calls the function again.
+
+As I said, this would not be the most efficient way to code it, but I find that the benefits outweigh the cost (which, tbh, is pretty low on IC so you're probably fine in most scenarios).
+
+In your scenario, I'd probably start with something like this:
+
+```rust
+pub enum QuestionStep{
+// once you get payment for a question, it gets opened. In this state, it can receive answers
+Opened,
+
+// answering is not allowed in this step, only votes from authenticated / whitelisted users will count
+Voting,
+
+// voting has ended, whatever the result, we now attempt to pay-out. 
+Decided,
+
+// Consider implementing some timestamp / retry logic here,
+// with an additional step that you set right as you enter the paying call, 
+// and re-set / it reverts itself if the async call fails.
+PayingOut (timestamp),
+
+// The payment has been made, no additional action is possible on this question
+Done
+}
+```
+
+With this approach, you maintain a single point that has a consistent state of a question. That canister can call into other canisters async, verify whatever it needs to verify, and only "move along" the happy path as it receives proper responses. This will guard you against double spending & such, since payment can only be done in a single state, and the first call that comes in that state gets to move the state along to PayingOut, blocking any subsequent calls.
+
+Let me know if I wasn't too clear, I can get into details if you want.
+
+-------------------------
+
+domwoe | 2022-11-24 09:22:35 UTC | #7
+
+Thanks @GLdev! This is a great pattern.
+
+-------------------------
+
+skilesare | 2022-11-24 14:23:18 UTC | #8
+
+This is great.  Interesting would've some kind of  history component for.each state to share for auditing.
+
+-------------------------
+
+Mathias | 2022-11-24 17:29:12 UTC | #9
+
+Thank you very much for the answer, that is very interesting (took some time to think about it).
+
+What makes it slightly confusing to me is that we already store the status of the question on the db. That said I think to understand your point. Right now we have a function that should "close" the question (on the market). So far that involved both triggering the payout and changing the status of the question to "closed" in the db.
+
+To solve the issues around atomicity I store the result of the payout on the market and only attempt to close it in the db if the payout was successfully done. And if not I obviously try to do the payout first. 
+I furthermore, prevent the function from executing the logic again when a previous call is still ongoing. So in a way, I try to do both tasks in one go. 
+
+It's a similar logic but it seems much nicer to think of the payout and the closing as separate steps the way you did. The "PayingOut" makes a lot of sense to me because it implies that we would not allow the logic to execute again when the question is in that stage. And if I understand correctly we would go back to the previous step if the payout would fail. 
+
+This is interesting because if it was all atomic I would think of the payout and the closing as one state transition. With 3 canisters I would need to think of this as 2 tasks basically, one for the invoice/ledger canister(s) and another task for the db. The tasks occur one after the other and can therefore be separate steps. I find it unintuitive that we do several steps for something that would normally be 1 state transition. I'm trying to understand what could go wrong doing so... But yeah maybe the "cost" is just that we can't solely use the db but need to keep track of these steps at least temporarily on the market. 
+
+This makes me further question if it makes any sense to have a separate db canister. Would it only make sense to store the contents of a question in case that is a lot of data (if I'd allow for pictures or so to be used)?
+
+And how exactly do you test all of that? It's not yet trivial to me yet how to write well-structured tests even in the atomic case. But with several canisters involved, I'm rather lost.
+
+-------------------------
+
+paulyoung | 2022-11-25 04:15:16 UTC | #10
+
+[quote="GLdev, post:6, topic:16777"]
+Does Motoko have something like enums?
+[/quote]
+
+Motoko has variants, which can be used in a similar way.
+
+Your example might look like this in Motoko:
+
+```
+type ExpeditionStep = {
+  #proposed;
+  #ready;
+  #starting : TimestampMillis;
+  #started : Principal;
+  #done;
+};
+```
+
+I gave a talk on them at Motoko Bootcamp:
+
+https://youtu.be/GFenqSGhj7I
+
+-------------------------
+
+paulyoung | 2022-11-25 04:20:35 UTC | #11
+
+I believe @Hazel is using sagas in Quark.
+
+I think this is probably a good overview but @Hazel might have a better resource.
+
+https://microservices.io/patterns/data/saga.html
+
+-------------------------
+
+GLdev | 2022-11-25 07:21:37 UTC | #12
+
+[quote="paulyoung, post:11, topic:16777"]
+using sagas
+[/quote]
+
+Huh, I always compared developing for IC with writing server-less / lambda functions from web2, but microservices is also a very good analogy. Very interesting pattern that probably has a lot of resources and tried and true approaches at solving atomicity & inter-communication.
+
+-------------------------
+

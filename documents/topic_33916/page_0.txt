@@ -1,0 +1,58 @@
+misha | 2024-08-06 09:07:21 UTC | #1
+
+Hi all!
+
+We have a component, called TX.Server, which prepares transactions for signature by a client. The client in this case is a component, called “Autosigner”, which does a variety of security checks before signing, then signs and submits the transaction. As it is built right now, the Autosigner does an outbound call once every 30 seconds and retrieves transactions to be signed from the server. Communication between Autosigner and TX.Server is secured. Autosigner authenticates against TX.Server with an API key. The goal is to run the Autosigner on-chain, keeping it secure and cycles-efficient.
+
+We have basically two options:
+
+1. We can change the mechanism from pull to push. Instead of the Autosigner authenticating against the TX.Server, there would be another off-chain component, polling TX.Server and pushing new transactions to the Autosigner. The problem here is, that we have to cut the Autosigner code more or less in half, and the Autosigner has to trust this new component.
+
+2. We can just make a listener and notification service, which runs off-chain. Same as in the previous setting, this service would constantly poll TX.Server. But instead of fetching the transactions, it would just notify the Autosigner, and the Autosigner would then independently establish an outbound connection to TX.Server, fetch the transactions, sign and return them. This would allow us to keep the Autosigner more or less intact and just run the costly repetitive calls off-chain.
+
+Which of the options do you find the most appropriate in terms of security and cycles efficiency? Or maybe should we look at some other completely different direction of implementing the requirements?
+
+-------------------------
+
+ulan | 2024-08-06 10:23:34 UTC | #2
+
+Hi @misha! Welcome to the forum.
+
+To check my understanding of transaction flow. Is this diagram accurate?
+
+```
+┌──────┐ TX   ┌─────────────┐  
+│ user ├──────►  TX.Server  │  
+└──────┘      └──────┬──────┘  
+                     │TX       
+                     │         
+              ┌──────▼─────┐   
+              │ Autosigner │   
+              └──────┬─────┘   
+                     │Signed TX
+                     │         
+              ┌──────▼──────┐  
+              │ TX Consumer │  
+              └─────────────┘  
+```
+
+1. Users send transactions to `TX.Server`.
+2. `TX.Server` is running off-chain. It is trusted and accumulates transactions from users.
+3. `Autosigner` is running on-chain. It should somehow fetch new transactions from `TX.Server` and sign them (I guess with tECDSA?)
+4. `Autosigner` then sends the signed transactions to some consumer that is running off-chain or on another blockchain. Or maybe it send signed transactions back to `TX.Server`?
+
+If that understanding is correct, then the most secure option (and cheapest in terms of cycles) option would be:
+1. `TX.Server` has an ICP principal (a pair of private / public keys).
+2. `TX.Server` uses `agent-rs` or `agent-js` to make an update call to `Autosigner` passing a list of TX signed by `TX.Server`'s ICP principal. That way `Autosigner` can check the caller_id to make sure that the call comes from `TX.Server`.
+3. `Autosigner` signes TXs and either returns them to `TX.Server` as a result of the update call or sends them to another consumer.
+
+This option is viable if you can modify `TX.Server`. 
+
+The main advantage of this option is that `Autosigner` doesn't have to store a secret "API key". Until the mainnet gets SEV-SNP storing secrets in a canister is not secure because node providers can in theory read memory of a canister (although it is not easy in practice, but still possible in theory).
+
+With that in mind, your option 1 seems safer assuming that the new component will have its own ICP principal and will sign messages to `Autosigner` and that you can provide the same security for it as you have for `TX.Server`.
+
+Option 2 would also work, but you'll have a weak point in "API key".
+
+-------------------------
+

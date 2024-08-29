@@ -1,0 +1,242 @@
+kolexstrings | 2024-05-12 19:32:42 UTC | #1
+
+I'm encountering an issue while attempting to generate account identifiers for tokens like ckETH and ckBTC using the ICP ledger canister. The recent update to the ICP ledger introduced a method to query the account identifier, requiring an `account` argument structured as follows:
+
+const account = {
+    owner: Principal?.fromText(principal),
+    subaccount: uint8Array,
+}
+
+
+While initializing the ICP ledger canister and calling the account identifier method, I provide the `principal` and dynamically generate the `subaccount` `Uint8Array` value based on the account name and selected token. However, I consistently receive the following error:
+
+Invalid record {owner:principal; subaccount:opt vec nat8} argument: 
+field subaccount -> Invalid opt vec nat8 argument: {"0":106,"1":107,"2":40,"3":240,"4":66,"5":23,"6":208,"7":53}, 
+
+Despite declaring the subaccount to be `UInt8Array`, the error persists. You can find the related code snippet [here](https://app.radicle.xyz/nodes/seed.radicle.garden/rad:z2L8zNLkFNmA8r2xNypKbQFFDYVpe/tree/72aa24a9d21c9437bc81158eed549996e92d1f7e/src/components/Wallet/AccountTokenModal.tsx)
+
+I would appreciate any insights into resolving this bug. Thank you!
+
+-------------------------
+
+Severin | 2024-05-13 09:15:32 UTC | #2
+
+I'm not familiar with TS, but I'd bet the problem is `opt vec nat8` vs `vec nat8`. In your code, are you declaring the subaccount as optional or not?
+
+-------------------------
+
+coin_master | 2024-05-13 09:50:57 UTC | #3
+
+Try this
+
+```
+
+subaccount : [Array.from(unit8Array)]
+
+```
+
+-------------------------
+
+kolexstrings | 2024-05-13 14:59:31 UTC | #4
+
+Thank you, 
+I have tried that before, and got this error
+
+There was an issue with fetching account identifier:  Call failed:
+  Canister: ryjl3-tyaaa-aaaaa-aaaba-cai
+  Method: account_identifier (query)
+  "Status": "rejected"
+  "Code": "CanisterReject"
+  "Message": "Fail to decode argument 0 from table2 to record { owner : principal; subaccount : opt vec nat8 }"
+
+-------------------------
+
+kolexstrings | 2024-05-20 05:55:19 UTC | #5
+
+**SOLVED**
+
+When the `account_identifier` query method from the ICP ledger didn't work as expected, I turned to the [@noble/hashes](https://www.npmjs.com/package/@noble/hashes) library to handle the conversion as it is done behind the scenes on the ICP ledger. This approach worked well, allowing me to obtain the account identifier from the account (i.e., owner (principal: Principal) and subaccount).
+
+Here's the code that made it work:
+
+```typescript
+import type { Principal } from "@dfinity/principal";
+import {
+  arrayOfNumberToUint8Array,
+  asciiStringToByteArray,
+  bigEndianCrc32,
+  uint8ArrayToHexString,
+} from "@dfinity/utils";
+import { sha224 } from "@noble/hashes/sha256";
+
+export class AccountIdentifier {
+  private constructor(private readonly bytes: Uint8Array) {}
+
+  public static fromHex(hex: string): AccountIdentifier {
+    return new AccountIdentifier(Uint8Array.from(Buffer.from(hex, "hex")));
+  }
+
+  public static fromPrincipal({
+    principal,
+    subAccount = SubAccount.fromID(0),
+  }: {
+    principal: Principal;
+    subAccount?: SubAccount;
+  }): AccountIdentifier {
+    const padding = asciiStringToByteArray("\x0Aaccount-id");
+
+    const shaObj = sha224.create();
+    shaObj.update(
+      arrayOfNumberToUint8Array([
+        ...padding,
+        ...principal.toUint8Array(),
+        ...subAccount.toUint8Array(),
+      ]),
+    );
+    const hash = shaObj.digest();
+
+    const checksum = bigEndianCrc32(hash);
+    const bytes = new Uint8Array([...checksum, ...hash]);
+    return new AccountIdentifier(bytes);
+  }
+
+  public toHex(): string {
+    return uint8ArrayToHexString(this.bytes);
+  }
+
+  public toUint8Array(): Uint8Array {
+    return this.bytes;
+  }
+
+  public toNumbers(): number[] {
+    return Array.from(this.bytes);
+  }
+
+  public toAccountIdentifierHash(): { hash: Uint8Array } {
+    return {
+      hash: this.toUint8Array(),
+    };
+  }
+}
+
+export class SubAccount {
+  private constructor(private readonly bytes: Uint8Array) {}
+
+  public static fromBytes(bytes: Uint8Array): SubAccount | Error {
+    if (bytes.length != 32) {
+      return Error("Subaccount length must be 32-bytes");
+    }
+
+    return new SubAccount(bytes);
+  }
+
+  public static fromPrincipal(principal: Principal): SubAccount {
+    const bytes = new Uint8Array(32).fill(0);
+
+    const principalBytes = principal.toUint8Array();
+    bytes[0] = principalBytes.length;
+
+    for (let i = 0; i < principalBytes.length; i++) {
+      bytes[1 + i] = principalBytes[i];
+    }
+
+    return new SubAccount(bytes);
+  }
+
+  public static fromID(id: number): SubAccount {
+    if (id < 0) throw new Error("Number cannot be negative");
+
+    if (id > Number.MAX_SAFE_INTEGER) {
+      throw new Error("Number is too large to fit in 32 bytes.");
+    }
+
+    const view = new DataView(new ArrayBuffer(32));
+
+    if (typeof view.setBigUint64 === "function") {
+      view.setBigUint64(24, BigInt(id));
+    } else {
+      const TWO_TO_THE_32 = BigInt(1) << BigInt(32);
+      view.setUint32(24, Number(BigInt(id) >> BigInt(32)));
+      view.setUint32(28, Number(BigInt(id) % TWO_TO_THE_32));
+    }
+
+    const uint8Arary = new Uint8Array(view.buffer);
+    return new SubAccount(uint8Arary);
+  }
+
+  public toUint8Array(): Uint8Array {
+    return this.bytes;
+  }
+}
+```
+
+For my use case, the code to generate the account identifier looked like this:
+
+```typescript
+const getAccountIdentifier = async () => {
+  if (!icpLedgerActor) {
+    console.log("To fetch account, please make sure the ICP ledger is initialized");
+    return;
+  }
+  if (!principal || !subAccount) {
+    console.log("Could not find principal or sub account");
+    return;
+  }
+
+  console.log("Principal: ", principal);
+  console.log("Sub account Uint8Array: ", subAccount);
+  const subAccountInstance = SubAccount.fromBytes(subAccount);
+  console.log("Sub Account from byte: ", subAccountInstance);
+
+  if (subAccountInstance instanceof Error) {
+    console.error(subAccountInstance.message);
+  } else {
+    const accountid = encodeIcrcAccount({
+      owner: Principal.fromText(principal),
+      subaccount: subAccount,
+    });
+    const accountIdentifier = AccountIdentifier.fromPrincipal(account);
+    console.log("Account Identifier: ", accountIdentifier);
+    console.log("Account Identifier Hex: ", accountIdentifier.toHex());
+    setAccountIdentifier(accountIdentifier.toHex());
+  }
+};
+```
+
+However, this method only worked one way: converting an account to an account identifier. It wasn't useful for my use case because I needed to reverse the process to obtain the account from the account identifier, especially when receiving user input for sending transactions.
+
+Eventually, I found that the [@dfinity/ledger-icrc](https://www.npmjs.com/package/@dfinity/ledger-icrc) library has functionalities for encoding and decoding ICRC accounts. This allowed me to achieve the desired functionality of both generating the accountId and reversing it to the account itself. Here's the code for my use case:
+
+```typescript
+const encodeAccount = () => {
+  if (!principal || !subAccount) {
+    console.log("Could not find principal or sub account");
+    return;
+  }
+  console.log("Principal: ", principal);
+  console.log("Sub account Uint8Array: ", subAccount);
+
+  const accountid = encodeIcrcAccount({
+    owner: Principal.fromText(principal),
+    subaccount: subAccount,
+  });
+  setAccountIdentifier(accountid);
+
+  console.log("Encoded account: ", accountid);
+};
+
+const decodeAccount = () => {
+  if (!accountIdentifier) {
+    console.log("Could not find account identifiers to decode");
+    return;
+  }
+
+  const account: IcrcAccount = decodeIcrcAccount(accountIdentifier);
+  console.log("Decoded accountIdentifier:", account);
+};
+```
+
+I hope this helps someone facing similar issues!
+
+-------------------------
+

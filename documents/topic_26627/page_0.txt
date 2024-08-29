@@ -1,0 +1,227 @@
+massimoalbarello | 2024-01-13 22:27:51 UTC | #1
+
+Hello everyone :slight_smile: 
+
+In case your canister needs to make non-replicated HTTPS requests to external APIs (both IPv4 and IPv6) you can now do so with a single inter-canister call. This reduces the cost of your outcalls by [two orders of magnitude](https://internetcomputer.org/docs/current/developer-docs/gas-cost#details-cost-of-compute-and-storage-transactions-on-the-internet-computer) and eliminates the need of [transformation functions](https://internetcomputer.org/docs/current/developer-docs/integrations/https-outcalls/https-outcalls-how-it-works#transformation-function) at the cost of some extra trust assumptions.
+
+@ilbert and I just released a **proxy canister** which relays the HTTPS requests via an off-chain client. The client connects to the proxy using [IC WebSockets](https://forum.dfinity.org/t/ic-websocket-stable-release/23872).
+
+A high level overview of the architecture is the following:
+![image|690x207](upload://2H3nK7qGbzsLnCmGM5TJapL7vO6.jpeg)
+Your canister can simply call the `http_request` method on the proxy canister [`iustv-tiaaa-aaaao-a3aga-cai`](https://dashboard.internetcomputer.org/canister/iustv-tiaaa-aaaao-a3aga-cai) with your **request** and a **callback** method (optional) which is called back by the proxy once it receives the response.
+Upon receiving an inter-canister call with your **request**, the proxy canister relays it to the off-chain client via the IC WebSocket connection. The client makes a call to the HTTPS endpoint specified by your request.
+Upon receiving the response, it sends it to the proxy which makes an inter-canister call to the **callback** method of your canister.
+
+This service can be used to make a non-replicated HTTPS outcall, thus enabling you to make POST **requests** without having to handle [idempotency](https://internetcomputer.org/docs/current/developer-docs/integrations/https-outcalls/https-outcalls-how-it-works#post-requests-must-be-idempotent). This also makes it super easy to make fire-and-forget HTTPS outcalls, simply do not specify the **callback**.
+
+The off-chain client is currently controlled by us but we are planning to remove us as a single point of failure by deploying it via [IC Side Services](https://forum.dfinity.org/t/proposal-enable-canisters-to-pay-in-icp-for-external-services/24459), which we will be releasing soon. 
+
+The source code is available at: https://github.com/omnia-network/ic-http-proxy.
+Getting started examples will also be available soon. For now consider this a work-in-progress and expect breaking changes. We are releasing it now to gather your feedback which will drive our development.
+
+Let us know what you think about this!
+
+-------------------------
+
+Sormarler | 2024-01-14 02:40:23 UTC | #2
+
+What would be the use case for this?
+
+-------------------------
+
+massimoalbarello | 2024-01-14 10:44:24 UTC | #3
+
+We developed this as we needed it ourselves to interact with other networks as described in [IC Side Services](https://forum.dfinity.org/t/proposal-enable-canisters-to-pay-in-icp-for-external-services/24459). We decided to release it as a standalone service to see if other devs find it useful.
+
+A general use case is when you want to make a POST to an API that does not support idempotent requests. The alternative to using this service would be to deploy your own proxy between the IC and the API in order to de-duplicate the responses.
+
+Also, there are use cases (like the "HTTP fire-and-forget") in which it might make sense to trust an external service in exchange for a much cheaper and simpler way of sending requests.
+
+I want to remark that this is not meant to substitute the IC-native HTTPS outcall feature as the trust assumptions are completely different. However, for the use cases mentioned above it might be a reasonable trade-off to make while the native feature improves.
+
+-------------------------
+
+h1teshtr1path1 | 2024-01-14 12:34:40 UTC | #4
+
+Thanks to you for making this open source. Now we can remove proxy servers which were used in many cases to handle idempotency.
+
+-------------------------
+
+ilbert | 2024-01-14 22:39:50 UTC | #5
+
+You can find the first basic example in the [examples/rust/basic](https://github.com/omnia-network/ic-http-proxy/tree/main/examples/rust/basic) folder.
+
+You can interact with the basic example's backend cansiter from [its Candid UI](https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=ittvb-6qaaa-aaaao-a3agq-cai). Refer to the [Usage](https://github.com/omnia-network/ic-http-proxy/tree/main/examples/rust/basic#usage) section of the README for how to configure the parameters properly.
+
+-------------------------
+
+charlesm | 2024-01-15 05:44:43 UTC | #6
+
+This is a great feature. I was trying to make HTTP outcalls to IPv4 addresses which isn't supported. Or like you mentioned, when trying to make fire-and-forget calls to APIs that aren't controlled by yourself. It's wonderful to have this proxy server that allows for easy setup of HTTP outcalls in situations where data is just being sent out of the IC.
+
+-------------------------
+
+tiago89 | 2024-01-15 11:34:42 UTC | #7
+
+Really good, congrats for publishing this guys :heart: This is very much in need.
+
+I have a few questions (since I didn't have the opportunity to look deeper into the code).
+
+I am assuming you will be paying the infrastructure and the proxy canister costs for now right? It's free to use it (meaning, we only pay the first inter-canister call, to the proxy, right?). Thanks for this early invest, it's totally understandable if later you start charging as it succeeds and cost structures become more clear.
+
+How are we safety wise? Many APIs use OAuth2, and give back the refresh/access tokens.
+Let's assume I am comfortable with the IC Canister/Node risk, what is the middle-man risk (assuming it's an HTTPS Post call)?
+
+Meaning, when is HTTPS applied (and body data encrypted), all the way from the proxy to the API Endpoint, or it decrypts on the websocket?
+
+Thanks and keep this great work!! :muscle:
+
+-------------------------
+
+massimoalbarello | 2024-01-15 13:08:12 UTC | #8
+
+[quote="tiago89, post:7, topic:26627"]
+I am assuming you will be paying the infrastructure and the proxy canister costs for now right? It’s free to use it (meaning, we only pay the first inter-canister call, to the proxy, right?).
+[/quote]
+Yes for now we are paying for the infra and will do until we can sustain it.
+
+[quote="tiago89, post:7, topic:26627"]
+Thanks for this early invest, it’s totally understandable if later you start charging as it succeeds and cost structures become more clear.
+[/quote]
+Offering it as a service is something that we are considering but best would be to enable developers to deploy the needed infrastructure via an orchestrator canister. This would basically give devs the best of both worlds: they control their own infrastructure without having to deploy and maintain it themselves.
+
+[quote="tiago89, post:7, topic:26627"]
+How are we safety wise? Many APIs use OAuth2, and give back the refresh/access tokens.
+Let’s assume I am comfortable with the IC Canister/Node risk, what is the middle-man risk (assuming it’s an HTTPS Post call)?
+[/quote]
+The requests are encrypted during all communications between the different components of the infrastructure (from canister to WS Gateway, to off-chain client, and to Web2 API). However, both the WS Gateway and the off-chain client (which we control) can read the requests. This is definitely not acceptable in the long run but for now it's not that far from what node providers can do.
+
+-------------------------
+
+skilesare | 2024-01-15 14:26:30 UTC | #9
+
+This is very cool and I can see a thousand use cases. I will make the following cautionary note:
+
+WARNING: If you use outcalls(other than fire and forget) you may be abandoning the cryptographic guarantees and deterministic guarantees that most expect from 'classic' crypto dapps.
+
+These may not be necessary for your canister, and if not, then carry on, but if they are, then just keep in mind there is a bunch you'll need to consider and plan for if you want to keep those properties.
+
+I've written in more detail here:
+
+https://forum.dfinity.org/t/the-double-edged-sword-of-http-outcalls-in-internet-computer-smart-contracts/19196?u=skilesare
+
+and here:
+
+https://forum.dfinity.org/t/oracles-i-m-suspicious-re-coming-http-requests/14360
+
+-------------------------
+
+lastmjs | 2024-01-15 15:26:43 UTC | #10
+
+We should also push for the protocol itself to offer these kinds of outcalls, for example like composite queries. Imagine if a query or an update could make a query http outcall
+
+-------------------------
+
+massimoalbarello | 2024-01-15 15:39:58 UTC | #11
+
+[quote="skilesare, post:9, topic:26627"]
+WARNING: If you use outcalls(other than fire and forget) you may be abandoning the cryptographic guarantees and deterministic guarantees that most expect from ‘classic’ crypto dapps.
+
+These may not be necessary for your canister, and if not, then carry on, but if they are, then just keep in mind there is a bunch you’ll need to consider and plan for if you want to keep those properties.
+[/quote]
+
+Yes, in particular, by using it you are trusting that we do not read/modify/block your requests/responses.
+
+-------------------------
+
+massimoalbarello | 2024-01-16 10:20:41 UTC | #12
+
+Yes, operating at the protocol level is the best way to have trustless HTTP outcalls. However, I find the current state of the native feature not so practical to use, that's why we released this service.
+
+Not sure whether Dfinity is planning to continue the work on native HTTP outcalls right now but it would be really much needed imo.
+
+-------------------------
+
+patnorris | 2024-01-18 15:35:19 UTC | #13
+
+Interesting feature! I was looking into setting up a proxy server on the IC a few months back but that didn't work because HTTP outcalls were too slow and expensive, so this could solve/improve the issues I had. Will the mid-/long-term plan be to integrate your work into the protocol, i.e. the developer could specify that just one node should make the outcall? Maybe even with the option to do this within one query call (for any use cases where no consensus might be needed)?
+
+-------------------------
+
+massimoalbarello | 2024-01-18 16:19:55 UTC | #14
+
+[quote="patnorris, post:13, topic:26627"]
+I was looking into setting up a proxy server on the IC a few months back but that didn’t work because HTTP outcalls were too slow and expensive, so this could solve/improve the issues I had
+[/quote]
+
+Which problem did you have exactly?
+
+[quote="patnorris, post:13, topic:26627"]
+Will the mid-/long-term plan be to integrate your work into the protocol, i.e. the developer could specify that just one node should make the outcall?
+[/quote]
+
+
+This is not something to be integrated into the protocol, more like a workaround of the current limitations of the HTTP outcalls (with a big trade-off).
+
+Improving the native HTTP outcalls would of course be amazing but we don't have the resources to do it by ourselves now.
+What we instead want to do is to deploy the off-chain client on a separate network which an orchestrator canister controls. Eventually, we are not the ones controlling the orchestrator, the HTTP proxy and off-chain client so that devs don't have to trust us when using this service.
+
+For a little more context, check [this](https://forum.dfinity.org/t/proposal-enable-canisters-to-pay-in-icp-for-external-services/24459) out. We will publish a more detailed explanation soon!
+
+-------------------------
+
+patnorris | 2024-01-19 13:14:57 UTC | #15
+
+Proxying every call through a canister that uses HTTP outcalls to the intended endpoint is too slow (and likely also too expensive, but I didn't measure that exactly) for the client, i.e. UX. So your work could decrease the costs and potentially also the time in the mid-term (depending on future plans).
+
+Alright, thanks, just wondered if maybe you coordinated/planned to coordinate this with someone who's working on HTTP outcalls on the protocol level and thus could potentially create some synergies there.
+
+-------------------------
+
+q2333gh | 2024-01-22 13:17:24 UTC | #16
+
+What an excellent project you are building there!
+
+
+1. I learned from Bing AI that `non-replicated` means making http calls without waiting for many nodes to agree (which takes about 2 seconds to do). So, making http calls on IC is very fast, right?
+Is Bing AI says right ? 
+
+2. I’m also curious if this project makes http calls easier. Is it like a web framework in some way (for example, in rust: something like Rocket web framework)?"
+
+-------------------------
+
+massimoalbarello | 2024-01-22 14:24:10 UTC | #17
+
+[quote="q2333gh, post:16, topic:26627"]
+I learned from Bing AI that `non-replicated` means making http calls without waiting for many nodes to agree (which takes about 2 seconds to do). So, making http calls on IC is very fast, right?
+[/quote]
+
+Not really, you have to make an inter-canister call to the proxy canister so you still have to go through consensus. I'm not sure whether there are any latency benefits. The benefits are mostly cost (inter-canister call is much cheaper than HTTP outcall) and simplicity (not having to deal with idempotency).
+
+[quote="q2333gh, post:16, topic:26627"]
+I’m also curious if this project makes http calls easier. Is it like a web framework in some way (for example, in rust: something like Rocket web framework)?"
+[/quote]
+It makes it easier yes, but with a big trade-off.
+It's not a framework, you simply use inter-canister calls to tell the proxy canister which requests to make and which handler to trigger when it receives the response. The rest is taken care by the proxy + off-chain client. So imagine it as a service more than a framework.
+
+-------------------------
+
+q2333gh | 2024-01-25 07:22:03 UTC | #18
+
+What proxy canister should i use in rust code ?
+```rust 
+pub fn http_init(proxy_canister_id: Principal) {
+  PROXY_CANISTER_ID.with(|id| {
+    id.replace(proxy_canister_id);
+  });
+}
+```
+
+-------------------------
+
+ilbert | 2024-01-25 08:07:22 UTC | #19
+
+The proxy canister that we deployed on mainnet is: [`iustv-tiaaa-aaaao-a3aga-cai`](https://dashboard.internetcomputer.org/canister/iustv-tiaaa-aaaao-a3aga-cai). On this link you can also find its Candid declarations.
+
+-------------------------
+

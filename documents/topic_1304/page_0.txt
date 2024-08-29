@@ -1,0 +1,174 @@
+wang | 2020-09-24 10:08:22 UTC | #1
+
+With the Sodium launch happening soon, I thought it'd be a good time to start thinking about token standards. 
+
+Here's my proposal for a unified canister interface, with support for single/multiple tokens per canister, fungible and non-fungible tokens. Feedback wanted!
+
+We should probably come up with a process for proposals (tentatively calling them *ICIPs* (Internet Computer Improvement Proposals). Perhaps a public github repo under dfinity?
+
+https://github.com/sailfish-app/proposals/blob/master/icip-1.md
+
+-------------------------
+
+Gabriel | 2020-09-28 08:35:05 UTC | #2
+
+Hi @wang 
+
+In terms of operator permissions  I was thinking they should be more granular? 
+
+From the top of my head even though an operator has access to just one token type maybe the principal should have the option to set a hard expense limit ? like 10% (or a fixed nuber) of the total bucket? 
+
+Eg: I want my canister to be free to a certain point (trial period).
+
+-------------------------
+
+wang | 2020-09-28 10:34:35 UTC | #3
+
+Agreed, more granular permissions are needed. 
+
+A simple way to do this is to set token permissions for each operator:
+```
+type TokenAllowance = {
+  tokenId: TokenId;
+  allowance: ?Nat; // if null, unlimited allowance for this TokenId
+}
+
+type TokenPermission = {
+  #All;
+  #Some: [TokenAllowance];
+};
+
+type OperatorAction = {
+  #SetPermissions: TokenPermission;
+  #RemoveOperator;
+};
+
+type OperatorRequest = {
+  owner: User;
+  operators: [(User, OperatorAction)]
+};
+```
+
+Another approach is to handle permissions in a separate canister (see [EIP-1761 scoped approvals](https://github.com/ethereum/EIPs/issues/1761)). This `TokenPermissions` canister could dynamically update allowances, eg. 10% of total $ value per day. Operators would then call `TokenPermissions.transfer()`, and if approved, the `transfer` would be proxied to the token canister. This approach gives users a central place to manage permissions, but requires operators to know about this second canister and also adds another async call.
+
+-------------------------
+
+senior.joinu | 2020-09-28 12:55:06 UTC | #4
+
+I really like the idea of having some spec like this BEFORE we're actually flood with different tokens for all our projects.
+
+Good job!
+
+-------------------------
+
+cryptoschindler | 2020-10-11 22:18:34 UTC | #5
+
+Thanks for the creation of this. Are you thinking of a token canister of being static after being set up? By that i mean that the interface can’t change? If not it might be useful to have some space for upgrades / new implementations.
+
+-------------------------
+
+wang | 2020-10-14 02:42:27 UTC | #6
+
+I think the core functions (eg. `getBalance`, `transfer`) should never change. Any additional functions that devs want to add are non-standard, and should be documented properly.
+
+There is a potential issue of adding non-standard functionality to the `transfer` function; some rebase tokens update their supply on every `transfer` call, which could lead to weird behavior. Consumers need to be aware of this when integrating tokens, but I don't have a good solution to this...
+
+-------------------------
+
+wang | 2020-10-14 02:50:51 UTC | #7
+
+Also, we have experimental token code in [motoko base](transfer). Looks like `Nat` is used for balances: if 1e12 cycle = 1 CHF, then the smallest unit of 1 cycle = 1e-12 CHF
+
+@crusso Has the team thought about a unified API for system funds and user tokens? On Ethereum, system ETH is handled completely different from userspace erc20 tokens, creating the need for a [wrapped ETH](https://weth.io). It would be ideal if we didn't need this :)
+
+-------------------------
+
+cryptoschindler | 2020-10-14 08:15:00 UTC | #8
+
+And what about a running canister that already has thousands of users. Imagine I want to add additional functionality to it. I know that there’s a Motoko keyword to ensure either stability or flexibility, although that is only for variables. From the talks I imagined it so far that you can create a token canister following your proposal, having the same interface and implementing the proposed functionality in a way that satisfies the constraints. 
+As a user of that canister I wouldn’t want anyone to have access to the canister in a way that changes it’s functionality or state. I want to see the token canister deployed, be able to review it’s code and be sure that it will stay like this forever.
+So if there has to be some new functionality added to the token canister, would I always need to go through the NNS to do so? What if the token canister hasn’t got enough users and that way my proposal to change won’t even be voted on because not enough people are interested in it. What can I as a owner/maintainer do to change it? I could if course create new one with the needed functionality and transfer the state to it. But this new one needs to be again accepted by the users. 
+
+So my point was if it would be possible to add some default extensibility – like extra bits in protocol headers – to not have to go through all that. And I would be happy to hear your thoughts on how the above mentionend process would look like, maybe I’m completely off track.
+
+-------------------------
+
+wang | 2020-10-15 03:42:55 UTC | #9
+
+Right, how can we ensure that a token canister doesn't upgrade maliciously? We don't have a keyword to force canisters to _not_ be upgradeable (at least not yet). It seems like there's two options for token issuers:
+
+1. **No upgrade** - Set the owner of your canister to a known unused address (eg. 0x0000...), allowing your users to verify that no upgrade is possible.
+2. **Upgrade** - Retain the ability to upgrade at any time, but you must convince your users that you won't steal their funds, and be transparent about all upgrades. If you're introducing breaking changes, it's up to you to notify all consumers. If your token is a key dependency of many other projects, using a formal governance process is probably a good idea.
+
+-------------------------
+
+nko | 2021-05-14 09:39:35 UTC | #10
+
+Hi!
+I'm curious about the state of this proposal and a token system in the ICP. Where are we now?
+
+-------------------------
+
+wang | 2021-05-14 14:18:55 UTC | #11
+
+I don't have solutions, only more questions :slight_smile: 
+
+**Where is transaction history stored?**
+
+_Option 1 - token ledger_
+Define a new ledger interface and include that in this token interface. Token creators choose pricing, eg. all users can query their latest 100 transfers for free, but need to pay for more access.
+Pros - more flexibility for token creators
+Cons - could cause lack of interoperability, hard to aggregate data
+
+_Option 2 - centralized ledger_
+An independent party creates and maintains a token ledger service, which acts as the central location to store all token transactions.
+Pros - easy for token creators, easy to aggregate data, can be most secure
+Cons - highest cost, prone to corruption
+
+_Option 3 - user ledger_
+All users maintain their own token ledgers (in addition to their own wallet canister) and pay for all reads and writes.
+Pros - data sovereignty, privacy, lowest cost
+Cons - complexity (users need to specify their ledger canister when interacting with a token), hard to aggregate data
+
+Perhaps a better idea is a combination of 1 and 3 - token creators that need to store their own history for compliance purposes should do so however they want, but also integrate with the "standard user ledger" if provided.
+
+-------------------------
+
+muquifuler | 2021-05-14 14:33:07 UTC | #12
+
+Good Ideas/Thoughts :+1:
+
+-------------------------
+
+stephenandrews | 2021-05-20 20:26:59 UTC | #13
+
+Hey Wang,
+
+I pushed a potential proposal: https://github.com/sailfish-app/proposals/pull/1
+
+I do notice that I doubled up on a change that you already mentioned in this forum (adding an allowance to operators). Our approaches are almost identical, so happy to revert to what you suggested above.
+
+I am currently working on a number of live tokens (NFTs and FTs) and I found my core calls were very similar and I have updated my code to the standard that you have proposed. I think this is a really good standard and gives us a good base to develop from.
+
+I have also tried to get around the idea of having a wrapped ICP, and initially tried to build my token calls to replicate that of the ledger canister, but I don't think it works well enough as a universal standard. 
+
+The two options I am considering are 1) a wrapped ICP, like wETH, or 2) An interface that has the same public calls as ICIP-1 to make it interoperable with other tokens, but behind the scenes it interacts directly with the ledger canister. Currently approach #2 seems too complex to have it working exactly the same, so a wrapped approach may be better...
+
+-------------------------
+
+wang | 2021-05-21 01:58:46 UTC | #14
+
+Thanks for the contributions!
+
+It does seem like we'll need both wrapped ICP and cycles - the first approach seems more flexible, and likely costs less cycles. 
+* Wrapping and unwrapping ICP will need to call the ledger, which uses AccountIdentifiers (seems like we need a [SHA224 in motoko](https://forum.dfinity.org/t/how-to-get-the-account-identifier-from-principal-in-motoko/4080)). 
+* The wrapped cycle container also comes with some complexity as a canister is limited to [2^64-1 cycles](https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-cycles), so it will need to support dynamic canister creation.
+
+-------------------------
+
+stephenandrews | 2021-05-21 03:23:05 UTC | #15
+
+I've done some work on a wrapped ICP contract, which I will post and share soon. I think we can get around working with AccountIdentifiers - I originally thought this was just Principal.toText (as the AccountIdentifier type is just Text) but I will look into this.
+
+-------------------------
+

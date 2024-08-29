@@ -1,0 +1,306 @@
+abk | 2022-10-18 15:50:29 UTC | #1
+
+# Wasm-Native Stable Memory
+## Objective
+	
+The goal of introducing Wasm-native stable memory is to improve the performance of stable reads and writes by letting these operations directly access stable memory in the same way Wasm loads and stores currently access the Wasm heap. This will make direct use of stable memory more practical and it will not require canister developers to make any changes to how they use stable memory.
+
+## Background
+### What is Stable Memory?
+	
+Stable memory is an array of bytes that canisters can use and is persisted across canister upgrades. Canisters with smaller amounts of data can use stable memory to persist data across updates by serializing objects from the Wasm heap into stable memory before an update and deserializing it back to the Wasm heap after the update. But larger canisters may permanently keep their data in stable memory and only move pieces of it to the Wasm heap when needed.
+
+Stable memory is accessed through the `stable64_read` and `stable64_write` [system API calls](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-stable-memory) which copy a slice of data between stable memory and the Wasm heap. 
+
+### Why is Stable Memory slower than the Wasm Heap?
+
+The stable memory system API functions are currently implemented by Rust code which is registered with the Wasmtime engine when it executes a message in a canister. This means that each read/write to stable memory requires the canister to call into the Wasmtime engine, which then executes the Rust function to handle the read/write (see diagram [1]). On the other hand, when a canister performs a read/write to the Wasm heap, the Wasmtime engine knows where the Wasm heap resides in RAM so it can compile the canister’s Wasm instructions into a single assembly `load` or `store` instruction.
+
+This proposal will make the performance of stable memory accesses closer to the performance of Wasm heap accesses.
+	
+## Benefits
+
+One current disadvantage of storing canister data directly in stable memory is that accessing it can be significantly slower than accessing the Wasm heap. This feature would significantly improve the performance of stable reads and writes (likely by 2x or more for certain workloads) to bring them closer to the performance of Wasm heap reads and writes [2]. This would make it easier for canisters to store the majority of their data directly in stable memory and keep the Wasm heap for “scratch space”. This pattern has several advantages:
+
+1. Canisters can store more data: Stable memory can currently hold up to 32 GiB as opposed to 4 GiB for the Wasm heap.
+2. Upgrades are faster: Upgrading no longer requires serializing and deserializing the entire Wasm heap.
+3. Upgrades are safer: Removing the (de)serializing steps can make upgrade code simpler which decreases the likelihood of bugs or hitting message instruction limits.
+
+Furthermore, introducing the ability for canisters to use multiple memories opens doors for several possible future improvements in the area of BigData:
+1. Canisters may eventually be able to have several different memories with different properties (e.g. many small memories that are just as fast as the wasm heap, or memories with different lifetimes).
+2. Tracking memory accesses could be done within the canister itself (in an additional memory) which would be faster than our current segfault handler implementation.
+3. We could introduce the ability for additional memories to be passed between canisters.
+
+## Proposal
+
+Wasm-native stable memory would use the Wasm [multi-memory](https://github.com/WebAssembly/multi-memory/blob/master/proposals/multi-memory/Overview.md) and [memory64](https://github.com/WebAssembly/memory64/blob/main/proposals/memory64/Overview.md) features to define a second 64-bit memory which the canister can directly access (diagram [3]). By “directly access” we mean that stable API calls will be converted to Wasm `memory.copy` instructions which Wasmtime can compile to standard assembly load/stores. This will be much faster than the layers of function calls currently needed to go through the Wasmtime engine. In particular, the main changes to be made are:
+
+1. Enable the multi-memory and memory64 features in Wasmtime and implement those features in our Wasm parser and code generator.
+2. Modify canister instrumentation to inject the second 64-bit memory for stable memory and replace stable memory API calls with the corresponding `memory.copy` instructions.
+3. Modify the existing segfault signal handler to be aware that there are now two memories each canister will be directly accessing and properly handle the two cases. 
+	
+Note that canisters will not directly use the multi-memory or memory64 features - they will only be used through code that is inserted during the instrumentation step. But it may happen that a later proposal offers a way to give canisters direct access to these features.
+
+## Risks
+
+The Wasm multi-memory feature is not yet standardized and has not yet been implemented in most Wasm engines. This means that we may waste engineering time if modifications are made to the spec while it is being standardized. It is also possible that the multi-memory feature is ultimately rejected, in which case this proposal would need to be rolled back. But that wouldn’t break any canisters because canisters will not directly use the multi-memory feature. 
+
+The memory64 feature is also not standardized, but it has already been implemented in Chrome and Firefox so it is likely to be standardized without any changes.
+
+## What are we asking the community
+- Review comments, ask questions, give feedback
+- Vote accept or reject on NNS Motion
+- Participate in technical discussions as the motion moves forward
+
+
+[1] Canisters currently access the Wasm heap directly, but cannot access stable memory directly.
+```txt
++-------------------+                +-------------+
+|                   |     Direct     |             |
+|       Canister    +---------------->  Wasm Heap  |
+|                   |   Read/Write   |             |
++----------+--------+----------------+-------------+
+|          |                                       |
+|          |            Wasmtime                   |
+|          |                                       |
++----------+---------------------------------------+
+|          |                                       |
+|          | System API Rust Implementation        |
+|          |                                       |
++----------v---------+-----------------------------+
+|                    |
+|    Stable Memory   |
+|                    |
++--------------------+
+```
+
+[2] Stable reads/writes would still not be quite as fast as Wasm heap reads/writes because the Wasm heap only has 32-bits of addressable memory which allows Wasmtime to do some [neat tricks](https://github.com/bytecodealliance/wasmtime/blob/32a7593c949a17f20c2a718e1cbf0d8c449b0c47/cranelift/wasm/src/code_translator.rs#L2246) to avoid checking that the memory accesses are in-bounds. The stable memory would need to use 64-bit addresses to allow it to grow beyond 4GiB and that means Wasmtime needs to insert a bounds check before each access.
+
+[3] Wasm-native stable memory would allow the canister to directly access stable memory.
+```txt
++---------------+               +----------+               +-----------+
+|               |     Direct    |          |     Direct    |           |
+| Stable Memory <---------------+ Canister +---------------> Wasm Heap |
+|               |   Read/Write  |          |   Read/Write  |           |
++---------------+---------------+----------+---------------+-----------+
+|                                                                      |
+|                               Wasmtime                               |
+|                                                                      |
++----------------------------------------------------------------------+
+|                                                                      |
+|                  System API Rust Implementation                      |
+|                                                                      |
++----------------------------------------------------------------------+
+```
+
+-------------------------
+
+rossberg | 2022-10-18 16:01:09 UTC | #2
+
+This is an interesting idea! It is an internal optimisation in the replica that should be completely transparent to canisters, and I agree that even if multi memory gets pulled from Wasm (very unlikely) it could just be rolled back.
+
+The one question I would think about is what the migration path will be once multi memory _does_ become an official feature, and canisters start using it independently. I suppose the injection would still work, you'd just add a new memory index on top of the existing ones. But it's worth playing through.
+
+As for parity-wasm, it has gotten in the way of progress more than once. Is there a chance to kill this dependency?
+
+-------------------------
+
+cryptoschindler | 2022-10-18 18:48:52 UTC | #3
+
+Why is it important for you that multi-memory and memory64 are being standardized?
+
+-------------------------
+
+ohsalmeron | 2022-10-19 05:30:56 UTC | #4
+
+Does this only affect Rust implementation or is it going to be available for Motoko as well?
+
+-------------------------
+
+rossberg | 2022-10-19 05:52:36 UTC | #5
+
+@cryptoschindler:
+> Why is it important for you that multi-memory and memory64 are being standardized?
+1. If it was ever removed from being on track to standardisation, then it would be rather unlikely that Wasmtime would keep it in, so the optimisation @abk suggests would no longer work.
+2. If it was a proper Wasm feature, then stable memory would be even more efficient (and more flexible) than under this optimisation.
+
+@ohsalmeron:
+> Does this only affect Rust implementation or is it going to be available for Motoko as well?
+
+This is an optimisation in the replica runtime, so would apply equally regardless of implementation language of a canister.
+
+-------------------------
+
+cryptoschindler | 2022-10-19 06:37:17 UTC | #6
+
+[quote="rossberg, post:5, topic:15966"]
+then it would be rather unlikely that Wasmtime would keep it in, so the optimisation @abk suggests would no longer work.
+[/quote]
+
+I was under the impression that DFINITY maintains a fork of wasmtime to expose their own host API anyways? Couldn't they just keep those features then, even if wasmtime decided to remove them?
+
+-------------------------
+
+abk | 2022-10-19 07:15:12 UTC | #7
+
+[quote="rossberg, post:2, topic:15966"]
+The one question I would think about is what the migration path will be once multi memory *does* become an official feature, and canisters start using it independently. I suppose the injection would still work, you’d just add a new memory index on top of the existing ones. But it’s worth playing through.
+[/quote]
+
+I think there's a couple of paths we could take there. One would be to reserve memory index 1 for the stable memory which we inject during instrumentation and if the canister directly uses other memories shift the indices up by one. This is what we already do when injecting additional functions and imports.
+
+Another option could be to have canisters choose between using multiple memories and the stable memory system API. That is, if the canister declares more than one memory we treat the second one as the stable memory and disallow any imports of `ic0.stable*` functions.
+
+What do you think about those ideas?
+
+[quote="rossberg, post:2, topic:15966"]
+As for parity-wasm, it has gotten in the way of progress more than once. Is there a chance to kill this dependency?
+[/quote]
+
+Actually `parity-wasm` was marked as unmaintained and deprecated 2 weeks ago. So we'll need to replace it with something else regardless of if this proposal goes through.
+
+-------------------------
+
+abk | 2022-10-19 07:25:39 UTC | #8
+
+@cryptoschindler: Dfinity doesn't maintain a fork of Wasmtime - we use the official releases put out by the Bytecode Alliance. The system API is imlemented using the Wasmtime [`Linker`](https://docs.rs/wasmtime/latest/wasmtime/index.html#linking) which let's the host expose functions that the Wasm module can then import.
+
+@ohsalmeron: @rossberg is correct that this would apply to Rust, Motoko, and any other language used to write canisters.
+
+-------------------------
+
+dymayday | 2022-10-19 10:48:01 UTC | #9
+
+Really excited by this @abk !! I can't wait to use it !
+
+-------------------------
+
+senior.joinu | 2022-10-19 11:56:43 UTC | #10
+
+Really exited about this, thanks, @abk!
+What is the timeline for this feature?
+
+-------------------------
+
+rossberg | 2022-10-20 17:25:26 UTC | #11
+
+[quote="abk, post:7, topic:15966"]
+I think there’s a couple of paths we could take there. One would be to reserve memory index 1 for the stable memory which we inject during instrumentation and if the canister directly uses other memories shift the indices up by one. This is what we already do when injecting additional functions and imports.
+[/quote]
+
+Why is that necessary? Can't you inject new definitions at the high end of the index space? Then no shifting is needed. And that should work just fine for stable memory as well.
+
+[quote]
+Another option could be to have canisters choose between using multiple memories and the stable memory system API. That is, if the canister declares more than one memory we treat the second one as the stable memory and disallow any imports of `ic0.stable*` functions.
+[/quote]
+
+There should be a relevant design doc from a few years ago, but I can't find the doc now – I believe it was called "Refining Persistence". That sketched a design for Wasm-native stable memories where a module can select different stability levels by _importing_ memory from the system using a specified import naming scheme that denotes the desired choice of semantics.
+
+-------------------------
+
+abk | 2022-10-21 07:20:24 UTC | #12
+
+[quote="rossberg, post:11, topic:15966"]
+Why is that necessary? Can’t you inject new definitions at the high end of the index space? Then no shifting is needed. And that should work just fine for stable memory as well.
+[/quote]
+
+Good point, injecting stable memory at the end would be easier. We have to do shifting when injecting an imported function because the import section comes before the function section which means imported functions all get indices lower than module-defined functions. Is there some trick to get around that? We could then remove the shifting logic :smile: 
+
+[quote="rossberg, post:11, topic:15966"]
+There should be a relevant design doc from a few years ago, but I can’t find the doc now – I believe it was called “Refining Persistence”.
+[/quote]
+
+I found it. Yeah, having the import name specify the semantics is a cool idea.
+
+-------------------------
+
+abk | 2022-10-21 07:22:31 UTC | #13
+
+[quote="senior.joinu, post:10, topic:15966"]
+What is the timeline for this feature?
+[/quote]
+
+I'm not sure about the exact timeline now, but it would be something on the order of months.
+
+-------------------------
+
+rossberg | 2022-10-21 11:58:47 UTC | #14
+
+[quote="abk, post:12, topic:15966"]
+We have to do shifting when injecting an imported function because the import section comes before the function section which means imported functions all get indices lower than module-defined functions. Is there some trick to get around that?
+[/quote]
+
+Ah, yes, I see. No, I'm afraid that can't be avoided.
+
+-------------------------
+
+jzxchiang | 2022-10-22 05:42:31 UTC | #15
+
+It's really exciting to see this finally proposed.
+
+It would also be nice to get a refreshed API for accessing stable memory, perhaps one that doesn't require making explicit system API calls. Would it be technically possible for canister code to just declare a variable as "stable" (kind of like in Motoko), and updates to that variable's state get transparently converted into the appropriate system API calls?
+
+-------------------------
+
+abk | 2022-10-24 08:06:40 UTC | #16
+
+Are you saying you'd like something like this in Rust? I guess that would need to be done by a library anyway - even if we give canisters direct access to the multiple memories, the Rust standard library is always going to allocate in `memory 0`.
+
+Note that the `ic_stable_structures` crate [already provides this](https://github.com/dfinity/stable-structures/blob/main/examples/src/basic_example/src/lib.rs) for the case of `BTreeMap`s. Maybe it wouldn't be too much work to add something like your asking for types that implement the [`Storable` trait](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/storable/trait.Storable.html). Any opinion on that @ielashi ?
+
+-------------------------
+
+chenyan | 2022-10-24 18:32:30 UTC | #17
+
+[quote="abk, post:12, topic:15966"]
+We have to do shifting when injecting an imported function because the import section comes before the function section which means imported functions all get indices lower than module-defined functions. Is there some trick to get around that? We could then remove the shifting logic
+[/quote]
+
+The [`walrus` crate](https://docs.rs/walrus/latest/walrus/) avoids the index shifting by using an [id_arena](https://docs.rs/id-arena/2.2.1/id_arena/index.html) for function ids. It basically renumbers everything when emitting the wasm module from AST. From the user/replica respective, it's totally transparent.
+
+-------------------------
+
+senior.joinu | 2022-10-24 19:35:12 UTC | #18
+
+`ic-stable-memory` also provides a notion of stable variables in rust.
+
+-------------------------
+
+abk | 2022-10-25 08:13:38 UTC | #19
+
+Yeah, we're aware of the `walrus` crate, but unfortunately it's not being maintained anymore. We've spoken with the authors of it and it doesn't sound like they have any plans to pick it up again.
+
+It's too bad because I really like that the added structure in `walrus` prevents an entire class of bugs that could appear during instrumentation.
+
+-------------------------
+
+ielashi | 2022-10-25 08:31:59 UTC | #20
+
+I believe someone from the community also ported `StableBTreeMap` to Motoko. See [this thread](https://forum.dfinity.org/t/icdevs-org-bounty-24-stablebtree-mokoko-up-to-10k/14867/9).
+
+-------------------------
+
+abk | 2023-08-16 08:45:07 UTC | #21
+
+New blog post about Wasm-native stable memory: https://internetcomputer.org/blog/features/wasm-native-stable-memory !
+
+-------------------------
+
+senior.joinu | 2023-08-16 10:37:59 UTC | #23
+
+![Screenshot from 2023-08-16 13-37-21|690x174](upload://fpnJS0bjtqwq6PlgYgsTAtWBbCa.png)
+
+Getting this trying to follow the link. Am I the only one?
+
+-------------------------
+
+abk | 2023-08-17 07:13:25 UTC | #24
+
+[quote="senior.joinu, post:23, topic:15966"]
+Getting this trying to follow the link. Am I the only one?
+[/quote]
+
+I think some people were seeing this in general yesterday (e.g. https://twitter.com/icircle_nft/status/1691642951984877908?t=R83MBNiT2Xa-MduO3_5XIA&s=19), but I believe it's been fixed now.
+
+-------------------------
+

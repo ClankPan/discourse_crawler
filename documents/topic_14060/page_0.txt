@@ -1,0 +1,95 @@
+dansteren | 2022-06-27 21:07:58 UTC | #1
+
+Summary:
+
+When using [`ic_cdk::api::call::reject`](https://docs.rs/ic-cdk/latest/ic_cdk/api/call/fn.reject.html) I can't get the canister to return a reject code of [`4`, i.e. `CANISTER_REJECT`](https://internetcomputer.org/docs/current/references/ic-interface-spec#reject-codes). I expect `ic_cdk::api::call::reject` to trap like [ic_cdk::api::trap](https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.trap.html) and return that code immediately, but instead execution continues and as a result I can only return a `5` i.e. `CANISTER_ERROR`.
+
+
+Additional Details:
+
+I'm trying to return a reject code of `4 (CANISTER_REJECT)` from a canister but it doesn't seem possible. I've implemented the following canister with a method that just calls reject:
+
+lib.rs
+```rust
+#[ic_cdk_macros::update]
+async fn method() -> () {
+    ic_cdk::api::call::reject("Custom message...")
+}
+```
+
+I expect that when called this would return a reject code of `4` and the "Custom message..." string that I passed in. Instead, when running `dfx canister call my_canister method` I get the following:
+
+> Error: The Replica returned an error: code 5, message: "Canister ryjl3-tyaaa-aaaaa-aaaba-cai violated contract: ic0.msg_reply_data_append: the call is already replied"
+
+I believe that what's happening is that `ic_cdk::api::call::reject` responds with a reject, but then execution continues, so when the method runs to completion it also attempts to send `()` the return value of this method.
+
+[I asked about this in discord](https://discord.com/channels/748416164832608337/872791506853978142/989976664693956638)  and [someone suggested](https://discord.com/channels/748416164832608337/872791506853978142/990543530889973830) that reject might only work from within `inspect_message`. However, according to the [IC Interface Spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-imports), reject can be called from updates, queries, or reply/reject callbacks:
+
+> ic0.msg_reject : (src : i32, size : i32) -> ();                             // U Q Ry Rt
+
+And when trying this as shown in the following canister it doesn't solve the problem:
+
+```rust
+#[ic_cdk_macros::update]
+async fn method() -> String {
+    "Custom Message".to_string()
+}
+
+#[ic_cdk_macros::inspect_message]
+async fn inspect_message() {
+    ic_cdk::api::call::reject("From Inspect Message...")
+}
+```
+Calling this from dfx results in:
+
+> Error: The replica returned an HTTP Error: Http Error: status 500 Internal Server Error, content type "", content: Requested canister failed to process the message acceptance request
+
+Additionally I've tried calling this canister in a cross-canister call in case there was a difference between `dfx call` and a cross-canister call. However when using `ic_cdk::api::call::reject_code` to check the return code, I still only get a 5 (`CANISTER_ERROR`) not a 4.
+
+Am I misunderstanding how to use `ic_cdk::api::call::reject` or is its implementation incorrect?
+
+-------------------------
+
+dansteren | 2022-06-27 21:10:44 UTC | #2
+
+@chenyan, @lastmjs pointed me your way. Do you have any idea what might be happening here?
+
+-------------------------
+
+levi | 2022-06-28 04:30:56 UTC | #3
+
+[quote="dansteren, post:1, topic:14060"]
+lib.rs
+```
+#[ic_cdk_macros::update]
+async fn method() -> () {
+    ic_cdk::api::call::reject("Custom message...")
+}
+```
+
+I expect that when called this would return a reject code of `4` and the “Custom message…” string that I passed in. Instead, when running `dfx canister call my_canister method` I get the following:
+
+> Error: The Replica returned an error: code 5, message: “Canister ryjl3-tyaaa-aaaaa-aaaba-cai violated contract: ic0.msg_reply_data_append: the call is already replied”
+[/quote]
+
+The `ic_cdk_macros::update` macro inserts a `ic_cdk::api::call::reply` into the end of the function. the system-api-specification says that there can be either one `reply` or one `reject` per call. For a manual reject, you can set the macro like this: `#[ic_cdk_macros::update(manual_reply = true)]`, but make sure to either call one `ic_cdk::api::call::reply` or one `ic_cdk::api::call::reject` in the function or else it will trap.
+
+
+and `ic_cdk::api::call::reject` can only be called within an update or query call or callback. `reject` cannot be called from within canister_inspect_message. [interface spec](https://internetcomputer.org/docs/current/references/ic-interface-spec/#system-api-imports).
+
+-------------------------
+
+lastmjs | 2022-06-28 14:25:21 UTC | #4
+
+@dansteren this is what I suspected, that the expanded macro was replying for us. We can discuss this offline, a bit problematic actually.
+
+@chenyan this seems like it might be a suboptimal DX? If the developer ever wants to call reject, they would have to remember to update their macro. Now in Azle it seems we'll have to create another type of Update call, perhaps an `UpdateManualReply`.
+
+-------------------------
+
+dansteren | 2022-06-28 16:30:37 UTC | #5
+
+Thanks for the insight! This gets me what I need to move forward.
+
+-------------------------
+

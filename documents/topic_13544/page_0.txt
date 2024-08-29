@@ -1,0 +1,100 @@
+modclub | 2022-06-06 20:03:51 UTC | #1
+
+Hi all, 
+
+Beginning yesterday Sunday, June 5, 2022, we noticed that many of our users are receiving the error "Exceeded the instruction limit for single message execution" for several of our calls. This issue does not impact all accounts, for example, some older accounts are able to make calls without any problems. Testing the exact same code in our development environment also shows no issues with new or older users. 
+
+My questions:
+
+* Is anyone currently experiencing similar issues?
+* Has anyone resolved similar issues in the past?
+* Has there been any recent issues with the Internet Identity or Boundary nodes that could be causing issues for some users but not others?
+
+Thanks,
+MODCLUB Team
+
+-------------------------
+
+icme | 2022-06-06 20:12:26 UTC | #2
+
+This can happen when you're trying to insert a large volume of data into your canister, or if you data are arranged in an inefficient manner. 
+
+As the data in your canister gets larger, you may be performing more iterations than permitted by the instruction limit if the operations being performed on your data or your data structures themselves are inefficient or not well suited to your use case.
+
+It might be a good time to do an analysis of your code to find any unnecessary loops, or if you are storing your data in a sub-optimal manner (such that you are iterating through your entire data set to perform a single insertion, update, or deletion).
+
+-------------------------
+
+modclub | 2022-06-06 22:25:03 UTC | #3
+
+@icme Thank you for the quick response. We are looking into that further, initially, we believed that to be the case but the existing users not experiencing the problem threw us off. However, there is a hashmap object that we only access when newer users make a request. This seems to have grown over some limit so we are adjusting this section of code.
+
+**Update**
+
+This wasn't a performance-related issue but a limit on HashMap, which we were using for auditing certain requests that had been added to overtime. The map reached a limit and we were unable to add more and so it returned the error: **Exceeded the instruction limit for single message execution**. 
+
+It would be good if the error returned was more specific to the issue but hopefully this helps other developers in the future.
+
+-------------------------
+
+matthewhammer | 2022-06-06 22:58:16 UTC | #4
+
+[quote="modclub, post:3, topic:13544"]
+The map reached a limit and we were unable to add more and so it returned the error: **Exceeded the instruction limit for single message execution**.
+
+It would be good if the error returned was more specific to the issue but hopefully this helps other developers in the future.
+[/quote]
+
+This seems like an outstanding performance bug with the HashMap (in Motoko, right?)
+
+Have you been able to reproduce that behavior?  Or if not, can you explain how someone would try?
+
+(It is possible that growing the hash table is too costly at some point, but it also seems possible that there's some performance bug that is preventing that from working correctly.
+
+If it is working correctly but running out of space, it could be due to the HashMap using a lot of linked list cells under the hood that all need to get replaced when it grows.  That step could churn a lot of memory, even if working correctly.  Still not sure myself.)
+
+Have you tried using the TrieMap in place of the HashMap?  Unlike with HashMap, there is no "growing" step for the TrieMap, so the same issue should not arise.  Every operation it does is worst-case O(#hashbits), as opposed to the worst-case O(N) insertion that can happen when growing the HashMap to the next doubling of its array size.
+
+[As one example, the Motoko Playground "saved projects" feature uses a Trie in a stable variable.](https://github.com/dfinity/motoko-playground/blob/808d05de556b2e98f880f85392fc5e359e1ed709/service/saved/Saved.mo#L27)
+
+-------------------------
+
+modclub | 2022-06-06 23:05:31 UTC | #5
+
+Here are some further details:
+
+* 262_144 is the number of elements in this HashMap
+* The HashMap type is HashMap.HashMap<Text, RequestObject>
+* RequestObject  = {
+        requestDesc: Text;
+        pId: Principal;
+        rId: Principal;
+    };
+
+We haven't used TrieMap but it is something we will explore in the future. It does make sense that this was caused by the growing steps for HashMap. Thank you @matthewhammer
+
+-------------------------
+
+matthewhammer | 2022-06-07 11:44:25 UTC | #6
+
+[quote="modclub, post:5, topic:13544"]
+* 262_144 is the number of elements in this HashMap
+* The HashMap type is HashMap.HashMap<Text, RequestObject>
+[/quote]
+
+Now I am looking at this number of elements and the type `Text` and wondering how long each `Text` element tends to be?
+
+Since writing my response above, I looked back at the resizing logic for HashMap in the base library to refresh my memory again.  Indeed, it actually rehashes the keys when it grows the table.
+
+That rehashing of *every* key is likely very expensive for `262_144` key elements each of some `Text` (the `RequestObject` type is not relevant to the time cost of inserting or resizing, but would be relevant to the overall size cost, of course.). It would not surprise me if doing that resizing step would exceed the instruction limit for a message execution.
+
+Again, the Trie and TrieMap structures will not suffer from this issue (as I mentioned in the "solution" above), but now I think an even better solution could be to revisit the design of this `HashMap`, with this issue in mind.  By storing some extra space for the hash value (as the `Trie` already does internally in its representation, for its own purposes), we can avoid a lot of the cost of this step for resizing.
+
+-------------------------
+
+modclub | 2022-06-07 22:31:48 UTC | #7
+
+The Text key element is roughly 50 - 60 characters long.
+
+-------------------------
+

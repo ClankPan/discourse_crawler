@@ -1,0 +1,129 @@
+iamenochchirima | 2023-09-26 09:30:40 UTC | #1
+
+So in Motoko, let's say I an actor X , and then a I have modules say A and B  which I'm importing in my Actor. Is it a good practice to declare some state variables in those modules and then access the data in my actor after importing or I should only declare state variables in the actor itself and use them directly from there? 
+If it's okay to declare and manage state variable in the modules are there some trade offs associated with that?
+
+-------------------------
+
+ilbert | 2023-09-26 10:55:52 UTC | #2
+
+I'm also interested in understanding this.
+Since we're building the Motoko CDK for the [IC WebSocket](https://forum.dfinity.org/t/ic-websocket-roadmap/21503), I was facing the same questions and I was discussing about it with @luc-blaeser two weeks ago, so he may have good suggestions.
+Following the topic!
+
+-------------------------
+
+claudio | 2023-09-26 12:58:20 UTC | #3
+
+By design, you are actually not allowed to declare mutable values in imported modules.
+
+Libraries cannot be stateful, but can declare functions or classes that return stateful values.
+
+-------------------------
+
+iamenochchirima | 2023-09-26 13:33:37 UTC | #4
+
+Okay thank you, so just to confirm if I understood correctly, I just can't declare mutable values in the module itself but in a class inside the module I can. 
+
+Does system pre and post upgrade functions work the same way within a class for the mutable state variables declared in that class just like they do in an actor itself?
+
+-------------------------
+
+claudio | 2023-09-26 13:40:06 UTC | #5
+
+No, they don't at the moment. Every bit of state you want to save has to be reachable from one of the actor's stable variables.
+
+Indeed, an ordinary class cannot declare pre and post upgrade hooks (only actor classes can, but instance of those are actually completely separate canisters).
+
+-------------------------
+
+iamenochchirima | 2023-09-26 14:29:48 UTC | #6
+
+I see, thank you. 
+
+I'm just trying to find a way for better code organisation and management by having some actual complete code functionalities run in classes that are in different modules and just access them as imports. 
+
+So if I create a class within some module, and then create some stateful variables in that class, if I want the state of those variables to persist accross canister upgrades I have to reach that data from the stable variables of the actor. 
+If I do that, let's say after an upgrade, is it possible to have the state of those variables back in the state variables of the class? Like is it possible to transfer some state from the actor to a class within some module in my code?
+
+-------------------------
+
+rossberg | 2023-09-27 13:05:54 UTC | #7
+
+Note that classes cannot have state in Motoko either. Only instance objects can, which you'll have to store somewhere. So by construction, you cannot define (non-garbage) state that is not reachable from an actor.
+
+-------------------------
+
+claudio | 2023-09-29 17:46:34 UTC | #8
+
+A pattern you can use is to define functional, not oo, libraries that define the state as a (stable) type, and then provide functions that take the state as an explicit argument.
+
+You can then store the actual state in stable variables of the actor.
+
+-------------------------
+
+claudio | 2023-09-29 18:16:12 UTC | #9
+
+Here's a very simple example I happen to have handy to illustrate the point (but don't use this in production because long linked lists don't play nice with our (current) serializer):
+
+Library HeapLogger.mo
+```
+import Nat64 "mo:base/Nat64";
+import Text "mo:base/Text";
+import Array "mo:base/Array";
+import List "mo:base/List";
+
+module HeapLogger {
+
+  // type Log is stable, but not scalable
+  type Log = { var list : List.List<Text> };
+
+  public func new() : Log {
+    { var list = List.nil<Text>() }
+  };
+
+  public func log(l : Log, t : Text) {
+    l.list := List.push(t, l.list);
+  };
+
+  public func readLast(l : Log, count : Nat) : [Text] {
+    List.toArray(List.take(l.list, count));
+  };
+};
+```
+
+Main actor:
+```
+import Logger "HeapLogger"
+
+actor Client {
+
+  stable let ok = Logger.new();
+
+  stable let err = Logger.new();
+
+  public func div(n : Nat, m : Nat) : async ?Nat {
+    if (m == 0) {
+      Logger.log(err, debug_show { n; m });
+      return null;
+    };
+    let d = n / m;
+    Logger.log(ok, debug_show { n; m; d });
+    ?d;
+  };
+
+  public query func history(n : Nat) : async {
+    ok : [Text];
+    err : [Text]
+  } {
+    {
+      ok = Logger.readLast(ok, n);
+      err = Logger.readLast(err, n);
+    };
+  };
+
+};
+```
+
+-------------------------
+

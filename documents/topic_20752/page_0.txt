@@ -1,0 +1,357 @@
+megared | 2023-06-16 09:48:08 UTC | #1
+
+Is it possible to perform functional testing of ICP-enabled features against a WebAssembly module built from some code (I'm using rust)?
+For example, cross-canister calls, writes to canister storage, calls to public query/update functions defined in a candid interface, etc., which can be in the form of a separate mock for each of these.
+
+I browsed the following places, but could not find anything like that, so I asked this question.
+https://internetcomputer.org/docs/current/developer-docs/security/general-security-best-practices
+https://internetcomputer.org/docs/current/developer-docs/security/rust-canister-development-security-best-practices
+
+The one that is already publicly available other than unit test is e2e, which uses canister that is actually deployed, and is done locally by building a small ICP network using dfx.
+https://github.com/krpeacock/sample-canister-e2e
+https://github.com/dfinity/invoice-canister/tree/main/test/e2e
+
+Is it possible to test using a generic wasm runtime (e.g. wasmtime) instead of deploying an actual canister?
+
+-------------------------
+
+domwoe | 2023-06-16 10:42:44 UTC | #2
+
+You should have a look at https://github.com/icopen/lightic (CC: @stopak).
+
+-------------------------
+
+megared | 2023-06-17 06:46:10 UTC | #3
+
+Thanks for your advice!
+A development environment like hardhat would be nice.
+How would you use this tool?
+I didn't find much about it in the README.
+Is there an example page or instructional page?
+
+-------------------------
+
+stopak | 2023-06-19 08:16:10 UTC | #4
+
+Hi
+
+I'm still working on that part :).
+
+In order to start using this tool you need to add it to package.json which should be in the same directory as your dfx.json file. 
+
+So you could start with
+
+```
+npm i lightic
+```
+
+Than you need to choose the js testing framework, it could be: mocha, jest, vitest or any other.
+
+For the mocha, you can check an example here:  https://github.com/icopen/lightic/tree/main/test
+
+In order to be able to write test in mocha using typescript, you need to add following packages
+```
+npm i     @types/mocha @types/node typescript mocha chai ts-node
+```
+
+And create `.mochars.json` with content
+```JSON
+// This config file contains Mocha's defaults.
+// This same configuration could be provided in the `mocha` property of your
+// project's `package.json`.
+{
+    "diff": true,
+    "extension": ["js", "cjs", "mjs", "ts"],
+    "package": "./package.json",
+    "reporter": "spec",
+    "slow": "75",
+    "timeout": "2000",
+    "ui": "bdd",
+    "watch-files": ["lib/**/*.js", "test/**/*.ts"],
+    "watch-ignore": ["lib/vendor"],
+    "loader": "ts-node/esm"
+  }
+```
+
+In order to actually test your canister, you need to add to your test file
+```
+import { TestContext } from 'lightic'
+
+const context = new TestContext()
+```
+
+This will create a context to run tests, it is a harness that gives you a possibility to install and run canisters
+
+```
+const canister = await context.deploy('./dfx/local/canisters/example/example.wasm')
+const caller = Principal.anonymous()
+const actor = Actor.createActor(canister.getIdlBuilder(), {
+  agent: context.getAgent(caller),
+  canisterId: canister.get_id()
+})
+```
+
+As you can see this works with a `wasm` file, so you need to first compile the project using dfx, in the future the test harness will also take care of compilation. 
+
+You also need to specify the identity principle (who is calling the canisters) and create an actor.
+
+Then you get an actor, which is the same type as regular dfinity actor.
+
+In order to call canister:
+
+```
+const result = await actor.test_caller()
+```
+
+If you have any questions regarding the usage, I can help
+
+-------------------------
+
+megared | 2023-06-22 15:53:22 UTC | #5
+
+Thank you for telling us about it!
+I was able to run a simple test with the information you gave me, and I'm going to try a few things.
+
+```ts
+  it("Deploy", async () => {
+    await context.deploy('./modules/hello_motoko/hello_motoko.wasm')
+    await context.deploy('./modules/hello_rust/hello_rust.wasm')
+  
+    const canisters = context.replica.get_canisters()
+    // there is management canister installed by default
+    assert.equal(canisters.length, 3)
+  })
+```
+
+By the way, not directly related to lightic, the wasm required by TestContext must have icp:public candid:service in the metadata, is there any way to automatically add this at dfx build time?
+I have used ic-wasm to add it myself.
+ref: https://github.com/dfinity/ic-wasm#metadata
+
+icp:private candid:service is granted by default, and if I grant myself icp:public and then try to deploy that wasm with actual dfx, I get an error.
+
+>Error: Failed while trying to deploy canisters.
+Caused by: Failed while trying to deploy canisters.
+  Failed while trying to install all canisters.
+    Failed to install wasm module to canister 'counter_motoko'.
+      Failed during wasm installation call: The Replica returned an error: code 5, message: "Wasm module of canister bkyz2-fmaaa-aaaaa-qaaaq-cai is not valid: Wasm module has an invalid custom section. Invalid custom section: name candid:service already exists"
+
+Is there a wrong way to configure icp:public candid:service?
+
+-------------------------
+
+megared | 2023-06-23 07:23:22 UTC | #6
+
+I tried to write my own canister test with this reference, but I get an error.
+Do you have any idea what it is?
+
+https://github.com/icopen/lightic/blob/main/test/test.spec.ts#L40-L48
+https://github.com/icopen/lightic/blob/main/spec_test/src/tests.rs#L18-L22
+
+Here is the test and wasm I made.
+
+test (typescript)
+```ts
+  it("Call function", async () => {
+    const caller = Principal.anonymous()
+    const canister = await context.deploy('./modules/counter_motoko/counter_motoko.wasm');
+    const actor = context.getAgent(caller).getActor(canister)
+    
+    const res = await actor.get() as any[] // fail here!!!
+    console.log(res)
+  })
+```
+canister code (motoko)
+```motoko
+actor Counter {
+
+  stable var counter = 0;
+
+  // Get canister label name.
+  public query func name() : async Text {
+    return "CounterMotoko";
+  };
+
+  // Get the value of the counter.
+  public query func get() : async Nat {
+    return counter;
+  };
+
+  // Set the value of the counter.
+  public func set(n : Nat) : async () {
+    counter := n;
+  };
+
+  // Increment the value of the counter.
+  public func inc() : async () {
+    counter += 1;
+  };
+
+  // Reset the value of the counter.
+  public func reset() : async () {
+    counter := 0;
+  };
+};
+
+```
+wasm
+```bash
+% ic-wasm modules/counter_motoko/counter_motoko.wasm metadata
+icp:private candid:service
+icp:private candid:args
+icp:private motoko:stable-types
+icp:private motoko:compiler
+icp:public candid:service
+% ic-wasm modules/counter_motoko/counter_motoko.wasm metadata candid:service
+service : {
+  get: () -> (nat) query;
+  inc: () -> ();
+  name: () -> (text) query;
+  reset: () -> ();
+  set: (nat) -> ();
+}
+```
+
+The error that occurred at this time is as follows
+`Error: Canister trap!: internal error: unexpected state entering InQuery`
+
+```text
+       Call function:
+     Error: Canister trap!: internal error: unexpected state entering InQuery
+      at Ic0.trap (node_modules/lightic/src/ic0.ts:279:15)
+      at importObject.<computed> (node_modules/lightic/src/ic0.ts:17:61)
+      at wasm://wasm/000ab3be:wasm-function[399]:0x17b6f
+      at wasm://wasm/000ab3be:wasm-function[354]:0x17390
+      at WasmCanister.process_message (node_modules/lightic/src/wasm_canister.ts:207:9)
+      at ReplicaContext.process_message (node_modules/lightic/src/replica_context.ts:49:22)
+      at ReplicaContext.process_messages (node_modules/lightic/src/replica_context.ts:82:18)
+      at MockAgent.query (node_modules/lightic/src/mock_agent.ts:151:24)
+      at caller (node_modules/lightic/src/mock_actor.ts:83:34)
+      at CanisterActor.handler [as get] (node_modules/lightic/src/mock_actor.ts:129:11)
+      at Context.<anonymous> (tests/simple.test.ts:26:29)
+```
+
+-------------------------
+
+megared | 2023-06-24 01:04:41 UTC | #7
+
+Thank you for introducing me to icopen/lightic.
+I would like to know more about this kind of developer environment, as well as other tools (more loosely coupled with the icp mechanism, dedicated to testing, etc.).
+Do you know of any others or have any suggestions?
+
+-------------------------
+
+stopak | 2023-06-24 12:56:21 UTC | #8
+
+Can you share the code, you are trying to test? It might be a bug in lightic
+
+-------------------------
+
+stopak | 2023-07-14 16:47:29 UTC | #9
+
+Hey, I've just published updated version of lightic. I've solved several issues, with symptoms similar to yours. New version is v0.3.0
+
+-------------------------
+
+ilbert | 2023-07-23 18:57:41 UTC | #10
+
+@stopak is it possible to use LightIC with [Jest](https://jestjs.io/) also?
+
+-------------------------
+
+stopak | 2023-07-24 07:33:40 UTC | #11
+
+Hey, of course. It will work with most of JS/TS test packages.
+
+-------------------------
+
+AliSci | 2024-01-20 12:58:30 UTC | #12
+
+How to mock a `caller` who is not `anonymous` can I 
+```tsx
+const caller = Principal.mockCaller()
+```
+
+-------------------------
+
+AliSci | 2024-01-20 13:32:15 UTC | #13
+
+```bash
+Unit Failed Tests 1 
+----
+
+ FAIL  src/frontend/tests/React/chat.test.tsx > Should contain a candid interface
+Error: ENOENT: no such file or directory, open '../../../../target/wasm32-unknown-unknown/release/user_canister.wasm'
+ ❯ Object.openSync node:fs:600:3
+ ❯ Object.readFileSync node:fs:468:35
+
+```
+```tsx
+import {TestContext} from 'lightic'
+
+const context = new TestContext()
+
+test("Should contain a candid interface", async () => {
+    const canister_context = await context.deploy("../../../../target/wasm32-unknown-unknown/release/user_canister.wasm")
+```
+any ideas please?
+
+-------------------------
+
+kristofer | 2024-01-20 18:11:28 UTC | #14
+
+Consider giving [PocketIc](https://crates.io/crates/pocket-ic) a try, it works great for integration testing canisters.
+
+> [PocketIC](https://github.com/dfinity/pocketic) is a local canister testing solution for the [Internet Computer](https://internetcomputer.org/).
+This testing library works together with the **PocketIC server** , allowing you to interact with your local IC instances and the canisters thereon.
+
+To mock a principal you can for example create one from a random seed.
+
+```Rust
+pub fn create_test_identity() -> BasicIdentity {
+    let mut ed25519_seed = [0u8; 32];
+    rand::thread_rng().fill(&mut ed25519_seed);
+    let ed25519_keypair =
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&ed25519_seed).unwrap();
+    BasicIdentity::from_key_pair(ed25519_keypair)
+}
+```
+
+-------------------------
+
+AliSci | 2024-01-21 07:21:41 UTC | #15
+
+Error: The PocketIC binary is only available for x64 Linux and Intel/rosetta-enabled Darwin, but you are running darwin arm64.
+```
+test("Should contain a candid interface", async () => {
+    let pic = await PocketIc.create()
+    const fixture = await pic.setupCanister<_SERVICE>(
+        idlFactory,
+        WASM_PATH,
+    );
+    let actor = fixture.actor;
+
+})
+```
+
+-------------------------
+
+AliSci | 2024-01-21 12:45:38 UTC | #16
+
+also in rust 
+```rs
+ let res_bytes: WasmResult = pic.update_call(
+        can_id,
+        Principal::anonymous(),
+        "register",
+        encode_one(args.clone()).unwrap(),
+    )
+        .expect("Failed to call counter canister");
+    // let expected = Err("Anonymous users are not allowed to register.".to_string());
+
+    println!("res_bytes: {:?}", res_bytes);
+
+```
+why this is in bytes not an acutal replay like `Result<String,String>` or something how to convert it?
+
+-------------------------
+

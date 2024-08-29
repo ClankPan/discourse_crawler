@@ -1,0 +1,108 @@
+gravity_vi | 2024-02-15 04:47:19 UTC | #1
+
+Migrating to the latest version of ic_stable_structures panics due to `max_size`  being greater than actual size of the struct. I have explained the problem in detail below
+
+I had a struct `WasmType` which looked like this:
+
+```rs
+#[derive(Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, CandidType)]
+pub enum WasmType {
+    SubnetOrchestratorWasm,
+    IndividualUserWasm,
+    PostCacheWasm
+}
+
+impl Storable for WasmType {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        let mut bytes = vec![];
+        ciborium::ser::into_writer(self, &mut bytes).unwrap();
+        Cow::Owned(bytes)
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        let wasm_type: WasmType = de::from_reader(bytes.as_ref()).unwrap();
+        wasm_type
+    }
+}
+
+impl BoundedStorable for WasmType {
+    const MAX_SIZE: u32 = 100;
+
+    const IS_FIXED_SIZE: bool = true;
+}
+```
+
+This worked perfectly fine.
+
+Once I migrated to latest version of ic-stable-structures (0.6.2) I reimplemented the trait `Storable` to include `Bound` and removed the implementation of `BoundedStorable`
+
+```rs
+impl Storable for WasmType {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        let mut bytes = vec![];
+        ciborium::ser::into_writer(self, &mut bytes).unwrap();
+        Cow::Owned(bytes)
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        let wasm_type: WasmType = de::from_reader(bytes.as_ref()).unwrap();
+        wasm_type
+    }
+
+    const BOUND: Bound = Bound::Bounded { max_size: 100, is_fixed_size: true };
+}
+```
+
+Using this again with stable_structures panics with error
+```sh
+Panicked at 'assertion `left == right` failed: expected a fixed-size element with length 100 bytes, but found 19 bytes\n
+```
+
+isn't `max_size` an upper bound for the size of the struct?
+
+-------------------------
+
+ielashi | 2024-02-15 09:34:20 UTC | #2
+
+If `is_fixed_size` is set to true, that means that every single element must be _exactly_ of length `max_size` (i.e. 100 bytes). If `max_size` is simply a cap and elements can be <= 100 bytes, then `is_fixed_size` should be false. The error you're seeing is exactly what I would expect.
+
+What is surprising to me is that you're saying that in the previous version this was working. Are you sure in your previous code that was deployed to production you had both `MAX_SIZE = 100` _and_ `IS_FIXED_SIZE = true`?
+
+-------------------------
+
+gravity_vi | 2024-02-15 12:01:50 UTC | #3
+
+Yes. 
+https://github.com/go-bazzinga/hot-or-not-backend-canister/blob/ad9d076a1b93d3ecd69a2e85dd29096c10f038ef/src/lib/shared_utils/src/common/types/wasm.rs#L10
+
+We are using version 0.5.6.
+
+-------------------------
+
+gravity_vi | 2024-02-15 12:04:26 UTC | #4
+
+I assumed `max_size` is an upper limit. So every value of type WasmType would be of fixed size and none of them would exceed 100 bytes limit
+
+-------------------------
+
+ielashi | 2024-02-15 12:32:33 UTC | #5
+
+I narrowed it down to [this commit](https://github.com/dfinity/stable-structures/commit/48866e6b2ee1af6d4abd2be101555890b1939d26) where we introduced more rigorous checks to ensure developers aren't specifying incorrect bounds, as is the case here.
+
+Your current configuration is definitely incorrect, but the only real consequence of it is that you're allocating more memory than you need.
+
+The easiest path forward, if you're keen on upgrading, would be a migration. How big is the data? If it's small enough that it can serialized within a single message, then migration can be relatively simple:
+
+1. Move the map temporarily to the heap.
+2. Upgrade stable structures
+3. Create a new `StableBTreeMap`
+4. Move the data back
+
+-------------------------
+
+gravity_vi | 2024-02-15 13:16:06 UTC | #6
+
+The data is small. I will follow the steps that you suggested. Thank you so much
+
+-------------------------
+

@@ -1,0 +1,282 @@
+infu | 2022-03-01 14:01:32 UTC | #1
+
+Just made this repo and decided to share it.
+I am going to make a security audit of my canisters with this.
+https://github.com/infu/icblast
+
+# Purpose
+
+Made for easy testing of any canisters, including Motoko Playground canisters without manually providing interface spec.
+
+If you use too high concurrency you may get IP blocked by gateways.
+
+By default works with production IC network.
+
+You can also make it work with your local replica if you specify NODE_ENV=development and IC_HOST in .env
+
+Easy as:
+
+```
+let output = await(await anycan("x2ojg-ciaaa-aaaab-qadba-cai")).anyfunc(input);
+```
+
+# Usage
+
+```
+import { anycan, fileIdentity, blast } from "./sys/index.js";
+
+let identityJohn = fileIdentity(0);
+
+// TIP: Go to Motoko Playground at https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/
+// Choose "Counter" and deploy it
+// Take the canister id and put replace it in this code
+
+let counterCanJohn = await anycan("x2ojg-ciaaa-aaaab-qadba-cai", identityJohn);
+
+// If you need different callers
+// let identityPeter = fileIdentity(1);
+// let counterCanPeter = await anycan("x2ojg-ciaaa-aaaab-qadba-cai", identityPeter);
+
+// sends 10 requests with max concurrency 5 at a time
+let results = await blast(10, 5, (idx) => {
+  return counterCanJohn.get();
+});
+```
+
+-------------------------
+
+infu | 2022-03-01 15:57:50 UTC | #2
+
+Here is one example of why I made this:
+A canister with the following code https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1189572458
+```
+actor Counter {
+
+  stable var counter:Nat32 = 0;
+
+  public func waste_some_time() : async () {
+    ()
+  };
+
+  public func inc() : async Nat32 {
+    
+    counter += 1;
+    await waste_some_time();
+
+    return counter
+
+  };
+};
+
+```
+
+When executed **without** concurrency, the output is
+[
+  1, 2, 3, 4,  5,
+  6, 7, 8, 9, 10
+]
+TEST: 38.432s
+```
+// No concurrency
+let results = await blast(10, 1, async (idx) => {
+  await delay(1); // 1ms 
+  return counterCanJohn.inc();
+});
+```
+
+When executed with 10 concurrent requests, the output is
+[
+  10, 9, 9, 9, 9,
+   9, 9, 9, 9, 9
+]
+TEST: 5.551s
+
+```
+// 10 concurrent requests
+let results = await blast(10, 10, async (idx) => {
+  await delay(1); // 1ms
+  return counterCanJohn.inc();
+});
+```
+
+The proper order -> you switch counter and await like so:
+```
+    await waste_some_time();
+    counter += 1;
+```
+Then 10 concurrent requests produce this:
+[
+  1, 2, 3, 4,  7,
+  8, 5, 6, 9, 10
+]
+TEST: 6.292s
+
+NOTE: at first I was getting the same results with concurrent requests no matter what the canister code was. After placing 1ms delay things got fixed. There is probably some protection in the fetch library or agentjs against making a lot of calls by mistake.
+
+-------------------------
+
+infu | 2022-09-27 17:05:21 UTC | #3
+
+Had to make a few can calls, change things, and do a few more in maintenance scripts and ic-repl wasn't getting the job done, so I repurposed `icblast` slightly. Probably the easiest way to make IC calls and do things for the JS fluent.
+
+```
+npm i @infu/icblast
+```
+
+https://www.npmjs.com/package/@infu/icblast
+
+```
+import icblast from "@infu/icblast";
+
+let ic = icblast({ local: true });
+
+let can = await ic("r7inp-6aaaa-aaaaa-aaabq-cai");
+
+console.log( await can.config_get() );
+```
+
+it uses the __get_candid_interface_tmp_hack, converts it to IDL, and creates an actor with AgentJs behind the curtains, so you don't have to give it canister spec
+
+-------------------------
+
+rckprtr | 2022-09-27 19:20:54 UTC | #4
+
+This is a great approach to a problem I face daily.
+
+-------------------------
+
+domwoe | 2022-09-27 19:29:08 UTC | #5
+
+Seems like a good fit for https://forum.dfinity.org/t/announcing-developer-tools/15662 ;)
+
+-------------------------
+
+kpeacock | 2022-09-27 20:31:46 UTC | #6
+
+If anyone is curious, I think we enabled unique nonces for concurrent requests by default since the first post. This is neat though, and fetching and interpreting the IDL automatically is an interesting pattern!
+
+-------------------------
+
+infu | 2022-09-27 21:22:40 UTC | #7
+
+The rabbit hole runs deep. I wanted it to be able to run with the identity from dfx and pretty much-tried everything, along with your node-identity repo and a few libraries.
+I can't get the pem file to create the same identity with Secp256k1KeyIdentity.fromSecretKey(..)
+
+Anyway, I have a better idea.
+
+-------------------------
+
+kpeacock | 2022-09-27 22:28:11 UTC | #8
+
+The only pattern i'm aware of is to start with a seed phrase, using the pattern from my node-identity repo. Then you can import the identity with Quill, and then use the identity from Quill in `dfx`.
+
+It's a really sketchy process though, and I don't encourage it
+
+-------------------------
+
+infu | 2022-09-28 10:42:38 UTC | #9
+
+Just added a new feature :slight_smile: 
+Internet Identity authorization.
+```
+let identity = await internetIdentity();
+console.log(identity.getPrincipal().toText());
+let ic = icblast({ identity });
+let can = await ic("kbzti-laaaa-aaaai-qe2ma-cai");
+let res = await can.config_get();
+```
+Demo: https://www.youtube.com/watch?v=P8UWlO4mY9c
+
+For me, it's pretty secure because I made it. Everyone else will have to trust me and my repo and that's suboptimal. It will probably be better if Dfinity takes and audits it. Not done with it tho. Will add wallet proxy calls later.
+
+The temporary website has this content inside https://github.com/infu/identitybridge
+
+This is what it does, not really sure taking the privateKey like that is correct and will always produce the same identity, but so far it's good.
+```
+authClient.login({
+      onSuccess: async (e) => {
+        let key = authClient._key._privateKey;
+
+        fetch("/key", {
+          method: "POST", // or 'PUT'
+          body: key,
+        }).then((x) => {
+          window.close();
+        });
+      },
+      onError: reject,
+    });
+```
+
+EDIT: As I suspected, it's wrong to take privateKey this way. I have to take the whole delegation chain
+
+EDIT: The proper way of passing it was the way auth-client does it:
+ ```
+let key = Ed25519KeyIdentity.fromJSON(req.body.key);
+let chain = DelegationChain.fromJSON(req.body.chain);
+let identity = DelegationIdentity.fromDelegation(key, chain);
+```
+
+-------------------------
+
+pramitgaha | 2023-05-29 03:09:22 UTC | #10
+
+hello, I try to run an example on my local machine, but it fails
+
+code:
+```
+import icblast from "@infu/icblast";
+// import { explainer } from "@infu/icblast";
+
+let ic = icblast({ local: true }); // you can also add local_host: "http://192.168.0.100:8000"
+
+let can = await ic("r7inp-6aaaa-aaaaa-aaabq-cai"); // It will fetch the IDL spec, no need to specify it manually
+
+console.log(await can.config_get());
+```
+
+error:
+```
+❯ node contract.mjs
+file:///Users/pramitgaha/programs/icp/DecentralisedTradeAssociation/interfaces/node_modules/@infu/icblast/src/index.mjs:9
+import { toState, explainer } from "./actress.js";
+                  ^^^^^^^^^
+SyntaxError: Named export 'explainer' not found. The requested module './actress.js' is a CommonJS module, which may not support all module.exports as named exports.
+CommonJS modules can always be imported via the default export, for example using:
+
+import pkg from './actress.js';
+const { toState, explainer } = pkg;
+
+    at ModuleJob._instantiate (node:internal/modules/esm/module_job:124:21)
+    at async ModuleJob.run (node:internal/modules/esm/module_job:190:5)
+
+Node.js v18.14.1
+```
+
+-------------------------
+
+infu | 2023-05-30 07:12:21 UTC | #11
+
+Hey, sorry you have trouble with it.
+Are you importing the last version?
+What are you importing it into? bundler?
+It looks like it finds toState, but can't find explainer. Try npm I @infu/icblast@latest
+If it's something from our repo, I think I can fix it with a new bundler
+
+-------------------------
+
+pramitgaha | 2023-05-30 07:34:10 UTC | #13
+
+thank you for the response :slight_smile: 
+I followed the repo instruction: https://github.com/infu/icblast#install
+and was trying to run one of the examples. I put the code in a file named `contract.mjs` and tried to run the file using `node contract.mjs`
+and it fails at that time...
+
+-------------------------
+
+infu | 2023-05-30 16:53:11 UTC | #14
+
+I just got the same problem. Going to get it fixed in the next version, probably tomorrow.
+
+-------------------------
+

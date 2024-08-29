@@ -1,0 +1,168 @@
+ildefons | 2022-10-11 12:48:04 UTC | #1
+
+When retrieving a block from the archive canister using the following dfx command:
+
+```
+> dfx canister --network ic call qjdve-lqaaa-aaaaa-aaaeq-cai get_blocks '(record {start = 1: nat64; length = 1:nat64})'
+```
+I get the following reply that I am not able to decode it. How can I decode it? 
+
+```
+dfx.json not found, using default.
+(
+  variant {
+    17_724 = record {
+      2_817_142_406 = vec {
+        record {
+          1_266_835_934 = record {
+            1_213_809_850 = 0 : nat64;
+            2_688_582_695 = variant {
+              859_142_850 = record {
+                25_979 = blob "t\ec\82\f5\e0\d8\05*\a1\1d\c7H$\9b\dd\0a\ec)\d6(\19\9e\ee\ef\ad\d0\13\8f\8b\1b\10Y";
+                3_573_748_184 = record { 5_035_232 = 311_585_714_285 : nat64 };
+              }
+            };
+            3_258_775_938 = record {
+              268_680_022 = 1_620_328_630_192_468_691 : nat64;
+            };
+          };
+          2_781_795_542 = record {
+            268_680_022 = 1_620_328_630_192_468_691 : nat64;
+          };
+          4_121_316_931 = opt blob "\ff\ca\0e\cf^\83uA\c7\ee[\e41\e43\ad\8e\97*\7f7\1e\86\fb\e4\f8\addl|\bc\ea";
+        };
+      };
+    }
+  },
+)
+
+```
+
+-------------------------
+
+Severin | 2022-10-11 15:28:42 UTC | #2
+
+Quickest: compare with the [archive canister did file](https://github.com/dfinity/ic/blob/master/rs/rosetta-api/ledger_canister/ledger_archive.did) and translate in your head. The order of lines stays the same between what's mentioned in the .did file and how it's outputted.
+
+Nicer solution: Download the .did file (linked above) and use the `--candid <path/to/can.did>` option with `dfx canister call`.
+
+-------------------------
+
+ildefons | 2022-10-12 10:40:02 UTC | #3
+
+I just used ```  --candid <path/to/can.did> ```
+
+I can now see the the fields of the transaction.
+
+However, there is still 2 fields ("to" and "parent_hash") of type "blob" and "opt blob" respectively that I don't know how to decode. How can I decode them? 
+
+```
+$ dfx canister --network ic call qjdve-lqaaa-aaaaa-aaaeq-cai get_blocks '(record {start = 1: nat64; length = 1:nat64})' --candid ./src/ledger_archive.did 
+dfx.json not found, using default.
+(
+  variant {
+    Ok = record {
+      blocks = vec {
+        record {
+          transaction = record {
+            memo = 0 : nat64;
+            operation = opt variant {
+              Mint = record {
+                to = blob "t\ec\82\f5\e0\d8\05*\a1\1d\c7H$\9b\dd\0a\ec)\d6(\19\9e\ee\ef\ad\d0\13\8f\8b\1b\10Y";
+                amount = record { e8s = 311_585_714_285 : nat64 };
+              }
+            };
+            created_at_time = record {
+              timestamp_nanos = 1_620_328_630_192_468_691 : nat64;
+            };
+          };
+          timestamp = record {
+            timestamp_nanos = 1_620_328_630_192_468_691 : nat64;
+          };
+          parent_hash = opt blob "\ff\ca\0e\cf^\83uA\c7\ee[\e41\e43\ad\8e\97*\7f7\1e\86\fb\e4\f8\addl|\bc\ea";
+        };
+      };
+    }
+  },
+)
+
+
+```
+
+-------------------------
+
+Severin | 2022-10-12 11:34:16 UTC | #4
+
+In both cases I'd expect the data to be binary data - the `to` field is likely an account identifier and the `parent_hash` is just what it says: a hash. As for how that would be converted to actual bytes (or hex) I don't know. I'll ping the Candid specialists for that.
+
+-------------------------
+
+chenyan | 2022-10-12 16:04:34 UTC | #5
+
+`blob` is a short hand for `vec nat8`, which represents binary data. If the byte is a printable ascii, we show that character directly. Otherwise, we use `\xx` to represent its hex byte. For example, blob "t\ec\82" would be 74ec82 in hex.
+
+-------------------------
+
+ildefons | 2022-10-13 17:14:32 UTC | #6
+
+@chenyan @Severin, could you help me with these more detailed questions about the record format:
+
+1) What is 'memo' for? it seems that it is always 0. If it always 0, why is it there?
+
+2) Every record has information about the destination of the transaction ('to' field) but it has no information about the origin (there is no 'from' field). Without this information, it is not possible to trace the flow of transactions. Is this correct? How can I identify the origin of every transaction?
+
+-------------------------
+
+Severin | 2022-10-14 06:25:06 UTC | #7
+
+1. I'm only 99% sure, but I think the memo is for transaction (TX) deduplication. I have a canister that triggers multiple identical transfers in the same function and if I don't change the memo between the TXs then it only executes one payment. Maybe there's some more behind the memo, but that's the use case I know about.
+2. If you look at the [.did file](https://github.com/dfinity/ic/blob/master/rs/rosetta-api/ledger_canister/ledger_archive.did#L7-L22), you can see that there's three TX types: Mint, Burn, and Transfer. It looks like you only found blocks with Mint operations in them, that's why you haven't seen a `from` field yet.
+
+-------------------------
+
+ildefons | 2022-10-16 14:31:02 UTC | #9
+
+@Severin @chenyan, I have successfully decoded the principal_ids and confirmed that they exist, so the decoding works. However, when I apply the same decoding algorithm to the `parent_hash` field, I am not able to find the transaction (FYI, I use https://www.icpexplorer.org/#/tx/<parent_hash_decoded> ). Is the `parent_hash` field using a different decoding algorithm?
+
+-------------------------
+
+Severin | 2022-10-17 07:26:22 UTC | #10
+
+I think that would be a different algorithm. I'm not familiar with ledger, but I would assume this is a good entry point to start searching: https://github.com/dfinity/ic/blob/master/rs/rosetta-api/icrc1/src/lib.rs#L370
+
+-------------------------
+
+ildefons | 2022-10-17 10:46:25 UTC | #11
+
+actually, before sending my question, I tried to reverse engineer the encoding strategy for ```parent_has``` unsuccessfully probably because my rust skills are quiet bad. I would appreciate ledger developer's feedback :pray:
+
+-------------------------
+
+Severin | 2022-10-17 11:37:13 UTC | #12
+
+I'll ask the ledger guys then
+
+-------------------------
+
+bogwar | 2022-10-17 16:32:21 UTC | #13
+
+Hi @ildefons , 
+
+Please take a look at the [specification](https://internetcomputer.org/docs/current/references/ledger/) for the ledger . In particular, there's a [section](https://internetcomputer.org/docs/current/references/ledger#_chaining_ledger_blocks) which describes how blocks are hashed. Hopefully that will help.
+
+-------------------------
+
+ildefons | 2022-10-21 11:09:08 UTC | #14
+
+@bogwar, I read the specification, but I cannot figure out how to extract the information I need. For instance, what I obtain from a dfx call is:
+
+```parent_hash = opt blob "\7f\a03-nLa\80L\be\22\a0|\aa\a8\c3\8eoZ\e5\d2\a2\d1\e5\b6\e8b\22\d9t\ef\9a";```
+
+What I want is a string that I can use to query the parent transaction using icscan for example (wrong tx hash):
+
+```https://icscan.io/transaction/59c91db5d34c06fcebb673f473d61c79de4532f87d257e652c097ce593da2700```
+
+Haw can I get the hash in string format?
+
+-------------------------
+

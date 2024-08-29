@@ -1,0 +1,829 @@
+lastmjs | 2022-02-07 16:31:57 UTC | #1
+
+GitHub issue: https://github.com/dfinity/certified-assets/issues/10
+
+I'm getting near the end of implementing partial responses for asset canisters, which allows more advanced streaming of audio and video content. My solution is working well locally, and I've deployed the new asset canister to production.
+
+The problem is that in production the partial responses no longer work. There are a few response headers that are key to getting this to work, `Content-Range` and `Accept-Ranges`. I wonder if the boundary nodes are filtering these out? Is there some boundary node whitelist that needs to be updated? And if so then why is the local IC replica not also implementing this whitelist?
+
+I'd love to get the whitelist updated ASAP so I can continue testing my solution. And as soon as this issue is addressed anyone can start using the new asset canister even before my pull request is approved (if they want to test it out).
+
+People I think can help: @yotam @diegop @ianblenke @jplevyak
+
+-------------------------
+
+jplevyak | 2022-02-07 17:41:07 UTC | #2
+
+The local replica does not route through the boundary node header filtering logic.
+I'll talk to the team and see about adding the Content-Range and Accept-Ranges headers.
+
+-------------------------
+
+lastmjs | 2022-02-07 18:21:56 UTC | #3
+
+Does the header filtering also filter out request headers?
+
+These are the additional request headers I need:
+
+1. Range
+2. If-Range (I don't have this implemented yet but it's in the http spec)
+
+These are the additional response headers I need:
+
+1. Accept-Ranges
+2. Content-Range
+
+I also need to allow status codes 216 and 416, not sure if those get filtered out somehow as well.
+
+-------------------------
+
+nomeata | 2022-02-07 19:05:46 UTC | #4
+
+It might help if someone writewrites up an actual specification for the HTTP gateway feature, so that we don't have to probe implementation defined behavior…
+
+-------------------------
+
+lastmjs | 2022-02-09 18:04:06 UTC | #5
+
+Can I get an update or ETA on when we could get these headers added? Also, seems the boundary nodes will be limiting a lot of functionality if we have to whitelist http headers
+
+-------------------------
+
+jplevyak | 2022-02-09 20:15:06 UTC | #6
+
+Why do you want range requests?  Best practices for video and audio are to name the path by a hash of the content and codecs, break up the content into time ranges and compression level named chunks and use separate files for each chunk.  Range requests are generally uncacheable and thus would requiring hitting the canister and would be very expensive and slow.   See https://en.wikipedia.org/wiki/HTTP_Live_Streaming for details.
+
+-------------------------
+
+lastmjs | 2022-02-09 20:50:14 UTC | #7
+
+Range requests seem to me to be fundamental to normally functioning audio and video on the web, otherwise the client players can't stop and resume at various locations in the audio or video. The `audio` and `video` elements make heavy use of range requests.
+
+My podcast Demergence is basically broken when people stream it because range requests aren't implemented. And this is through players like Apple Podcasts as well. Range requests are well supported on many client platforms.
+
+Notice how you can't skip around any of the audio elements here: https://ic3o3-qiaaa-aaaae-qaaia-cai.ic0.app/
+
+Notice how you can't jump around this video: https://rdbii-uiaaa-aaaab-qadva-cai.raw.ic0.app/canvas-timelapse.mp4
+
+Here's the issue in the certified-assets repo: https://github.com/dfinity/certified-assets/issues/10
+
+And this was kicked off by this tweet: https://twitter.com/dominic_w/status/1467144071449915395
+
+I need this feature for my podcast Demergence, and anyone else who wants to host audio or video will need range requests to work as well.
+
+-------------------------
+
+lastmjs | 2022-02-09 20:45:53 UTC | #8
+
+It also looks like HLS has very bad support in browsers if I'm not mistaken: https://caniuse.com/?search=hls
+
+-------------------------
+
+jplevyak | 2022-02-09 20:49:27 UTC | #9
+
+Range requests should not be served from the canister.  Instead we can implement the range responses from a fully cached object out of the boundary nodes.  See https://www.nginx.com/blog/smart-efficient-byte-range-caching-nginx/
+
+-------------------------
+
+janeshchhabra | 2022-02-09 20:55:16 UTC | #10
+
+Agree with this. Storing chunks would be optimal especially for serving it from a cache. Currently serving content from the Boundary Nodes is free and it would scale much better than doing it in a canister. 
+
+If you serve/compute range requests from a canister, there would have to be multiple canisters storing the same content in order to serve large magnitudes of content, as opposed to just having the chunks cached on the boundary.
+
+-------------------------
+
+lastmjs | 2022-02-09 20:56:01 UTC | #11
+
+The boundary nodes are going to cache the entire resource for every canister that range requests are used on? This doesn't seem like it will scale well...and if this is the solution, why do we have the `StreamingStrategy` in the asset canister?
+
+-------------------------
+
+jplevyak | 2022-02-09 21:00:49 UTC | #12
+
+The reason for StreamingStrategy is because the responses are limited in size.  StreamingStrategy is not a cache breaker because the boundaries are controlled by the canister rather than the client.  The problem with Range is that it breaks caching which means it will not scale.
+
+-------------------------
+
+jplevyak | 2022-02-09 21:06:55 UTC | #13
+
+ In the future we are planning to be able to serve read-only queries geo-replicated from boundary nodes i.e. from the edge.   This would allow custom Range logic in a scalable fashion, but we are not there yet.
+
+-------------------------
+
+lastmjs | 2022-02-09 21:10:21 UTC | #14
+
+I'll yield this to you then if partial content can be better implemented elsewhere. Could I get an ETA on this? I would like the functionality for myself and the listeners of Demergence, and there's one other podcast trying to host on the IC right now.
+
+If we could get boundary nodes to allow those response headers I could at least deploy my solution in the mean time for my canister and others that want the functionality sooner rather than later.
+
+Also, it would have been very ideal to have known this before I put in all of the work for this PR: https://github.com/dfinity/cdk-rs/pull/199
+
+How can we avoid this situation in the future? This issue has been open for a few months now: https://github.com/dfinity/certified-assets/issues/10 and the bounty mentioned specifically adding the functionality to the certified-assets canister: https://twitter.com/dominic_w/status/1467144071449915395
+
+-------------------------
+
+jplevyak | 2022-02-09 21:20:01 UTC | #15
+
+Sorry, I just found out about this.  It is also not clear to me how you can do certified Range queries at all from the canister.  You would have to return the certified chunks in full to the service worker and icx-proxy and have them form the range response rather than sending it from the canister directly, so in any case you would not be able to serve directly from the canister.  Your PR doesn't seem to handle that so it would not work in production AFAICT
+
+-------------------------
+
+lastmjs | 2022-02-09 21:27:18 UTC | #16
+
+It's okay, I think in the future if we have bounties like this the developer should meet with the team to discuss first, or have someone sign off on the design in the proposed issue. Perhaps I should have been more proactive in gathering opinions from the team.
+
+It should work fine in production as long as you use `raw.ic0.app`, which is what I've been doing for my audio anyway (just for the audio URLs, you can still serve a certified app from `ic0.app`, but any audio or video URLs would need to be served from `raw.ic0.app`). It's a trade-off but it's working just great for my audio now (you just have to download the file in your podcast player), and I don't think the security is that necessary for streaming audio and video.
+
+The same types of issues with streaming and certification are discussed here: https://forum.dfinity.org/t/is-it-possible-to-make-raw-ic0-app-calls-from-ic0-app-and-reverse/8224
+
+I'd much rather just use `raw.ic0.app` for audio and video files and have the much better streaming experience than wait for certification to get figured out.
+
+Not to mention I foresee canisters wanting to provide their own http response headers, and I'm hoping we can allow those. I think it's quite likely someone will run into this limitation in the future and why not address it sooner rather than later.
+
+-------------------------
+
+jplevyak | 2022-02-09 21:28:00 UTC | #17
+
+If you would like, we can talk about a design.
+
+-------------------------
+
+lastmjs | 2022-02-09 21:34:42 UTC | #18
+
+If we can return arbitrary http response headers from our canisters then I think most of my issues are resolved. Is this the design you're talking about?
+
+-------------------------
+
+lastmjs | 2022-02-09 21:38:06 UTC | #19
+
+What's the reason for the whitelist? I assume that's the only thing blocking my canister from working...then I can wait for your much more robust and scalable partial content implementation.
+
+-------------------------
+
+jplevyak | 2022-02-09 21:55:31 UTC | #20
+
+The whitelist exists because of security concerns.  However, I am looking into a opt out solution which might be a flexible way to address this situation as well as others.  That will have security implications as does providing non-certified asset results and the important thing is to make sure that those implications are well understood by all parties.
+
+-------------------------
+
+lastmjs | 2022-02-09 21:56:51 UTC | #21
+
+I look forward to hearing more about the opt out solution, thanks for the discussion today!
+
+-------------------------
+
+jplevyak | 2022-02-09 22:01:33 UTC | #22
+
+Thank you!  Looking forward to a suite of solutions for all use-cases.
+
+-------------------------
+
+paulyoung | 2022-02-09 22:29:28 UTC | #23
+
+[quote="jplevyak, post:15, topic:10747"]
+You would have to return the certified chunks in full to the service worker and icx-proxy and have them form the range response rather than sending it from the canister directly, so in any case you would not be able to serve directly from the canister.
+[/quote]
+
+This sounds like what I was proposing here, but for uploads:
+
+https://github.com/dfinity/certified-assets/issues/10#issuecomment-1030502391
+
+Specifically:
+
+> I think the code from the certified assets crate that `dfx` uses would need to be used by `icx-proxy` to enable arbitrary-sized file uploads from other clients in general.
+>
+> For web-based apps that probably needs changes to the service worker as well.
+
+I was at least going to be advocating for this if not attempting it myself in the near future, assuming it was the right way to go about it.
+
+-------------------------
+
+paulyoung | 2022-02-09 22:38:28 UTC | #24
+
+@jplevyak @lastmjs I’m mostly interested in uploads but they seem to be two sides of the same coin so I’d be happy to be involved in any design discussions
+
+-------------------------
+
+lastmjs | 2022-02-10 15:21:03 UTC | #25
+
+This is interesting: https://github.com/dfinity/certified-assets/issues/10#issuecomment-1034287222
+
+According to that little experiment there is no response header filtering occurring. So is there a whitelist? Is it on the request headers or the response headers? And I would like to know more about the security reasons for the whitelists, especially if it's on the response headers. What security risks do they present? I’m doubting the security risks possible with response headers and would love to understand more.
+
+-------------------------
+
+lastmjs | 2022-02-10 15:24:49 UTC | #27
+
+I would still say this can be accomplished now with the Rust agent (that's what icx-proxy and I believe dfx use), and thus any agent could implement this. No changes are necessary to the asset canister or the boundary nodes.
+
+But if we want a general solution, then arbitrary size ingress messages I think is the best path forward (which is on the tentative Foundation roadmap). I'm not sure this has much to do with the boundary nodes, unless they are part of the arbitrary size ingress messages solution.
+
+Uploads aren't cached and don't need to be scaled out to many requesting clients, so I think it's quite a different issue.
+
+-------------------------
+
+paulyoung | 2022-02-10 15:24:38 UTC | #28
+
+[quote="nomeata, post:4, topic:10747, full:true"]
+It might help if someone writewrites up an actual specification for the HTTP gateway feature, so that we don’t have to probe implementation defined behavior…
+[/quote]
+
+@nomeata are you volunteering? 🙂
+
+-------------------------
+
+paulyoung | 2022-02-10 15:28:34 UTC | #29
+
+[quote="lastmjs, post:27, topic:10747"]
+arbitrary size ingress messages
+[/quote]
+
+I don’t know enough about this proposal yet but my concerns with this alone would be the amount of memory involved and/or how much work can be done in a single block.
+
+-------------------------
+
+lastmjs | 2022-02-10 15:47:30 UTC | #30
+
+Yes I believe they are addressing the block issues with deterministic time slicing: https://dfinity.org/roadmap/?m=chromium
+
+"ETA: Q1 2022
+
+Currently, the amount of computation a canister can perform per call is limited by the block time. Deterministic time slicing allows for long(er) running, multi-round computations by suspending the execution at the end of one round and resuming it later."
+
+-------------------------
+
+paulyoung | 2022-02-10 16:07:05 UTC | #31
+
+My concern with that is:
+
+https://forum.dfinity.org/t/deterministic-time-slicing/10635/3?u=paulyoung
+
+It seems like that could be avoided with streaming uploads.
+
+-------------------------
+
+lastmjs | 2022-02-10 16:27:38 UTC | #32
+
+So I've been doing some tests in production, and I'm not finding any evidence of an http response header whitelist. I am able to return a `206` status code, `Content-Range` header, and even a custom header called `Range-Request-Header`.
+
+But I don't think my `Range` http request header is coming through, but not sure yet. It makes more sense to me to have an http request header whitelist than an http response header whitelist, so this is making sense.
+
+-------------------------
+
+lastmjs | 2022-02-10 16:32:23 UTC | #33
+
+I think I've tracked down the final issue: The `Range` http request header is being filtered out before it reaches the canister. I've just tested this with a simplified canister in production.
+
+@jplevyak it looks like I just need the `Range` request header to not be filtered out. Can we make an exception for the `Range` header and not filter it out?
+
+-------------------------
+
+jplevyak | 2022-02-10 20:09:36 UTC | #34
+
+Range queries can't be certified, so it doesn't make sense to try to handle them in the "certified assets" canister.  We can have some way of certifying opt-out of certification in which case they might make sense, although as I said above they would be uncacheable which makes them unscalable and thus less widely useful. I will talk to the security and other folks to see if we can pass the Range header to the backend.  We have an automatic chunking system for uploads and downloads and we can use that for reading certified chunks in the service worker and icx-proxy and constructing the Range response seems like the most promising path and the most in keeping with the spirit of the twitter request as certification is an important security feature.   Currently the chunk size is set to a constant 1_900_000 and generally we probably want to have this as metadata, but using that constant should be fine for now.   Using the get_chunk() query method of the existing certified assets canister would allow those calls to be cached as well which would scale well to many clients once we can set the cache control headers (we are working on that).  The net is that I think the work for this feature is actually in the service worker and icx proxy.
+
+-------------------------
+
+lastmjs | 2022-02-10 20:37:50 UTC | #35
+
+Makes sense. I would like the Range header to deploy my own canister that myself and others want sooner rather than later. I'll just maintain a fork of the certified-assets canister until the better solution is implemented.
+
+I would keep in mind that certification isn't always necessary/desired, and the asset canister will be useful even without certification. I've viewed the certified-assets canister more as just an assets canister, and certification is a nice added feature, but isn't appropriate for all use cases.
+
+For example in podcasting audio files are hosted anywhere on the Internet, and the RSS feed is what podcast players consume to fetch the audio on client devices. If we force podcast audio to be certified in the client then it would make the IC a bad place to host podcasts because then most podcast players would not be able to serve the audio.
+
+-------------------------
+
+jplevyak | 2022-02-10 20:48:34 UTC | #36
+
+I agree that we need a way to opt out of certification for things like dynamically generated content, relays, incompatible clients etc.   The podcast players could go through an ixc-proxy translation layer e.g. raw.ic0.app which could read the certified data and format it for non-service worker targets e.g. standalone podcast players after verifying the certification.  Would that work for the use-case of the podcast players you are talking about?  We are trying to balance security and useability and I am trying to probe the edges of that balance.
+
+-------------------------
+
+levi | 2022-02-10 20:50:03 UTC | #37
+
+[quote="lastmjs, post:16, topic:10747"]
+and I don’t think the security is that necessary for streaming audio and video.
+[/quote]
+[quote="lastmjs, post:16, topic:10747"]
+I’d much rather just use `raw.ic0.app` for audio and video files and have the much better streaming experience than wait for certification to get figured out.
+[/quote]
+The whole point of the advanced video/audio streaming is that it is certified on the blockchain. Anyone can make setup uncertified streaming now without the certified-assets canister. It is possible to set up audio/video streaming with the certification now through the certified assets canister By this method:
+
+[quote="jplevyak, post:6, topic:10747"]
+Best practices for video and audio are to name the path by a hash of the content and codecs, break up the content into time ranges and compression level named chunks and use separate files for each chunk.
+[/quote]
+
+-------------------------
+
+lastmjs | 2022-02-10 20:51:23 UTC | #38
+
+I believe that would work for the podcasting use case if there is a URL exposed for non-certified uses. `.raw` has been working well for me so far.
+
+-------------------------
+
+lastmjs | 2022-02-10 20:57:23 UTC | #39
+
+I don't think the discussion is about how to implement the streaming anymore, it seems clear it's best done in a much more scalable/secure manner outside of the assets canister.
+
+Unfortunately it looks like we'll have to wait a while to get this working, so I just want the boundary nodes to not filter out Range headers since my fork of the certified-assets canister has an implementation of partial responses that will work for certain use cases.
+
+-------------------------
+
+lastmjs | 2022-02-10 21:00:18 UTC | #40
+
+[quote="levi, post:37, topic:10747"]
+Anyone can make setup uncertified streaming now without the certified-assets canister
+[/quote]
+
+You still need to implement partial responses, my solution does this from a canister.
+
+I don't care where it's done (except I want the best solution possible) it just needs to be done. I have a working canister implementation that myself and others would benefit from.
+
+Again, I just need Range headers. Just ignore my fork of the assets canister, it's just there temporarily for whoever wants to use it.
+
+-------------------------
+
+nomeata | 2022-02-10 21:50:24 UTC | #41
+
+[quote="jplevyak, post:34, topic:10747"]
+Range queries can’t be certified, so it doesn’t make sense to try to handle them in the “certified assets” canister.
+[/quote]
+
+There are certification schemes that support that, using suitable hash functions, and we did consider them back then before we settled on this certification MVP because we needed something simple. But I wouldn't say it's impossible, we could extend our protocol here. See, e.g.
+
+https://tools.ietf.org/search/draft-thomson-http-mice-02
+
+
+[quote="jplevyak, post:36, topic:10747"]
+I agree that we need a way to opt out of certification for things like dynamically generated content, relays, incompatible clients etc
+[/quote]
+
+We do - that's the `raw.ic0` URL, isn't it? And there I would have indeed expected headers to be passed through.
+
+-------------------------
+
+jplevyak | 2022-02-10 22:00:57 UTC | #42
+
+Thanx for the pointer!  I had wondered if rolling hashes or something could do it.   We want to have certification checking by default with opt out for raw.ic0.app via icx-proxy where the opt out would itself be certified.  We could pass the headers but currently there is no way to certify the Range response.  That said I don't think there is a security issue, but I need to get it vetted.
+
+-------------------------
+
+paulyoung | 2022-02-11 00:25:39 UTC | #43
+
+[quote="jplevyak, post:34, topic:10747"]
+We have an automatic chunking system for uploads and downloads and we can use that for reading certified chunks in the service worker and icx-proxy
+[/quote]
+
+This sounds like exactly what I need.
+
+-------------------------
+
+3cL1p5e7 | 2022-02-11 20:57:53 UTC | #44
+
+HI, @nomeata :)
+Why is the SHA-256 hash stored for each asset and validated on service-worker?
+I'm not expert, but isn't it enough that the service worker checks the IC-certificates in the headers of asset  (to avoid data spoofing) for "certification"?
+For example about sha: if I load assets myself with manually generated md5-hash, then hash saved on certified-assets canister, but service-worker validation will fail.
+
+-------------------------
+
+nomeata | 2022-02-11 21:32:34 UTC | #45
+
+I don’t quite understand the question. The certification needs to build a trust path between something that the user (the service work) knows, namely the IC root key, and the file just loaded. This involves a few steps (root public key → subnet public key → subnet state merkle tree root → subnet state merkle tree entry with certified data from canister → canister merkle tree root → canister merkle tree entry with sha256 of file loaded → file), and one of the steps requires the SHA256 signature of the file. So the canister needs the SHA256. Also see this video for more details:
+
+https://www.youtube.com/watch?v=mZbFhRIHIiY
+
+Is it the case that the default asset canister doesn't calculate the SHA256 upon upload, but requires the uploader to set it? Then that’s an engineering choice around that canister.
+
+-------------------------
+
+3cL1p5e7 | 2022-02-11 21:48:03 UTC | #46
+
+Now everything is clear for me, thanks a lot!
+
+-------------------------
+
+3cL1p5e7 | 2022-02-11 22:03:47 UTC | #47
+
+[quote="nomeata, post:41, topic:10747"]
+There are certification schemes that support that, using suitable hash functions, and we did consider them back then before we settled on this certification MVP because we needed something simple. But I wouldn’t say it’s impossible, we could extend our protocol here. See, e.g.
+[/quote]
+
+Do you have any plans for this in the near future?
+
+-------------------------
+
+nomeata | 2022-02-11 22:33:05 UTC | #48
+
+[quote="3cL1p5e7, post:47, topic:10747"]
+Do you have any plans for this in the near future?
+[/quote]
+
+I don't.
+
+BTW, for many applications it might be a good option to serve HTML and JavaScript safely over the certified URL, and then do more complicated stuff (e.g. fetch video chunks certified by a stream signature) from your JS in an application-specific way, and _not_ using the certified HTTP stuff in that case. This way no need to wait for me or DFINITY to find generic solutions (which tend to be harder).
+
+-------------------------
+
+faraz.shaikh | 2022-02-12 00:29:01 UTC | #49
+
+Guys this is a humble opinion on two things that I feel are faces of the same decentralization coin. 
+
+1. _raw 
+This is a security hole I wish Dfinity as org had never introduced. The implication of a single replica serving arbitrary data that cannot be checked for integrity is difficult to digest. Also now that _raw is deployed in the wild it's difficult to roll back such decisions.
+
+2. http header
+My opinion is that Dfinity should NOT provide guidance/spec out "web content related" canisters. HTTP is an independent spec, what does mean to have a restrictive/additive HTTP spec within IC spec. It's a slippery slope why  stop at  webserver specs, lets's also do mail server specs
+
+
+I sympathize with @lastmjs, he is being coerced into doing streaming "a" particular way. Having said that I don't think adding anything to spec or boundary nodes is the right idea.
+
+Instead, let's work towards some solution where
+@lastjms can run his canister, and **his** boundary nodes and expose **any** HEADER, any un/secure content he wants to. There is dissonance in what we are asking developers to do.  Providing an unsecured _raw path, having an opinion on streaming be done X vs Y way is not an IC concern.  
+
+The effort required may be similar.
+
+-------------------------
+
+3cL1p5e7 | 2022-02-12 20:54:51 UTC | #50
+
+I agree with your words!
+
+About your suggestion: there are some limitations for boundary node:
+- The deploing own boundary node under custom domain is might be a great solution. But then it will lose the ability to work under `ic0.app` domain, especially when custom subdomains are released. Demergence-podcasts will live fine on `demergence.com` (for example), but not on potentially `demergence.ic0.app`.
+- This may can affect the audience's trust (not a fact)
+- The streaming feature needs not only for demergence, it might be useful for others. And the **easiest** way to get streaming feature for ordinary developer is to use `certified_assets` canister (simple set `"type"="assets"` in your `dfx.json` and lets gooo)
+
+In general, a solution is acceptable. Moreover, there is an [info about deploy boundary node](https://forum.dfinity.org/t/btcflower-xyz-seems-to-be-hosted-on-ic-but-why-this-domain-name-does-not-need-redirection/10787/4)
+
+@lastmjs 
+I've been thinking about this for the last week and can suggest the next:
+- In theory, you can to develop custom service-worker with range streaming support and register it on your canister manually. It will catch `.raw.` requests with `range` headers, will try to collect chunks from canister query methods and will return response with ranges to the client. [There is my attempts](https://github.com/dfinity/ic/compare/master...3cL1p5e7:feature/service-worker-streaming-chunks) to do this and it works **nearly** fine with TODOs for `certfied_assets`
+
+-------------------------
+
+skilesare | 2022-04-23 17:05:16 UTC | #51
+
+To whom it may concern:  I've been working with Daniel to try to figure out this strange safari issue where I can't get our video to play from our canister.  If I run a local version of the icx-proxy and point it at ic0.app I can get my video to play at http://localhost:3000/-/1/ex?canisterId=r5m5i-tiaaa-aaaaj-acgaq-cai but if I call the same thing at https://r5m5i-tiaaa-aaaaj-acgaq-cai.raw.ic0.app/-/1/ex the video does not play. 
+
+In both cases, safari stops the request when it sees 'video' in the content type and sends a new range request asking for the first two bytes.  When I go through a local proxy that range request gets through(It is a header on the request (Range: bytes=0-1).  When I go straight to raw.ic0.app Safari says that it is sending the header, but i've manipulated my server to return the actual headers that I'm getting and the range request is not there.  So either Safari is lying(Daniel thinks so) or something is stripping off the range request on the way to my canister. I don't know the topgraphy of where a request actually goes, but I suspect there is a boundary node and a proxy?
+
+```
+Request - through local version of icx-proxy
+GET /-/1/ex HTTP/1.1
+Accept: */*
+Connection: Keep-Alive
+Range: bytes=0-1
+Host: localhost:3000
+Accept-Language: en-US,en;q=0.9
+User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15
+Referer: http://localhost:3000/-/1/ex?canisterId=r5m5i-tiaaa-aaaaj-acgaq-cai
+Accept-Encoding: identity
+X-Playback-Session-Id: 6FFA5EE3-52F6-4DDC-8297-300A4C22A9DF
+
+Response
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 0-1/46984888
+Accept-Ranges: bytes
+Content-Type: video/mp4
+Content-Length: 2
+Date: Thu, 21 Apr 2022 22:58:16 GMT
+
+
+Request 2 - through raw.ic0.app
+GET /-/1/ex
+Range: bytes=0-1
+Accept: */*
+Referer: https://r5m5i-tiaaa-aaaaj-acgaq-cai.raw.ic0.app/-/1/ex
+Accept-Encoding: identity
+Connection: Keep-Alive
+User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15
+X-Playback-Session-Id: 62FA3A12-FD2A-4C34-839A-B6963DCFC6F1
+
+Actual headers that get to my canister
+[("host", "r5m5i-tiaaa-aaaaj-acgaq-cai.raw.ic0.app"), 
+("x-real-ip", "108.230.245.93"), 
+("x-forwarded-for", "108.230.245.93"), 
+("x-forwarded-proto", "https"), ("connection", "close"), 
+("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15"), ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+ ("accept-language", "en-US,en;q=0.9"), 
+("accept-encoding", "gzip, deflate, be")]
+
+Response:
+200
+Access-Control-Allow-Credentials: true
+Content-Type: video/mp4
+Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS
+Access-Control-Expose-Headers: Content-Length,Content-Range
+Access-Control-Allow-Origin: *
+Date: Thu, 21 Apr 2022 22:56:06 GMT
+Access-Control-Allow-Headers: DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Cookie
+Server: nginx/1.21.3
+x-cache-status: MISS
+```
+
+This thread confirms my suspicions.
+
+Looks like the short term solution is to set up a server running icx-proxy that can server your requests. So @lastmjs you could set up stream.demergence.com/episode-tag?canisgerId=xxxxxxxxxxxxx and it would work.
+
+As far as certified assets go, range requests allow you to return the results you want vs. what was requested, so if you certified 1MB chunks you could always return at least that chunk.  If it requests something in the middle of a chunk, rewind to the earliest certified starting point and return the chunk.  maybe the chunks need to be smaller, but since safari requests them in order and the latency is pretty bad it can take along time to download large files.
+
+A bit irrelevant as it seems like icx-proxy does not certify data anyway (but it would be great to have confirmation at https://forum.dfinity.org/t/can-the-icx-proxy-return-certified-assets/12358
+
+-------------------------
+
+lastmjs | 2022-04-23 17:26:35 UTC | #52
+
+The boundary nodes are most likely removing the Range header, that's exactly the issue I was having
+
+-------------------------
+
+faraz.shaikh | 2022-04-23 17:30:41 UTC | #53
+
+https://github.com/dfinity/ic/blob/master/ic-os/boundary-guestos/rootfs/etc/nginx/conf.d/001-mainnet-nginx.conf
+ 
+Line 390
+
+This is *not* the nginx configuration on the boundary nodes but its a exact copy.   You can check how the boundary is configured with respect to header stripping by looking at this code.
+
+-------------------------
+
+skilesare | 2022-04-23 17:47:29 UTC | #54
+
+So if it isn't being stripped, do you think that safari is just not sending it properly?
+
+-------------------------
+
+faraz.shaikh | 2022-04-23 17:48:57 UTC | #55
+
+If it’s getting stripped it doesn’t matter how safari is sending it. It will get stripped
+
+-------------------------
+
+skilesare | 2022-04-23 18:21:06 UTC | #56
+
+Implementing our own version of a ICX proxy should fix this issue, correct?
+
+-------------------------
+
+faraz.shaikh | 2022-04-23 18:49:36 UTC | #57
+
+@skilesare no, the next step for the issue you are facing would be
+
+-what header is being stripped and where (in the nginx source code i shared)
+-motivate inclusion of the header/or workaround the header.
+
+Currently AFK, would love to get your problem resolved under the video streaming effort already underway at Dfinity.  there are many ways to do video streaming - the core focus is to select one that doesn’t break boundary node caching
+
+Boundary node caching is absolute must if the IC is to host YouTube scale videos. So it’s not just about simply enabling range headers. What’s your project/contact point I will try to get you plugged into the video effort
+
+-------------------------
+
+skilesare | 2022-04-23 19:03:16 UTC | #58
+
+Well…I have it mostly solved for my purposes through a local icx-proxy. We’re going to deploy it to a domain early next week and see if it continues to work.
+
+You can simulate your self by running a local icx proxy and pointing it to ic0.app and hitting that same url from safari. It does some strange things for that video about 30MB in, but full video ends up coming down.
+
+Added you to an on going conversion.
+
+-------------------------
+
+lastmjs | 2022-05-14 14:58:31 UTC | #59
+
+Can we get an update from DFINITY on when boundary nodes will allow for range requests? I would also love to know the current strategy for supporting streaming audio/video and when we can expect this all to be released.
+
+My podcast Demergence is hosted 100% on the IC but its streaming has been broken since the beginning since there is no support for range requests. I would to get this resolved soon so we can have full podcast support on the IC!
+
+-------------------------
+
+skilesare | 2022-05-14 23:27:10 UTC | #60
+
+Range requests work through icx proxy. 
+
+See: https://nft.origyn.network/-/nftforgood_uffc/-/ogy.nftforgood_uffc.1/social
+
+Even works in safari for the most part.
+
+-------------------------
+
+lastmjs | 2022-05-15 02:01:42 UTC | #61
+
+What about on a regular IC subdomain with no proxy?
+
+-------------------------
+
+skilesare | 2022-05-15 05:41:37 UTC | #62
+
+Nope. They block the header for some reason.
+
+-------------------------
+
+jzxchiang | 2022-05-15 06:09:40 UTC | #63
+
+I thought every boundary node (that every request must go through) runs icx-proxy. Can you clarify what you mean by a "regular IC subdomain"?
+
+-------------------------
+
+paulyoung | 2022-05-15 12:07:46 UTC | #64
+
+I think @lastmjs is referring to boundary nodes, whereas I think @skilesare is saying that Origyn is running their own instance of `icx-proxy` somewhere.
+
+-------------------------
+
+skilesare | 2022-05-15 12:26:09 UTC | #65
+
+Yes. This is what I mean. Although I still have confusion as to if when we run icx proxy and point to ic0.app if we are ourselves using a boundary node. are we proxying to a proxy?
+
+-------------------------
+
+paulyoung | 2022-05-16 01:06:23 UTC | #66
+
+Which command line flags do you use when calling `icx-proxy`?
+
+I assume `--dns-alias`, hopefully not `--fetch-root-key`, but what do you provide to `--address`?
+
+-------------------------
+
+skilesare | 2022-05-15 22:56:17 UTC | #67
+
+ --replica "https://ic0.app" --address 0.0.0.0:5000
+
+-------------------------
+
+paulyoung | 2022-05-16 01:05:58 UTC | #68
+
+Sorry, yes, I meant `--replica`, not `--address`.
+
+-------------------------
+
+jzxchiang | 2022-05-17 01:09:52 UTC | #69
+
+Now I'm really confused 🤔
+
+My understanding is that the DNS record for ic0.app points to IP addresses of boundary nodes (the closest one by geographical proximity).
+
+I didn't know you could bypass a BN.
+
+-------------------------
+
+skilesare | 2022-05-17 02:02:54 UTC | #70
+
+I don’t know that you can…that is what I’m asking.  I don’t know that I’m bypassing it. What I do know is that if I use my own proxy then the chunk requests aren’t stripped off.
+
+-------------------------
+
+faraz.shaikh | 2022-05-17 02:12:22 UTC | #71
+
+on use of icx-proxy:
+
+The requests which are CBOR encoded do not go through icx-proxy. 
+HTTP requests are not CBOR encoded and require protocol conversion from http<>cbor. This conversion is the main is done job of the icx-proxy.  icx-proxy's services can be invoked on the boundary node or the service worker.      You can run any number for reverse proxies in serial, adding value add services. @skilesare is using his own icx-proxy in proxy mode to serve content but from a different domain nft.origyn
+
+-------------------------
+
+faraz.shaikh | 2022-05-17 02:57:36 UTC | #72
+
+Let's list down the type of requests handled by the  Internet computer IC and go through the paths taken by the requests.
+
+`Invariant`: canisters ultimately understand only CBOR[1] encoded requests. Talking to them using any other protocol requires marshaling and unmarshaling to and from that protocol  Ex. http<>cbor
+
+
+**Types of requests**
+
+`1. CBOR encoded requests.` (No ICX proxy)
+
+     These requests interact with the canisters by sending an HTTP POST request to REST endpoints of the from
+
+      http://<canisterid>.ic0.app/canisterid/api/v2/[*call | query*]
+
+  These requests originate from stand-alone NON-browser clients like dfx & quill which use the underlying agent-rs or agent-js libraries. Handling these requests is relatively simple.   A HTTP put request with CBOR encoded data a request body is sent to the closet boundary nodes resolved by ic0.app.  The boundary node forwards the message to the destination replica. Thus in this path, there is NO need for icx-proxy to be invoked by the boundary node routing infra as the request/response is already in the IC native CBOR format.
+
+
+`2. Non-CBOR encoded request.  (ICX proxy or service worker path)`
+
+   You can interact with canisters using any legacy protocol. One of the protocols is HTTP/s. HTTP request looks like text blocks of the form
+
+```
+GET /index.html HTTP/1.1
+Host: www.<canisterid>.ic0.app/
+```
+
+Such HTTP requests originate from browsers. Now the HTTP request above has to be converted to CBOR before sending it to the replica (see invariant above), and the CBOR response has to be marshaled back into the HTTP response on its way back to the browser.  These non-CBOR requests are further categorized into 2 types.
+
+
+`2.a Non-CBOR plain request Example https://canisterid.ic0.app/index.html`
+
+These plain non-CBOR (aka HTTP requests) are intercepted in the browser itself by the service worker. The service worker converts them CBOR and then the CBOR request is handed to the boundary nodes. After this, the path for the request is the same as CBOR requests.
+ 
+
+`2.b Non-CBOR raw request  Example https://canisterid.raw.ic0.app/index.html`
+
+These non-CBOR requests bypass the service worker and onto the boundary node as HTTP requests. Here the boundary node handles the CBOR<>HTTP conversion by employing a locally run icx-proxy. That is each boundary node is locally running a icx-proxy.
+
+`Other interesting interactions.`
+
+IC local development uses an icx-proxy that routes requests to the *locally* run replica. Here locally mean the developers laptop :slight_smile: 
+
+@skilesare scenario - Any of the above-mentioned paths can be augmented by placing yet another icx-proxy in front of the boundary nodes.
+
+
+We are constantly trying to simplify the paths, but are limited by the past decision which dictate certain paths be maintained for backward compatibility. Some of the *raw* interactions are also because of certificate verification limitations like lack of streaming in the service worker and memory restrictions in the browser that prohibit certificate checks for big sized assets   
+
+[1]https://en.wikipedia.org/wiki/CBOR
+
+-------------------------
+
+skilesare | 2022-05-17 03:16:10 UTC | #73
+
+Ok...my guess is that this is what is happening when I request https://nft.origyn.network/-/nftforgood_uffc/-/ogy.nftforgood_uffc.1
+
+1. Browser Gets to nft.origyn.network and is answered by the ICX proxy running there.
+2. The ICX proxy there converts the request to CBOR and sends to canister.ic0.app as specified by our internal translation table.  Thus, since our ICX proxy does not strip any headers the range request header is being encoded into cbor.
+3. The boundary node that answers asks the IC for the query.
+4. A Node answers.
+5. The Boundry node sends the cbor encoded data to the ICX Proxy.
+6. The ICX proxy converts it back to an HTTP response and sends it to the browser.
+
+-------------------------
+
+faraz.shaikh | 2022-05-17 03:28:41 UTC | #74
+
+:) yes but I won't count on that to work forever.
+
+All icx-proxy copies come from the same code base, so there is no reason to believe that icx-proxy run on nft origyn behaves any different than the one thats runs on boundary nodes. 
+
+Any behavioral difference is accidental and not intentionally engineered. So it may break as things reconcile.
+
+------
+Also looks like this is not  doing range queries
+https://nft.origyn.network/-/nftforgood_uffc/-/ogy.nftforgood_uffc.1
+
+Most likely  ICX proxy on nft.origyn is downloading the entire video. Can't say - but try with a very large video of 1G or so. I think it will not start streaming until it downloads the whole video on the nft.origyn server first and then streams.
+
+IMHO nft.origyn is not solving the streaming issue. Please try with a large video asset. With range queries, working correctly the streaming should start immediately
+
+-------------------------
+
+jzxchiang | 2022-05-18 00:59:05 UTC | #75
+
+Thank you for the great explanation.
+
+A couple of questions:
+
+1. It seems like there is no way to directly talk to replica nodes. Everything must go through boundary nodes, even when the request is already CBOR-encoded. Is that right?
+
+2. Why does the service worker handle the CBOR encoding/decoding for non-raw requests but can't do so for raw requests?
+
+3. How do boundary nodes discover the IP addresses of replica nodes? Where do they look up the mapping from canister ID to replica IPs?
+
+-------------------------
+
+JaMarco | 2022-05-18 01:15:55 UTC | #76
+
+[quote="jzxchiang, post:75, topic:10747"]
+How do boundary nodes discover the IP addresses of replica nodes? Where do they look up the mapping from canister ID to replica IPs?
+[/quote]
+
+Pretty sure they query from the NNS, which keeps a list of all the ICs canisters/nodes/IPs.
+
+-------------------------
+
+jzxchiang | 2022-05-18 01:18:46 UTC | #77
+
+What happens if I do that query myself and directly call the replica? Is that a security risk?
+
+-------------------------
+
+skilesare | 2022-05-18 03:25:45 UTC | #78
+
+[quote="faraz.shaikh, post:74, topic:10747"]
+All icx-proxy copies come from the same code base, so there is no reason to believe that icx-proxy run on nft origyn behaves any different than the one thats runs on boundary nodes.
+[/quote]
+
+If this is a fork, why would it change unless we wanted it  too?
+
+> Also looks like this is not doing range queries
+
+Try with Safari. It is the one pissy with range requests and it was hell to get it working.  With chrome you can just stream the file down and that this what we do at the moment.
+
+![image|690x464](upload://mtjAh587ThWkifC9ar9eABUohR8.jpeg)
+
+-------------------------
+
+skilesare | 2022-05-18 03:34:48 UTC | #79
+
+I think the issue here is that we are using our own NGINX proxy and we're not stripping headers so they are making through to our ICXProxy and then we turn it into cbor and forward it along.  The regular boundary nodes have NGINX set up to strip the range request.  Range response is allowed.
+
+We are working on certifying chunks so they come back through with certified headers.
+
+-------------------------
+
+lastmjs | 2024-02-22 06:47:18 UTC | #80
+
+Sadly range requests are still not supported on the IC because seemingly the boundary nodes are stripping out the `Range` header: https://forum.dfinity.org/t/range-headers-being-stripped-out/27761
+
+-------------------------
+

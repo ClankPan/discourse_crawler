@@ -1,0 +1,51 @@
+roam | 2024-05-06 15:12:49 UTC | #1
+
+Hello, everyone. I'm a core developer on the [Omnity Network](https://www.omnity.network/). In the first phase of our project, We have completed the cross-chain functionality for Runes Token to ICP, which operates very similarly to ckBTC.
+
+When a user crosses Rune Token from the BTC network to ICP, the Rune Token will be locked in the canister's address. When a user needs to redeem Rune Token from ICP back to the BTC network, the canister will construct and send a BTC transaction, sending the Rune Token from the canister's address to the specified receiving address. Additionally, a transaction requires extra BTC as gas, which is also provided by the canister's address.
+
+Therefore, in the transaction output, there will ultimately be two change outputs, each sending the remaining Rune Token and BTC Token to the canister address. For the sake of managing UTXOs, they are two addresses derived from different derivation paths. Suppose there is a transaction submitted but not confirmed, called submitted_tx, with two change addresses: rune_change_address and btc_change_address.
+
+The canister will periodically call:
+rune_change_utxos = bitcoin_get_utxos(rune_change_address, 12)
+
+The second parameter, 12, indicates that the returned UTXOs need to have 12 confirmations. When it discovers that any UTXO in the returned result satisfies utxo.txid = submitted_tx.txid, it considers that the submitted_tx has been finalized.
+
+At this point, the canister will place rune_change_utxos into the available_rune_utxos in the canister's state for future construction of new redeem transactions.
+
+The canister will also simultaneously call:
+btc_change_utxos = bitcoin_get_utxos(btc_change_address, 12)
+
+It will place the obtained btc_change_utxos into available_btc_utxos as a source for transaction fees in subsequent transactions.
+
+Now, the problem is that we found the first call to bitcoin_get_utxos returned the rune change output of submitted_tx, but the second call to bitcoin_get_utxos did not return the btc change output of submitted_tx.
+
+Why is this happening? These two change outputs are from the same transaction, so they should have been finalized together. The tricky part is that this issue doesn't occur every time. Moreover, extensive testing on localnet hasn't revealed this problem.
+
+In the final release version, we avoided this issue by changing the implementation. However, we're still very curious to know the reason behind it. If anyone knows the answer to this problem, we would greatly appreciate it.
+
+-------------------------
+
+ielashi | 2024-05-07 09:51:47 UTC | #2
+
+Thanks for sharing this, @roam. You are mentioning that the code makes two calls:
+
+1. A call to get the UTXOs of `rune_change_address`.
+2. A call to get the UTXOs of `btc_change_address`.
+
+Are you sure the code makes these requests in this order and sequentially? I'm wondering if these two calls are perhaps happening in parallel, or in a different sequence than what its expected, such that when the first call is processed the UTXOs didn't exist, but by the time the second call is processed, the UTXOs do now exist.
+
+-------------------------
+
+roam | 2024-05-07 10:25:02 UTC | #4
+
+Yeah, I think you are right, I first called bitcoin_get_utxos(btc_change_address) in the code, and then called bitcoin_get_utxos(rune_change_address). Considering the potentially high delay in canister calls, it's possible that the transaction has not been finalized by the time of the first call, but has been finalized by the time of the second call. Thank you very much for your reply.
+
+-------------------------
+
+mozhiyun | 2024-05-28 08:48:31 UTC | #5
+
+Hello,@roam I would like to know that the official Bitcoin canister currently only provides a simple API to get the number of UTXOs. How do you handle the issue of the number of Runes tokens? I noticed that your canister provides an `update_runes_balance` API, which is passed by the frontend. Wouldn't this pose a risk?
+
+-------------------------
+

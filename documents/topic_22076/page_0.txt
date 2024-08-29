@@ -1,0 +1,61 @@
+justmythoughts | 2023-08-11 05:24:23 UTC | #1
+
+I understand that sending messages globally and reaching consensus between a group of nodes is limited by the speed of light and the quality/pathing of cables that transmit a data packet between locations.
+
+However, this evening I was curious and found this [global ping chart](https://wondernetwork.com/pings), where the slowest pair I can find is 358ms.
+
+Given this, how many back and forth trips between nodes does consensus take? An all pairs single message, or a round trip?
+
+If I was to look at a flame graph of the time taken by different parts of an update call, what would it look like? 80-90% consensus, maybe some latency between the boundary node and the subnet, and then what other significant parts?
+
+-------------------------
+
+PaulLiu | 2023-08-11 09:03:15 UTC | #2
+
+Most application subnets have a block time of 0.9s or 900ms, which is the time taken to produce a block. So we don't have to dive too deep into the circulation of consensus messages. With this in mind, let's look at where time is spent:
+
+1. Assume the latency from a user's computer to one of the boundary node is 200ms
+2. Assume the latency from a boundary node to one of the subnet node is 200ms
+3. Assume no mempool congestion, i.e. an ingress message will always be packed into the next block. This means on average a message will spend (1/2 * block time = 450ms) sitting in the mempool.
+4. A block that contains this message is produced & finalized, taking 900ms.
+5. IC uses a pipeline model for message execution, so it can overlap with consensus block making. But it is reasonable to assume the overall execution time is less than block time under normal conditions (otherwise consensus will actually slow down to accommodate execution). Suppose the block execution plus the certification time (which involves consensus) takes no more than 1 block time, and the average is 1/2 * block time = 450ms.
+6. The user's computer actually polls the `read_state` endpoint to see the execution result of an ingress message. Assume there is no delay on the polling part (i.e., ignore the time where the polling message goes from user computer to boundary node and then to subnet node), we only count the time it takes for the certified result to go from subnet node to boundary node and then to user computer. This is another 200 + 200 = 400ms.
+
+So average round trip latency for an update call is 400 + 450 + 900 + 450 + 400 = 2600 ms = 2.6s
+
+If the user is physically close to the boundary node, we can perhaps shave off 300ms from the sum, which is perhaps not very significant.
+
+----
+Fine prints:
+* In reality, consensus needs not to spend the full 900ms to produce a finalized block. We settled on the 900ms block time to balance between block execution & consensus block making & network message latencies.
+* Execution will immediately start once we have a finalized block. So the actual time it takes between a message enters a block and its execution result is certified may be actually less than 900ms + 450ms.
+* Depending on the read_state polling strategy used by the client, the latency there should be accounted for.
+
+-------------------------
+
+lastmjs | 2023-08-11 14:32:26 UTC | #3
+
+Also ICC consensus takes two rounds of communication among all nodes to come to consensus. The family of protocols it is in seem to all have this as a requirement, and I'm not sure how promising it is to ever remove it.
+
+-------------------------
+
+lastmjs | 2023-08-11 14:32:50 UTC | #4
+
+So if we could ever somehow get rid of that second round, I assume we could remove a significant amount of latency.
+
+-------------------------
+
+massimoalbarello | 2023-09-16 15:53:23 UTC | #5
+
+That is what we tried to do [here](https://github.com/massimoalbarello/consensus_on_demand/). In case replicas are in pre-agreement, FICC algorithm enables them to finalize blocks in 1 RTT (no need to wait for finalization shares). Otherwise, it simply falls back to the original ICC.
+
+The algorithm reduces the latency of block finalization by approximately 30%. However, this comes at a cost as the safety threshold is reduced to `f < n/5`.
+
+-------------------------
+
+lastmjs | 2023-09-16 17:07:01 UTC | #6
+
+Wow very interesting, thanks for the link. Just fix the safety threshold and we're good 👍👍👍
+
+-------------------------
+

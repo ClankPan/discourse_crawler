@@ -1,0 +1,254 @@
+Gabriel | 2021-10-22 16:53:08 UTC | #1
+
+Hi, 
+
+So I've been playing with this piece of code: https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3920285685
+
+So based on this 2 struct types: 
+
+```
+public type Parent = {
+ name: Text;
+ description: Text;
+ extraValue : ?Text;
+};
+public type Child = {
+ extraValue : ?Text;
+};
+```
+
+So I'm not sure if this is a bug or a feature, but should this be allowed? 
+` validate = func (e: Parent: Child )` this works and the compiler doesn't complain about it. 
+
+Parent struct has to contain same identical values like Child in order for this to compile eg: `extraValue` but the optional ? doesn't seem to be make a difference tho. 
+
+This was found by accident and tbh it would be a great way to enforce struct inheritance if it was meant that way?
+
+-------------------------
+
+claudio | 2021-10-25 12:50:03 UTC | #2
+
+Maybe I'm misunderstanding but that looks like a serious bug to me.
+
+The compiler correctly rejects this similar example:
+
+```
+[nix-shell:~/motoko/test/run]$ more bug.mo
+
+type Child = { foo: Nat };
+type Parent = { foo: Nat; bar: Bool};
+
+func f ( x : Parent : Child) : Bool { x.bar };
+
+let ohoh = f( { foo = 1 } );
+
+[nix-shell:~/motoko/test/run]$ moc bug.mo
+bug.mo:5.10-5.20: type error [M0117], pattern of type
+  Parent = {bar : Bool; foo : Nat}
+cannot consume expected type
+  {foo : Nat}
+```
+
+It should reject it, otherwise `ohoh` would attempt access a missing field.
+
+-------------------------
+
+claudio | 2021-10-25 12:51:15 UTC | #3
+
+Your playground example should also be rejected (but isn't) so I think there is a bug and will investigate.
+
+Thanks very much for reporting this!
+
+-------------------------
+
+Gabriel | 2021-10-25 13:33:04 UTC | #4
+
+Hi @claudio, yes, in a normal scenario I'm getting a compiler rejection. 
+
+But in that particular case it's working and it shouldn't. 
+
+No worries and please do share your finds.
+
+-------------------------
+
+claudio | 2021-10-25 14:58:18 UTC | #5
+
+https://github.com/dfinity/motoko/issues/2857
+
+-------------------------
+
+claudio | 2021-10-25 16:42:40 UTC | #6
+
+Actually, I think this may not be a bug per se but a subtle consequence of the type checker having more information to hand in one situation than another. @rossberg will take a look once he has the time, but I don't think there's a type unsoundness here (just weird typing behaviour).
+
+-------------------------
+
+rossberg | 2021-10-26 07:41:22 UTC | #7
+
+Actually, this is working as intended. But the explanation is a bit complicated.
+
+First, note that the argument of a function is defined by a pattern, and patterns work backwards from expressions: an expression *constructs* a value *inside-out*, whereas a pattern *deconstructs* a value *outside-in*. One consequence is that the subtyping requirements for type annotations in patterns work in the opposite direction from expressions, i.e., the annotation has to be a *subtype* of the pattern it annotates (which makes it a supertype of the scrutinee).
+
+Another way to understand this is that patterns are *contra-variant*, as they can only occur in negative position. This can perhaps be best seen via an example. Consider:
+```motoko
+type A = {a : Nat};
+type B = {a : Nat; b : Nat};
+type C = {a : Nat; b : Nat; c : Nat};
+```
+Now, a function can be written with an outer type annotation:
+```motoko
+(func (x) { x }) : (B -> B)
+```
+I can duplicate the type information inside the function:
+```motoko
+(func (x : B) { x : B }) : (B -> B)
+```
+Due to subtyping, the outer annotation can also refine the type, in the usual co/contra-variant manner:
+```motoko
+(func (x : B) { x : B }) : (C -> A)
+```
+Now, we can also pull in the extra annotation into the function:
+```motoko
+(func ((x : B) : C) { (x : B) : A }) : (C -> A)
+```
+and this all type-checks consistently. Note how the subtyping order in the pattern is opposite that in the expression.
+
+The other direction, where the inner type is smaller than the outer, is rejected:
+```motoko
+// ill-typed
+(func (x : C : B) { x : B : A }) : (B -> A)
+```
+Allowing this direction, with the expected meaning, would be unsound, as @claudio's example shows.
+
+Now, given that, the next question then is: what is the type of `x` in such a case? It turns out that the typing rules propagates the outer subtype (i.e., `C`), not the inner supertype (`B`). This has to do with coverage checking. If we allowed to "forget" the more precise type of the scrutinee on the way into the pattern, then we would allow weird things, especially in a switch:
+```motoko
+func f(x : Nat) {
+  switch x {
+    case (-1 : Int) {}
+    ...
+  }
+}
+``` 
+This would break coverage checking, at least as it works now, since it depends on precise type information.
+
+Hence, if there are two types feeding into a pattern, the typing rules pick the smaller one to propagate inwards.
+
+Now, this has the weird effect that the following actually becomes okay:
+```motoko
+(func (((x : C) : B) : C) { (x : B) : A }) : (C -> A)
+```
+The reason is that the we start with the outer `C`, then see `B` but keep propagating the smaller `C` inwards, and so, the inner `C` is not in conflict. That is essentially the situation from the playground example (where there are three type annotations, though the outermost one is on the outer function's return type in that case).
+
+In fact, that behaviour allows even odder examples:
+```motoko
+type D = {c : Nat};
+(func (((x : D) : B) : C) { (x : B) : A }) : (C -> A)
+```
+That type-checks fine as well, because both `B` and `D` are supertypes of `C`, although they are unrelated.
+
+I wouldn't defend this behaviour on semantic grounds. It merely was simpler. The alternative would be to propagate the supertype, and thereby have typing allow an example like `case ((-1 : Int) : Nat)`, but have coverage checking do its own type propagation, figuring out that `-1` is a redundant pattern. Conceptually, that would be nicer, and I'd be open to changing it, but it would be a substantial complication to coverage checking (both in terms of specification and implementation).
+
+-------------------------
+
+claudio | 2021-10-26 14:01:50 UTC | #8
+
+Nice explanation, but it still makes me nervous.
+
+-------------------------
+
+rossberg | 2021-10-29 10:45:38 UTC | #9
+
+[quote="rossberg, post:7, topic:8095"]
+I wouldn’t defend this behaviour on semantic grounds. It merely was simpler. The alternative would be to propagate the supertype, and thereby have typing allow an example like `case ((-1 : Int) : Nat)` , but have coverage checking do its own type propagation, figuring out that `-1` is a redundant pattern. Conceptually, that would be nicer, and I’d be open to changing it, but it would be a substantial complication to coverage checking (both in terms of specification and implementation).
+[/quote]
+
+I couldn't let this rest and went ahead and actually [implemented](https://github.com/dfinity/motoko/pull/2860) this change. So the surprising examples should be illegal in the next Motoko release (while some others become legal).
+
+-------------------------
+
+Gabriel | 2021-10-29 11:01:36 UTC | #10
+
+Hi @rossberg and @claudio 
+
+Thanks for looking into this and thanks for the amazing explanation. I do understand it might not be a critical bug but at first sight it might be weird and confusing, I mean look at javascript after all this years and we still get WAT (skip to 1:24) https://www.destroyallsoftware.com/talks/wat
+
+`while some others become legal` could you expand a bit on this? 
+
+Thanks
+
+-------------------------
+
+claudio | 2021-10-29 11:16:06 UTC | #11
+
+> `while some others become legal` could you expand a bit on this?
+
+The description of https://github.com/dfinity/motoko/pull/2860
+gives an example and there may be more in the tests.
+
+-------------------------
+
+Gabriel | 2021-10-29 11:29:24 UTC | #12
+
+I see now, 
+
+`switch (n : Nat) { case (-1 : Int : Nat) {...} };` So basically the effect of this is none except the compiler won't complain now.
+
+-------------------------
+
+claudio | 2021-10-29 11:45:47 UTC | #13
+
+[quote="Gabriel, post:12, topic:8095"]
+`switch (n : Nat) { case (-1 : Int : Nat) {...} };`
+[/quote]
+
+It will warn you that the pattern is never matched, but it won't reject the code ( in this example).
+
+-------------------------
+
+claudio | 2021-10-29 11:48:46 UTC | #14
+
+Before:
+```
+> let n = 0;
+> switch (n : Nat) { case (-1 : Int : Nat) {}};                 
+stdin:1.26-1.28: type error [M0050], literal of type
+  Int
+does not have expected type
+  Nat
+```
+
+After:
+```
+> let n = 0;
+let n : Nat = 0
+> switch (n : Nat) { case (-1 : Int : Nat) {}};                 
+stdin:2.26-2.28: warning [M0146], this pattern is never matched
+stdin:2.1-2.45: warning [M0145], this switch of type
+  Nat
+does not cover value
+  0 or 1 or _
+> stdin:2.20-2.44: execution error, switch value 0 does not match any case
+```
+
+-------------------------
+
+rossberg | 2021-10-29 15:02:52 UTC | #15
+
+[quote="Gabriel, post:12, topic:8095"]
+So basically the effect of this is none except the compiler won’t complain now.
+[/quote]
+
+It now rejects out cases like
+```
+func (x : Nat : Int : Nat) {...}
+```
+where a type shrinks again. Your playground example was a variation of that, except that in your case, the outermost type annotation was propagated from the enclosing function's return type. Simplifying a bit, yours was like:
+```motoko
+func f() : {g : Nat -> ()} {
+  {g = func(x : Nat : Int) {}}
+};
+```
+which had a similar effect before, because the knowledge from f's return type is propagated all the way into the inner function. It now is rejected as well.
+
+-------------------------
+

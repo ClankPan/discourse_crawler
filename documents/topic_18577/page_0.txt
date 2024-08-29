@@ -1,0 +1,306 @@
+p_d | 2023-02-19 09:56:30 UTC | #1
+
+Since two days I'm getting the following error using Internet Identity canister **locally** (dev-build) from within my app: 
+![Screenshot 2023-02-19 at 09.39.10|456x404](upload://YTx6ZzMLB1FTQgJdhTAiAUK9Ae.png)
+
+Console logs:
+```
+index.js:331 Refused to connect to 'http://icp-api.io/api/v2/status' because it violates the following Content Security Policy directive: "connect-src 'self' https://identity.internetcomputer.org https://icp-api.io https://*.icp0.io https://*.ic0.app".
+```
+I'm quite sure that I did not change anything in the code related to II recently...
+
+Does anyone have the same issue?
+
+-------------------------
+
+peterparker | 2023-02-19 11:46:00 UTC | #2
+
+I've got a small idea why but, not sure how to resolve it so I'll forward your question to the II team to be sure they notice it.
+
+Meanwhile, maybe I ask how you deploy II locally? Maybe you can "just" pin an older commit version and it should unblock you.
+
+-------------------------
+
+p_d | 2023-02-19 16:06:08 UTC | #3
+
+Thanks for forwarding to the team!
+
+I'm simply using the latest dev-build to instanciate the canister locally:
+```
+"internet_identity": {
+    "type": "custom",
+    "candid": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity.did",
+        "wasm": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity_dev.wasm",
+            "remote": {
+                "id": {
+                    "ic": "rdmx6-jaaaa-aaaaa-aaadq-cai"
+                }
+          },
+            "frontend": {}
+ }
+```
+Might it be related to the `ic0.app` blacklist issue?
+
+-------------------------
+
+peterparker | 2023-02-19 16:24:38 UTC | #4
+
+I would bet indeed that it's related to last week work about the new domain `internetcomputer.org`, like a side effect.
+
+Instead of `https://github.com/dfinity/internet-identity/releases/latest/download/...` try to pin a previous release.
+
+e.g. `release-2023-02-12_2`:
+
+```
+"internet_identity": {
+    "type": "custom",
+    "candid": "https://github.com/dfinity/internet-identity/releases/download/release-2023-02-12_2/internet_identity.did",
+        "wasm": "https://github.com/dfinity/internet-identity/releases/download/release-2023-02-12_2/internet_identity_dev.wasm",
+            "remote": {
+                "id": {
+                    "ic": "rdmx6-jaaaa-aaaaa-aaadq-cai"
+                }
+          },
+            "frontend": {}
+ }
+```
+
+p.s.: not sure I got above github urls correct but you get the idea
+
+-------------------------
+
+p_d | 2023-02-19 20:05:18 UTC | #5
+
+I tried release `https://github.com/dfinity/internet-identity/releases/download/release-2023-02-12_2/internet_identity_dev.wasm` but same result...
+
+What really puzzles me is that using `https://github.com/dfinity/internet-identity/tree/main/demos/using-dev-build` as a demo application for local internet identity works fine, but the same approach from within our app fails...
+
+-------------------------
+
+peterparker | 2023-02-19 20:47:20 UTC | #6
+
+Oh I was almost expecting that pinning the version would solve it 😥.
+
+I read the error message again and the issue is clear to me now.
+
+```
+index.js:331 Refused to connect to 'http://icp-api.io/api/v2/status' because it violates the following Content Security Policy directive: "connect-src 'self' https://identity.internetcomputer.org https://icp-api.io https://*.icp0.io https://*.ic0.app".
+```
+
+It says something tries to connect to `http://icp-api.io/...` but the CSP allows "only" `https://icp-api.io`
+
+i.e. http vs http**s**
+
+That said, now sure where the call is made and why it goes through http instead of https 🤷‍♂️
+
+-------------------------
+
+p_d | 2023-02-19 21:09:16 UTC | #7
+
+Yes, I noticed that, however this url is not something we can configure in our app, it‘s somewhere within II wasm I guess…
+
+-------------------------
+
+peterparker | 2023-02-19 21:11:54 UTC | #8
+
+Maybe indeed, let’s see what team says…
+
+-------------------------
+
+nmattia | 2023-02-20 14:47:13 UTC | #9
+
+Hi @p_d ,
+
+TL;DR: do you use `0.0.0.0` for deployment? If so, apologies, we'll fix this soon.
+
+---
+
+We changed some of the logic for figuring out what endpoint to use for the IC, but it looks like we've broken something. Here's the logic for local development:
+
+```ts
+  if (
+    location.host === "127.0.0.1" ||
+    location.hostname.endsWith("localhost")
+  ) {
+    // If this is a local deployment, then assume the api and assets are collocated
+    // and use this asset (page)'s URL.
+    return location.protocol + "//" + location.host;
+  }
+```
+
+Effectively this means "if the URL is `127.0.0.1` or ends with `localhost` then assume the API is a local replica served at that same URL". In production, it should be using `https://icp-api.io` instead:
+
+``` ts
+  // In general, use the official IC HTTP domain.
+  return location.protocol + "//" + IC_API_DOMAIN;
+```
+
+See the source [here](https://github.com/dfinity/internet-identity/blob/41de943dff2a4bef5b55e702f8b8c772ffd00c98/src/frontend/src/utils/iiConnection.ts#L653-L678). We tried to reuse some logic from [agent-js](https://github.com/dfinity/agent-js/blob/bf6e338af103b07e28cc2c23005cff48231c80db/packages/agent/src/agent/http/index.ts#L234-L237) but evidently we got something wrong.
+
+@p_d what do you have in your address bar when the issue happens? I'm guessing you're neither on `localhost` nor on `127.0.0.1`? Maybe `0.0.0.0`? I didn't think of that.
+
+Either way, you probably should pin your version of II as @peterparker suggested!
+
+[quote="peterparker, post:2, topic:18577"]
+Maybe you can “just” pin an older commit version and it should unblock you.
+[/quote]
+
+-------------------------
+
+p_d | 2023-02-20 15:29:32 UTC | #10
+
+Hi @nmattia, thanks for your support!
+
+My local frontend app is running on `http://127.0.0.1:8080` (webpack server) and `http://127.0.0.1:4943/?canisterId=ryjl3-tyaaa-aaaaa-aaaba-cai` (local replica). The corresponding redirect to local II is to `http://127.0.0.1:4943/?canisterId=rkp4c-7iaaa-aaaaa-aaaca-cai#authorize`.
+
+So if my understanding is right this should work, isn't it?
+
+I'm using now `release-2023-02-17` which works, I just had to ensure that the old canister was really deleted (`dfx canister delete --all`) when switching the II version...
+
+-------------------------
+
+p_d | 2023-02-20 15:36:26 UTC | #11
+
+Hmmm, after having deleted all my canisters (`dfx canister delete --all`) it seems to work now also with the latest release.
+
+I'm feeling kind of stupid now, but I guess there was something wrong in my local replica and without deleting all canisters I couldn't fix it, even with pinning a older release...
+
+Anway, I think it should be all fine now, sorry for this issue!
+
+-------------------------
+
+nmattia | 2023-02-20 15:48:03 UTC | #12
+
+Hah, that's odd!
+
+Well, good thing it works. I think it's still worth fixing the issue for `0.0.0.0`, even though it doesn't seem to be why you had issues...
+
+Anyway, let us know if anything else comes up!
+
+-------------------------
+
+peterparker | 2023-04-07 15:16:45 UTC | #13
+
+FYI @nmattia, today Joao on discord had the exact same issue and also solved it by deleting all canisters 🤷‍♂️
+
+[https://discord.com/channels/748416164832608337/748416164832608341/1093910297204490260](https://discord.com/channels/748416164832608337/748416164832608341/1093910297204490260)
+
+-------------------------
+
+sadernalwis | 2023-12-25 11:23:57 UTC | #14
+
+Anywhere I can find a functioning II repo? :sweat_smile: 
+can not find any branch ```auth-client-demo``` that will give a local deployment.
+Unable to find the doesn't direct to a valid II endpoint.
+have the ports changed?
+
+-------------------------
+
+sadernalwis | 2023-12-25 12:50:10 UTC | #15
+
+![image|690x357](upload://3Exk8o5l6IpOpR4uMpYYrh2fQ44.png)
+
+everything except ```spa.js``` is loaded in the redirect.
+
+-------------------------
+
+p_d | 2023-12-26 09:55:24 UTC | #16
+
+Are you looking for this? https://github.com/dfinity/internet-identity
+
+-------------------------
+
+sadernalwis | 2023-12-26 17:30:23 UTC | #17
+
+Actually that's where I am at rn. Thank you !
+Build works.
+But still haven't checked the test cases and integration.
+any idea why the above doesn't work?
+
+-------------------------
+
+p_d | 2023-12-30 10:01:50 UTC | #18
+
+Hmmm, I facing the same issue now with my application when running it locally **but found out that it only occurs in Chrome browser. In Safari it works fine!**
+
+What really puzzles me is that using `https://github.com/dfinity/internet-identity/tree/main/demos/using-dev-build` as a demo application for local internet identity works fine, but the same approach from within our app fails. I tried to clean the cache, delete all canisters, delete localStorage in the browser, etc., but no luck...
+
+Anyone else having this problem?
+
+-------------------------
+
+sadernalwis | 2023-12-30 15:33:50 UTC | #19
+
+followed through up until here using a sepreate II build from [Repo](https://github.com/dfinity/internet-identity)
+
+but the captcha won't load..
+
+![image|690x456](upload://9zIpQyUyWM6mB9jMHaTgZztBXj5.jpeg)
+
+-------------------------
+
+peterparker | 2023-12-30 15:37:40 UTC | #20
+
+[quote="p_d, post:18, topic:18577"]
+Anyone else having this problem?
+[/quote]
+
+I don't. Can you reproduce the issue you are encountering with a sample repo as well?
+
+-------------------------
+
+peterparker | 2023-12-30 15:40:08 UTC | #21
+
+Ah, I've got an idea which might explain why it works in Safari but, not in Chrome.
+
+Are you using the auth url as described in the II's README?
+
+> To access Internet Identity or configure it for your dapp, use one of the following URLs:
+>
+>    Chrome, Firefox: http://<canister_id>.localhost:4943
+>    Safari: http://localhost:4943?canisterId=<canister_id>
+
+-------------------------
+
+sadernalwis | 2023-12-30 15:56:20 UTC | #22
+
+fixed it by deleting the
+
+```bash
+~/.config/dfx/networks.json
+```
+
+but it think you are right about the url being the culprit.
+mine works for:
+by using vite frontend host;
+```
+http://localhost:5173/?canisterId=bnz7o-iuaaa-aaaaa-qaaaa-cai
+```
+
+phew... for now.. :sweat_smile:
+
+-------------------------
+
+sadernalwis | 2023-12-30 15:58:02 UTC | #23
+
+Thanx for checking and reply. @peterparker @p_d 
+much appreciated! :pray: :pray:
+
+-------------------------
+
+p_d | 2023-12-30 20:07:09 UTC | #24
+
+Arghh, you're right, I should have read the README more carefully. Chaning the auth url to the Chrome one did solve the issue... Seems that the Chrome/Firefox url changed recently, I'm quite sure it worked some weeks ago with the same url as for Safari...
+
+Anyway, thanks a lot for your helpl @peterparker, much appreciated!
+
+-------------------------
+
+peterparker | 2023-12-30 20:13:47 UTC | #25
+
+Great to hear it worked out!
+
+@frederikrothenberger we should maybe find a way to make the note we added recently about "Local dev URL in Chrome vs Safari" in the readme more predominant?
+
+-------------------------
+

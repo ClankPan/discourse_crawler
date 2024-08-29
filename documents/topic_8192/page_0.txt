@@ -1,0 +1,210 @@
+lastmjs | 2021-10-28 05:12:47 UTC | #1
+
+I've also opened this up on the candid repo. Does anyone have experience using serde_json with candid::Nat with Rust? I can't get a simple JSON string to deserialize to a Rust struct with a field that is of type candid::Nat.
+
+Here's a link to the issue with more information: https://github.com/dfinity/candid/issues/289
+
+-------------------------
+
+chenyan | 2021-10-28 16:06:58 UTC | #2
+
+Can you post the error message in the issue?
+
+-------------------------
+
+rckprtr | 2021-10-28 16:25:18 UTC | #3
+
+Without the error message, Im guessing Rust WASM doesn't support arbitrary length integers?  Nat8, Nat32, Nat64...
+
+-------------------------
+
+lastmjs | 2021-10-28 16:31:47 UTC | #4
+
+```rust
+Error("invalid type: integer `100`, expected Nat value", line: 1, column: 33)
+```
+
+-------------------------
+
+lastmjs | 2021-10-28 16:37:12 UTC | #5
+
+It's a deserialization error, that's what the `candid::Nat` type is for, since there is no native Rust representation of a candid Nat. The problem is getting serde to deserialize a JSON number to a `candid::Nat`.
+
+-------------------------
+
+chenyan | 2021-10-28 16:46:43 UTC | #6
+
+I see. I can add the visitor for integer. `Nat` currently only takes a specific internal representation for deserialization.
+
+-------------------------
+
+lastmjs | 2021-10-28 16:56:03 UTC | #7
+
+It would be amazing to allow any JSON number to be deserialized to candid::Nat!
+
+-------------------------
+
+lastmjs | 2021-10-28 16:58:59 UTC | #8
+
+Do you have an ETA on this? Just wondering if I should use something like [#[serde(deserialize_with)]](https://users.rust-lang.org/t/need-help-with-serde-deserialize-with/18374) in the mean time. I assume I would just manually implement a visitor for this field for now, and then when the candid library is updated I can just remove that code. And our code would essentially be doing the same thing?
+
+-------------------------
+
+chenyan | 2021-10-28 17:17:47 UTC | #9
+
+Can you try this branch: https://github.com/dfinity/candid/pull/290
+
+I didn't look at which integer type is used by serde_json, but I think it should be enough.
+
+-------------------------
+
+lastmjs | 2021-10-28 18:11:58 UTC | #10
+
+Thank you! I will try this branch and let you know how it goes
+
+-------------------------
+
+lastmjs | 2021-10-28 19:19:48 UTC | #11
+
+I'm trying to use that branch, but now my code won't compile where it would compile before. Perhaps there are some issues with the ic-cdk version?
+
+For this struct that worked with version `0.7.8` of candid:
+
+```rust
+#[derive(serde::Deserialize, candid::CandidType)]
+        struct TransferRequest {
+            from: String,
+            to: String,
+            amount: candid::Nat
+        }
+```
+
+I get this error now: ```the trait bound `TransferRequest: ic_cdk::export::candid::CandidType` is not satisfied```
+
+If I change the struct to look like this:
+
+```rust
+#[derive(serde::Deserialize, ic_cdk::export::candid::CandidType)]
+        struct TransferRequest {
+            from: String,
+            to: String,
+            amount: candid::Nat
+        }
+```
+Then I get the following error: 
+```rust
+the trait `ic_cdk::export::candid::CandidType` is not implemented for `candid::Nat`
+```
+
+I'm using `ic-cdk = "0.3.2"`
+
+-------------------------
+
+chenyan | 2021-10-28 19:31:19 UTC | #12
+
+Right, the second code is correct. You will need to patch Cargo.toml.
+```
+[patch.crates-io.candid]
+git = "https://github.com/dfinity/candid.git"
+branch = "nat-visitor"
+```
+
+-------------------------
+
+lastmjs | 2021-10-28 20:10:17 UTC | #13
+
+[quote="chenyan, post:12, topic:8192"]
+```
+[patch.crates-io.candid]
+git = "https://github.com/dfinity/candid.git"
+branch = "nat-visitor"
+```
+[/quote]
+
+Oh I see, should I not be installing candid directly? I've been installing candid and using `candid::Nat` and `candid::CandidType`. Should I be doing `ic_cdk::export::candid::` always, generally speaking?
+
+-------------------------
+
+lastmjs | 2021-10-28 20:12:59 UTC | #14
+
+It all works!!! Thank you so much for getting this fixed and pointing me in the right direction. I will be doing a lot of deserialization in Rust for Azle https://github.com/lastmjs/azle, so if I run into any more issues maybe I'll just post to this thread if the problems are similar
+
+-------------------------
+
+chenyan | 2021-10-28 20:30:41 UTC | #15
+
+`ic_cdk::export::candid` is the current recommendation. This avoids candid version mismatch between ic-cdk and user's import. Not sure if it's the best way to handle version mismatch.
+
+-------------------------
+
+lastmjs | 2021-10-29 15:27:52 UTC | #16
+
+@chenyan Now I need to get my Rust structs serialized into JSON.
+
+Imagine I have this struct:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, ic_cdk::export::candid::CandidType)]
+struct TransferRequest {
+    nat: ic_cdk::export::candid::Nat
+}
+```
+
+I am trying to take a value of type `TransferRequest` and serialize it into JSON like this:
+
+```rust
+serde_json::to_string(&transferRequest);
+```
+
+But I get the following error:
+
+```bash
+^^^^^^ the trait `Serialize` is not implemented for `ic_cdk::export::candid::Nat`
+```
+
+-------------------------
+
+lastmjs | 2021-10-29 16:55:36 UTC | #17
+
+You know, the documentation here says I can just use `u128` in Rust instead of `candid::Nat`...is that true? https://sdk.dfinity.org/docs/candid-guide/candid-types.html#type-nat
+
+Any best practices? Seems much easier to just use `u128`.
+
+-------------------------
+
+chenyan | 2021-10-29 18:56:54 UTC | #18
+
+`Serialize` is not needed for Candid, so it's not implemented for `candid::Nat`. You are right, you can use `u128` for nat in Rust. The limitations are 1) `u128` is always 128bit, while `candid::Nat` can take fewer space for smaller numbers; 2) You cannot decode numbers out of the 128bit range. Otherwise, they are identical.
+
+-------------------------
+
+lastmjs | 2022-03-29 17:49:07 UTC | #19
+
+I am running into this issue again and would love for it to be addressed, not as easy to workaround now: https://github.com/dfinity/candid/issues/331
+
+-------------------------
+
+lastmjs | 2022-03-29 17:49:50 UTC | #20
+
+And yet it seems to be implemented for candid::Principal, as I don't run into the same error when using a candid::Principal value.
+
+-------------------------
+
+diegop | 2022-03-29 18:13:14 UTC | #21
+
+I will ping @chenyan , Jordan
+
+-------------------------
+
+lastmjs | 2022-03-29 18:13:47 UTC | #22
+
+Thank you, I have found a somewhat flaky workaround but I would love to finally get this addressed.
+
+-------------------------
+
+chenyan | 2022-03-29 18:38:57 UTC | #23
+
+Replied in the issue. I think the standard way is to define a new type in your application and implement the trait there.
+
+-------------------------
+

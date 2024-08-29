@@ -1,0 +1,284 @@
+alex-df | 2023-08-11 06:37:37 UTC | #1
+
+## Summary
+
+The Wasm instrumentation of the Internet Computer is critical for the performance of canister code and the block rate consistency. Recently we discovered that the existing Wasm instrumentation produces sub-optimal code in certain cases. We propose to redesign the instrumentation and expect the following user-visible impact: (1) an order of magnitude speedup in interpreters for languages such as Python or JavaScript; (2) small changes in most applications (+/-20%); (3) a more stable block rate.
+
+## What does it mean to you?
+
+The new implementation will be gated behind a feature flag. This means:
+
+* On mainnet, the new instrumentation is not enabled and will not influence your existing canisters until an NNS motion proposal is voted in by the community to enable it.
+* There will be a new dfx version with the new instrumentation enabled for local deployment. You can experiment with it to understand its impact on your canisters. Please report back any discrepancies or large regressions.
+* Once all feedback from the community is addressed, we will submit an NNS motion proposal to enable the feature on mainnet.
+* If the NNS motion proposal passes, then DFINITY will propose a replica version with the feature enabled for rollout on mainnet.
+
+## Technical details
+
+The IC instruments Wasm binaries by injecting tiny snippets of code in order to count the number of executed instructions. This is needed to ensure that canister execution terminates and is fairly charged for.
+
+The current instrumentation algorithm works well, but is inefficient for certain kinds of applications such as language interpreters. The new Wasm instrumentation addresses these inefficiencies and achieves an order of magnitude better performance for such applications, allowing developers to run their canisters more efficiently and possibly cheaper.
+
+This proposal significantly revamps the way the IC performs instrumentation, modifying its core algorithm as well as important algorithm parameters, such as weights to be taken into account for Wasm instructions and system calls. The end result will be more efficient execution of user code, more stable block rate, and fair resource sharing between IC users.
+
+Whereas the old instrumentation treats all instructions as equal in terms of cost, the actual cost of an instruction depends on its type. For example, division is more expensive than addition. The standard practice in the blockchain world is to have different costs for different instructions, for example varying gas costs per opcode in the EVM, as specified in the Yellow Paper. Therefore, in the reworking of the instrumentation component we propose to take instruction weights into account when doing instruction counting. This leads to a non-uniform instruction cost model that might affect the total cycle consumption of certain workloads.
+
+Below you can find several examples of how applications can be impacted by the new instrumentation’s initial prototype. While this is no exhaustive list, it gives an indication of what canister developers can expect for different types of applications. Once the dfx distribution including the new instrumentation is available, we invite you all to experiment with it and report back any corner cases, which are possible.
+
+|Application|No. of Instructions Counted|
+| --- | --- |
+|QuickJS|-97% (30x less instructions, cheaper)|
+|Sqlite|-47% (2x less instructions)|
+|NNS Ledger|+17% (more instructions, costlier)|
+|NNS voting reward distribution|+15%|
+|SHA3 computation|+2%|
+
+(Note that a X% increase in the number of instructions does not directly translate to an X% increase in overall cost. This does not include ingress and message execution fees.)
+
+*A more detailed timeline plan will follow.*
+
+*Article with contributions also from Andriy, Maciej and Ulan.*
+
+-------------------------
+
+alex-df | 2023-09-07 12:46:58 UTC | #2
+
+We’re happy to announce that a new version of DFX that includes the new instrumentation is available. In this DFX version, the new instrumentation flag is enabled by default. Please note that this change is not enabled on mainnet and it will not be until the community votes to enable it. Below we have more details about the changes we propose.
+
+We stress that the proposed changes are not final and are up for a healthy discussion with the community. In case your canisters are affected, don’t hesitate to contact us using this thread and we will investigate it.
+
+**TL;DR:** we expect that either (1) your application will be faster and cost fewer cycles; or (2) if it uses heavily weighted instructions its overall cycle usage may regress by several percentage points, depending on the programming language.
+
+## Proposed solution and changes
+
+We propose a redesign of the way the IC performs instrumentation, modifying its core algorithm as well as important algorithm parameters, such as weights to be taken into account for Wasm instructions and system calls. The end result will be more efficient execution of user code, more stable block rate, and fair resource sharing between IC users.
+
+Whereas the old instrumentation treats all instructions as equal in terms of cost, the actual cost of an instruction depends on its type. For example, division is more expensive than addition, and that also holds for floating point operations. Another example is function calls, which have higher overhead. Adjusting these helps with fairness and smooth operation.
+
+The standard practice in the blockchain world is to have different costs for different instructions, for example varying gas costs per opcode in the EVM, as specified in the [Yellow Paper](https://ethereum.github.io/yellowpaper/paper.pdf). Therefore, in the reworking of the instrumentation component we propose to take instruction weights into account when doing instruction counting. This leads to a non-uniform instruction cost model that might affect the total cycle consumption of certain workloads.
+
+Specifically, the proposed changes for the new instrumentation and its parameters are:
+
+1. The new instrumentation algorithm – found in the proposed [code](https://github.com/dfinity/ic/commit/4cb8960512763da6fe995b77a0780944dbf26273).
+2. Instruction weights are re-calibrated in several changes: [code](https://github.com/dfinity/ic/commit/82ab6b8ec3521d3df62ae2db206e4cc87f0aebc8), [code](https://github.com/dfinity/ic/commit/9d106b8064863f58a80567ac42c79c06efb942b2), [code](https://github.com/dfinity/ic/commit/857978f942e1ad392ae3117dc8c3d6fb1022d4f4), [code](https://github.com/dfinity/ic/commit/4e46b7ca8db9168656da47692b61f58488825ef1).
+
+## What should I do?
+
+Download and install the new DFX version. Deploy your canisters locally using this new DFX version and run your most usual workloads.
+
+The new DFX version can be obtained using the following command:
+
+`DFX_VERSION=0.15.0-beta.5 sh -ci "$(curl -fsSL[ https://internetcomputer.org/install.sh](https://internetcomputer.org/install.sh))"`
+
+To compare against the old instrumentation use the `--use-old-metering` flag to turn on the old version of the instrumentation.
+
+## What metrics should I look at?
+
+There are two important metrics you should consider: cycle balance and performance counter (which measures instruction counts). Please note that considering only the latter does not paint the whole picture with regard to the overall conclusion. Please measure both these metrics with the new DFX and compare them with the data you are used to using the old instrumentation (through the old DFX).
+
+## Understanding the data
+
+Note that a slight variation in cycle consumption and instruction counts is expected. Several applications see a dramatic improvement in cycle consumption and instruction counts (as we announced earlier). However, other types of applications and canisters might see a slight increase. When increases happen, they should not be more than 15-20%. In case you encounter larger increases or unexpected behavior or failures, don’t hesitate to contact us using this thread and we will investigate it.
+
+## Understanding the IC cost model
+
+When a message is sent to an IC canister, the overall cost in cycles of that message is a sum of per-message fees, network ingress fees, and the number of instructions executed. Details about the cost model can be found [here](https://internetcomputer.org/docs/current/developer-docs/gas-cost) and an example calculation can also be found [here](https://wiki.internetcomputer.org/wiki/Comparing_Canister_Cycles_vs_Performance_Counter). A simplified version of the cost of executing a message can be thought of like the following:
+
+Message_cost = message_fee + ingress_cost + ingress_bytes_cost + **instructions_executed**.
+
+Note that the new instrumentation only affects the way the IC counts instructions (**instructions_executed**). Therefore, an X% increase in the number of reported instructions (measured through the performance counter) will not result in the exact same increase in the message cost.
+
+In the example below (Fig. 1), DFINITY engineers tested the new instrumentation on NNS and SNS canisters to understand the outcome of the new instrumentation. We have observed improvements in performance and decreased instruction counts in most of the top-ranking function calls. An exception to this is the reward distribution function of the NNS Governance canister, which, according to our experiments increases in complexity because it uses heavy floating point instructions.
+
+![|591x300](upload://bNhlM1mpx93iIKnBGhB8lkPboPZ.png)
+
+Fig. 1. New instrumentation experiments using NNS and SNS canisters. Lower is better.
+
+## Impact on Motoko code
+
+We expect code that uses Wasm br_table instructions (computed jumps) (e.g. bytecode interpreters but also Rust Candid decoding) to significantly reduce in cost, but code that calls functions (e.g. to reduce code size) to increase in cost. The Motoko compiler does not generate br_table instructions but does emit and call many functions to reduce code size, so, in the short term, Motoko programs are more likely to increase, in our estimation by up to 22% in overall cost. The Motoko team will mitigate these regressions with more aggressive in-lining, either in the compiler itself, or via [ic-wasm](https://github.com/dfinity/ic-wasm).
+
+## Report back and work with us
+
+As mentioned before, new instrumentation weights are not final and we will work with the community to find a good solution. There are many possible corner cases that are difficult to test, therefore we need your help. Test your canisters and report back to us in case of any possible issues. Once we have solved everything, we will make an NNS proposal to vote for the agreed changes.
+
+IMPORTANT: In case of any issues, please reply back within two weeks.
+
+-------------------------
+
+diegop | 2023-09-08 15:10:45 UTC | #3
+
+
+
+-------------------------
+
+icpp | 2023-09-10 04:54:41 UTC | #4
+
+How do I extract the performance counter for a canister? Sorry if it is a trivial question, I just never dug into that yet...
+
+I am a bit worried for my case of running LLMs in a canister, because it is very floating point compute heavy, and I like to run a comparison.
+
+-------------------------
+
+Severin | 2023-09-11 06:55:51 UTC | #5
+
+[quote="icpp, post:4, topic:22080"]
+How do I extract the performance counter for a canister?
+[/quote]
+
+Rust: https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.performance_counter.html
+Motoko: https://internetcomputer.org/docs/current/motoko/main/base/ExperimentalInternetComputer#function-countinstructions
+
+-------------------------
+
+domwoe | 2023-09-11 12:49:43 UTC | #6
+
+[quote="icpp, post:4, topic:22080"]
+How do I extract the performance counter for a canister?
+[/quote]
+
+Since you're implementing a CDK, here's the relevant section in the Interface Specification: https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-performance-counter
+
+-------------------------
+
+b3hr4d | 2023-09-14 09:55:32 UTC | #7
+
+[quote="alex-df, post:2, topic:22080"]
+DFX_VERSION=0.15.0-beta.5 sh -ci "$(curl -fsSL[ https://internetcomputer.org/install.sh](https://internetcomputer.org/install.sh))"
+[/quote]
+
+`
+DFX_VERSION=0.15.0-beta.5 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+`
+
+-------------------------
+
+b3hr4d | 2023-09-14 10:41:57 UTC | #8
+
+Hello Community,
+
+I've been actively testing the new Wasm instrumentation on my local `dfx` setup and I have some encouraging news to share. 
+
+### The Issue I Faced:
+
+In my project, I utilize a global timer function called `canister_global_timer`. Within this function, I had a line of code that spawned an asynchronous task using `ic_cdk::spawn(execute_task(task_timer));`. This task was responsible for making an inter-canister call to another local canister. The specific code snippet is something like this:
+
+```rust
+ic_cdk::call(
+    vetkd_system_api_canister_id(),
+    "vetkd_public_key",
+    (request,),
+)
+.await
+```
+
+For some reason, this process would halt or freeze when executed in my local `dfx` environment. Interestingly, this issue was not present when running the same code on the mainnet.
+
+### The Resolution:
+
+After updating to the new DFX version that incorporates the latest Wasm instrumentation, this issue has been completely resolved. The timer function and the inter-canister call now execute as expected in my local environment.
+
+### Why the New Instrumentation Might Have Fixed It:
+
+1. **Efficiency**: The new Wasm instrumentation is designed to optimize canister execution, which could have positively impacted the performance of asynchronous tasks like the one I was running.
+  
+2. **Resource Allocation**: The new version aims to allocate computational resources more fairly by taking into account the actual cost of different Wasm instructions. This might have led to a more balanced and efficient execution of my code.
+
+I'm currently diving deeper into other functionalities to see how they are impacted by this update. I'll be sure to share more findings as I continue my testing.
+
+Best regards,
+Behrad
+
+-------------------------
+
+berestovskyy | 2023-09-15 12:36:04 UTC | #9
+
+Hey Behrad,
+Thanks for your feedback. As the new `dfx` includes many other improvements, to make sure the improvements come from the new instrumentation, you can run the `dfx` with the old metering:
+
+```
+dfx start --use-old-metering
+```
+
+-------------------------
+
+berestovskyy | 2023-09-15 12:38:46 UTC | #10
+
+JFYI folks, a new `dfx` beta is available:
+
+```
+DFX_VERSION=0.15.0-beta.6 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+```
+
+There are no changes related to the instrumentation, but it includes other fixes and updates.
+
+-------------------------
+
+b3hr4d | 2023-09-15 15:34:35 UTC | #11
+
+You are right, The fix comes from the `dfx` improvements.
+
+-------------------------
+
+alex-df | 2023-09-25 09:42:12 UTC | #12
+
+Hello everyone, we will go ahead and follow up with a NNS motion proposal on the topic.
+
+-------------------------
+
+lastmjs | 2023-09-27 00:55:35 UTC | #13
+
+Hey everyone, I wanted to share some basic benchmarking we've done with Azle and Kybra showing pre and post instrumentation (dfx 14 vs 15) and Azle with the Boa JS engine and the more performant QuickJS engine.
+
+The benchmark was a simple for loop adding numbers together.
+
+## For Loop Performance
+
+|             | dfx v0.14.4 | dfx v0.15.0 |
+| ----------: | ----------: | ----------: |
+| Rust        | 15_544      | 10_827      |
+| Azle@0.17.1 | 390_104_399 | 378_918_154 |
+| Azle@0.18.0 | 627_412_226 |  10_991_385 |
+|       Kybra | 252_171_360 |  44_304_052 |
+
+As you can see the instrumentation changes are extremely desirable for Azle and Kybra moving forward.
+
+-------------------------
+
+berestovskyy | 2023-09-27 06:38:57 UTC | #14
+
+Thanks for sharing this, Jordan!
+
+-------------------------
+
+b3hr4d | 2023-09-27 06:43:10 UTC | #15
+
+Also the rust is huge! Around 30%!
+Thanks for sharing.
+
+-------------------------
+
+alex-df | 2023-09-27 06:51:30 UTC | #16
+
+sounds great, Jordan, thank you for sharing!
+
+-------------------------
+
+rossberg | 2023-09-27 12:58:49 UTC | #17
+
+Out of interest, I had a look at the implementation of the instrumentation (I think the cost model should be specified in a proper doc, and not just defined-by-implementation, but that's a different complaint). I was extremely surprised to see that bulk instructions on memories and tables are budgeted with constant cost, and a relatively low one at that. That seems highly dubious, given that their real cost is linear in the length operand, and can range from near 1 to millions or even billions of CPU cycles. Similar considerations apply to memory/table grow operations. Shouldn't this be taken into account?
+
+-------------------------
+
+alex-df | 2023-09-27 13:10:06 UTC | #18
+
+Thanks for the comment. The constant budgeted weight is only for the instruction itself. There is a dynamic weight that is calculated separately, depending on how many bytes are touched. This functionality existed before.
+
+-------------------------
+
+rossberg | 2023-09-27 14:29:07 UTC | #19
+
+Ah, okay, thanks for the clarification! (I suppose a specification could make that more obvious. :) )
+
+-------------------------
+

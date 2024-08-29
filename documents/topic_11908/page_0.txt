@@ -1,0 +1,92 @@
+dsarlis | 2022-04-04 18:53:48 UTC | #1
+
+# Summary
+
+A member of the [Ceto Swap](https://github.com/Ceto-Labs/CetoSwap) team reported that the IC incorrectly refunded an excessive amount of cycles to a single canister upon the completion of a call. The canister sent an `install_code` message that trapped during execution and created a reject response that was above the maximum allowed size. The unexpectedly large response size triggered an underflow in the function that refunds cycles upon the completion of a call, resulting in the canister that originally sent the `install_code` message being credited with a huge amount of cycles. The discovered bugs have existed since Genesis.
+
+A new replica version was proposed in proposal [52627](https://dashboard.internetcomputer.org/proposal/52627):
+
+1. The bugs that were discovered are fixed.
+2. The cycles balance of the affected canister was fixed by subtracting the incorrectly added cycles.
+
+Thank you to the Ceto Swap developer (who wished not to be identified) for alerting DFINITY and working alongside DFINITY to resolve this issue. While a Vulnerability Rewards Program is still in the process of being formalized, DFINITY will award an appropriate reward for the finding. In the meantime, please flag potential vulnerabilities through the [Vulnerability Disclosure Program](https://dfinity.org/vulnerability-disclosure-program/) or write to [securitybugs@dfinity.org](mailto:securitybugs@dfinity.org).
+
+# Impact
+
+The canister that hit the above scenario ended up with a huge amount of cycles in their balance. Further, the canister’s controller noticed that the canister was trapping when attempting to execute messages on it because it was using an older version of the System Api that only supported 64-bit cycles balances, which led to some downtime for this individual canister. After the subnet was updated to the newly elected replica version, the incorrectly added cycles were removed and the canister was functional again. There was no impact for other canisters.
+
+# Timeline (UTC)
+
+All times are in UTC on 2022-04-01 (unless explicitly stated otherwise):
+
+* 06:31: A very large error response is returned for canister install message on subnet mpubz, causing an underflow in refunded cycles when processed.
+* 07:13: An engineer shares a message from a ceto-swap developer who has a canister with a very large Cycles balance.
+* 07:24: The team starts investigating.
+* 09:00: A bug is found in `CyclesAccountManager::response_cycles_refund` that performs unchecked subtraction of the actual payload size from the maximum payload size. The theory is that the actual payload size exceeds the maximum payload size and causes the underflow. The team is searching for cases where the payload size exceeds the limit to confirm the theory.
+* 09:37: Quiet period starts: Mirroring to the public github repository is disabled according to the IC’s [security patch policy](https://dashboard.internetcomputer.org/proposal/48792) until the issue has been fixed.
+* 09:39: A fix is prepared for the underflow bug discovered above.
+* 11:26: A fix is prepared for the cycles balance of the affected canister to subtract the incorrectly added cycles.
+* 12:00: Issues with reproducibility of builds delay the process of rolling out the fixes.
+* 12:08: A bug in the system api (`ic0.trap`) that allows responses bigger than the maximum to be produced is identified and a fix is prepared. This is confirmed to be the case that the canister hit.
+* 12:30: The reproducibility issues are fixed by merging another patch to the release branch.
+* 13:41: A reproducible build including all fixes succeeds.
+* 14:52: NNS [proposal](https://dashboard.internetcomputer.org/proposal/52627) to elect the replica version with fixes
+* 15:00: NNS [proposal](https://dashboard.internetcomputer.org/proposal/52630) to update mpubz
+* 15:25-19:15: Series of proposals to update remaining subnets except NNS
+* 2022-04-04 07:15: NNS [proposal](https://dashboard.internetcomputer.org/proposal/53053) to update NNS
+* 2022-04-04 17:40: Quiet period ends and the source code for the elected replica version with fixes is now publicly available on [github](https://github.com/dfinity/ic/tree/8ddc21605527de3802557f195e870cc6a3cb6393).
+
+# What went wrong?
+
+* The huge increase in cycles was not immediately detected.
+* An underflow bug in calculating the cycles refund when processing the response resulted in a canister getting a huge amount of cycles as a refund.
+* A bug in `ic0.trap` allowed a canister to produce response payloads larger than the maximum limit.
+* Reproducibility issues with the build system caused delays of the fix rollout.
+
+# What went right?
+
+* The team quickly audited the code for the vulnerabilities and discovered the cases that can lead to potential underflows in a canister’s cycles balance.
+
+# Action items
+
+* Add the regression tests that the team used when reproducing the issue.
+* Audit remaining parts of the code that deal with cycles and add more defensive checks.
+* Be more defensive in checking various invariants that should hold (e.g. response size is not bigger than max allowed) across the system.
+* Audit the replica codebase for integer underflow/overflow errors.
+
+# Technical details
+
+Whenever a canister sends a message to another canister it has to pay in cycles for both the request and the eventual response that it will receive. Given that the size of the response is not known in advance, the system [reserves an amount of cycles that would be needed for the maximum possible response size](https://github.com/dfinity/ic/blob/master/rs/cycles_account_manager/src/lib.rs#L470-L471) (currently 2MB) and [refunds any excess amount](https://github.com/dfinity/ic/blob/master/rs/cycles_account_manager/src/lib.rs#L489) after the response has been processed by adding back to the canister’s balance the amount of cycles that correspond to the difference between the maximum response size and the actual response size. For example, a canister that sends a request and gets a 500KB response will first pay for a 2MB response and then get a refund for the cost of 2MB - 500KB = 1.5MB.
+
+The incident was caused by a combination of bugs that existed since Genesis. A canister attempted to upgrade another canister by sending an `install_code` message to the management canister. The message trapped and created a reject response that was a lot bigger than the maximum limit because `ic0.trap` [incorrectly allowed a canister to include an arbitrarily large error message](https://github.com/dfinity/ic/blob/master/rs/system_api/src/lib.rs#L2697). That, in turn, triggered [an underflow](https://github.com/dfinity/ic/blob/master/rs/cycles_account_manager/src/lib.rs#L492) when calculating the difference between maximum response size and actual response size. The result was to calculate a huge cycles refund which was credited to the affected canister’s balance.
+
+The fixes in the replica version elected in proposal 52627 enforced that `ic0.trap` cannot produce a response bigger than the maximum limit, fixed the bug when calculating the difference between maximum response size and actual response size by performing a checked subtraction and adjusted the affected canister’s balance by subtracting the amount of cycles that were incorrectly added in the first place.
+
+-------------------------
+
+nomeata | 2022-04-05 10:36:12 UTC | #2
+
+Thanks for the excellent retrospective write up!
+
+-------------------------
+
+GLdev | 2022-04-05 11:23:55 UTC | #3
+
+[quote="dsarlis, post:1, topic:11908"]
+That, in turn, triggered [an underflow ](https://github.com/dfinity/ic/blob/master/rs/cycles_account_manager/src/lib.rs#L492) when calculating the difference between maximum response size and actual response size.
+[/quote]
+
+> I keep warning you. **Doors** **and** **corners** , kid. That's where they get you.
+
+Awesome write-up, thanks for all the details!
+
+-------------------------
+
+goose | 2022-06-07 07:45:56 UTC | #4
+
+On April 1st, 2022, at around 14:30, Ceto team was batch deploying a rust version of the NFT trading environment and came across a failure in both deployment and upgrade in one canister. Each trading environment requires 3 canisters deployed, the first few environment setups all succeeded, however, the last one failed to proceed no matter how we tried. Query by the canister ID, dfx canister --network ic status, we found that the canister balance value was close to the maximum status of u64. At that time, I suspected that there was an underflow incident in the cycle balance, and proceeded to restore and upgrade the wallet, but also reported as an error. Therefore, I reported this problem to our community technical exchange group to see how others may fix this issue. In the meantime, I also submitted the incident to Dfinity team via [securitybugs@dfinity.org](mailto:securitybugs@dfinity.org). Paul Liu saw my message in the group and immediately contacted me and worked on resolving the problem.
+
+On May 13th, we received the bounty rewards from Dfinity [https://dashboard.internetcomputer.org/transaction/64e1ef167ccd5f21be572f2ce13435daf102563a44759ea30bffbf168d23639f](https://dashboard.internetcomputer.org/transaction/64e1ef167ccd5f21be572f2ce13435daf102563a44759ea30bffbf168d23639f)
+
+-------------------------
+

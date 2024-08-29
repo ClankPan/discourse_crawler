@@ -1,0 +1,206 @@
+alexeychirkov | 2022-02-21 07:38:16 UTC | #1
+
+Say I have a API between frontend and canister (e.g. motoko):
+
+
+```
+type Request = {
+ #getInfo;
+ #getMessages;
+}
+
+type Response {
+ #info = Text;
+ #messages = [Text];
+}
+
+actor {
+  public query func makeRequest(request: ?Request) : async ?Response {
+    switch(request) {
+      case (null) { 
+        //got unsupported variant
+        null;
+      };
+      case (?requestUnwrapped) {
+         //respond with corresponding response variant...
+         ?#info "hello from info";
+      }
+ }
+}
+```
+
+I would like to evolve this API over time - add new request-response variant pairs.
+
+E.g. add "#getLastMessages" case to `Request` or add "#status" to `Response`
+
+Those changes can be made in different ways:
+
+**1. new UI can talk to old canister API**
+
+UI candid (passing `Request #getLastMessages`)
+```
+type Request = {
+ #getInfo;
+ #getMessages;
+ #getLastMessages; //new!
+}
+type Response {
+ #info = Text;
+ #messages = [Text];
+ #status = Text; //new!
+}
+```
+
+Canister
+```
+type Request = {
+ #getInfo;
+ #getMessages;
+}
+type Response {
+ #info = Text;
+ #messages = [Text];
+}
+```
+
+All is good - canister gets `null` as a fallback for unsupported opt type.
+
+**2. old UI can talk to new canister API**
+
+UI candid
+```
+type Request = {
+ #getInfo;
+ #getMessages;
+}
+type Response {
+ #info = Text;
+ #messages = [Text];
+}
+```
+
+Canister (responding with `Response #status`)
+```
+type Request = {
+ #getInfo;
+ #getMessages;
+ #getLastMessages; //new!
+}
+type Response {
+ #info = Text;
+ #messages = [Text];
+ #status = Text; //new!
+}
+```
+
+Provided approach give an error in **second case** "old UI- new canister": adding new variant case in canister and returning it to UI (javascript in the browser) gives an error: `Error: Cannot find field hash _xxxxxx_`.
+
+If there is a way to get a fallback to `null` for non matching types on both sides - in canister and in javascript?
+
+As I understand - I get NULL case in motoko because of "Candid - opt is a special".
+
+@nomeata @claudio Please share your thoughts on building API that evolves and handles unsupported variant cases in parameter and return type on both sides.
+
+-------------------------
+
+nomeata | 2022-02-21 10:34:28 UTC | #2
+
+Yes, I think it should work as you describe; maybe the JS library isn’t implementing the spec correctly in that case?
+
+-------------------------
+
+alexeychirkov | 2022-02-21 10:44:06 UTC | #3
+
+Thanks for a quick reply.
+Can you tag tech guys who clarify that question from JS side?
+
+-------------------------
+
+nomeata | 2022-02-21 10:56:51 UTC | #4
+
+@chenyan woud be your man here
+
+-------------------------
+
+alexeychirkov | 2022-11-03 17:19:08 UTC | #5
+
+@kpeacock maybe you can help?
+
+-------------------------
+
+kpeacock | 2022-11-03 17:22:15 UTC | #6
+
+It should be possible - I have a really bad intuition about how candid typing works so I'd need to dive into it
+
+-------------------------
+
+alexeychirkov | 2022-11-03 18:10:33 UTC | #7
+
+One more inconsistency on JS side when "evolving" structs:
+
+As an example (sample 1) - simple Actor and its IDL on Javascript side:
+
+```
+//Sample 1
+//Actor - motoko
+actor Test {
+    public type MyRec = {
+        a: ?Text;
+    };
+
+    public query func test() : async MyRec {
+        return {
+            a = ?"myValue";
+        }
+    };
+};
+
+//IDL - javascript
+const MyRec = IDL.Record({
+    'a' : IDL.Opt(IDL.Text),
+});
+return IDL.Service({
+    'test': IDL.Func([], [IDL.Opt(MyRec)], ['query'],)
+})
+```
+
+So here we have simple `test` query method that returns structure with optional Text ("myValue"). Actual response in javascript is `{a: ["myValue"]}`
+
+If we add new optional field to `MyRec` on motoko side and NOT on javascript side - no matter what will be set in `a` field - on javascript side it will be null (technically empty javascript array as it is optional null representation) - see sample 2
+
+```
+//Sample 2
+//Actor - motoko
+actor Test {
+    public type MyRec = {
+        a: ?Text;
+        b: ?Text;
+    };
+
+    public query func test() : async MyRec {
+        return {
+            a = ?"myValue";
+            b = null;
+        }
+    };
+};
+
+//IDL - javascript
+const MyRec = IDL.Record({
+    'a' : IDL.Opt(IDL.Text),
+});
+return IDL.Service({
+    'test': IDL.Func([], [IDL.Opt(MyRec)], ['query'],)
+})
+```
+
+In sample 2 - actual response in javascript is `{a: []}`
+
+I think it is also a bug.
+
+UPDATE:
+
+Case with evolving structures fixed in [AgentJS 0.14.0 release](https://github.com/dfinity/agent-js/releases/tag/v0.14.0)
+
+-------------------------
+

@@ -1,0 +1,208 @@
+psykomal | 2024-02-23 13:53:16 UTC | #1
+
+This happens when using ic-agent and deploying to cloudflare worker. I am not sure about the root cause for the error, but I have temporarily fixed it with custom code shared below. Sharing here to highlight the issue and a temporary workaround.
+
+```
+ic-agent = { version = "0.33.0", features = ["wasm-bindgen", "pem"] }
+```
+
+On doing
+```
+    let request_id = agent
+        .update(&canister_id, "call_name")
+        .with_arg(candid::encode_args(()).unwrap())
+        .call_and_wait()
+        .await
+        .unwrap()
+```
+
+Get below error. (using `panic::set_hook(Box::new(console_error_panic_hook::hook));` for the trace)
+
+```
+
+  global window unavailable
+
+  Stack:
+
+  Error
+      at ht (file:///Users/komalsai/learning/cf-exp/reclaim_canisters/build/worker/shim.mjs:2:6168)
+      at [object Object]xfd569
+      at [object Object]x12dbe2
+      at [object Object]x130e5a
+      at [object Object]x139097
+      at [object Object]x136757
+      at [object Object]x1370db
+      at [object Object]x13524f
+      at [object Object]x128e61
+      at [object Object]x138218
+
+
+✘ [ERROR] panicked at /Users/komalsai/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ic-agent-0.33.0/src/agent/mod.rs:783:22:
+
+  unable to setTimeout: JsValue(RuntimeError: unreachable
+  RuntimeError: unreachable
+      at [object Object]x1390dc
+      at [object Object]x12dc0b
+      at [object Object]x130e5a
+      at [object Object]x139097
+      at [object Object]x136757
+      at [object Object]x1370db
+      at [object Object]x13524f
+      at [object Object]x128e61
+      at [object Object]x138218
+      at K (file:///Users/komalsai/learning/cf-exp/reclaim_canisters/build/worker/shim.mjs:2:428))
+
+  Stack:
+
+  Error
+      at ht (file:///Users/komalsai/learning/cf-exp/reclaim_canisters/build/worker/shim.mjs:2:6168)
+      at [object Object]xfd569
+      at [object Object]x12dbe2
+      at [object Object]x130e5a
+      at [object Object]x139097
+      at [object Object]x136757
+      at [object Object]x1370db
+      at [object Object]x132849
+      at [object Object]x3419e
+      at [object Object]xbdcc7
+
+
+  A hanging Promise was canceled. This happens when the worker runtime is waiting for a Promise from
+  JavaScript to resolve, but has detected that the Promise cannot possibly ever resolve because all
+  code and events related to the Promise's I/O context have already finished.
+
+
+✘ [ERROR] Uncaught (in response) Error: The script will never generate a response.
+
+``` 
+
+After some digging, it is due to this part of code in ic-agent 
+
+```
+    pub async fn wait(
+        &self,
+        request_id: RequestId,
+        effective_canister_id: Principal,
+    ) -> Result<Vec<u8>, AgentError> {
+        let mut retry_policy = Self::get_retry_policy();
+
+        let mut request_accepted = false;
+        loop {
+            match self.poll(&request_id, effective_canister_id).await? {
+                PollResult::Submitted => {}
+                PollResult::Accepted => {
+                    if !request_accepted {
+                        // The system will return RequestStatusResponse::Unknown
+                        // (PollResult::Submitted) until the request is accepted
+                        // and we generally cannot know how long that will take.
+                        // State transitions between Received and Processing may be
+                        // instantaneous. Therefore, once we know the request is accepted,
+                        // we should restart the backoff so the request does not time out.
+
+                        retry_policy.reset();
+                        request_accepted = true;
+                    }
+                }
+                PollResult::Completed(result) => return Ok(result),
+            };
+
+            match retry_policy.next_backoff() {
+                #[cfg(not(target_family = "wasm"))]
+                Some(duration) => tokio::time::sleep(duration).await,
+                #[cfg(all(target_family = "wasm", feature = "wasm-bindgen"))]
+                Some(duration) => {
+                    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |rs, rj| {
+                        if let Err(e) = web_sys::window()
+                            .expect("global window unavailable")
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                &rs,
+                                duration.as_millis() as _,
+                            )
+                        {
+                            use wasm_bindgen::UnwrapThrowExt;
+                            rj.call1(&rj, &e).unwrap_throw();
+                        }
+                    }))
+                    .await
+                    .expect("unable to setTimeout");
+                }
+                None => return Err(AgentError::TimeoutWaitingForResponse()),
+            }
+        }
+    }
+```
+Issue is with `set_timeout_with_callback_and_timeout_and_arguments_0` . This approach is for async sleep timeout (shared here - https://users.rust-lang.org/t/async-sleep-in-rust-wasm32/78218/6). Another approach shared in the same post is to use gloo_timers which fixed the issue for me.
+
+My code looks like this now . Essentially had to tweak the wait functionality using [gloo-timers](https://docs.rs/gloo-timers/latest/gloo_timers/).
+
+```
+// Usage instead of call_and_wait()
+
+    let request_id = agent
+        .update(&canister_id, "save_snapshot_json")
+        .with_arg(candid::encode_args(()).unwrap())
+        .call()
+        .await
+        .unwrap();
+
+    let res = custom_agent_wait(&agent, request_id, canister_id)
+        .await
+        .unwrap();
+
+-------------------
+
+use gloo_timers::future::TimeoutFuture
+
+
+fn get_retry_policy() -> ExponentialBackoff<SystemClock> {
+    ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(500))
+        .with_max_interval(Duration::from_secs(1))
+        .with_multiplier(1.4)
+        .with_max_elapsed_time(Some(Duration::from_secs(60 * 5)))
+        .build()
+}
+
+pub async fn custom_agent_wait(
+    agent: &Agent,
+    request_id: RequestId,
+    effective_canister_id: Principal,
+) -> Result<Vec<u8>> {
+    let mut retry_policy = get_retry_policy();
+    let mut request_accepted = false;
+
+    loop {
+        match agent
+            .poll(&request_id, effective_canister_id)
+            .await
+            .unwrap()
+        {
+            PollResult::Submitted => {}
+            PollResult::Accepted => {
+                if !request_accepted {
+                    request_accepted = true;
+                }
+            }
+            PollResult::Completed(result) => {
+                return Ok(result);
+            }
+        };
+
+        match retry_policy.next_backoff() {
+            Some(duration) => {
+                let duration_in_millis = duration.clone().as_millis();
+                spawn_local(async move {
+                    TimeoutFuture::new(duration_in_millis as u32).await;
+                    web_sys::console::log_1(&"Hello from a timeout!".into());
+                });
+            }
+            None => return Err("Timeout".into()),
+        }
+    }
+}
+
+
+```
+
+-------------------------
+

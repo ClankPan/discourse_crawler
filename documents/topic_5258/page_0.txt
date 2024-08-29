@@ -1,0 +1,223 @@
+heldrida | 2021-06-16 21:02:54 UTC | #1
+
+Hi,
+
+My use-case is a cloud environment, as an example a continuous integration process that runs `dfx deploy` in a `dfx start --emulator` local network.
+
+When testing locally, noticed that after the first run and the existence of the `.dfx` directory, the `dfx deploy` is a bit faster.
+
+In the cloud environment, I compute if there are any changes in the repo source, otherwise use the previous cache for `.dfx`, in hope to `dfx deploy` to use it (I still see compile commands in the logs, which I'll investigate), but I find it quite slow still.
+
+Suggestions are appreciated to improve the speed for `dfx deploy`, after the first create/build.
+
+*The source code is in Rust (slow)
+
+Thank you!
+
+-------------------------
+
+stephenandrews | 2021-06-16 20:45:18 UTC | #2
+
+The only thing I can think of is only re-deploying the canister's that have actually changed. e.g. if you have 10 canisters listed in dfx.json, `dfx deploy` will rebuild all 10 even if only 1 has changed.
+
+The other route is:
+```
+dfx build <canister id>
+dfx canister install <canister id> --mode upgrade
+```
+
+This will only work for existing canisters. If the canister is new (hasn't been created) you would need to do `dfc canister create <canister name>` first
+
+-------------------------
+
+heldrida | 2021-06-16 20:52:47 UTC | #3
+
+That's correct! Although for the cloud version, running in a CI is trickier as I'd have to write logic to map changes to particular canister ids, to be picky about updates.
+
+Meanwhile, the `dfx deploy` seems to handle what to upgrade for us, by checking the .dfx directory...
+
+-------------------------
+
+lsgunn | 2021-06-16 21:04:05 UTC | #4
+
+I'm not sure if this works with --emulator, but just in case, you might try:
+* A new `--no-artificial-delay` option enables you to reduce the time it takes for the local Internet Computer to start.
+
+This change adds the `--no-artificial-delay` flag to `dfx start` and `dfx replica` commands. By default, the local Internet Computer replica that is installed with the DFINITY Canister SDK has an artificial consensus delay to simulate the delay users might see in a networked environment. With this new flag, you can skip the built-in delay when you start the local Internet Computer by running either the `dfx start --no-artificial-delay` or `dfx replica --no-artificial-delay` command.
+
+For example, you can start the local Internet Computer without a delay by running the following command:
+
+```
+dfx start -no-artificial-delay
+```
+
+If you use this option, however, you might an increase in the CPU used by the local Internet Computer replica.
+
+-------------------------
+
+heldrida | 2021-06-16 21:06:27 UTC | #5
+
+Hi @lsgunn, thanks for your suggestion!
+
+I'll check the flag, wasn't aware of it ;)
+
+-------------------------
+
+lsgunn | 2021-06-16 21:07:53 UTC | #6
+
+It was just added in 0.7.1, so it isn't in the regular doc just yet. Hope it helps you out.
+
+-------------------------
+
+heldrida | 2021-06-16 21:11:35 UTC | #7
+
+Yeh thanks! Already testing, and locally seems faster already. Will wait for the cloud version (which is a slower environment, running on a VM).
+
+By the way, noticed that the 0.7.2 was released. Maybe there're other new flags, I'll check!
+
+-------------------------
+
+heldrida | 2021-06-16 21:37:57 UTC | #8
+
+Just thought about something that might be useful. It was my assumption that the `dfx deploy` only takes into account the `.dfx` directory. When the related build commands during `dfx deploy`, the rust directories might also change, on subsequent calls probably preventing compile times.
+
+I'll cache the rust source directories and see if that helps, locally it does, so its probably that! As only cached the `.dfx` this far.
+
+Will provide feedback later.
+
+-------------------------
+
+prithvi | 2021-06-16 21:44:59 UTC | #9
+
+@heldrida this is really good feedback. dfx hasn't been optimized for a CI environment and there's a lot of room for improvement here. Like Lisa pointed out, if you use `--no-artificial-delay` this will speed up the local replica's consensus, but as you might have already tried, it does not work with the emulator. Please note your suggestions here that we can pull into our backlog
+
+>I’ll cache the rust source directories and see if that helps, locally it does, so its probably that! As only cached the .dfx this far.
+
+This is a great idea too
+
+-------------------------
+
+heldrida | 2021-06-16 21:51:28 UTC | #10
+
+Thanks for checking out and the feedback so far! I'll share my findings definitely ;)
+
+-------------------------
+
+heldrida | 2021-06-16 23:18:50 UTC | #12
+
+Here're some high-level notes (of course that is not so linear, especially if you consider that it'd run in the cloud). Managed to reduce a 20m build to 5~8m.
+
+My use-case is a test runner, in which git clone's a remote repository and performs tests against it. This is a Rust project for the IC.
+
+1) Assumes that required binaries, libraries exist in the container or VM (these are pre-compiled to the target architecture, macosx, linux distro, added to PATH and /usr/local/bin )
+2) The remote repository is cloned and saved in a temporary directory
+3) Gets the remote repository HEAD commit hash, used to control if to use cached version
+4) Copy temporary directory content to a work directory (depending on cache assertion, as mentioned in the previous point, otherwise skips)
+5) Starts the dfx network by using the flags --background, --clean, --emulator.The network process is placed in the background otherwise would block the process. Clean, to prevent errors such as *1 Bad request for non existing canister.
+6) When running `dfx deploy` after the `dfx start`, a long process will occur, but if the repository is the cached version the process will be much faster by several times, but this is only possible if the `dfx start` network is started with `--clean`, as it won't make it compile everything again which is what takes a lot of time, but will `install code for canister`, instead of upgrading, which is ok as its fast enough.
+
+NOTE: At time of writing this was run on a MacOS VM, as the project was written in MacOS, and because there were issues building the project on Ubuntu Linux; ideally, if using a Docker image with most binaries pre-compiled this might be faster, surely.
+
+
+(*1) - when a cached repository, contained `.dfx` and other artifacts previously built against a different network `dfx start`, the following happens:
+```
+Installing canisters...
+Installing code for canister dank, with canister_id xxxxxxxxxxxx
+The replica returned an HTTP Error: Http Error: status 400 Bad Request, content type "text/plain", content: canister does not exist: xxxxxxxxxxx
+```
+
+-------------------------
+
+prithvi | 2021-06-16 23:24:08 UTC | #13
+
+[quote="heldrida, post:12, topic:5258"]
+* Starts the dfx network by using the flags --background, --clean, --emulator.The network process is placed in the background otherwise would block the process. Clean, to prevent errors such as *1 Bad request for non existing canister.
+[/quote]
+
+I am curious, what was the reason you used --emulator instead of the replica?
+
+-------------------------
+
+kpeacock | 2021-06-16 23:28:57 UTC | #14
+
+The emulator uses the `ic-ref` build of the replica instead of the full build that we run by default with `dfx`. For reference, here is the config we use for end to end tests of our JavaScript agent codebase: https://github.com/dfinity/agent-js/blob/main/.github/workflows/nodejs-ci.yml
+
+You'll see that we compile and run `ic-ref` directly instead of installing `dfx` for the performance benefits. Bringing those kinds of optimizations to `dfx` for CI is still definitely something that the SDK team can include in our goals for the coming quarters
+
+-------------------------
+
+prithvi | 2021-06-17 00:19:06 UTC | #15
+
+[quote="kpeacock, post:14, topic:5258, full:true"]
+The emulator uses the `ic-ref` build of the replica instead of the full build that we run by default with `dfx` . For reference, here is the config we use for end to end tests of our JavaScript agent codebase: [agent-js/nodejs-ci.yml at main · dfinity/agent-js · GitHub](https://github.com/dfinity/agent-js/blob/main/.github/workflows/nodejs-ci.yml)
+[/quote]
+
+@kpeacock I think we should clarify. `--emulator` uses ic-ref but that shouldn't be described as an "`ic-ref` build of the replica instead of the full build." This may imply it's from the same codebase as the replica that is built with feature-flags to enable/disable functionality. It's better described as a [reference implementation](https://github.com/dfinity/ic-hs#ic-ref-a-ic-reference-implementation) for some parts of the IC's external interface. 
+
+[quote]
+You’ll see that we compile and run `ic-ref` directly instead of installing `dfx` for the performance benefits. 
+[/quote]
+
+The `ic-ref` is run in the agent repos because there is a separation of concerns between the agents & dfx, not due to performance benefits. The agents implement low-level interfaces as defined in the Interface Specification. They test against `ic-ref` because it provides a reliable reference implementation for those interfaces and because new versions of it are released in lock-step with the spec versions. Running dfx & the replica to test the agents is avoided because we need decouple dependencies between those components and decouple their development cycles (the replica and the agents as both are downstream of the spec, adding `dfx` and the replica to agent tests would create a cyclic dependancy.)
+
+Furthermore, the performance can actually be poorer with `ic-ref` than with with the replica bundled by `dfx` in some cases. This is because the `ic-ref` uses `winter` ([a wasm interpreter](https://github.com/dfinity-side-projects/winter)). Because it uses an interpreter, Candid decoding of large messages can take a very long time, especially if the message is serialized inefficiently (for example encoding a raw Vec<u8> instead of using serde_bytes::ByteBuf.) Even a poorly serialized message will be decoded pretty fast using the replica's wasm embedder.
+
+For these reasons, today the `--emulator` option is offered more as a debugging aid than a substitute for the local replica. This is why I was curious to see why you're using it in CI @heldrida
+
+-------------------------
+
+kpeacock | 2021-06-17 00:51:58 UTC | #16
+
+Thanks, that's a much more accurate answer!
+
+-------------------------
+
+heldrida | 2021-06-17 21:50:41 UTC | #17
+
+Thank you both @kpeacock @prithvi!
+
+Your extended explanation @prithvi prove enough clarity into the subject; although, for a previous execution, the particular project for which I'm writing the CI for, fails when the flag is not present, as follows:
+
+```
+Installing canisters...
+Creating UI canister on the local network.
+The UI canister on the "local" network is "xxxxxxxxxxx"
+Installing code for canister foobar, with canister_id yyyyyyyyyyyy
+The replica returned an HTTP Error: Http Error: status 500 Internal Server Error, content type "text/plain; charset=utf-8", content: Protocol wrong type for socket (os error 41)
+```
+
+-------------------------
+
+heldrida | 2021-06-17 17:10:30 UTC | #18
+
+The 500 error has been reported before but no answer, you can find it here: https://forum.dfinity.org/t/the-replica-returned-http-error-status-500-internal-server-error/4928
+
+-------------------------
+
+heldrida | 2021-06-17 21:39:19 UTC | #20
+
+The ic-cdk-optimizer
+
+-------------------------
+
+prithvi | 2021-06-17 22:07:05 UTC | #21
+
+@heldrida I replied in that thread
+https://forum.dfinity.org/t/the-replica-returned-http-error-status-500-internal-server-error/4928/3?u=prithvi
+
+But the 500 error may be because your canister is not optimized. Do you run binaryen or ic-cdk-optimizer?
+
+-------------------------
+
+heldrida | 2021-06-17 22:32:45 UTC | #22
+
+Thank you! Read your message there. I'll check with my team and make sure it's optimized.
+
+-------------------------
+
+heldrida | 2021-06-17 22:36:55 UTC | #23
+
+Thinking about it @prithvi , if you questioned the --emulator usage in the context of CI, more specifically integration tests; does it mean that the --emulator makes these tests unreliable? Lacking correctness?
+
+-------------------------
+

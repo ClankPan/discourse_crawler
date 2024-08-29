@@ -1,0 +1,72 @@
+eichhorl | 2024-05-17 14:55:14 UTC | #1
+
+# Summary
+
+On May 13, 2024, between 11:10 UTC and 13:46 UTC, a critical incident occurred in the upgrade process, affecting the IC Mainnet subnet `uzr34`, which resulted in a temporary interruption of services. Most notably, this downtime impacted the exchange rate canister and Internet Identity, which are used by various applications across the IC.
+
+The root cause of the incident was traced to the existence of some very old artifacts, which mistakenly haven’t been purged from the block payload of ECDSA subnets. These old artifacts were incompatible with a change made in replica version [2c4566b](https://dashboard.internetcomputer.org/release/2c4566b7b7af453167785504ba3c563e09f38504). Specifically, this replica version required a newly added field to be present in these artifacts. As the unpurged artifacts didn’t have this field yet, deserialization of the catch-up package failed during the upgrade. Consequently, nodes were unable to start their replica processes, leading to the subnet remaining in a stalled state.
+
+# Actions Taken
+
+Immediate actions included rolling back the affected subnet to the previous replica version, which didn’t require the new field, in order to restore service. This rollback process involved:
+
+* Identifying and addressing the issue with the failed CUP deserialization.
+* Submitting an NNS proposal to downgrade the affected subnet.
+* Submitting an NNS proposal to recover the affected subnet onto a new set of replacement nodes.
+
+After the incident was mitigated, further actions were taken to prevent the issue from reappearing:
+
+* A [hotfix](https://dashboard.internetcomputer.org/proposal/129706) was proposed to revert the change which made the new field mandatory.
+* A [fix](https://github.com/dfinity/ic/commit/4d2ac2dd7b05a4fec8a2d1322405e1b815eba6ae) was merged to the master branch, in order to purge ECDSA reshare agreements from the block payload, once they are no longer needed.
+
+# Timeline of Events
+
+* 11:02 UTC - [Proposal 129701](https://dashboard.internetcomputer.org/proposal/129701) is executed to upgrade subnet `uzr34` to replica version [2c4566b](https://dashboard.internetcomputer.org/release/2c4566b7b7af453167785504ba3c563e09f38504).
+* 11:10 UTC - Nodes on subnet `uzr34` encountered issues and stalled.
+* 11:16 UTC - The problem was detected by the monitoring stack, and the incident response team was alerted.
+* 12:00 UTC - The decision is made to roll back the upgrade by recovering the subnet onto a new set of replacement nodes.
+* 12:34 UTC - [Proposal 129702](https://dashboard.internetcomputer.org/proposal/129702) to rollback subnet `uzr34` to the previous replica version [bb76748](https://dashboard.internetcomputer.org/release/bb76748d1d225c08d88037e99ca9a066f97de4966f97de496) is submitted.
+* 13:14 UTC - A list of unassigned replacement nodes maximizing the decentralization of the subnet is assembled.
+* 13:28 UTC - [Proposal 129703](https://dashboard.internetcomputer.org/proposal/129703) to recover subnet `uzr34` onto the determined replacement nodes is submitted.
+* 13:46 UTC - The recovery of `uzr34` is completed, thereby mitigating the incident.
+
+## What went well
+
+* Alerts were in place and quickly notified the incident response team of the issue. Escalation to the appropriate teams happened also quickly within the first few minutes of the incident.
+* The subnet was recovered relatively quickly using the established process.
+
+## Lessons Learned
+
+* It is necessary to ensure that artifacts inserted into the block payload are purged eventually.
+* It is important to spread out the upgrades of subnets holding the same tECDSA key. However, moving the upgrade of subnets hosting critical services such as Internet Identity closer towards the end of the rollout, could reduce the overall impact of failures.
+
+# Technical details
+
+As part of the tSchnorr implementation, a new field was introduced to the `EcdsaReshareRequest` struct of block payloads, with the intention of enabling the resharing of tSchnorr keys in the future.
+
+This was done in stages to preserve backward and forward compatibility ([a97f796](https://github.com/dfinity/ic/commit/a97f7960c5891da78de0c294e13a9fc53c0ce81e), [847abcf](https://github.com/dfinity/ic/commit/847abcf9febd8e0241df56dd4552b74a844bc631), [c8788db4](https://github.com/dfinity/ic/commit/c8788db4a8bde25df58525882b029ac00662c524)). However, due to an existing bug in the ECDSA key resharing protocol, the payload of ECDSA mainnet subnets still contained old ECDSA cross-net reshare agreements from when the mainnet ECDSA keys were first generated. As our tests do not access mainnet data, this flaw was impossible to catch in tests covering the compatibility of the new field. The implementation of the added field therefore didn’t account for the existence of these artifacts.
+
+The old reshare agreements didn’t contain the newly introduced field yet. Therefore, rolling out the third change mentioned above (making the new field mandatory) broke the compatibility of the CUP. As the orchestrator panics when encountering a CUP that cannot be deserialized, this led to the upgrade routine getting stuck. Since the upgrade routine was stuck, existing nodes of the subnet would be unable to fetch new recovery CUPs. Therefore a recovery using a new set of replacement nodes was required.
+
+The actual rollback was performed by first submitting a proposal ([129702](https://dashboard.internetcomputer.org/proposal/129702)) to downgrade `uzr34` to its previous version. Subsequently, the proposal ([129703](https://dashboard.internetcomputer.org/proposal/129703)) to recover the subnet onto a new set of replacement nodes was submitted. This required extracting the latest checkpoint hash of the subnets. The hash was determined by logging into the DFINITY controlled node on the subnet and running the `state-tool`. The replacement nodes were selected from the current set of healthy unassigned nodes with maximum possible decentralization.
+
+After the incident was mitigated, a fix reverting the mandatory field ([2022da6](https://github.com/dfinity/ic/commit/2022da6dee393a036f9ce0ed063aa1b5d4b328e9)) was merged to master and later to a new hotfix release branch. This issue only affects the four ECDSA subnets. If the hotfix is adopted ([Proposal 129706](https://dashboard.internetcomputer.org/proposal/129706)), it will therefore be rolled out to these subnets exclusively. The remaining subnets continue with the existing release rollout, as planned. Later, an additional fix ([4d2ac2d](https://github.com/dfinity/ic/commit/4d2ac2dd7b05a4fec8a2d1322405e1b815eba6ae)) was merged to master, purging ECDSA reshare agreements from the block payload once they are no longer needed.
+
+## Action Items
+
+Following this incident, we are taking several further actions:
+
+* Moving the upgrade of uzr34 more towards the end of the release rollout.
+* Supporting the redeployment of nodes that stalled during the incident.
+* Making the orchestrator more fail-safe by avoiding panics where possible.
+
+-------------------------
+
+Lorimer | 2024-05-19 07:49:31 UTC | #2
+
+Thanks for sharing this @eichhorl, it's very informative. I have a few extra questions that I've asked elsewhere but copying here for reference, because they relate to the content of this post-mortem:
+- [Does testnet ever get synced with mainnet so that testing is representative?](https://forum.dfinity.org/t/proposal-to-elect-new-release-rc-2024-05-09-23-02/30606/15?u=lorimer). I see that the post-mortem states "As our tests do not access mainnet data" (*directly*), but I'm not clear on whether or not testnet is periodically synced with mainnet data. If not, how come?
+- [Are IC-OS release rollout schedules planned up front, and can this information be published alongside IC-OS election proposals for the sake of review by the community?](https://forum.dfinity.org/t/proposal-to-elect-new-release-rc-2024-05-09-23-02/30606/14?u=lorimer)
+
+-------------------------
+

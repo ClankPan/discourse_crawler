@@ -1,0 +1,104 @@
+lastmjs | 2023-04-14 22:35:35 UTC | #1
+
+We have recently updated to `dfx 0.13.1` and `ic-cdk = "0.8.0-beta.0"` in Azle's implementation to take advantage of the new `ic_cdk::export::candid::define_function!` macro, and our http outcalls tests are passing but we're getting this output in the replica logs:
+
+```
+FIX ME! record { 340_962_072 : table3; 427_267_567 : table4 } <: opt record {
+  function : func (
+      record {
+        context : vec nat8;
+        response : record {
+          status : nat;
+          body : vec nat8;
+          headers : vec record { value : text; name : text };
+        };
+      },
+    ) -> (
+      record {
+        status : nat;
+        body : vec nat8;
+        headers : vec record { value : text; name : text };
+      },
+    ) query;
+  context : vec nat8;
+} via special opt rule.
+This means the sender and receiver type has diverged, and can cause data loss.
+```
+
+I've tried so many variations of the following code, I don't know what's going on:
+
+```typescript
+$update;
+export async function xkcdRaw(): Promise<Manual<HttpResponse>> {
+    const httpResult = await ic.callRaw(
+        Principal.fromText('aaaaa-aa'),
+        'http_request',
+        ic.candidEncode(`
+            (
+                record {
+                    url = "https://xkcd.com/642/info.0.json";
+                    max_response_bytes = 2_000 : nat64;
+                    method = variant { get };
+                    headers = vec {};
+                    body = null;
+                    transform = record { function = func "${ic
+                        .id()
+                        .toString()}".xkcdTransform; context = vec {} };
+                }
+            )
+        `),
+        50_000_000n
+    );
+
+    match(httpResult, {
+        Ok: (httpResponse) => ic.replyRaw(httpResponse),
+        Err: (err) => ic.trap(err)
+    });
+}
+```
+
+What's wrong with that candid string? This code, which doesn't use call raw, works fine:
+
+```typescript
+$update;
+export async function xkcd(): Promise<HttpResponse> {
+    const httpResult = await managementCanister
+        .http_request({
+            url: `https://xkcd.com/642/info.0.json`,
+            max_response_bytes: 2_000n,
+            method: {
+                get: null
+            },
+            headers: [],
+            body: null,
+            transform: {
+                function: [ic.id(), 'xkcdTransform'],
+                context: Uint8Array.from([])
+            }
+        })
+        .cycles(50_000_000n)
+        .call();
+
+    return match(httpResult, {
+        Ok: (httpResponse) => httpResponse,
+        Err: (err) => ic.trap(err)
+    });
+}
+```
+
+-------------------------
+
+diegop | 2023-04-15 14:33:28 UTC | #2
+
+Odd! Let me ping some folks
+
+-------------------------
+
+chenyan | 2023-04-16 17:02:07 UTC | #3
+
+What's `ic.candidEncode`? It seems that you are trying to parse a candid string without providing a type. We cannot infer the function type just from the candid value text. You will have to provide the candid type. Ideally, you would have to provide a `candidEncodeWithType` function.
+
+It worked before, because we typed all function as `() -> ()`. Now with the `function!` macro, we are providing the correct type. Therefore, the function type on the user side has to match the server side. Thus the FIX ME error.
+
+-------------------------
+

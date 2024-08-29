@@ -1,0 +1,203 @@
+karim | 2023-03-13 13:13:00 UTC | #1
+
+My goal is to have a canister create a new canister and install a pre-built wasm module. Now, the `install_code()` function of the management canister expects type `[Nat8]` as an argument for the wasm module. I've read some related threads, but wasn't able to get a solution from it unfortunately. If I'm not mistaken, all I need to do is to somehow convert the wasm module to a [Nat8] array and hard-code the argument for the `install_code()` function. My problem is that I don't know how to convert the wasm module to an appropriate format so that I could store it in the (parent-)canister like so:
+
+```
+let wasmBlob : [Nat8] = [];
+
+public shared(msg) func uploadWasm(wasm : [Nat8]) : async () {
+    wasmBlob := wasm;
+};
+```
+
+As always, any help would be much appreciated :slight_smile:
+
+-------------------------
+
+peterparker | 2023-03-13 13:44:11 UTC | #2
+
+Got that in Papyrs in Motoko+NodeJS if it can help?
+
+Canister:
+
+```
+ private stable var storageWasm : [Nat8] = [];
+
+public shared ({caller}) func storageLoadWasm(blob : [Nat8]) : async ({total : Nat; chunks : Nat}) {
+    if (not Utils.isAdmin(caller)) {
+      throw Error.reject("Unauthorized access. Caller is not an admin. " # Principal.toText(caller));
+    };
+
+    // Issue: https://forum.dfinity.org/t/array-to-buffer-in-motoko/15880/15
+    // let buffer: Buffer.Buffer<Nat8> = Buffer.fromArray<Nat8>(storageWasm);
+    // let chunks: Buffer.Buffer<Nat8> = Buffer.fromArray<Nat8>(blob);
+    // buffer.append(chunks);
+    // storageWasm := buffer.toArray();
+
+    storageWasm := Array.append<Nat8>(storageWasm, blob);
+
+    // return total wasm sizes
+    return {
+      total = storageWasm.size();
+      chunks = blob.size();
+    };
+  };
+```
+
+JS script load the wasm to array as follow:
+
+```
+export const loadWasm = async (type) => {
+  const buffer = await readFile(`${process.cwd()}/.dfx/local/canisters/${type}/${type}.wasm`);
+  return [...new Uint8Array(buffer)];
+};
+```
+
+and the the scripts chunks and upload it:
+
+```
+const installWasm = async ({actor, type, wasmModule}) => {
+  console.log(`Installing ${type} wasm code in manager.`);
+
+  const chunkSize = 700000;
+
+  const upload = async (chunks) => {
+    const result = await actor.storageLoadWasm(chunks); // <---- here call of above Motoko endpoint
+    console.log('Chunks:', result);
+  };
+
+  for (let start = 0; start < wasmModule.length; start += chunkSize) {
+    const chunks = wasmModule.slice(start, start + chunkSize);
+    await upload(chunks);
+  }
+
+  console.log(`Installation ${type} done.`);
+};
+```
+
+Source in this repo: [https://github.com/papyrs/ic](https://github.com/papyrs/ic)
+
+-------------------------
+
+v1ctor | 2023-03-13 14:12:42 UTC | #3
+
+Depending on the size of your Wasm module, the Motoko compiler won't be able to process it if it's an array. See: https://github.com/dfinity/motoko/issues/3557
+
+So you must convert your wasm module to hexadecimal first (there are a many options online and some Unix tools to do that offline) and convert the result to be compatible with Motoko's Text, like:
+
+```
+let wasmModule: Blob = "\de\ad\be\ef";
+```
+
+Then it's simple to install the module:
+
+```
+Cycles.add(300_000_000_000);
+let id = await IC.create_canister({
+     settings = ?{
+        controllers = ?[Principal.fromActor(this)];
+        compute_allocation = null;
+        memory_allocation = null;
+        freezing_threshold = null;
+    }
+});
+```
+```
+  await IC.install_code({
+      mode = #install;
+      canister_id = id.canister_id;
+      wasm_module = wasmModule;
+      arg = to_candid({
+          //your canister's arguments, ex: foo = 1234;
+      });
+  });
+```
+
+-------------------------
+
+gladguy | 2023-03-16 17:31:55 UTC | #4
+
+I will try this out victor. Thank you and regards
+
+-------------------------
+
+karim | 2023-03-17 09:18:32 UTC | #5
+
+Sorry for my late response, took me some time. I tried Victor's approach and it works perfectly. Thank you both for your answers!
+
+-------------------------
+
+gladguy | 2023-03-18 06:52:10 UTC | #6
+
+Karim sir,
+How did you converted wasm to blob, which tool did you used?
+
+-------------------------
+
+cymqqqq | 2023-03-18 07:19:40 UTC | #7
+
+Hi all, I have a question here:
+can we dynamically generate candid method, read wasm code, and install wasm code on chain?
+
+-------------------------
+
+jamesbeadle | 2024-08-19 06:45:53 UTC | #8
+
+Because the wasm is chunked, I couldn't use the governance system to accept the data via an actor as I think that would need multiple proposals for each chunk. I think I need to convert the frontend wasm to a txt file at this point? I've never done anything like this so at some point I will have a txt output and I will need to somehow check it is correct before uploading it to the manager canister.
+
+-------------------------
+
+peterparker | 2024-08-19 07:04:58 UTC | #9
+
+I'm not exactly sure what you're trying to achieve, but if your goal is to upload a WASM for a "child canister" within a canister governed by an SNS, I believe the process would involve the following steps: uploading the WASM to the canister, generating a hash for that specific upload, and then submitting a custom proposal with that hash. If the custom proposal is approved and executed by comparing the hash, it will populates the WASM you uploaded to the canister.
+
+It's kind of the same flow as the one involved to upgrade a [DFX asset canister of a SNS](https://internetcomputer.org/docs/current/developer-docs/daos/sns/managing/sns-asset-canister#submitting-an-sns-proposal-and-upgrading-an-asset-canister).
+
+I doubt this will be of much help, but even though Juno is not a DAO (yet), this is the process I follow to upload the WASM files for the Satellites, Mission Controls, and Orbiters within the Console.
+
+https://github.com/junobuild/juno
+
+-------------------------
+
+jamesbeadle | 2024-08-19 07:35:01 UTC | #10
+
+Thank you for this David, yes that is what I am trying to achieve, updating the child canisters.
+
+Will give this a look.
+
+-------------------------
+
+jamesbeadle | 2024-08-19 07:51:48 UTC | #11
+
+So I know the list of child canister ids, there’s only 1. So I’d run dfx deploy <id> -- ic- - by-proposal? The canister isn’t named in my dfx json so not sure if it will work.
+
+-------------------------
+
+peterparker | 2024-08-19 07:56:10 UTC | #12
+
+No idea about dfx. What I meant is that you might need to implement something custom with a similar flow.
+
+-------------------------
+
+jamesbeadle | 2024-08-19 07:56:15 UTC | #13
+
+I tried just deploying the manager canister actor class to the canister but it expected it to be an asset canister to be by-proposal I think.
+
+![image|690x475](upload://1kyssN4IzOoZVUz2Y0sTtj84j8Z.png)
+
+-------------------------
+
+peterparker | 2024-08-19 08:48:03 UTC | #14
+
+I would suggest to read again my answers. I did not meant “use and install the dfx canister” but “you may have to implement a custom solution as for example…”.
+
+-------------------------
+
+jamesbeadle | 2024-08-19 08:49:58 UTC | #15
+
+Ok I will look into implementing a custom solution.
+
+Thanks for the help.
+
+-------------------------
+

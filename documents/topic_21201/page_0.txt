@@ -1,0 +1,197 @@
+infu | 2023-07-05 21:48:44 UTC | #1
+
+There seem to be 3 ways you can make a library that works with data structures inside.
+
+## Functional
+You have no classes.
+**Pros**: Data structure can be **stable**. You don't have to use pre and post_upgrade.
+**Cons**: You have to provide types and auxiliary functions when using it. Example:
+```
+BTree.insert<Text, Blob>(mystore, Text.compare, key, val)
+```
+
+## Class
+You use classes.  
+**Pros**: You have easy-to-use syntax. Example:
+```
+mystore.insert(key, val);
+```
+**Cons:** They can't be **stable**. You have to upgrade using pre and post_upgrade
+
+## Class+
+You have a class that accepts memory from outside.
+**Pros**: You can make it **stable**. You have easy-to-use syntax. Example:
+```
+mystore.insert(key, val);
+```
+**Cons**: If you have nested structures (BTree inside BTree) this will bring overhead, so you should use the functional style if you want to spend fewer cycles. But that's a rare case.
+
+## How to transform Class into Class+
+**Before:**
+![image|690x256, 75%](upload://7Or8kGYGDgZh3bZduMgetsKC49a.png)
+
+**After:**
+![image|690x428, 75%](upload://qMYHbmX1P2uVkfPmPIlgsXrnauX.png)
+
+**Usage:**
+```
+
+stable let some_stored = MyLib.init<Text>();
+
+let some = MyLib.Class(?some_stored, Text.hash)
+
+// then inside functions...
+some.put(key, val);
+```
+
+You can also use it without the stable memory coming from outside
+```
+let my = MyLib.Class(null, Text.hash);
+my.put(key, val);
+```
+
+Your Class is not losing any of its capabilities and doesn't get less performant (correct me if I am wrong), but gains the ability to be **stable**. This is the typical case when you use it in the body of your actor. If you don't instantiate new classes in a loop (which you may do if you have nested structures) then you will not lose significant performance. Otherwise, you are creating a lot of objects with a bunch of functions and then leaving them to be garbage collected.
+
+It's probably not news for many, but I wanted to put it here because only ~10% of the libraries use Class+
+
+If you think there are some disadvantages to this, let me know @claudio @timo @skilesare
+
+Who is using Class+  (probably there are more)
+<https://github.com/nomeata/ic-certification> by @nomeata 
+<https://mops.one/certified-http> and <https://mops.one/rxmodb> by me
+
+The base libraries: TrieMap, HashMap, Buffer, RBTree can be converted to Class+ with few lines of code, but you may not want to do that for backward compatibility reasons.
+
+-------------------------
+
+timo | 2023-07-06 07:29:11 UTC | #2
+
+I don't see any disadvantage of Class+ and I had planned to use it, too.
+
+The fourth option is to provide `share()` and `unshare()` functions in the class which export/import the class' internal memory, and then to call these functions in `preupgrade/postupgrade`. Disadvantage is of course that you need to define the upgrade hooks at all, even though they are very simple. In some cases, it may gain you some flexibility. For example, in some rare cases the internal memory of the class may not be well suited for being declared stable directly and has to be transformed. That's what `share()` can do.
+
+-------------------------
+
+nomeata | 2023-07-06 10:07:21 UTC | #3
+
+This is a nice write up! It’s good to document such patterns.
+
+Maybe even over time common idioms for the naming of the components (`Module.Mem`, `init`, `Class` in your case; `Module.Store`, `Module.newStore` and `Module.Ops` in  [my example](https://github.com/nomeata/ic-certification/blob/main/demo/main.mo#L58-L59)) emerge.
+
+-------------------------
+
+claudio | 2023-07-06 10:38:13 UTC | #4
+
+Very nice write up indeed! Thanks for taking the time!
+
+Maybe one can explore a way to extend base without breaking existing users, e.g. adding StableTrieMap and  re-implementing TrieMap in terms of that (passing null).
+
+-------------------------
+
+sardariuss | 2023-07-06 11:50:19 UTC | #5
+
+I don't get this syntax:
+
+`let ?mem = stored else BTree.init<K, Blob>(?32);`
+
+Is it the same thing as doing 
+
+`let mem = Option.get(stored, BTree.init<K, Blob>(?32)); `
+
+Why is it not working in my code then xD does it work only for members of a class ?
+
+-------------------------
+
+sardariuss | 2023-07-06 11:59:04 UTC | #6
+
+About the class+, I gotta say I never understood why this hasn't become more of a standard. It gradually became the goto in my codebase. I remember asking the question earlier this year: https://forum.dfinity.org/t/what-prevents-me-from-wrapping-stable-types-from-the-motoko-base-library-in-a-oop-way-using-a-ref-on-the-stable-type/17999
+
+You can wrap pretty much everything in a class+. I use a (quite ugly) type for simple variables:
+
+```
+  public type Ref<V> = {
+    var v: V;
+  };
+```
+that I initialize in stable memory and then "inject" in my class+.
+I think the downside is that you cannot make it const, sometimes I'd like to have a class that reads the value but is not able to modify it.
+
+-------------------------
+
+infu | 2023-07-06 12:00:56 UTC | #7
+
+My apologies. My dev environment was bugged, so I didn't have the language server running while typing this. It's pseudocode.
+You use it like so
+```
+let ?x = some else return #err("Some err"); // or Debug.trap("Some err")
+```
+I thought it works like Option.get, but it doesn't.
+
+-------------------------
+
+infu | 2023-07-06 12:29:33 UTC | #8
+
+This is probably better. Playground <https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/?tag=1906955023>
+
+You usually need to pass init parameters like Btree order and such. 
+```
+import List "mo:base/List";
+
+module {
+  public type Store<A> = List.List<A>;
+
+  public type Init<A> = {
+    one: Nat;
+    two: Nat;
+  };
+
+  public func Init<A>(p: Init<A>) : Store<A> {
+    List.nil<A>();
+  };
+
+  public class Class<A>(from: { #store:Store<A>; #init:Init<A> }, keyToHash: (Text)-> Nat32 ) {
+
+    let mem : Store<A> = switch(from) {
+      case (#store(x)) x;
+      case (#init(p)) Init(p); 
+    };
+
+    // Example func
+    
+    public func get(n:Nat) : ?A {
+      List.get<A>(mem, n)
+    };
+
+  };
+
+}
+```
+
+Usage:
+
+```
+import MyLib "./MyLib";
+import Text "mo:base/Text";
+
+actor Counter {
+
+  stable let some_stored = MyLib.Init<Nat>({one = 12; two = 15});
+  let some = MyLib.Class(#store some_stored, Text.hash);
+
+  public query func get() : async ?Nat {
+    some.get(5);
+  };
+
+  // local
+  public query func getb() : async ?Nat {
+      let another = MyLib.Class(#init {one=1; two=2}, Text.hash);
+
+      another.get(4);
+    };
+
+};
+
+```
+
+-------------------------
+

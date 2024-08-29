@@ -1,0 +1,111 @@
+lastmjs | 2024-02-22 19:55:45 UTC | #1
+
+Is there documentation anywhere that details the performance limitations for query calls?
+
+The current motivation for me is understanding how video and audio streaming will scale using traditional range requests implemented in a single canister. So imagine a 1 Gib video file serves with Express from Azle with 2-3 MiB ranges supported per HTTP GET request. Clients would use HTTP GET requests and not the Canister API directly.
+
+So how will this scale right now? How many queries per second can a single canister sustain? How will the boundary nodes handle this scale? When and where would rate limits kick in? Would the rate limits be per IP or globally, for the canister or for the subnet?
+
+In general I think it would be amazing to have a dedicated page on internetcomputer.org similar to the [resource limits](https://internetcomputer.org/docs/current/developer-docs/smart-contracts/maintain/resource-limits) page that describes scalability limitations, not just for queries but for updates and HTTP requests as well.
+
+@free @ulan @rbirkner
+
+-------------------------
+
+ulan | 2024-02-23 08:05:29 UTC | #2
+
+Good idea about adding a page about scalability limits. 
+
+Some estimates  from the replica side:
+
+- there are 4 query threads per node (but a single canister can use only 2 threads).
+- each thread can execute about 1000-2000 queries per second and 2B instructions per second.
+- an application subnet has 13 nodes.
+
+(Please consider these number as ballpark numbers, the actual numbers depend on specific Wasm instructions execution and may be off in either direction)
+
+By measuring the number of executed instructions in the query using ic0.performance_counter, you can get a ballpark number on the theoretical query throughput limit. Note that the actual number may be lower because there could be other canisters running.
+
+**Example 1.** The query is short-running and executes at most 1M instructions. In this case the number of instructions per second is not a bottlneck: `2B / 1M = 2000`. The bottleneck is the number of queries per second, which is 1000-2000. So, the upper limit on the query throughput is
+```
+ 2000 queries/second/thread * 2 threads/node * 13 nodes/subnet
+ = 52K queries/second/subnet
+```
+
+**Example 2.** The query is long-running and uses 100M instructions. In this case the throughput is bounded by the instruction throughput: `2B / 100M = 20`:
+```
+ 20 queries/second/thread * 2 threads/node * 13 nodes/subnet
+ = 520 queries/second/subnet
+```
+
+As you can see, the number of instructions executed per query is the major factor in the overall performance.
+
+As a sidenote, I'd like to caution against promoting the video use case until there is query charging with sustainable pricing. Otherwise, you would be setting up your users for failure when query charging is enabled (which is unavoidable at some point in the future).
+
+-------------------------
+
+lastmjs | 2024-02-23 13:07:21 UTC | #3
+
+Thanks for this excellent information!
+
+-------------------------
+
+lastmjs | 2024-02-23 13:11:46 UTC | #4
+
+[quote="ulan, post:2, topic:27776"]
+As a sidenote, I’d like to caution against promoting the video use case until there is query charging with sustainable pricing. Otherwise, you would be setting up your users for failure when query charging is enabled (which is unavoidable at some point in the future).
+[/quote]
+
+Is there any idea about the timeline and the cost of query charging? I would much rather get people excited and building with the information available that it won't always be free, especially considering how long it could take to introduce query charging, and people should expect to pay right? It's somewhat surprising that queries are free right now, so maybe it won't be that much of a shock?
+
+Price and time to implement would be great to have an idea about. Some people are pretty excited about this right now and I'd like to give them the mainnet solution once the boundary node issue is resolved, and let them deal with the information about having to pay for it eventually.
+
+-------------------------
+
+ulan | 2024-02-23 15:55:53 UTC | #5
+
+> Is there any idea about the timeline and the cost of query charging?
+
+There was a pushback both from the community and internally against introducing query charging soon and we had to rescope it to query stats: https://forum.dfinity.org/t/community-consideration-explore-query-charging/19247/23
+There is also a big challenge of protecting canisters against cycle draining attacks. I think there needs to be some push from the community for this to start progressing.
+
+Regarding pricing: there was no proper research on this AFAIK. Here are some ballpark numbers that one could calculate using common sense from data available on the Internet.  I might be missing something (e.g. effects of boundary nodes), so please take this with a grain of salt and don't quote me, but rather verify it and use it as a starting point of your own research.
+
+- Execution cost: 1/13-th of [execution cost of updates](https://internetcomputer.org/docs/current/developer-docs/gas-cost#cycles-price-breakdown) on a 13 node subnet since each query executes on a single node.
+- Traffic cost:
+  - Required bandwidth for an IC node is [300mbps](https://wiki.internetcomputer.org/wiki/Node_Provider_Networking_Guide).
+  - Monthly reward for an IC node is [~2K XDR] (https://dashboard.internetcomputer.org/proposal/123312) ~ $2.5K.
+  - Let's assume queries consume about half of the bandwidth: `160 mbps = 20 MB/s`
+  - A month has ~`2.5M` seconds.
+  - Cost per GB: `$2.5K / (2.5M s * 0.02GB/s) = $1/20 / GB = $0.05 / GB`
+
+Assuming that video streaming uses about `2mbps` and a subnet has `13` nodes with `160mbps` of query bandwidth each, we can compute how many concurrent streaming users a subnet can support (without caching at the boundary nodes): `13 * 160 / 2 = 1040`.  Again, I might be missing something, so please verify and don't trust.
+
+-------------------------
+
+lastmjs | 2024-03-05 14:12:52 UTC | #6
+
+@rbirkner do you have similar estimates to Ulan's but from the boundary node perspective? As there are currently 20 boundary nodes and they have some kind of range caching enabled, is there a good way to estimate scalability/number of concurrent users/throughput etc here?
+
+I would love to know where to find information on boundary node specs, rate limits, etc to be able to understand more deeply how this all comes together.
+
+-------------------------
+
+rbirkner | 2024-03-06 09:48:15 UTC | #7
+
+Hey @lastmjs 
+
+We are at the moment in the process of running performance tests against the BNs. Once that is done, I will summarize our findings.
+
+Since the beginning of the year, we invested quite a lot of resources into making the BNs more performant. Now, we want to quantify that. The problem is a bit that it heavily depends on the "workload":
+* Do we only get API calls (e.g., query/update/read_state/status) or also HTTP requests? API calls are relatively light-weight as they "just" need to be forwarded to the right subnet and replica. HTTP requests require more processing as we translate them into an API call and perform response verification.
+* How long does a request take to complete? For example, in case of a query call, the performance also depends on how long the canister requires to reply to it.
+* How large are the responses? This matters especially for the HTTP requests that go through `icx-proxy` and response verification.
+* Do we enable/disable caching? 
+
+At the moment, we are taking a simple approach of only testing against two workloads:
+1. Only queries to a simple counter canister that replies immediately without any caching on the BN.
+2. Only HTTP requests to a simple canister without any caching on the BN.
+
+-------------------------
+

@@ -1,0 +1,106 @@
+infu | 2023-06-06 14:01:48 UTC | #1
+
+If a canister attempts to upgrade itself with 
+**aaa.install_code(...)**
+then it gets error:
+**trapped explicitly: canister_pre_upgrade attempted with outstanding message callbacks (try stopping the canister before upgrade)**
+I've tried to use setTimer and one-shot calls, but these won't work either.
+The only workaround that worked, was to create another canister that proxies the **install_code** call.
+
+**When it is useful:**
+A canister has its own governance system which has to run checks on the wasm before it upgrades the old one. It is a feature Neutron will require. 
+
+It's possible to create a blackhole similar to this: <https://github.com/ninegua/ic-blackhole> 
+```
+actor {
+    let IC = actor "aaaaa-aa" : AAA.Interface;
+
+    public shared({caller}) func upgrade(wasm: [Nat8]) : async () {
+        // require cycles here..
+        ignore IC.install_code({
+            arg = [];
+            wasm_module = wasm;
+            mode = #upgrade;
+            canister_id = caller;
+            });
+    }
+}
+```
+But won't that create a bottleneck? 
+I prefer if the management 'canister' checks if caller == canister_id and somehow clears the message callback caused by the call to install_code, so the upgrade can proceed.
+
+-------------------------
+
+dsarlis | 2023-06-07 12:29:10 UTC | #2
+
+> If a canister attempts to upgrade itself with
+**aaa.install_code(…)**
+then it gets error:
+**trapped explicitly: canister_pre_upgrade attempted with outstanding message callbacks (try stopping the canister before upgrade)**
+
+This is a Motoko specific check, it's not enforced by the system. i.e. if you are certain that you can upgrade your canister without stopping it first (which I sort of assume given that you're trying to self-upgrade), then it should work (e.g. this would work for a Rust canister).
+
+> I prefer if the management ‘canister’ checks if caller == canister_id and somehow clears the message callback caused by the call to install_code, so the upgrade can proceed.
+
+I would prefer we don't add such special casing on the protocol level. Even if we did, clearing the callback is easier said than done -- there's bookkeeping on the system side that needs the response eventually to happen properly. Clearing would need to happen in a way that doesn't break some other assumption/invariant and it would need very careful thought to ensure we don't miss anything. That said, I actually don't think we need a "fix" on the protocol level, because you can have a self-upgrading canister technically, it's just that Motoko has decided to take a more cautious path.
+
+A more general comment: While I understand the appeal of self-upgrading canisters, I would strongly recommend to think through your design. You're probably familiar with what happened with Taggr and the difficult spot they found themselves in with a self-upgrading canister and no way out in case the code of said canister is broken. You should consider the worst case and how you can get out of it. There are options, e.g. you can do what Taggr did and add the NNS root canister as an additional controller so you can be bailed out or you can have two instances of the governance canister in your system where one is on stand-by and basically only kicks in if the other is broken and you need an "override" to upgrade/fix it (or the proxy you mentioned is yet another approach).
+
+-------------------------
+
+lastmjs | 2023-06-06 16:09:20 UTC | #3
+
+I can affirm that you are able to self-upgrade a canister in Rust, and thus in Azle as well. We are doing this as part of the Kybra build system to allow larger Wasm modules, and we will probably need to do it for Azle soon as well.
+
+-------------------------
+
+infu | 2023-06-06 18:30:59 UTC | #4
+
+[quote="dsarlis, post:2, topic:20486"]
+This is a Motoko specific check
+[/quote]
+
+Thanks for the clarification.
+
+[quote="dsarlis, post:2, topic:20486"]
+I would strongly recommend to think through your design
+[/quote]
+You are probably right. Well, the problem here is, one user should be good with one canister. Having two per user will add to the cost. But, if we have one immutable canister that handles all canister upgrades, I suppose it is not too bad. We can add a recovery phrase (basically a second principal able to upgrade the canister) that will justify the need for that additional canister.
+
+-------------------------
+
+claudio | 2023-06-23 13:11:27 UTC | #5
+
+Sorry, late to the party.
+
+You can actually self upgrade with Motoko using a trick. Import the ic0.install_code functions as a oneway method and then Motoko will call it without registering a real callback, passing the check and allowing the upgrade to proceed:
+
+See here:
+
+
+https://github.com/dfinity/threshold/blob/93bf6dd18b3c7ca060983c5d79b07444a0e58734/threshold.mo#L185
+
+-------------------------
+
+lastmjs | 2023-06-25 00:14:12 UTC | #6
+
+A word of caution! If your canister upgrades itself, you should not use a regular call, you should use notify.
+
+It seems that when using a regular call, the callback will be executed on a new Wasm binary, thus the callback will not be the original callback function but some new function from your new Wasm binary. This caused crazy errors in our canisters while building Kybra. We switched to notify and all of the errors have gone away.
+
+It would be nice to get this issue fixed somehow, because getting the response is desirable for multiple reasons: 1. The await waits for the init or post_upgrade function to entirely finish before returning, and 2. no errors can be retrieved if the call fails for some reason.
+
+-------------------------
+
+lastmjs | 2023-06-25 00:15:14 UTC | #7
+
+I should say this seems to be the case, I am still running my tests to verify, but the first round of tests has passed. I will run multiple rounds more to ensure that this issue is because of not using notify.
+
+-------------------------
+
+lastmjs | 2023-06-26 19:30:49 UTC | #8
+
+Indeed my tests seem to indicate that this was the problem.
+
+-------------------------
+

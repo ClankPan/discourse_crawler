@@ -1,0 +1,124 @@
+qwertytrewq | 2024-01-30 15:11:07 UTC | #1
+
+On Ethereum, to prove that a user owns an account need to make the user to sign a message. On IC, can I do this (confirming that an account belongs to a currently logged in user) without asking the user? If yes, how? If no, how to sign a message?
+
+Note that in my case the backend is a regular server (e.g. AWS), not a canister.
+
+That is, I want to check Internet Identity of a user without the user sending any requests to a canister.
+
+-------------------------
+
+warnersmithe3 | 2024-01-31 13:08:41 UTC | #2
+
+No, unfortunately, it's not possible to verify a user's Internet Identity ownership without involving the user in the process on the Internet Computer (IC)
+
+-------------------------
+
+qwertytrewq | 2024-01-31 13:50:19 UTC | #3
+
+Definitely, I want to involve the user in process. (He/she should login.)
+
+-------------------------
+
+sea-snake | 2024-01-31 22:59:13 UTC | #4
+
+This will be standardized with ICRC-32 in the identity & authentication working group: https://github.com/dfinity/wg-identity-authentication
+
+The user will basically sign some data (challenge) to return a signature which in turn can be verified by the dapp. Currently working on implementing this and other standards in a lib.
+
+Keep in mind user identities can be ed25519, p256, secp256k1 or canister key algorithm. Verifying the signature is different depending on the key algorithm, the first few bytes (OID) of the DER encoded public key indicates the key algorithm that needs to be used to verify signatures made by the public key.
+
+Example signature verification implementation that supports all these different key algorithms and delegations (Internet Identity) can be found here: https://github.com/slide-computer/signer-js/blob/master/src/signature/identity.ts#L19
+
+There's also a WASM web implementation that can be found here: 
+https://www.npmjs.com/package/@dfinity/standalone-sig-verifier-web
+
+-------------------------
+
+qwertytrewq | 2024-01-31 23:13:12 UTC | #5
+
+[quote="sea-snake, post:4, topic:27133"]
+Keep in mind user identities can be ed25519, p256, secp256k1 or canister key algorithm. Verifying the signature is different depending on the key algorithm, the first few bytes (OID) of the DER encoded public key indicates the key algorithm that needs to be used to verify signatures made by the public key.
+[/quote]
+
+And which library to use, if I need to verify a signature in Python?
+
+-------------------------
+
+qwertytrewq | 2024-01-31 23:16:30 UTC | #6
+
+[quote="sea-snake, post:4, topic:27133"]
+The user will basically sign some data (challenge) to return a signature which in turn can be verified by the dapp.
+[/quote]
+
+I don't want the user to explicitly sign anything. Instead in `onSuccess` of use authentication I construct a message with user's principal and random nonce, to validate it in the Python backend.
+
+Bard refused to tell me about code for that, claiming that it is an insecure practice. It isn't, because when user signs in, he/she gives my app the right to act on his/her behalf.
+
+As you see from my other response, I am still investigating how to check the signature in Python.
+
+-------------------------
+
+sea-snake | 2024-02-01 00:39:36 UTC | #7
+
+Since you're referring to `onSuccess` I assume you're referring to an Internet Identity?
+
+An Internet Identity is different from a normal public/private key identity. Since it uses delegation, which basically means the following process happens when a user authenticates:
+
+1. Dapp generates public/private key pair
+2. Dapp asks auth client to authenticate with II, the public key from the previous step is sent in this request to II
+3. User logs in with II
+4. II will create a delegation and return it to the dapp
+5. When the dapp calls a canister it will sign the request with private key from step 1 and also send the delegation in this request
+6. The IC receives the signed request, verifies that it indeed has been signed by private key from step 1
+7. Since also a delegation is received it will check which public key has been delegated towards and checks if the signature of the delegation has indeed been signed by the II canister
+
+* AuthClient by default generates the key in step 1 and sends it in step 2 for you.
+* A delegation is a signed message by private key B that states that public key A can make calls for public key B. This means that private key B never has to leave the II canister.
+
+So all this means that you have to verify two signatures for II just like the IC does in step 6 and 7. A JS implementation for this can be found at https://github.com/slide-computer/signer-js/blob/master/src/signature/identity.ts#L19
+
+As far as I'm aware there's no Python implementation, you'll likely have to implement it from scratch. Depending on the key algorithm that has been delegated towards (ecdsa p256 by default in AuthClient), you'll need different signature verification libraries. You'll also need to verify the IC canister signature in the delegation (bls signature)
+
+Also to clearify, the principal is a unique hash of the public key of an identity. It's enough to differentiate between identities but you'll need the public key instead to actually verify signatures.
+
+A simpler identity verification approach without the need for any signature verification in python would be e.g. creating a canister that keeps a list of principals that have called the canister. You could then query the canister with a principal as argument to check if it's within the list and return true/false. This basically moves the signatures check onto the IC.
+
+-------------------------
+
+qwertytrewq | 2024-02-01 19:19:29 UTC | #8
+
+Yes, I use Internet Identity.
+
+It's unclear, how to use https://github.com/slide-computer/signer-js/blob/master/src/signature/identity.ts:
+
+It seems that I understand what are `publicKey` and `signature`. But what are `challenge`, `rootKey`, and `delegationChain`?
+
+-------------------------
+
+sea-snake | 2024-02-01 22:13:32 UTC | #9
+
+* challenge: original bytes that the signature was created for, often these are just random bytes
+
+* rootKey: the IC root key, is the following hardcoded in the agent js library https://github.com/dfinity/agent-js/blob/main/packages/agent/src/agent/http/index.ts#L52
+
+* delegationChain: is one or multiple signatures that proof  that private key A can sign requests for public key B(without needing private key B), this chain can be more than one delegation which means key A can sign for B for C for D etc. More info here: https://medium.com/dfinity/web-authentication-and-identity-on-the-internet-computer-a9bd5754c547
+
+-------------------------
+
+qwertytrewq | 2024-03-11 17:37:41 UTC | #10
+
+[quote="sea-snake, post:7, topic:27133"]
+A JS implementation for this can be found at [signer-js/src/signature/identity.ts at master · slide-computer/signer-js · GitHub](https://github.com/slide-computer/signer-js/blob/master/src/signature/identity.ts#L19)
+[/quote]
+
+Please, correct the URL.
+
+-------------------------
+
+sea-snake | 2024-03-11 18:48:28 UTC | #11
+
+Hey, the package was split into multiple separate packages. This signature verification part is now a standalone package that can be found at [NPM](https://www.npmjs.com/package/@slide-computer/signer-signatures) and [GitHub](https://github.com/slide-computer/signer-js/tree/main/packages/signer-signatures)
+
+-------------------------
+

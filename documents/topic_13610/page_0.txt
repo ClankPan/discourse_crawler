@@ -1,0 +1,270 @@
+mariop | 2022-06-14 09:01:15 UTC | #1
+
+Hi everyone,
+
+Yesterday during the Ledger&Tokenization Working Group we discussed ERC-20 the `approve/transferFrom` flow and its issues. Only 16 people participated in the meeting so I thought it could be useful to have a conversation about the topic here on the forum.
+
+For context, on Friday we asked people whether ERC-20 like `approve/transferFrom` should be added to the [ICRC-1 Token Standard](https://github.com/dfinity/ICRC-1) and half of the people voted against it. If we had to make a decision right now we would not include `approve/transferFrom` in the standard. I actually would like to give it a second go to be sure this is what we want and that's why I'm writing this post.
+
+From what I understand, the main reasons for not wanting ERC-20 like `approve/transferFrom` are security concerns and issues with cycle draining.
+
+# Security concerns
+
+ERC-20's `approve/transferFrom` have been highly criticized for their issues. There is a [famous attack vector](https://docs.google.com/document/d/1YLPtQxZu1UAvO9cZ1O2RPXBbT0mooh4DYKjA_jp-RLM/edit) using them. Another issue is with phishing. Many phishing attacks on Ethereum involve tricking users into signing approvals. Phishing attacks exist everywhere but `approve` can make them trivial to do. On one hand, users get used to `approve` third parties without fully understanding the implications and lower their defenses regarding this approach. This is exacerbated by the fact that there is no immediate effect in approving somebody. On the other hand, third-parties often abuse `approve` and the trust of their users by getting approval for an unlimited amount of tokens. The combination of these two aspects together with simple phishing techniques  is highly damaging.
+Note that the ERC-20 standard implicitly relies on wallet UIs to help users understand what they are signing. To date wallets are poor at fulfilling this task.
+
+I would like to know what you guys think about those security concerns.
+
+We don't have to have exactly the same `approve/transferFrom` ERC-20 provides. We could improve over Ethereum's standard now that we know it has issues. For instance, a way to avoid the attack vector on ERC-20's `approve/transferFrom` is to change the way `approve/transferFrom` works to mimic how cheques work in real life. In essence, `approve/transferFrom` would be a 2 steps transfer. To better reflect this, let’s rename `approve` into `approveTransfer` and `transferFrom` into `commitTransfer`. `approveTransfer` would be equivalent to signing a check with an amount of tokens. The cheque can be destroyed by the issuer or can be cashed by the beneficiary via `commitTransfer`. Multiple `approveTransfers` would sign multiple cheques meaning that the attack vector would not exist anymore. The interface would look like this
+
+```
+approveTransfer(
+  from_subaccount: opt Subaccount,
+  to_principal: Principal,
+  to_subaccount: opt Subaccount,
+  amount: Tokens,
+) -> ApprovalId;
+
+commitTransfer(
+  from_principal: Principal,
+  from_subaccount: opt Subaccount,
+  to_principal: Principal,
+  to_subaccount: opt Subaccount,
+  approvalId: ApprovalId,
+) -> CommitTransferResult;
+
+revokeApproval(approvalId: ApprovalId) -> ();
+
+allowance(approvalId: ApprovalId) -> Tokens;
+```
+
+Now this solves only partially the issue with ERC-20's `approve/transferFrom` but it's a significant improvement over the original standard in terms of security.
+
+Other solutions could include having a max allowance and having expiration for the allowance and forcing the user to renew the allowance. Now the problem with these two solutions is what is the right max amount and expiration time. This can be quite tricky to decide but better than allowing unlimited values or infinite time.
+
+# Cycles draining
+
+Another issue with `approve/transferFrom` that was raised is the cycle draining issue for service canisters. Approvals don’t really give any guarantee to a service that `transferFrom` will succeed. A user can approve a service and then notify the service about the approval. The service will then use some cycles to attempt a `transferFrom`. The user can control how many tokens it has in its own account so it can make `transferFrom` fail. At that point the service can only retry, ask the user to retry or black list the user. None of them really take care of the problem. Retries means using more cycles by doing an operation that only the user knows if it will fail or not. Blacklisting users work but only if you require users to register to your service first.
+
+Another solution is that approvals can be done against a “service invoice” that will be issued by the service only after a creation fee has been paid by the user.
+
+# Conclusions
+
+I hope this gives food for thought to everybody involved with the discussion. Looking forward to the answers and the next working group next Tuesday!
+
+Best,
+Mario
+
+References:
+- [Ledger & Tokenization Working Group](https://forum.dfinity.org/t/announcing-token-standard-as-topic-of-the-first-meeting-of-the-ledger-tokenization-working-group/11925)
+
+EDIT:
+- 14 Jul 22 11:01 add `revokeApproval`
+
+-------------------------
+
+witter | 2022-06-08 17:22:00 UTC | #2
+
+make sense. 
+But the arguments  need to be optimized:
+The account ID or principal is what the user can provide, not the sub-account.
+
+```
+
+approveTransfer(
+  from_subaccount: opt Subaccount,
+  to: string, // principal or account id 
+  amount: Tokens,
+) -> ApprovalId;
+
+commitTransfer(
+  from: string, // principal or account id 
+  to: string, // principal or account id 
+  amount: Tokens,
+  approvalId: ApprovalId,
+) -> CommitTransferResult;
+
+
+allowance(approvalId: ApprovalId) -> Tokens;
+
+```
+
+-------------------------
+
+mariop | 2022-06-09 08:34:58 UTC | #3
+
+[quote="witter, post:2, topic:13610"]
+The account ID or principal is what the user can provide, not the sub-account.
+[/quote]
+
+I'd suggest to move this conversation in its own specific post but the quick answer is that we don't have account ID anymore in the ICRC-1 standard because we decided to use the tuple `(Principal, Subaccount)`. You can see the [API here](https://github.com/dfinity/ICRC-1). Subaccount is optional and when not set then the default one is used.
+
+-------------------------
+
+witter | 2022-06-09 09:05:23 UTC | #4
+
+It's awesome.
+But I don't think using tuple (Principal, Subaccount) is a good idea.
+IC is designed to use account id to some extent to protect user privacy, so using tuple (Principal, Subaccount) in the token standard is not as good as using the account id directly.
+I have submitted a PR and explained why
+
+-------------------------
+
+skilesare | 2022-06-09 15:48:34 UTC | #5
+
+I am surprised by the vote as I did not hear much opposition in the call. Cycle drain seems like a problem. This is where a witness would make a bunch of sense. If approve requires a lock time and the return provided a witness them the user could send the witness with assurance that it is there.
+
+We have added this kind of mechanism a couple of places where a user agrees to not touch funds for a timespan(contract enforces). This acts as/is an escrow account.
+
+-------------------------
+
+jzxchiang | 2022-06-09 22:07:59 UTC | #6
+
+Thanks for sharing this.
+
+> The cheque can be destroyed by the issuer or can be cashed by the beneficiary via `commitTransfer`.
+
+Will this be part of the interface? I don't see a `destroy` method or something like that.
+
+Also, how do you notify a canister about tokens that you've sent this with this interface? Is that not specified in the standard?
+
+-------------------------
+
+oss | 2022-06-10 03:36:22 UTC | #7
+
+This has been discussed already, and account ids really only obfuscate. it is possible to collect principal ids as a service and calculate and discover linked account ids, so there is no point. Block explorers (ie icscan) have even implemented automatically discovering and indexing the principal id for an account id. Account ids are essentially a category/label and provide purely separation of funds/concerns for a wallet. This is especially useful when it comes to a service, as a canister can then create separate subaccounts while remaining open and transparent
+
+-------------------------
+
+witter | 2022-06-11 03:53:12 UTC | #8
+
+Thank you very much for your kind and detailed explanation
+
+-------------------------
+
+roman-kashitsyn | 2022-06-13 12:19:51 UTC | #9
+
+[quote="jzxchiang, post:6, topic:13610"]
+Will this be part of the interface? I don’t see a `destroy` method or something like that.
+[/quote]
+
+Yes, we'll need something like the following method:
+```
+revokeApproval(approvalId: ApprovalId) -> ();
+```
+
+[quote="jzxchiang, post:6, topic:13610"]
+Also, how do you notify a canister about tokens that you’ve sent this with this interface? Is that not specified in the standard?
+[/quote]
+
+You will need to notify the destination canister directly, just as with regular transfers.
+
+-------------------------
+
+mariop | 2022-06-14 09:01:42 UTC | #10
+
+[quote="roman-kashitsyn, post:9, topic:13610"]
+[quote="jzxchiang, post:6, topic:13610"]
+Will this be part of the interface? I don’t see a `destroy` method or something like that.
+[/quote]
+
+Yes, we’ll need something like the following method:
+
+```
+revokeApproval(approvalId: ApprovalId) -> ();
+```
+[/quote]
+
+I've added to the original post, thanks.
+
+-------------------------
+
+jzxchiang | 2022-06-15 00:36:28 UTC | #11
+
+Perhaps it would be useful to add a section explaining the pros and cons of having the sending canister directly notify the recipient, instead of the token canister doing it.   This pattern seems to go against the `transferAndNotify` pattern more commonly found in the ERC-20 ecosystem.
+
+-------------------------
+
+domwoe | 2022-06-15 09:46:16 UTC | #12
+
+[quote="jzxchiang, post:11, topic:13610"]
+This pattern seems to go against the `transferAndNotify` pattern more commonly found in the ERC-20 ecosystem.
+[/quote]
+
+Where do you see the `transferAndNotify` pattern in the ERC-20 ecosystem? AFAIK ERC-20 uses `approve` and `transferFrom` when the receiver is a smart contract.
+
+-------------------------
+
+jzxchiang | 2022-06-16 05:09:14 UTC | #13
+
+I believe ERC-667 does that.
+
+I found [this](http://blockchainers.org/index.php/2018/02/08/token-erc-comparison-for-fungible-tokens/) to be a very informative resource on the history of token standards.
+
+-------------------------
+
+domwoe | 2022-06-16 06:14:10 UTC | #14
+
+[quote="jzxchiang, post:13, topic:13610"]
+I believe ERC-667 does that.
+[/quote]
+
+Ah, yep, ERC-667 uses `transferAndCall`. See https://github.com/ethereum/EIPs/issues/677 for a discussion. 
+
+ERC-777 has a related function to call a `tokensReceived` hook of a receiving contract if it has registered that hook in a special registry ([EIP-1820](https://eips.ethereum.org/EIPS/eip-1820)).
+
+These patterns have currently issues on the IC if we want token canisters to be upgradable, but could be added as an extension (similar to ERC-667) later on.
+
+[quote="roman-kashitsyn, post:9, topic:13610"]
+You will need to notify the destination canister directly, just as with regular transfers.
+[/quote]
+
+Btw. I don't understand this. The flow would be the same as for `approve`/`transferFrom`. There the sender will inform the recipient about the approval (I guess this step is meant here) and the receiver will then call `commitTransfer` directly. 
+
+It's interesting to have a look at the usage of the standards on Ethereum:
+`transferFrom`: https://bloxy.info/functions/23b872dd
+`transferAndCall` https://bloxy.info/functions/4000aea0
+`tokenReceived` https://bloxy.info/functions/0023de29
+
+You can see that the `transferFrom` pattern is used overwhelmingly, despite its issues.  
+
+[quote="jzxchiang, post:13, topic:13610"]
+I found [this ](http://blockchainers.org/index.php/2018/02/08/token-erc-comparison-for-fungible-tokens/) to be a very informative resource on the history of token standards.
+[/quote]
+
+That's a great summary!
+
+-------------------------
+
+dieter.sommer | 2022-06-20 07:59:42 UTC | #15
+
+[quote="domwoe, post:14, topic:13610"]
+You can see that the `transferFrom` pattern is used overwhelmingly, despite its issues.
+[/quote]
+
+The reason for this widespread use of transferFrom may be that as it is initiated by a smart contract, it can be part of a transaction that may be rolled back. If a user would make a transfer, this is not the case any more.
+
+-------------------------
+
+jzxchiang | 2022-06-22 00:37:34 UTC | #16
+
+I'm not sure I understand. This IC standard should also support the case where a transfer is initiated by a canister, I thought. The rationale you gave for `transferFrom` would thus seem to also apply to this IC standard then?
+
+-------------------------
+
+dieter.sommer | 2022-06-22 12:40:37 UTC | #17
+
+[quote="jzxchiang, post:16, topic:13610"]
+This IC standard should also support the case where a transfer is initiated by a canister, I thought.
+[/quote]
+
+Yes, this understanding is perfectly correct. Both users and canisters can initiate a payment flow following the approve / commit protocol discussed in the token standard WG.
+
+-------------------------
+
+Aadvit | 2022-07-07 21:45:50 UTC | #18
+
+Seems waiting on implementation is a better idea until the a large amount of bugs in security are resolved.
+
+-------------------------
+

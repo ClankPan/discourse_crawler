@@ -1,0 +1,407 @@
+mymikemiller | 2023-06-11 17:20:29 UTC | #1
+
+I'm following the [ckBTC example code](https://dfinityorg.notion.site/ckBTC-example-Encode-Hackathon-0aaf6292e3404dabb49df5d1b5abc797#08a7469beaf14d6ba35e8827e363e160) for the Encode Hackathon currently in progress, the Fortune Cookie app, but I'm not able to get my code to communicate with the icrc-1 ledger wasm that I downloaded and used as a local canister according to the tutorial. The error I'm getting sounds like nonsense, saying two simple types are not the same when they look identical to me.
+
+The error I'm getting when I run dfx deploy:
+
+```
+type error [M0096], expression of type
+  {owner : Principal; subaccount : ?Subaccount}
+cannot produce expected type
+  {owner : Principal; subaccount : ?Subaccount__1}
+```
+
+I've seen errors like this before, where some types have __N appended to them, but usually I can ignore them and fix the other meaningful differences in the error and once they're all fixed, the __N issue disappears. But there's nothing else meaningful in this error, so I'm not sure how to proceed.
+
+The definition for Subaccount from the [icrc1.did](https://raw.githubusercontent.com/dfinity/ic/794fc5b9341fa8f6a0e8f219201c35f0b5727ab9/rs/rosetta-api/icrc1/ledger/ledger.did) file I downloaded and referenced in my dfx: 
+
+`type Subaccount = blob;`
+
+And my definition in my canister:
+
+`public type Subaccount = Blob;`
+
+Seems like these should be compatible and I should be able to send a Subaccount that I created from my own type into the ckbtc_ledger (by way of an enclosing Account type), but it complains with the above "cannot produce expected type" error:
+
+```
+let acct : Account = {
+  owner = Principal.fromText("hello");
+  subaccount = ?Blob.fromArray([0, 1, 2]);
+};
+let balance = await CkBtcLedger.icrc1_balance_of(acct);
+```
+
+Obviously this nonsense data wouldn't do what I want, but it should at least be able to make it into the ledger cansiter, which it currently fails to do. I get this same failure even if I use the toSubaccount code exactly as it is in the Fortune Cookie example and attempt to send in real data.
+
+I had a theory that the problem might be that the Fortune Cookie example, and referenced icrc1.did and .wasm were created in dfx 0.14.0 and I am using 0.14.1, but I can't test that theory because I'm not able to downgrade to 0.14.0 because apparently [it's been pulled](https://forum.dfinity.org/t/installing-dfx-0-14-0-is-broken/20515/2?u=mymikemiller) due to a broken asset canister. But even so, I'd expect simple types like this to be able to be compatible between dfx versions, so I'm at a loss.
+
+Anyone have an idea why I can't send seemingly-compatible types into the icrc1 ledger canister?
+
+-------------------------
+
+claudio | 2023-06-12 12:32:12 UTC | #2
+
+This does seem odd.
+
+What is the definition of the `Account` type above?
+
+If the code isn't sensitive, could you share the repo so I can investigate (or whittle it down to a small example?).
+
+-------------------------
+
+claudio | 2023-06-12 14:28:21 UTC | #3
+
+I think I know what the problem might be.
+
+The candid 'blob' type is the same as the Candid 'vec nat8' - it's just an abbreviation for the latter.
+
+In Motoko, a `vec nat8` (and thus a `blob`) can be imported either as a `Blob` or `[Nat8]`, but these types are not the same. 
+
+I suspect `CkBtcLedger.icrc1_balance_of`has imported type 
+```
+shared { owner: Principal; subaccount : [Nat8]}  ->  Nat 
+```
+
+But you are passing it a value of type
+
+```
+{ owner : Principal; subaccount : Blob }
+```
+
+and the type of the actual argument `acct` isn't actually compatible with the function's formal argument type. You need to convert the `Blob` field to a `[Nat8]`.
+
+For example, does this work:
+
+```
+let balance = await CkBtcLedger.icrc1_balance_of(
+  {  owner = Principal.fromText("hello"); 
+      subaccount = ?[0, 1 ,2] });
+```
+(Note that I'm just passing an array for subaccount, not a `Blob`.)
+
+-------------------------
+
+mymikemiller | 2023-06-12 16:10:19 UTC | #4
+
+Thanks for looking into this, Claudio. I tried your array suggestion and that results in 
+
+```
+type error [M0096], expression of type
+  [Nat]
+cannot produce expected type
+  Blob
+```
+
+So I tried converting all the entries to Nat8 as follows:
+
+```
+let acct : Account = {
+  owner = Principal.fromText("hello");
+  subaccount = ?[Nat8.fromNat(0), Nat8.fromNat(1), Nat8.fromNat(2)];
+};
+```
+
+Which results in:
+
+```
+type error [M0096], expression of type
+  [Nat8__2]
+cannot produce expected type
+  Blob
+```
+
+The Nat8__2 moniker is confusing to me. Why the __2? I see this __N all the time and the value of N never seems to mean much, other than the compiler seems to think it's a completely different type than what comes before the __N. 
+
+Note that I'm getting the error when trying to create an object of my own Account type, not yet sending it into the CkBtcLedger canister. When I use your code above I seem to be getting closer to the solution and the compiler finally complains about the import, which has been underlined in red since the beginning. Maybe that's the real problem. Maybe I'm not importing correctly. Here's the import:
+
+`import CkBtcLedger "canister:ckbtc_ledger";`
+
+And here's the relevant section from dfx.json, pulled straight from the [tutorial](https://dfinityorg.notion.site/ckBTC-example-Encode-Hackathon-0aaf6292e3404dabb49df5d1b5abc797#503fbddd84e843ecbff7bc99f168b320):
+
+```
+    "ckbtc_ledger": {
+      "type": "custom",
+      "candid": "icrc1.public.did",
+      "wasm": "icrc1.wasm",
+      "remote": {
+        "candid": "icrc1.public.did",
+        "id": {
+          "ic": "mxzaz-hqaaa-aaaar-qaada-cai"
+        }
+      }
+    },
+```
+
+The icrc1.did file (duplicated and renamed to icrc1.public.did and with the service parameter removed) and the icrc1.wasm are the same version as in the tutorial: 794fc5b9341fa8f6a0e8f219201c35f0b5727ab9
+
+I wonder if I did something wrong in getting deploy to use the correct version. I didn't do two deploy steps, one with the original and one with the public did file. The tutorial could be more clear on exactly what commands to use to deploy the ledger and get it to use the correct version of the did file each time. After deploy, I do end up with an entry for ckbtc_ledger in /.dfx/local/canister_ids.json, but I still end up with red squigglies under the import statement, and it complains when I tried to use it:
+
+```
+import error [M0011], canister alias "ckbtc_ledger" not defined
+```
+
+I'm stumped. I feel like I shouldn't have any problem creating an object of my locally defined Account type but I'm failing to do that (as shown above) so I can't even try to send it into getBalance, but even if I create it directly in the call to getBalance as you show, dfx surfaces the import issue which might be at the root of the problem in the first place.
+
+-------------------------
+
+claudio | 2023-06-12 21:12:09 UTC | #5
+
+Hmm, could it be that you also need a local id?
+
+I'd be happy to play with the code if you can share it somehow, perhaps in a private message, as a gzip or private GH repo.
+
+The _N suffixes are used to distinguish type abbreviations with the same name but possibly different definitions. They are a bit ugly and in most cases we would be better off suppressing them unless there is a real reason to distinguish the types.
+
+Ignoring VSCode and the red squiggles, does dfx build actually report an error for the import? Perhaps the VSCode plugin gets tripped up by the custom project type for the ledger canister.
+
+-------------------------
+
+mymikemiller | 2023-06-12 21:33:21 UTC | #6
+
+It's a big project, but the failing code is in the ckBTC tree of my Videate project: [GitHub - mymikemiller/videate at ckBTC](https://github.com/mymikemiller/videate/tree/ckBTC)
+
+See the [import](https://github.com/mymikemiller/videate/blob/ckBTC/credits/src/serve/serve.mo#L30) and [usage attempts](https://github.com/mymikemiller/videate/blob/ckBTC/credits/src/serve/serve.mo#L924) in serve.mo 
+
+Interestingly, adding the import causes the below error, though I can't find that did file to investigate (using `dfx build serve` is the first time I've seen the below error. `dfx deploy serve` causes the "unexpected type" errors I was mentioning earlier)
+
+```
+The build step failed for canister 'bd3sg-teaaa-aaaaa-qaaba-cai' (serve) with an embedded error: Failed to build Motoko canister 'serve'.: Failed to compile Motoko.: Failed to run 'moc'.: The command '"/Users/mikem/.cache/dfinity/versions/0.14.1/moc" "/Users/mikem/projects/videate/credits/src/serve/serve.mo" "-o" "/Users/mikem/projects/videate/credits/.dfx/local/canisters/serve/serve.wasm" "-c" "--debug" "--idl" "--stable-types" "--public-metadata" "candid:service" "--public-metadata" "candid:args" "--actor-idl" "/Users/mikem/projects/videate/credits/.dfx/local/canisters/idl/" "--actor-alias" "ckbtc_ledger" "bkyz2-fmaaa-aaaaa-qaaaq-cai" "--actor-alias" "frontend" "br5f7-7uaaa-aaaaa-qaaca-cai" "--actor-alias" "internet_identity" "bw4dl-smaaa-aaaaa-qaacq-cai" "--actor-alias" "serve" "bd3sg-teaaa-aaaaa-qaaba-cai" "--package" "base" "/Users/mikem/.cache/dfinity/versions/0.14.1/base"' failed with exit status 'exit status: 1'.
+Stdout:
+
+Stderr:
+bkyz2-fmaaa-aaaaa-qaaaq-cai.did:276.2-276.3: syntax error, unexpected token
+```
+
+-------------------------
+
+claudio | 2023-06-12 21:42:40 UTC | #7
+
+Thanks, I'll take a look tomorrow (bedtime here).
+
+-------------------------
+
+claudio | 2023-06-12 22:10:20 UTC | #8
+
+https://github.com/letmejustputthishere/ckbtc-payments/blob/main/icrc1.public.did
+
+Looks a bit different than yours.
+
+You still have a 'service' argument type, it has none.
+
+It has no final semicolon, yours does.
+
+-------------------------
+
+mymikemiller | 2023-06-12 23:51:58 UTC | #9
+
+Thanks for pointing those out.
+
+The semicolon was added automatically by the "Motoko Language Support" VSCode extension (v0.13.2). If that's not valid .did syntax, the extension should probably be updated not to add it on save (if we're supposed to be editing .did files manually as the Fortune Cookie tutorial has us doing)
+
+Also, I thought when the tutorial said "we remove those arguments in the public version of the dids", that `service : () -> {` would work just as well as `service : {`. Are they not equivalent .did expressions?
+
+Now that that's fixed I'm back to getting the `canister alias "ckbtc_ledger" not defined` error on `dfx deploy serve` or just `dfx deploy`. Interestingly, `dfx build serve` and `dfx canister install serve --mode=reinstall` succeed (but the red squigglies remain) and `dfx deploy serve` fails (`"ckbtc_ledger" not defined`)
+
+I suspect something is going amiss when I'm trying to use the npm scripts set up in package.json with all the switching from icrc1.did to icrc1.public.did. I'm not sure which commands I was supposed to run, and in what order.
+
+When I manually switch ckbtc_ledger's definition in dfx.json to point to icrc1.did for candid entries, I get `Expected arguments but found none.` When I switch them to icrc1.public.did, I get the following:
+
+```
+Failed to install wasm module to canister 'ckbtc_ledger'.
+  Failed during wasm installation call: The Replica returned an error: code 5, message: "Canister bkyz2-fmaaa-aaaaa-qaaaq-cai trapped explicitly: failed to decode call arguments: Custom(No more values on the wire, the expected type variant {
+  Upgrade : opt record {
+    token_symbol : opt text;
+    transfer_fee : opt nat64;
+    metadata : opt vec record {
+      text;
+      variant { Int : int; Nat : nat; Blob : vec nat8; Text : text };
+    };
+    change_fee_collector : opt variant {
+      SetTo : record { owner : principal; subaccount : opt vec nat8 };
+      Unset;
+    };
+    max_memo_length : opt nat16;
+    token_name : opt text;
+  };
+  Init : record {
+    token_symbol : text;
+    transfer_fee : nat64;
+    metadata : vec record {
+      text;
+      variant { Int : int; Nat : nat; Blob : vec nat8; Text : text };
+    };
+    minting_account : record { owner : principal; subaccount : opt vec nat8 };
+    initial_balances : vec record {
+      record { owner : principal; subaccount : opt vec nat8 };
+      nat64;
+    };
+    fee_collector_account : opt record {
+      owner : principal;
+      subaccount : opt vec nat8;
+    };
+    archive_options : record {
+      num_blocks_to_archive : nat64;
+      max_transactions_per_response : opt nat64;
+      trigger_threshold : nat64;
+      max_message_size_bytes : opt nat64;
+      cycles_for_archive_creation : opt nat64;
+      node_max_memory_size_bytes : opt nat64;
+      controller_id : principal;
+    };
+    max_memo_length : opt nat16;
+    token_name : text;
+  };
+} is not opt, reserved or null)"
+```
+
+In both of these cases, I ran these commands after making changes to dfx.json:
+
+```dfx build ckbtc_ledger; dfx canister install ckbtc_ledger --mode=reinstall```
+
+Note that I had to split the command up in to the build and install commands because `dfx deploy ckbtc_ledger` always seemed to complete successfully, and `dfx deploy serve` was resulting in the import error.
+
+-------------------------
+
+claudio | 2023-06-13 11:51:18 UTC | #10
+
+
+
+> The semicolon was added automatically by the "Motoko Language Support" VSCode extension (v0.13.2). If that's not valid .did syntax, the extension should probably be updated not to add it on save (if we're supposed to be editing .did files manually as the Fortune Cookie tutorial has us doing)
+
+I think this may be  a bug in Motoko that is not allowing the trailing semi-colon, which I think is legal Candid. (I filed issue https://github.com/dfinity/motoko/issues/4037)
+
+> Also, I thought when the tutorial said "we remove those arguments in the public version of the dids", that `service : () -> {` would work just as well as `service : {`. Are they not equivalent .did expressions?
+
+No, they aren't equivalent, you should strip the entire `... ->`. Motoko is expecting a candid file describing the interface of the installed service, i.e. everything after the `->`, while installing the ledger requires an explicit argument (everything to the left of the arrow). This inconvenience hacking could be avoided if we just let Motoko silently ignore the argument in the did file, which we intend to do in a release or two.
+(There is an issue for that too https://github.com/dfinity/motoko/issues/3990.)
+
+>Now that that's fixed I'm back to getting the `canister alias "ckbtc_ledger" not defined` error on `dfx deploy serve` or just `dfx deploy`. Interestingly, `dfx build serve` and `dfx canister install serve --mode=reinstall` succeed (but the red squigglies remain) and `dfx deploy serve` fails (`"ckbtc_ledger" not defined`)
+
+Ok, I think that's due to a missing dependency of serve on `ckbtc_ledger` in `dfx.json`. See the dfx.json diffs below.
+(Discovered by comparing with dfx.json in https://dfinityorg.notion.site/ckBTC-example-Encode-Hackathon-0aaf6292e3404dabb49df5d1b5abc797#08a7469beaf14d6ba35e8827e363e160)
+
+> I suspect something is going amiss when I'm trying to use the npm scripts set up in package.json with all the switching from icrc1.did to icrc1.public.did. I'm not sure which commands I was supposed to run, and in what order.
+
+Indeed. I think you need to start with dfx.json referencing icrc1.did (with argument) to deploy the ledger, switch to the public did (without the argument) and then (build and) deploy `serve` using the public did. All a bit gross. Sorry, I've never used the original project so am pretty fresh to this pain. For me, after this
+ (after fixing dfx.json and icrc1.public.did).
+
+```bash
+npm run private-dids  
+npm run deploy
+```
+seems to work for me.
+
+Here are the diffs I applied to get this to work:
+```bash
+crusso@vm:~/videate/credits$ git diff
+diff --git a/credits/dfx.json b/credits/dfx.json
+index 9ef11a4..aa94add 100644
+--- a/credits/dfx.json
++++ b/credits/dfx.json
+@@ -2,10 +2,10 @@
+   "canisters": {
+     "ckbtc_ledger": {
+       "type": "custom",
+-      "candid": "icrc1.public.did",
++      "candid": "icrc1.did",
+       "wasm": "icrc1.wasm",
+       "remote": {
+-        "candid": "icrc1.public.did",
++        "candid": "icrc1.did",
+         "id": {
+           "ic": "mxzaz-hqaaa-aaaar-qaada-cai"
+         }
+@@ -13,7 +13,10 @@
+     },
+     "serve": {
+       "main": "src/serve/serve.mo",
+-      "type": "motoko"
++      "type": "motoko",
++      "dependencies": [
++        "ckbtc_ledger"
++      ]
+     },
+     "frontend": {
+       "dependencies": [
+diff --git a/credits/icrc1.public.did b/credits/icrc1.public.did
+index 216a7aa..a77fbda 100644
+--- a/credits/icrc1.public.did
++++ b/credits/icrc1.public.did
+@@ -259,7 +259,7 @@ type DataCertificate = record {
+     hash_tree : blob;
+ };
+ 
+-service : () -> {
++service : /* () -> */ {
+     icrc1_name : () -> (text) query;
+     icrc1_symbol : () -> (text) query;
+     icrc1_decimals : () -> (nat8) query;
+@@ -273,4 +273,4 @@ service : () -> {
+     get_transactions : (GetTransactionsRequest) -> (GetTransactionsResponse) query;
+     get_blocks : (GetBlocksArgs) -> (GetBlocksResponse) query;
+     get_data_certificate : () -> (DataCertificate) query;
+-};
++}//;
+```
+
+With those diffs, and after staring the replica, this seems to work:
+
+```bash
+crusso@vm:~/videate/credits$ npm run deploy
+
+> credits_assets@0.1.0 deploy
+> npm run deploy:ledger && npm run deploy:serve
+
+
+> credits_assets@0.1.0 deploy:ledger
+> PRINCIPAL=$(dfx identity get-principal) && dfx deploy ckbtc_ledger --argument "(variant {Init = record {minting_account = record { owner = principal \"$PRINCIPAL\" };transfer_fee = 10;token_symbol = \"ckBTC\";token_name = \"Token ckBTC\";metadata = vec {};initial_balances = vec {record { record {owner = principal \"$PRINCIPAL\"}; 100_000_000_000 } };archive_options = record {num_blocks_to_archive = 10_000;trigger_threshold = 20_000;cycles_for_archive_creation = opt 4_000_000_000_000;controller_id = principal \"$PRINCIPAL\";};}})"  --mode=reinstall -y
+
+Deploying: ckbtc_ledger
+All canisters have already been created.
+Building canisters...
+Installing canisters...
+Reinstalling code for canister ckbtc_ledger, with canister ID b77ix-eeaaa-aaaaa-qaada-cai
+Deployed canisters.
+URLs:
+  Frontend canister via browser
+    frontend: http://127.0.0.1:4943/?canisterId=by6od-j4aaa-aaaaa-qaadq-cai
+  Backend canister via Candid interface:
+    ckbtc_ledger: http://127.0.0.1:4943/?canisterId=asrmz-lmaaa-aaaaa-qaaeq-cai&id=b77ix-eeaaa-aaaaa-qaada-cai
+    internet_identity: http://127.0.0.1:4943/?canisterId=asrmz-lmaaa-aaaaa-qaaeq-cai&id=avqkn-guaaa-aaaaa-qaaea-cai
+    serve: http://127.0.0.1:4943/?canisterId=asrmz-lmaaa-aaaaa-qaaeq-cai&id=bw4dl-smaaa-aaaaa-qaacq-cai
+
+> credits_assets@0.1.0 deploy:serve
+> npm run public-dids && dfx deploy serve
+
+
+> credits_assets@0.1.0 public-dids
+> perl -i -pe 's|icrc1\.did|icrc1\.public\.did|g' dfx.json
+
+Deploying: ckbtc_ledger serve
+All canisters have already been created.
+Building canisters...
+Installing canisters...
+Module hash 8ddd17ccaab8bd6adf337acb38f89b0db6db3c976f5768bb9a7ced5cef7bd481 is already installed.
+Module hash a53d6ff98451b4dfaa802f6a1a48947ba39626138879873030d27dbd01823438 is already installed.
+Deployed canisters.
+URLs:
+  Frontend canister via browser
+    frontend: http://127.0.0.1:4943/?canisterId=by6od-j4aaa-aaaaa-qaadq-cai
+  Backend canister via Candid interface:
+    ckbtc_ledger: http://127.0.0.1:4943/?canisterId=asrmz-lmaaa-aaaaa-qaaeq-cai&id=b77ix-eeaaa-aaaaa-qaada-cai
+    internet_identity: http://127.0.0.1:4943/?canisterId=asrmz-lmaaa-aaaaa-qaaeq-cai&id=avqkn-guaaa-aaaaa-qaaea-cai
+    serve: http://127.0.0.1:4943/?canisterId=asrmz-lmaaa-aaaaa-qaaeq-cai&id=bw4dl-smaaa-aaaaa-qaacq-cai
+```
+
+-------------------------
+
+mymikemiller | 2023-06-13 17:48:40 UTC | #11
+
+The missing dependency! :man_facepalming:
+
+I got it up and running thanks to you pointing that out, and specifying the commands to run. The secret was to use "npm run deploy" instead of "dfx deploy".
+
+I still have red squigglies under the CkBtcLedger import, but at least it's working now. Thank you for your help!
+
+-------------------------
+

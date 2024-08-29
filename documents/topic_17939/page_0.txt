@@ -1,0 +1,227 @@
+blabagastered | 2023-01-12 14:00:02 UTC | #1
+
+The error is produced here:
+[quote="timo, post:6, topic:17343"]
+```
+        Utils.get_ok_except(Bitcoin.buildTransaction(2, own_utxos, [(#p2pkh dst_address, amount)], #p2pkh own_address, Nat64.fromNat(total_fee)), "Error building transaction.");
+          
+```
+[/quote]
+
+I'm using an address derived this way
+
+
+ 
+```
+  // Get BTC address for a given user:
+  public func get_btc_address_for_a_given_user(user_principal : Principal) : async Text {
+    let derivation_path_with_double_array : [[Nat8]] = await get_btc_derivation_path_for_a_given_user(user_principal);
+    let bitcoin_address : Text = await get_p2pkh_address_for_a_given_derivation_path(derivation_path_with_double_array);
+    return bitcoin_address;
+  };
+
+  // Get BTC derivation path for a given user:
+  public func get_btc_derivation_path_for_a_given_user(user_principal : Principal) : async [[Nat8]] {
+    let user_principal_blob : Blob = Principal.toBlob(user_principal);
+    let user_principal_array : [Nat8] = Blob.toArray(user_principal_blob);
+    let derivation_path_with_double_array : [[Nat8]] = [user_principal_array];
+    return derivation_path_with_double_array;
+  };
+
+  // Adapted from BasicBitcoin example:
+  /// Returns the P2PKH address of this canister for a given (as an argument) derivation path.
+  public func get_p2pkh_address_for_a_given_derivation_path(derivation_path : [[Nat8]]) : async BitcoinAddress {
+    await BitcoinWallet.get_p2pkh_address(NETWORK, KEY_NAME, derivation_path);
+  };
+```
+
+And on send I'm seeing 
+
+
+```
+Uncaught (in promise) Error: Call was rejected:
+  Request ID: bdd267afdeb9a1abda78fd1627bbdae5ea7654a2ef1e03e7ab43f64f7fa63ab6
+  Reject code: 4
+  Reject text: IC0503: Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped explicitly: Error building transaction.
+```
+
+and 
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Fetching UTXOs...
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Building transaction...
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] pattern failed
+```
+ How might I fix this?
+
+The problem arises only on send. Address generation throws no errors.
+
+-------------------------
+
+blabagastered | 2023-01-12 15:40:59 UTC | #2
+
+The problem seems to be my using the user's principal as derivation path directly. The functions don't complain but actually the derivation path needs to be a very specific format of [[Nat8]], namely one along the lines of [[44, 223, 0, 0, 0]]. You can't just throw any [[Nat8]], eg the user principal, and get a valid bitcoin address back using that function. It assumes a correctly formatted :upside_down_face: (I think BIP32?) derivation path. 
+
+Even though I do get a bitcoin-looking address when I simply use a user principal in [[Nat8]] form as derivation path, the resulting "address" does not pass the checksum validation for bitcoin addresses.
+
+However, I _am_ able to mint blocks to it in my local bitcoin core instance, and successfully query the balance via 
+
+ 
+```
+/// Returns the balance of the given Bitcoin address.
+  public func get_balance(address : BitcoinAddress) : async Satoshi {
+    await BitcoinApi.get_balance(NETWORK, address);
+  };
+```
+It is only send that fails.
+
+I'm now looking for a way to do a secure mapping from
+
+sha256 hash of user_principal -> valid_derivation_path : (correctly formatted) [[Nat8]]
+
+in Motoko.
+
+Pseudocode work in progress (not Motoko):
+
+```
+public func sha256_to_derivation_path(sha256_hash_value : [Nat8]) : async [Nat8] {
+
+    // Use the hash value to generate the derivation path
+    let derivation_path = [
+      44 + int.from_bytes(sha256_hash_value[: 4], byteorder = 'big') % 45,
+      int.from_bytes(sha256_hash_value[4 : 8], byteorder = 'big') % 235,
+      int.from_bytes(sha256_hash_value[8 : 12], byteorder = 'big') % 65535,
+      int.from_bytes(sha256_hash_value[12 : 16], byteorder = 'big') % 65535,
+      int.from_bytes(sha256_hash_value[16 : 20], byteorder = 'big') % 65535,
+    ] 
+    return derivation_path;
+  }
+```
+if anyone knows the Motoko syntax.
+
+As a sidenote, it might be good to add checksum validation to `get_p2pkh_address()`, `get_balance()`, etc, before returning.
+
+-------------------------
+
+timo | 2023-01-13 20:20:14 UTC | #3
+
+Your derivation path should only be 1 level deep for your application.
+
+Bitcoin wallets like to use `[[44, 223, 0, 0, 0, 0]]` (EDIT: that was wrong, they use `[[44],[223],[0],[0],[0],[0]]`)because of BIP44 but the first four of those levels are so-called "hardened derivation" which the threshold key technology cannot provide for fundamental cryptographic reasons. So there is no point to try to mimic any of those standards when doing derivations inside a canister. 
+
+If you want to derive one address per principal then you should keep a table (mapping) internally and map the principals to consecutive Nats (0,1,2,...). Then for a given principal you look up the principals number in the map. For principal number n you use derivation path [n]. That is one level deep, just the value n on the first level. n can be at most 4 bytes long. You have to encode n in big endian to type [Nat8]. For example with the code from  [here](https://forum.dfinity.org/t/how-to-convert-blob-to-nat-nat-to-blob/10149):
+```
+func fromNat(len : Nat, n : Nat) : [Nat8] {
+    let ith_byte = func(i : Nat) : Nat8 {
+        assert(i < len);
+        let shift : Nat = 8 * (len - 1 - i);
+        Nat8.fromIntWrap(n / 2**shift)
+    };
+    Array.tabulate<Nat8>(len, ith_byte)
+};
+```
+You have to call it with `len=4`. So your derivation path will look like this `[[a,b,c,d]]` for some Nat8s a,b,c,d where [a,b,c,d] is the big endian encoding of n.
+
+You can make the encoding more efficient of course if you start with n of type Nat32 since you already know the length (4 bytes). So the code above is just an example.
+
+A deep derivation path is expensive. The threshold ECDSA functionality probably has a limit on how deep it can be.
+
+-------------------------
+
+blabagastered | 2023-01-12 16:13:12 UTC | #4
+
+Thanks. Partly for security reasons, I want to avoid an arbitrary mapping principal -> nat because if anything goes wrong with that relationship, funds would be lost.
+
+I'm trying to avoid adding moving parts as much as possible to minimise opportunities for entanglement / attack surface. It also introduces complexity around two users creating accounts at the same time and things of that nature, which I would rather avoid thinking about at all if possible.
+
+For those reasons, I'm looking for something that produces a derivation path starting only from the user's principal, probably via hashing in between.
+
+Can anything along the lines of `sha256_to_derivation_path()` be produced, (at the appropriate depth for IC canister controlled addresses)?
+
+-------------------------
+
+blabagastered | 2023-01-12 18:14:42 UTC | #5
+
+[quote="timo, post:3, topic:17939"]
+```
+func fromNat(len : Nat, n : Nat) : [Nat8] {
+    let ith_byte = func(i : Nat) : Nat8 {
+        assert(i < len);
+        let shift : Nat = 8 * (len - 1 - i);
+        Nat8.fromIntWrap(n / 2**shift)
+    };
+    Array.tabulate<Nat8>(len, ith_byte)
+};
+```
+[/quote]
+
+
+Neither using the output of this directly, as a double array, nor adding 44 or 32 as a first element, eg [44, a, b, c, d], resulted in valid bitcoin addresses when given as input to
+
+
+```
+  public func get_p2pkh_address_for_a_given_derivation_path(derivation_path : [[Nat8]]) : async BitcoinAddress {
+    await BitcoinWallet.get_p2pkh_address(NETWORK, KEY_NAME, derivation_path);
+  };
+```
+
+The addresses generated with those derivation paths have invalid checksums.
+
+What are the constraints and form the DERIVATION_PATH variable must take for it to work?
+
+I'm using the sha265 hash (in Nat form) as input to the `fromNat()` function, so that aspect should be ok, but I still can't produce derivation paths that result in a valid bitcoin address.
+
+-------------------------
+
+timo | 2023-01-12 23:25:30 UTC | #6
+
+[quote="blabagastered, post:5, topic:17939"]
+The addresses generated with those derivation paths have invalid checksums.
+[/quote]
+
+This sounds like the bug is not in the derivation path then.
+
+You should paste your code otherwise it is hard to find people who can help you.
+
+[quote="blabagastered, post:5, topic:17939"]
+What are the constraints and form the DERIVATION_PATH variable must take for it to work?
+[/quote]
+
+The API is described here: https://internetcomputer.org/docs/current/developer-docs/integrations/t-ecdsa/t-ecdsa-how-it-works#api
+
+There it says for the function `ecdsa_public_key`:
+- The `derivation_path` is a vector of variable length byte strings.
+- each byte string (blob) in the `derivation_path` must be a 4-byte big-endian encoding of an unsigned integer less than 2^31
+
+So I would start by calling that function directly by hand with arguments of type [Blob] and debug from there. Then call the function that you were using that wraps around `ecdsa_public_key` and that takes arguments of type [[Nat8]]. Then try by hand with value [[0,1,2,3]]. See if that gives you valid addresses. Etc.
+
+I have never used the API myself, so can only guess. But I'm sure if you post code then there will be people who can help you.
+
+-------------------------
+
+PaulLiu | 2023-01-13 11:33:11 UTC | #7
+
+[The spec document](https://internetcomputer.org/docs/current/developer-docs/integrations/t-ecdsa/t-ecdsa-how-it-works#api) says:
+
+> For curve `secp256k1`, the public key is derived using a generalization of BIP32 (see ia.cr/2021/1330, Appendix D). **To derive (non-hardened) BIP-0032-compatible public keys**, each byte string (blob) in the `derivation_path` must be a 4-byte big-endian encoding of an unsigned integer less than 231.
+
+Note my added emphasis. It means this rule only applies when you want BIP32 compatible public keys. If you don't need this compatibility, **any byte array** should work.
+
+So I suspect the OP's "error building transaction" thing was for a different reason. I've personally used principal serialized byte arrays as a derivation path with absolutely no problem.
+
+-------------------------
+
+blabagastered | 2023-01-13 13:23:56 UTC | #8
+
+Glory! Now it sank in. Thank you @PaulLiu . 
+
+This may (not sure) cause compatibility problems down the line with traditional Bitcoin wallets, non-IC, but that's for another day.
+
+-------------------------
+
+blabagastered | 2023-01-13 13:17:12 UTC | #9
+
+Much appreciated guidance and feedback, timo.
+
+-------------------------
+

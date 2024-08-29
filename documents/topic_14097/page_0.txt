@@ -1,0 +1,165 @@
+Safik | 2022-06-30 15:31:58 UTC | #1
+
+How to get around the restrictions on the number of operations for long calculations?
+If sequential calculations (that is, new data depends on the previous ones) For example, in hash functions.
+
+I had a few ideas, but they have failed so far.
+I tried to generate and run several actors sequentially, but as a result, the operation counter detected the main call cluster and interrupted the operation.
+
+```
+dfx canister call calc result '(500000)'Error: The Replica returned an error: code 5, message: "Canister rrkah-fqaaa-aaaaa-aaaaq-cai exceeded the instruction limit for single message execution."
+
+```
+
+-------------------------
+
+domwoe | 2022-07-01 08:00:49 UTC | #2
+
+Not sure if I'm following, but if you call another canister or your canister itself asynchronously than your subsequent calculation can happen in another execution round. 
+
+In addition, [Deterministic Time Slicing](https://forum.dfinity.org/t/deterministic-time-slicing/10635) is coming soon which allows to run computation of several rounds transparently, i.e. without you having to take care of that explicitly.
+
+-------------------------
+
+Safik | 2022-07-01 08:25:15 UTC | #3
+
+Hi!
+Yes. You got it right.
+1)How can I organize the tracking of rounds in the code?
+I tried with
+` system func heartbeat(): async(){           };`
+But so far not very successful.
+
+> [Deterministic Time Slicing](https://forum.dfinity.org/t/deterministic-time-slicing/10635)
+
+I think this will fix the situation, but there are peculiarities with the size of the transmitted data in canisters. So there will still be nuances in the code (depending on the functional load)
+Thanks!
+
+-------------------------
+
+domwoe | 2022-07-01 10:11:34 UTC | #4
+
+`heartbeat` will call your canister regularly, but I'm not sure if that helps your use case.
+
+I thought of something like the following (stupid example):
+
+```
+actor ExpensiveComputation {
+
+  func partial_computation(input: Nat): async Nat {
+    return input + 1;
+  };
+
+  public func expensive_computation() : async Nat {
+
+    var result: Nat = 0;
+    label l loop {
+      result := await partial_computation(result);
+      if (result==3) {
+        break l;
+      }
+    };
+
+    return result;
+  };
+};
+```
+
+Even if you're inside one actor/canister you can call your methods with the `async/await` syntax and as such can happen in another round of execution.
+
+-------------------------
+
+Safik | 2022-07-01 11:01:00 UTC | #5
+
+Ok.
+Let's say I have this actor (actor ExpensiveComputation) 
+Is a canister to which I make calls. Let's say there is a code in this canister (actor) that creates other actors (temporary) But the operation counter will always count and sum the operations of derivatives (actors) so is the main container. Actually counting cycles. I wanted to say that I have tried such options. They are wrong. Of course, I would like to have an operator to force reset the counter in this round. But to do this, you need to track the rounds. 
+Although... there are some new ideas...
+I have a question:
+Every pulse(system func heartbeat()) indicates a new round? In the local environment I noticed that the delta is 0.6 seconds.
+
+Thanks.
+
+Update 1.
+I have another idea here: Create two actors(in IC) as containers with the same code and call them sequentially(actor("xxxx")) as if through a round. And in the control container, adjust the data and sequence.
+
+-------------------------
+
+domwoe | 2022-07-01 11:04:30 UTC | #6
+
+
+[quote="Safik, post:5, topic:14097"]
+Is a canister to which I make calls. Let’s say there is a code in this canister (actor) that creates other actors (temporary)
+[/quote]
+
+I'm not sure why you want to create other actors. This is quite expensive.
+
+[quote="Safik, post:5, topic:14097"]
+Of course, I would like to have an operator to force reset the counter in this round. But to do this, you need to track the rounds.
+[/quote]
+
+Everytime you use `await` you give the IC the chance to execute code in another round. 
+Btw, you can measure the instructions you use yourself: https://forum.dfinity.org/t/introducing-performance-counter-on-the-internet-computer/14027
+
+[quote="Safik, post:5, topic:14097"]
+Every pulse(system func heartbeat()) indicates a new round? In the local environment I noticed that the delta is 0.6 seconds.
+[/quote]
+
+Not entirely true. Your canister is called regularly but there's no guarantee that its happening every round.
+
+-------------------------
+
+Safik | 2022-07-04 08:43:31 UTC | #7
+
+> Everytime you use `await` you give the IC the chance to execute code in another round.
+
+OK. But it looks like the internal counter (limiter) is not limited to one round. I haven't been able to prove it for sure, but it looks like it is.
+
+> Not entirely true. Your canister is called regularly but there’s no guarantee that its happening every round.
+
+Yes. I also realized that
+```
+system func heartbeat()
+```
+Stops responding if there is a long call. I thought it was a parallel function, since it is marked as a system function
+
+Below I tried to divide a long operation between rounds. For a simple example, counted the factorial of a number. (Although the goal is to calculate sha-2)
+```
+ system func heartbeat(): async(){
+        var time = Time.now();
+        _time_round := _time_round + (time - _time);
+ 
+        if(_time_round > _round){//new round
+            _time_round := 0;
+            _count_round := _count_round + 1;
+        }; 
+        _time := time;
+    };
+```
+
+The actor is executed in parallel on multiple nodes (consensus) Therefore (most likely) any calling function is blocking.
+
+That is, when calculating the factorial (for example), I will not be able to track the rounds.
+
+If you try to track (departures) and restart the operation. Then the call is reset anyway. Below I tried to address the caller from the called canister. But when it hits the catch block, the operation is interrupted.
+
+Below is part of the code
+
+```
+ public func calc(_c:  Nat, _j:  Nat, _d:  Nat, callback: shared (Nat, Nat, Nat)-> async ()): async (){
+        try{
+            //**We are counting something**//
+            if(j == d ){
+                return;
+            };
+            await callback(c, j, d);
+        }
+        catch e{
+            ignore await callback(c, j, d); //this line of code is not called
+            Debug.print("calc error : " # debug_show(Error.message(e))); 
+        }
+    }; 
+```
+
+-------------------------
+

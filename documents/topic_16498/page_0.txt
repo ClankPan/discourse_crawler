@@ -1,0 +1,329 @@
+Safik | 2022-11-11 07:37:15 UTC | #1
+
+Hi!
+I have a few questions that are slowing down my project in development
+I realized that there are nuances that are not visible at first glance.
+
+I would like to clarify
+There will be a lot of users on the site. They will need to finance their canisters. In the web interface mode.
+Authorization will be via Plug wallet. (This is not particularly important, you can also Stoic or add from Definity)
+
+I was trying to send (replace) cycles to the user's canister. Writes that the balance in the wallet is 0.
+
+Questions:
+1) How to understand the IСP so that they Cycles would go to the same account.
+2) How to send cycles to the canister from the account to the destination canister.
+3) Do I need to finance a subaccount for this if it is needed?
+
+I understand that the questions are vague, but in my vision it was initially like this: I put ICP into a Cycle mint canister and say I will profinase me or the canister I selected in exchange for ICP with newly created cycles. But this is not the case.
+
+-------------------------
+
+Severin | 2022-11-11 08:30:56 UTC | #2
+
+[quote="Safik, post:1, topic:16498"]
+How to understand the IСP so that they Cycles would go to the same account.
+[/quote]
+
+The same _account_ is very difficult. ICP can be held on the ledger or many different wallets, cycles can only be held by canisters, or as XTC / otherwise wrapped cycles in wallets.
+
+[quote="Safik, post:1, topic:16498"]
+How to send cycles to the canister from the account to the destination canister.
+[/quote]
+This depends on the wallet/mechanism you use.
+
+I don't quite understand your last question. I recommend you read through the following, and then try to ask some more specific questions.
+
+- [Working with cycles in Plug](https://docs.plugwallet.ooo/resources/buying-cycles/)
+- [Working with XTC from Dank](https://docs.dank.ooo/xtc/overview/) (linked in the previous link)
+- [Conceptual explanation of the CMC on the Wiki](https://wiki.internetcomputer.org/wiki/NNS_Canisters#Cycles_Minting_Canister_and_Cycles.5B2.5D)
+- [CMC interface](https://github.com/dfinity/ic/blob/master/rs/nns/cmc/cmc.did)
+- A snippet I use to work with the CMC to use canisters. Minting cycles would look similar:
+``` motoko
+      // transfer some ICP to CMC
+      let ledger_response = await LEDGER.transfer({
+            memo = CANISTER_CREATE_MEMO;
+            from_subaccount = null;
+            to = CMC_CREATE_ADDRESS;
+            amount = { e8s = amount_e8s };
+            fee = { e8s = 10_000 };
+            created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(Time.now()) - Nat64.toNat(n)) };
+          });
+      switch ledger_response {
+        case (#Ok(blockIndex)) {
+          block_index := blockIndex;
+        };
+       <some error handling removed>
+      };
+      // notify_create
+      let cmc_response = await CMC.notify_create_canister({
+        block_index = block_index;
+        controller = THIS_CANISTERS_PRINCIPAL;
+      });
+
+      switch cmc_response {
+        case(#Ok(new_canister_id)) {
+          ignore Queue.pushBack(canisters_reserve, new_canister_id);
+        };
+    <some error handling removed>
+    };
+```
+
+-------------------------
+
+Safik | 2022-11-12 19:13:20 UTC | #3
+
+Hi! Ok, thanks
+
+Here is an example from my many attempts
+```
+//1
+    public shared({caller}) func canister_ledger_transfer( 
+        icp_amount: Nat) : async TransferResult{
+        return await ledger_transfer(caller, icp_amount);
+    };
+    //2
+    public shared({caller}) func ledger_transfer(
+        user_caller: Principal,
+        icp_amount: Nat) : async TransferResult{
+        var amount = Nat64.fromNat(icp_amount);
+        var res: TransferResult = #Err(#TxCreatedInFuture);
+        let CYCLE_MINTING_CANISTER = Principal.fromText(Const.canister_nns_cycles_minting);//https://icscan.io/canister/rkp4c-7iaaa-aaaaa-aaaca-cai
+        let cycle_sub = Account.principalToSubaccount(caller); //caller - this canister
+        let cycle_ai = Account.accountIdentifier(CYCLE_MINTING_CANISTER, cycle_sub);
+        let _created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(Time.now())) };
+        try{
+            res := await public_ledger.transfer({
+                to = cycle_ai;
+                fee = { e8s = 10_000; };
+                memo = 0;
+                from_subaccount = null;
+                created_at_time = _created_at_time;
+                amount = { e8s = amount - 10_000 };
+            });
+            return res;
+        }
+        catch(e){ };
+        return res;
+    };
+```
+Return error
+
+`(
+  variant {
+    Err = variant {
+      InsufficientFunds = record { balance = record { e8s = 0 : nat64 } }
+    }
+  },
+)
+`
+
+Can't tell you how to form this variable CMC_CREATE_ADDRESS ?
+(I was trying to find a string search in github. Could not find any repository with a line of code containing CMC_CREATE_ADDRESS)
+
+
+Also my code checking balance
+
+(I have ICP and cycles in my account)
+```
+    public shared({caller}) func account_balance(user_caller: Principal) : async Tokens{
+        return await public_ledger.account_balance(
+            { account = Account.accountIdentifier(user_caller, Account.defaultSubaccount())});
+    };
+```
+returned
+`(record { e8s = 0 : nat64 })`
+
+-------------------------
+
+Safik | 2022-11-14 07:57:14 UTC | #4
+
+Decided to reschedule
+https://forum.dfinity.org/t/canister-financing-issues/16498/4
+
+I'm having similar problems
+
+
+```
+public shared({caller}) func ledger_transfer_icp(
+        icp_amount: Nat) : async TransferResult{
+        var amount = Nat64.fromNat(icp_amount);
+        var res: TransferResult = #Err(#TxCreatedInFuture);
+        // let to_ai = Account.principalToSubaccount(Principal.fromText(Const.canister_project_cycles_wallet));
+        let to_ = Account.accountIdentifier(
+            Principal.fromText("3sq5w-t7zis-qf3wl-vgvih-byre2-ttswt-vzupn-6mnpw-mju7l-jhbfi-hae"), Account.defaultSubaccount());
+        try{
+            res := await public_ledger.transfer({
+                to = to_;
+                fee = { e8s = 10_000; };
+                memo = 0;
+                from_subaccount = null;
+                created_at_time = null;
+                amount = { e8s = amount - 10_000 };
+            });
+            return res;
+        }
+        catch(e){ };
+        return res;
+    };
+```
+![scrin|690x360](upload://nCsuioNJtt5eLPacrOrT5HDxLp3.png)
+
+
+ygvtn-qaaaa-aaaan-qa32a-cai - my canister cycles wallet
+mxjrx-tiaaa-aaaah-aaoxq-cai  - my canister where deploy code
+
+All my balances are displayed but writes that there are no funds
+I don't understand where the dog is buried
+
+I don't understand at what stage the failure is.
+
+-------------------------
+
+Severin | 2022-11-14 08:21:13 UTC | #5
+
+[quote="Safik, post:3, topic:16498"]
+I have ICP and cycles in my account
+[/quote]
+
+Yes, but it's not YOU who's initiating the transfer. It's your _canister_, which has a separate balance. To compare yourself: `dfx ledger account-id` is your account, and `dfx ledger account-id --of-principal $(dfx canister --network ic id <canister name>)` will be your canister's ledger account id.
+
+[quote="Safik, post:3, topic:16498"]
+Can’t tell you how to form this variable CMC_CREATE_ADDRESS ?
+[/quote]
+Here's the example from dfx: https://github.com/dfinity/sdk/blob/master/src/dfx/src/commands/ledger/mod.rs#L178-L199
+
+And here's what I wrote down in a different (non-public) place: `main account = <CMC principal>, subaccount ~ <this canister's principal>. But do not use dfx ledger account-id to derive that, it'll end up wrong. Go through ic-ledger-types::AccountIdentifier::new to derive it.`
+
+-------------------------
+
+Safik | 2022-11-14 10:51:07 UTC | #6
+
+Thanks you [Severin](https://forum.dfinity.org/u/Severin)
+There has been some progress
+
+I have more questions:
+1)How do I get in motoko the address of a canister by its canister id ?
+2) Now I was sending an ICP from my wallet can I program this for myself (in a simple case)
+
+-------------------------
+
+Severin | 2022-11-14 10:58:33 UTC | #7
+
+[quote="Safik, post:6, topic:16498"]
+How do I get in motoko the address of a canister by its canister id ?
+[/quote]
+
+I'll have to ask around for that. Let me ping some relevant folks
+
+[quote="Safik, post:6, topic:16498"]
+Now I was sending an ICP from my wallet can I program this for myself (in a simple case)
+[/quote]
+I don't quite understand your question. Would you mind rewording/expanding on that?
+
+-------------------------
+
+Severin | 2022-11-14 11:06:40 UTC | #8
+
+Response from the team: To work with AccountIds, use [this code](https://github.com/dfinity/examples/blob/master/motoko/ledger-transfer/src/ledger_transfer/Account.mo) or find a community library to do it.
+
+-------------------------
+
+Safik | 2022-11-14 11:58:48 UTC | #9
+
+[quote="Severin, post:7, topic:16498"]
+I’ll have to ask around for that. Let me ping some relevant folks
+[/quote]
+Ok. Thanks.I will also think about the implementation.
+[quote="Severin, post:7, topic:16498"]
+I don’t quite understand your question. Would you mind rewording/ex
+panding on that?
+[/quote]
+I had to send ICP to the destination canister via a plug-in wallet (Stoic or Plug or via terminal) but I would like the ability to send programmatically. I understand that a keychain is needed (that is, to sign a transaction) It's not safe. I asked if you suddenly have options.
+
+-------------------------
+
+Severin | 2022-11-14 12:31:25 UTC | #10
+
+Options without any user interaction are rather limited. The first one that comes to mind is dfx with an unencrypted identity, but that leaves your private key on your disk in plain text. Alternatively, maybe it's possible to automate some wallet, either through something like selenium (browser automation) or by doing dfx calls, which is probably what the wallets do in the background.
+
+By far the safest way would probably be a canister that sends funds around when the need arises, using the heartbeat functionality. But that would not come out of your own balance, but from its own.
+
+-------------------------
+
+Safik | 2022-11-14 12:42:01 UTC | #11
+
+Thanks [Severin](https://forum.dfinity.org/u/Severin)!
+An exhaustive answer.
+
+-------------------------
+
+Safik | 2022-11-17 12:39:48 UTC | #12
+
+Hi!
+Update.
+https://forum.dfinity.org/t/error-exchanging-icp-for-cycles/16645
+
+-------------------------
+
+cryptoschindler | 2022-12-01 20:03:30 UTC | #13
+
+I've been wondering if the memo can be set to an arbitrary value? Or does it need to be `CANISTER_CREATE_MEMO`? If so what does this constant look like? And what would it look like for a top up?
+
+-------------------------
+
+GLdev | 2022-12-01 20:16:23 UTC | #14
+
+[quote="cryptoschindler, post:13, topic:16498"]
+And what would it look like for a top up?
+[/quote]
+
+```const MEMO_TOP_UP_CANISTER: u64 = 1347768404_u64;```
+
+from 
+[here](https://github.com/dfinity/sdk/blob/master/src/dfx/src/commands/ledger/top_up.rs).
+
+And for create:
+```pub const MEMO_CREATE_CANISTER: u64 = 1095062083_u64;```
+
+from [here](https://github.com/dfinity/sdk/blob/master/src/dfx/src/commands/ledger/create_canister.rs)
+
+-------------------------
+
+cryptoschindler | 2022-12-01 20:23:12 UTC | #15
+
+I'm not too fluent with Rust, does the CMC expect those memos and fails if I set them to another value?
+
+-------------------------
+
+GLdev | 2022-12-01 20:38:55 UTC | #16
+
+Yes, it would appear so 
+
+```rust
+if memo != expected_memo {
+        return Err(NotifyError::InvalidTransaction(format!(
+            "Intent in the block ({} == {}) different than in the notification ({} == {})",
+            memo.0,
+            memo_to_intent_str(memo),
+            expected_memo.0,
+            memo_to_intent_str(expected_memo),
+        )));
+    }
+```
+
+I also found out why those values were chosen :smiley: 
+
+```
+pub const MEMO_CREATE_CANISTER: Memo = Memo(0x41455243); // == 'CREA'
+pub const MEMO_TOP_UP_CANISTER: Memo = Memo(0x50555054); // == 'TPUP'
+```
+
+-------------------------
+
+cryptoschindler | 2022-12-01 20:56:42 UTC | #17
+
+Thanks, that's really helpful
+
+-------------------------
+

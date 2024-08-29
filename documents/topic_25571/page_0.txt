@@ -1,0 +1,543 @@
+ielashi | 2023-12-15 14:10:38 UTC | #1
+
+## Background
+
+* When a canister traps, changes it makes to the state are completely reverted. As a result, it’s not possible for developers to detect these errors.
+* The IC provides a way to log messages throughout execution, the `debug_print` API, but it’s only available when running the canister locally.
+
+## Problem
+
+There is no reliable way for canister developers to know that their canister is trapping.
+
+* Traps leave no trace in the replica that’s visible for developers.
+* `debug_print` is available locally, but on mainnet.
+* Heartbeat and timer traps are completely silent.
+* Logging solutions that are built by canister developers can only capture logs on the happy paths (i.e. when the canister doesn’t trap)
+
+**The only way for developers to know of errors today is by relying on user reports.** A user encounters an error, and then the user needs to report that error to the developers to be aware of it.
+
+## Proposal
+
+* An endpoint is added to the management canister to fetch a canister’s logs. The IC will maintain the last few KBs of logs + trap messages and return them in the response.
+
+```
+// New API on the management canister
+fetch_logs : (record { canister_id }) -> (fetch_logs_response) query;
+
+type log_record = record {
+  idx: nat;
+  timestamp: nat;
+  contents: blob;
+};
+
+type fetch_logs_response = record {
+  log_records: vec log_record;
+};
+```
+
+* Every log record returned has an `idx`, which is an auto-incrementing ID for each log record. This is useful for merging logs between different requests and for detecting missing logs.
+
+* A new setting will be added in the canister’s settings for configuring the log’s visibility. Logs are visible only to controllers by default, but can also be configured to be available publicly.
+
+```
+// An enum for setting logs' visibility.
+type log_visibility = variant {
+  public;
+  controllers;
+};
+```
+
+* Logs persist across upgrades.
+* Logs are deleted if the canister is reinstalled or uninstalled.
+* Logs include:
+  * Messages in `debug_print`
+  * Trap messages
+  * (In the future) Stack traces
+
+### SDK Changes
+
+A new command to tail a canister’s log can be added to the SDK to facilitate retrieving the latest logs.
+
+```
+dfx canister tail <canister_id>
+```
+
+### Use-Cases
+
+* Integration with 3rd party logging services
+  * Logs can be pulled into logging services like Kibana, DataDog, etc for developers to store, index, add alerts, etc.
+* Live debugging sessions
+  * `dfx canister tail` can print the canister’s logs in realtime.
+
+### Feedback Request
+
+Let us know your thoughts! This proposal is meant to be a very simple yet functional way for canisters to access their logs and trap messages on mainnet. It isn’t meant to be a fully satisfying solution in the long-term, but rather a simple solution that can be delivered quickly. Specifically, the following are non-goals at this point:
+
+* Supporting large amounts of logs.
+* Supporting searching (by timestamp, method name, etc.)
+* Supporting log levels
+
+In the future this solution can be expanded to address the above shortcomings.
+
+-------------------------
+
+Gekctek | 2023-12-15 16:10:08 UTC | #2
+
+Does this mean that trap logs will also be available locally when developing. I've had issues using timers and not seeing any errors.
+
+-------------------------
+
+ielashi | 2023-12-15 20:14:22 UTC | #3
+
+That's correct, the same functionality will be available locally as well.
+
+-------------------------
+
+ilbert | 2023-12-16 19:10:23 UTC | #4
+
+I'd really like to be able to access the logs, especially for traps! Can't wait for this feature to be available!
+
+-------------------------
+
+NS01 | 2023-12-18 13:15:18 UTC | #5
+
+Agree that this is an issue - but I'd like something a bit more than just logging. It would be good if you could run a function on traps. For example - notify X canister of error or re-attempt/ re-start a timer to try again.
+
+-------------------------
+
+peterparker | 2023-12-18 13:17:24 UTC | #6
+
+- For future-proofing purposes, it could maybe be beneficial to consider adding a log level parameter, such as `info|warn|error` to the interface?
+
+- Including `from|to` filters in the `fetch_logs` interface, based on timestamps, would be a useful feature to consider, as it can provide more precise log retrieval options and I guess won't add too much work on the implementation.
+
+- Having two timestamps, one for the time of the error and another for when the log entry was collected, could maybe provide valuable context during the debugging process?
+
+-------------------------
+
+ielashi | 2023-12-18 13:32:36 UTC | #7
+
+Absolutely, I agree with you. In some limited capacity, the IC does support executing a function if the canister traps, but only when making an inter-canister request. There, you can specify a `cleanup` function that is called if your canister traps when handling the response. This is supported by the protocol (see the `call_on_cleanup` System API in the [interface specification](https://internetcomputer.org/docs/current/references/ic-interface-spec/)), but to my knowledge neither Motoko nor the Rust CDK actually expose that feature for developers.
+
+We did have discussions about how we can generalize the `call_on_cleanup` System API and allow developers to instead be able to specify a `cleanup` throughout all replicated execution.
+
+cc @claudio
+
+-------------------------
+
+ielashi | 2023-12-18 13:35:14 UTC | #8
+
+Thanks for the feedback! We did discuss a lot of these suggestions, but see my note at the very bottom of the initial post:
+
+[quote="ielashi, post:1, topic:25571"]
+Specifically, the following are non-goals at this point:
+
+* Supporting large amounts of logs.
+* Supporting searching (by timestamp, method name, etc.)
+* Supporting log levels
+[/quote]
+
+All these features can easily be introduced in future iterations, and given that logging support is non-existent today, we wanted to start with the simplest possible solution, release it quickly, and iterate from there. We'll take that feedback into account of course in the next iterations :)
+
+-------------------------
+
+erikblues | 2023-12-18 13:54:52 UTC | #9
+
+Really good proposal. And to include both log ID and timestamp is great!
+
+-------------------------
+
+saikatdas0790 | 2024-01-18 09:56:09 UTC | #10
+
+I know we are trying to build an MVP logging solution but I think it's a good idea to try and have Open Telemetry support in mind from the get go.
+
+https://opentelemetry.io/
+
+Even if we are not 100% spec compliant from the get go, it's a good idea to reserve the necessary keywords, conventions, aspects, etc. as this gets built out.
+
+This will lead to us not having to reinvent the wheel on common observability conventions.
+
+I believe this should be a lesson learned from how the IC System API is solving the same conventions that WASI does but it reinvented the wheel during implementation and now we are having to figure out how to wrap the System API to be WASI compatible. Also the same story for Candid and [WIT](https://github.com/WebAssembly/component-model/blob/main/design/mvp/WIT.md)
+
+Thoughts?
+
+-------------------------
+
+ielashi | 2024-01-18 10:44:23 UTC | #11
+
+Hey @saikatdas0790, thanks for your feedback. I'm not familiar myself with OpenTelemetry. Can you share what concretely would you change in the current proposal in order to add OpenTelemetry support?
+
+-------------------------
+
+saikatdas0790 | 2024-01-20 09:50:01 UTC | #12
+
+To be honest, I don't have any experience designing a logging destination. I have mostly been on the publishing end of logs.
+
+I can take a stab however. I imagine we just want to be compliant with this part of the spec:
+https://opentelemetry.io/docs/specs/otel/logs/data-model/
+
+Here are some example models that show how to take the internal data respresentation of a platform and translate that to the OpenTelemetry model:
+https://opentelemetry.io/docs/specs/otel/logs/data-model-appendix/
+
+Now, on the log viewer side of things we have some assurances on the kinds and shape of data that's expected to come in and we can have nice structures to messages on both TUIs and GUIs
+
+The ultimate benefit of doing this is you become automatically compatible with a host of vendors that support OT and you don't have to painstakingly build the additional tooling required to consume the logs/metrics/traces generated as we build this system out.
+
+Here's an indicative list of vendor support:
+https://opentelemetry.io/ecosystem/vendors/
+
+Imagine just being able to point your Grafana deployment to the relevant endpoint and having pretty printed logs that you can query with all the power of that tooling. Or pretty graphs once we do OT compliant metrics monitoring. And so on..
+
+Thoughts?
+
+-------------------------
+
+peterparker | 2024-01-21 12:52:54 UTC | #13
+
+@ielashi will this work when the canister is bundled with ic-wasm [shrink](https://github.com/dfinity/ic-wasm#shrink) option?
+
+-------------------------
+
+q2333gh | 2024-01-24 06:53:31 UTC | #14
+
+Any  supported dfx version info and example of using canister logging feature using  rust code? 
+
+```bash
+btwl@btwl-virtual-machine ~/c/R/e/hello (master) [2]> dfx --version
+dfx 0.15.3
+btwl@btwl-virtual-machine ~/c/R/e/hello (master)> dfx canister tail v7g7o-oiaaa-aaaag-qcj3q-cai
+error: unrecognized subcommand 'tail'
+
+Usage: dfx canister [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+```
+
+-------------------------
+
+Severin | 2024-01-24 07:49:33 UTC | #15
+
+The commands in the OP were suggestions about how it could look like in the future. There's nothing released yet
+
+-------------------------
+
+Gabriel | 2024-01-29 12:27:23 UTC | #16
+
+do you have a rough release date for a beta we can try? Also when you say the last few Kbs are we talking the last 5 min of logs or a fixed amount of logs no matter the time elapsed? 
+
+Is there a difference in cycle cost when you pull the last chunk of logs vs tail? 
+
+Thanks
+
+-------------------------
+
+Severin | 2024-01-29 12:30:20 UTC | #17
+
+I forwarded the question about an ETA
+
+[quote="Gabriel, post:16, topic:25571"]
+Also when you say the last few Kbs are we talking the last 5 min of logs or a fixed amount of logs no matter the time elapsed?
+[/quote]
+
+Fixed amount of bytes. It depends on the volume of logs how much time that would cover.
+
+[quote="Gabriel, post:16, topic:25571"]
+Is there a difference in cycle cost when you pull the last chunk of logs vs tail?
+[/quote]
+
+`dfx tail` would simply regularly poll the logs. It would be equivalent to querying the logs on a timer
+
+-------------------------
+
+ielashi | 2024-01-29 12:55:18 UTC | #18
+
+Regarding an ETA, I think we're talking on the order of short weeks to have something available for people to try.
+
+-------------------------
+
+Seb | 2024-02-20 11:01:30 UTC | #19
+
+Hey @ielashi @claudio 
+Is there more information available on this feature `call_on_cleanup` or any idea on when it will be available in Motoko? I have a usecase for it that I'd love to implement.
+
+-------------------------
+
+claudio | 2024-02-20 14:10:11 UTC | #20
+
+No progress on the Motoko side, I'm afraid. The compiler is using it internally to free the resource(s) associated with the unused callback(s), but you can't hook into that yourself at the moment.
+
+What is your use-case?
+
+-------------------------
+
+Seb | 2024-03-04 06:30:44 UTC | #21
+
+@claudio 
+I'm running on-chain testing for the Motoko Bootcamp (https://www.motokobootcamp.com/) - I essentially perform inter-canister calls on submitted projects by students. Occasionally, when students modify the interface or send unexpected types, my canister trap.Having access to this `call_on_cleanup` would have been great to handle those cases. 
+
+
+
+I've found some workaround  (checking the **Candid** interfaces in advance through the frontend and WASM metadata, as well as isolating tests in a separate canister and using `try/catch`) so it's not an important item for me anymore.
+
+-------------------------
+
+lastmjs | 2024-03-08 14:45:21 UTC | #22
+
+Hey it seems dfx 0.18.0 has some sort of log reading functionality? Can we get an update?
+
+-------------------------
+
+dsarlis | 2024-03-11 08:25:49 UTC | #23
+
+It's unfortunately not working yet because there was a mixup in the type of call used when dfx is trying to retrieve logs. That's why we didn't advertise it yet. We'll get it fixed in the next dfx version and there's also going to be a presentation/demo in one of the following weeks global R&D meetings.
+
+Stay tuned, we'll give you updates and make more noise once it's available in dfx for beta testing! We're definitely going to need you guys to test it out and give us feeback!
+
+-------------------------
+
+maksym | 2024-04-02 13:57:40 UTC | #24
+
+Good news, everyone!
+The first canister logging implementation is now available in dfx 0.19.0 release.
+Please try it out and let us know about your experience!
+
+-------------------------
+
+Gabriel | 2024-04-03 10:31:22 UTC | #25
+
+Hey, 
+
+Thanks for all the hard work. 
+
+Is the logging enabled on all subnets? Because I get `Failed to query call function 'fetch_canister_logs' regarding canister 'xcgns-iqaaa-aaaae-aai7a-cai'.
+Query call (without wallet) failed.
+The replica returned a rejection error: reject code CanisterError, reject message IC0504: fetch_canister_logs API is not enabled on this subnet, error code Some("IC0504")`
+
+-------------------------
+
+maksym | 2024-04-03 11:55:19 UTC | #26
+
+Hi Gabriel. 
+Canister logging is not enabled on mainnet subnets yet.
+We wanted to make it available locally in DFX first.
+There is no firm ETA on rolling out this feature on mainnet subnets. We would like to see the first feedback on local DFX to see if canister developers are happy with the current look and feel before rolling out it to mainnet.
+
+-------------------------
+
+bitdivine | 2024-04-29 07:49:57 UTC | #27
+
+Hello @maksym .  Is there any update on this?  (Just a periodic ping; I am sure there are many people waiting for this feature. :-) )
+
+-------------------------
+
+peterparker | 2024-05-02 06:48:50 UTC | #28
+
+I literally searched this post to ask the same question as @bitdivine. Wen mainnet?
+
+-------------------------
+
+maksym | 2024-05-02 08:41:26 UTC | #29
+
+Hello everyone!
+
+We're in the final stages of implementing canister logging. 
+We still need to add some metrics and feature flag handling to ensure a smooth rollout on the mainnet. 
+I expect it to be available in the next few weeks.
+
+-------------------------
+
+Gabriel | 2024-05-22 08:50:02 UTC | #30
+
+Hey @maksym could you confirm if this will be released with the next DFX version?
+
+-------------------------
+
+maksym | 2024-05-22 10:36:45 UTC | #31
+
+hi @Gabriel , if you mean enabling the feature on mainnet then it should happen with the next replica release ([see releases page](https://github.com/dfinity/ic/releases)). Here is the [commit](https://github.com/dfinity/ic/commit/cd8c75eb3d91351f7aaf49d630d2bf919e081e80) to keep an eye for.
+
+-------------------------
+
+peterparker | 2024-05-24 12:39:43 UTC | #32
+
+[quote="maksym, post:31, topic:25571"]
+with the next replica
+[/quote]
+
+I'm guessing that's the one:
+
+https://forum.dfinity.org/t/proposal-to-elect-new-release-rc-2024-05-22-23-01/31096?u=peterparker
+
+-------------------------
+
+maksym | 2024-05-24 13:05:46 UTC | #33
+
+> I’m guessing that’s the one:
+
+You are right, that's the release that enables canister logging on mainnet.
+
+-------------------------
+
+peterparker | 2024-05-25 12:32:21 UTC | #34
+
+Is there anything that needs to be configured to activate the canister logging in a local replica?
+
+I upgraded my Docker image with the proposed release ([thread](https://forum.dfinity.org/t/proposal-to-elect-new-release-rc-2024-05-22-23-01/31096), [PR](https://github.com/junobuild/juno-docker/pull/28)) but, not logs are collected. Neither `ic_cdk::print` nor `trap` are delivered when querying the IC mgmt end point `fetch_canister_logs`, I just get an empty array.
+
+```
+pub fn list_docs(collection: CollectionKey, filter: ListParams) -> ListResults<Doc> {
+    let caller = caller();
+
+    print("test"); // <------ This is not provided
+
+    let result = list_docs_store(caller, collection, &filter);
+
+    match result {
+        Ok(value) => value,
+        Err(error) => trap(&error), // <------ This is not provider neither
+    }
+}
+```
+
+-------------------------
+
+maksym | 2024-05-25 13:17:41 UTC | #35
+
+[quote="peterparker, post:34, topic:25571"]
+Is there anything that needs to be configured to activate the canister logging in a local replica?
+[/quote]
+
+If you start local replica the same way it's done in DFX (using `ic-starter`) then canister logging should be enabled since a month or two. Here's ic-starter [related code](https://github.com/dfinity/ic/blob/master/rs/starter/src/main.rs#L638).
+
+I have recently added rust & motoko examples that are using local DFX replica (without the feature enabled on mainnet), here is a [related test](https://github.com/dfinity/examples/blob/master/rust/canister_logs/Makefile).
+
+There should be no extra configurations to make it work. 
+Things to keep an eye on though:
+- it'll reject a call to `fetch_canister_logs` if mainnet subnet does not have the feature enabled with `API is not enabled on this subnet`
+- it'll reject a call if the caller does not fit `log_visibility` setting (try calling it as controller first) with `Caller X is not allowed to query ic00 method...`
+- it'll reject an update call to `fetch_canister_logs`, it must be a query call ([related code](https://github.com/dfinity/sdk/blob/master/src/dfx/src/lib/operations/canister/mod.rs#L151))
+- make sure to use the correct `canister_id` when fetching canister logs, otherwise it can return a valid response with an empty array in `canister_log_records` field.
+
+-------------------------
+
+peterparker | 2024-05-25 15:20:45 UTC | #36
+
+Thank you for your answer. Have you test with the foundation `agent-js` library as well?
+
+I might be missing something but, as far as I can tell, it doesn't work.
+
+Here's a sample with dfx v0.20.0 and agent-js v1.3.0 which also returns an empty array.
+
+https://github.com/peterpeterparker/canister_logging 
+
+![Capture d’écran 2024-05-25 à 17.17.09|690x463](upload://A7b5bACzgbHYJGeFyxBEojbB50h.jpeg)
+
+-------------------------
+
+icme | 2024-05-25 19:17:01 UTC | #37
+
+```
+type log_visibility = variant {
+    controllers;
+    public;
+};
+```
+
+@maksym @dfx-json 
+
+Did the team think about extending this variant beyond just controllers and public (i.e. to allow a specific non-controller to pull logs).
+
+Something like this:
+
+```
+type log_visibility = variant {
+    controllers;
+    allowed_viewers : opt vec principal;
+    public;
+};
+```
+
+It would be really helpful to be able to allowlist a specific canister/dfx generated principal to pull logs within an automated job without needing to explicitly assign it as a controller of the canister.
+
+Especially for DAOs or other high value canisters, it's harder to use this if only the root/governance canister are able to read the logs, or for 3rd party monitoring services to integrate without using a blackhole monitoring approach.
+
+-------------------------
+
+maksym | 2024-05-27 08:50:13 UTC | #38
+
+[quote="icme, post:37, topic:25571"]
+Did the team think about extending this variant beyond just controllers and public?
+[/quote]
+
+Yes, we considered adding allowed viewers, but decided not to add it on the first iteration.
+It can be added later in the process.
+
+-------------------------
+
+peterparker | 2024-07-03 14:40:38 UTC | #39
+
+The issue I mentioned above has been resolved and requires no further action.
+
+The root cause of the problem was a misunderstanding. Logs can only be collected if the functions that generated them were called in replicated mode – for example, when an update call is executed.
+
+I did not understand this and inadvertently used query calls in my tests, but it wasn't communicated clearly neither, so let's say it was a shared effort that led to the issue :wink:. 
+
+Documentation, particularly the sample code, has now been updated to make this more obvious.
+
+Thanks to @maksym and @kpeacock for the support.
+
+-------------------------
+
+peterparker | 2024-07-03 15:04:22 UTC | #40
+
+Logs are live in [Juno](https://juno.build/)! :partying_face:
+
+![frame|690x483](upload://xEELsx1ILDDPUmiS89eNhcpATFu.jpeg)
+
+-------------------------
+
+maksym | 2024-07-04 11:46:35 UTC | #41
+
+[quote="peterparker, post:39, topic:25571"]
+Documentation, particularly the sample code, has now been updated to make this more obvious.
+[/quote]
+
+Here's an update on specs, [link](https://github.com/dfinity/interface-spec/pull/322/files).
+
+And also dfinity/examples repo was updated to have cases for both replicated and non-replicated queries, [link](https://github.com/dfinity/examples/blob/master/rust/canister_logs/src/lib.rs#L29):
+
+rust/canister_logs/src/lib.rs: 
+
+```rs
+#[update]
+fn print(text: String) {
+    ic_cdk::print(text);
+}
+
+#[query]
+fn print_query(text: String) {
+    ic_cdk::print(text);
+}
+```
+
+and tests
+
+```makefile
+	# Test print via update call.
+	dfx canister call canister_logs print 'print via update'
+	dfx canister logs canister_logs \
+		| grep 'print via update' && echo 'PASS'
+
+	# Test print via replicated query call.
+	dfx canister call --update canister_logs print_query 'print via replicated query'
+	dfx canister logs canister_logs \
+		| grep 'print via replicated query' && echo 'PASS'
+
+	# Test print via non-replicated query call should NOT record the message.
+	dfx canister call --query canister_logs print_query 'print via non-replicated query'
+	! dfx canister logs canister_logs \
+		| grep 'print via non-replicated query' && echo 'PASS'
+```
+
+-------------------------
+

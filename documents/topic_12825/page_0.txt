@@ -1,0 +1,282 @@
+alexeychirkov | 2022-05-09 13:56:18 UTC | #1
+
+Hello
+
+Currently each response from IC (it is a boundary node if I understand it correctly) has following headers:
+
+* x-ic-canister-id
+* x-ic-node-id
+* x-ic-subnet-id
+
+Sending the same **query** request multiple times - every client gets response from different (sometimes the same of course) boundary nodes (*x-ic-node-id* is different).
+
+Is it possible to have additional header like *x-ic-last-state-timestamp*?
+
+Having multiple responses - I would like to figure out - which of them has the most recent state and is "up-to-date".
+
+P.S. maybe @nomeata is the right person to start with...?
+
+Thanks!
+
+-------------------------
+
+nomeata | 2022-05-09 14:35:44 UTC | #2
+
+I’m not too familiar with the inner workings of the boundary nodes. But `x-ic-node-id` is very likely _not_ the boundary node, but rather the actual “normal” node that is answering this request.
+
+I assume that these headers are added by the boundary node, which does not know the state timestamp. We’d first have to change the [query call interface](https://smartcontracts.org/docs/current/references/ic-interface-spec/#request-query-call) to include that information, and then the boundary node can add it to response. It would be untrustworty, though (but so is the other information).
+
+-------------------------
+
+alexeychirkov | 2022-05-10 08:14:26 UTC | #3
+
+Looks like on mainnet - some nodes are out of sync by 1.5 minutes...
+
+Please take a look at log: https://gist.github.com/alexeychirkov/6b5fc5216fa8b4acd797e32464f167f5
+
+Each line is a request-response information for a particular canister and query method `listings`:
+
+As an example line: `INFO   | jvm 1    | 2022/05/09 14:45:42 | 2022-05-09 14:45:42 INFO  AbstractNFTCollectionCanisterCommand:83 - [6wih6-siaaa-aaaah-qczva-cai]:[icbucks]:[qoxup-yfb2y-2hpsx-6nz4w-3fxcx-eg7yj-wtarr-3dt47-6qiqw-g654f-dae] - 'listings' loaded bytes [76839]:[2030564593] in [1753] ms.` means that:
+
+* reponse got at `2022/05/09 14:45:42`
+* response got from node-id `qoxup-yfb2y-2hpsx-6nz4w-3fxcx-eg7yj-wtarr-3dt47-6qiqw-g654f-dae`
+* response size was `76839` bytes
+* hash of response bytes was `2030564593`
+* reponse got in `1753` milliseconds
+
+By analyzing records we can see that:
+
+* from `2022/05/09 14:41:11` to `2022/05/09 14:44:26` we got 20 responses from different nodes with the same content (all response contents has the same hash `-1278708667`)
+* the state in the canister changed and from `2022/05/09 14:44:34` to `2022/05/09 14:45:42` we got 8 responses from different nodes with hash `2030564593`
+* then at `2022/05/09 14:45:52` from the node `hy7f5-pw2f5-6qinp-znpu5-6gb25-xmbg2-vunun-uzcuk-fodvd-lwg4m-mqe` we got updated (with previous hash `-1278708667`) content 
+* all subsequent responses had correct current hash `2030564593`
+
+Please note!
+* node `hy7f5-pw2f5-6qinp-znpu5-6gb25-xmbg2-vunun-uzcuk-fodvd-lwg4m-mqe` finally responded twice with correct at `2022/05/09 14:46:53` and `2022/05/09 14:47:32`
+* node `hy7f5-pw2f5-6qinp-znpu5-6gb25-xmbg2-vunun-uzcuk-fodvd-lwg4m-mqe` was outdated for at least `1 minute and 18 seconds` (from time when we first got `2030564593` hash till outdated response on that node...
+
+**So question is:
+Is is normal that node can be out of sync for that long (1.5 minutes)?**
+
+P.S. @diegop please mention someone from Dfinity devs who can answer
+
+-------------------------
+
+alexeychirkov | 2022-05-10 13:06:32 UTC | #4
+
+@diegop anyone?
+It is very critical I guess...
+
+-------------------------
+
+diegop | 2022-05-10 13:34:14 UTC | #5
+
+Hi there @alexeychirkov thanks for pinging me. I will escalate this to the right folks. (I cannot believe I missed it the first time, i appreciate you pinging a second time).
+
+-------------------------
+
+Manu | 2022-05-10 14:21:33 UTC | #6
+
+In which timezone are those timestamps @alexeychirkov?
+
+-------------------------
+
+alexander | 2022-05-10 18:03:38 UTC | #7
+
+Coordinated Universal Time (UTC)
+
+-------------------------
+
+diegop | 2022-05-10 20:00:53 UTC | #8
+
+Fwiw folks are looking into this
+
+-------------------------
+
+martin_DFN1 | 2022-05-10 20:38:46 UTC | #9
+
+'x-ic-subnet-id' is the IC subnet_id;
+'x-ic-node-id' is the IC node_id;
+x-ic-canister-id is the IC canister ID calculated from the URI, length 27.
+
+-------------------------
+
+faraz.shaikh | 2022-05-10 21:21:39 UTC | #10
+
+Hi, 
+
+This is a very pertinent request. We don't have a view consistency model formally defined for data written on the IC. FWIW `writes` using updates calls and `reads` using queries without global timestamp amounts to local consistency i.e. weakest form of consistency.  A reader can read old data, and new data, followed again by old data depending on the replica that is chosen to serve the query. (boundary nodes choose a random replica to serve a read)
+
+Having said the HTTP response header in the form of the block number at which the query was replied to will *_NOT_* solve any developer woes. Esp. for developers trying to reason about the consistency model.  Timestamps/block height will let users know out of N response which one is the latest. But users still won't know if the N responses came from the same replica or overlap of lagging replicas.   The question that needs to answer is -
+
+1. Is query response X served from the most up-to-date replica?
+
+Timestamps in headers won't answer this. 
+
+So where next?
+1. if one wants to read the most up-to-date state of a canister. The state has to be read using an update call.
+OR.
+2. Collect 1/3+ responses with unique node-id and the response with the highest block id is the latest one.  Assumes one of the 1/3+ nodes participated in the consensus of the update and thus has the highest block number for responding to the query. (And also didn't mount a dynamic attack of responding with old data :) )
+
+2 is no better than an update call. I don't see a workaround for R+W>N (where N=2/3 i.e. the consensus quorum) for any form on a strong consistency model.
+
+*x-ic-node-id* is the replica that responded to the query. Its chosen randomly by the boundary node.
+
+https://github.com/dfinity/ic/blob/master/ic-os/boundary-guestos/rootfs/etc/nginx/ic_router.js#L147
+
+-------------------------
+
+faraz.shaikh | 2022-05-11 04:12:43 UTC | #11
+
+In my reply above I claimed `"we don't have a ... view consistency model formally defined for data written on the IC"`
+
+Coincidentally, I came across this today 
+https://smartcontracts.org/docs/current/references/ic-interface-spec#synchronicity-across-nodes
+
+This section specifically calls out the local consistency behavior - Thanks @nomeata
+
+-------------------------
+
+alexander | 2022-05-11 06:36:21 UTC | #12
+
+The question was not answered: **Is is normal that node can be out of sync for that long (1.5 minutes)?**
+What is expected synchronisation delay time between nodes?
+
+-------------------------
+
+alexander | 2022-05-11 06:41:24 UTC | #13
+
+For some cases having 'x-ic-block-id' or something like that would be really helpful.
+
+-------------------------
+
+alexander | 2022-05-11 06:44:03 UTC | #14
+
+'x-ic-block-id' with the comparing possibility (to define which one is the latest one)
+
+-------------------------
+
+free | 2022-05-11 08:08:30 UTC | #15
+
+It is not that the node is "out of sync for 1.5 minutes". What's happening is that this one node is consistently behind, trying to catch up. And, for reasons we are still unable to pinpoint, it is failing to catch up.
+
+What should be happening in an ideal world is that as long as the subnet is not CPU bound (with canisters executing 1+ second worth of instructions every single round), a replica that has fallen behind for any reason will be able to execute messages at full speed, resulting in a block rate > 1 and eventually catching up. (Arguably the replica should be able to catch up even if the subnet is CPU bound, as the block rate of the subnet is limited by the 1/3 slowest replicas. And there is a whole lot of work around Consensus that a catching up replica does not need to do.)
+
+What we are seeing instead is this replica actually making (very slightly) slower advance than up-to-date replicas, even though the average round execution time is around 600 ms. Based on which one would expect execution to advance at `1/0.6` or about `1.66` blocks per second. As said above, this is not what we are seeing, meaning the replica stays behind by about a constant amount, then doing a state sync.every 10 or so minutes.
+
+As for how far behind is "normal", that depends very much on the subnet. Assuming the case that we're seeing (catching up replica not managing to outpace up-to-date replicas), the delta between the catching-up replica and the up-to-date ones is basically dictated by how long it takes to complete state sync. On this particular subnet (`pjljw`, with about 5.5K canisters and 130 GB of state):
+1. computing the manifest (producing a hash of the whole 130 GB of state) takes about 15 seconds;
+2. followed by 30+ seconds of long tail latency before the CUP is certified (before 2/3 of the replicas have done (1) and agreed on the result);
+3. the catching-up replica takes about 15 seconds to complete a state sync; and finally
+4. the catching-up replica takes about 20 seconds to verify that it has the full, correct state before it starts execution.
+
+The above all adds up to about 1 minute 20 seconds before the catching-up replica is in the same state as the other replicas, which would seem to match up quite well with what you are seeing.
+
+This is not an issue for the health of the subnet as a whole (we can see that it manages to consistently put out 1 block per second even with 12 out of 13 replicas), but it does cause some proportion of queries to be served from an out-of-date state.
+
+-------------------------
+
+alexeychirkov | 2022-05-11 09:05:11 UTC | #16
+
+Thanks for such in depth answer.
+
+How big is the chance that we have "x-ic-block-height" header in reponse to deal with this situation?
+
+-------------------------
+
+faraz.shaikh | 2022-05-11 18:55:59 UTC | #17
+
+@alexeychirkov if there is a strong usecase then chances are 100pct.
+
+How would one use the x-block-Id feature ? It would be great to drive this discussion around
+
+1. The problem ?
+2. The expected solution … and
+3. How exactly will the http header solve the problem
+
+-------------------------
+
+alexeychirkov | 2022-05-11 20:17:59 UTC | #18
+
+All answers are in previous messages:
+
+problem - one of N requests has old state
+
+solution - store block height from the response header and skip subsequent responses with lower or the same block height
+
+-------------------------
+
+faraz.shaikh | 2022-05-11 21:56:59 UTC | #19
+
+As I described in the earlier post,  there is no good way to have N queries, handled by N unique replicas.
+
+Boundary nodes choose a random replica for answering the queries. One might get lucky if N queries land on unique replicas but that’s unlikely. There are good reasons for choosing a random replica.
+
+ why not do a single update call, instead of N query calls? - this doesn’t need any further fixes
+
+-------------------------
+
+alexeychirkov | 2022-05-12 10:28:34 UTC | #20
+
+> why not do a single update call, instead of N query calls? - this doesn’t need any further fixes
+
+Update calls are expensive, query calls - for free
+
+Constantly calling canisters (in our NFTGeek case - canisters of each NFT collection) with update calls will drain their cycles.
+
+-------------------------
+
+free | 2022-05-12 11:48:42 UTC | #21
+
+Query calls are free (in cycles) **for now**. Eventually, once we agree on a way to filter out outliers (malicious nodes) and find the time to implement it, they should be charged for, as they are very much not free in terms of compute (and, if you look at canisters issuing downstream queries to other canisters, in some ways more expensive than updates).
+
+Probably a more sane solution would be for boundary nodes to only route queries to "up-to-date" replicas (which must be at least 2/3 + 1 of them, so there is still room for randomly picking one). This could either be done deterministically ("continuously" poll all replicas and only route queries to those that are at the maximum block height) or optimistically (poll replicas at reasonable intervals, e.g. 10 seconds, and only route queries to those that were up to date when last polled). The latter is probably sufficient, as there is no guarantee that any given replica isn't malicious and e.g. lying about its height or just returning garbage regardless.
+
+-------------------------
+
+alexeychirkov | 2022-05-13 05:11:39 UTC | #22
+
+In the end, after all the explanations, is there any chance in the near future to make an update so that the nodes have "block height" response header?
+
+-------------------------
+
+jzxchiang | 2022-05-15 03:07:04 UTC | #23
+
+> (and, if you look at canisters issuing downstream queries to other canisters, in some ways more expensive than updates).
+
+Am I reading this right that if a canister makes an inter-canister call to another canister's query method (which still goes through consensus like a regular update call), that calling canister will NOT be charged cycles?
+
+But if the called method was instead an update method, then it would be charged?
+
+-------------------------
+
+free | 2022-05-15 14:01:18 UTC | #24
+
+No, all calls that go through consensus (and end up in a block) are charged for just the same, regardless of whether the called method is labeled as a query or as an update.
+
+Query calls to query methods are currently not charged for, because a malicious replica might claim that any number of query calls have been made to any given canister, unilaterally causing arbitrarily large charges to the canister. We couldn't reach agreement regarding how to filter out potentially fraudulent charges, so queries are free for the time being.
+
+-------------------------
+
+skilesare | 2022-05-15 14:57:36 UTC | #25
+
+[quote="free, post:24, topic:12825"]
+Query calls to query methods are currently not charged for, because a malicious replica might claim that any number of query calls have been made to any given canister, unilaterally causing arbitrarily large charges to the canister. We couldn’t reach agreement regarding how to filter out potentially fraudulent charges, so queries are free for the time being.
+[/quote]
+
+That is fascinating.  What an interesting problem to try to solve.  Are there any discussions around this that are accessible(github issues etc?).
+
+-------------------------
+
+free | 2022-05-15 18:06:34 UTC | #26
+
+Not as far as I know, unfortunately.
+
+But the main idea would be to essentially eliminate outliers (whether malicious or not) and charge based on the traffic seen by e.g. the 25th to 75th percentile.
+
+On other idea I remember hearing about in order to actually detect malicious replicas would be for some (small) proportion of queries to be routed to two replicas instead of one. As long as the two queries are served based on the same state (i.e. at the same height) one could compare responses (or hashes thereof) and record any inconsistencies.
+
+I guess the main reason why nothing was attempted in this direction yet is that it was not deemed important enough (compared to other work that needs doing) and so no one had time to look into it beyond a chat over lunch,
+
+-------------------------
+

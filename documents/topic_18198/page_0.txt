@@ -1,0 +1,589 @@
+blabagastered | 2023-01-28 11:43:12 UTC | #1
+
+ I want `hearbeat` to jump the queue to the first spot in line.
+
+eg, once all private function calls (or public functions called by the canister itself) in queue are done executing, don't execute any externally triggered functions yet: first trigger `heartbeat`, then continue with the externally-triggered queue.
+
+-------------------------
+
+blabagastered | 2023-01-26 18:01:59 UTC | #2
+
+I was told "no".
+
+I'm thinking in terms of people attempting to DoS time-critical function executions by just filling the queue with random calls for as long as they need the canister to remain effectively frozen.
+
+What approach can be taken to prevent that sort of thing?
+
+-------------------------
+
+dsarlis | 2023-01-27 09:07:17 UTC | #3
+
+> I want `hearbeat` to jump the queue to the first spot in line.
+
+The heartbeat (or timer) is executed always as the first message whenever a canister is scheduled for execution.
+
+> I was told “no”.
+
+Was this in some other forum thread? If so, can you give me a pointer? Maybe there was a misunderstanding.
+
+It could be the case that whoever told you that meant that a canister cannot choose between ingress/inter-canister calls and which one gets executed when (there's a simple round-robin mechanism we use for executing these messages). This part is true.
+
+-------------------------
+
+blabagastered | 2023-01-27 10:16:48 UTC | #4
+
+[quote="dsarlis, post:3, topic:18198"]
+whenever a canister is scheduled for execution.
+[/quote]
+
+It seems you're thinking in terms of the subnet's queue, whereas I'm thinking in terms of the canister's own queue. Not sure how it works behind the scenes or whether there is such a thing as "the canister's own queue". But now I'm worried about the same problem but at the subnet level: how does one ensure that certain functions of certain canisters get called eg within 30 seconds of their intended trigger and not eg 4 weeks later after a DoS attack is abandoned?
+
+[quote="dsarlis, post:3, topic:18198"]
+can you give me a pointer?
+[/quote]
+
+https://discord.com/channels/748416164832608337/748420568268800060/1068223860610171021
+
+Further context for the question:
+
+What I need it for actually checks enough time has passed first so that it triggers something inside heartbeat only every eg 30 seconds, not every heartbeat. (It doesn't matter if it's 22 seconds or 39 seconds in this case. I'm using the timestamp for a minimum time elapsed threshold, and it definitely needs to happen within let's say 10 minutes: in that sense it is time-critical. If it takes eg 4 weeks the system would break). How do I ensure that hearbeat and the function calls within it run on their own "priority" lane in practice, protected from external DoS-motivated calls? 
+
+The aim is achieving security in practice.
+
+-------------------------
+
+dsarlis | 2023-01-27 10:40:16 UTC | #5
+
+> It seems you’re thinking in terms of the subnet’s queue, whereas I’m thinking in terms of the canister’s own queue. Not sure how it works behind the scenes or whether there is such a thing as “the canister’s own queue”.
+
+No, I was referring to the order within a canister's queue. Canisters have an ingress queue (for all ingress messages they receive) and further input/output queues for each canister they communicate with. When we execute messages for a canister, heartbeats and timers are injected in the front of their queue (if the canister defines them of course). Then, we start executing ingress and inter-canister messages from the input queues of this canister.
+
+> But now I’m worried about the same problem but at the subnet level: how does one ensure that certain functions of certain canisters get called eg within 30 seconds of their intended trigger and not eg 4 weeks later after a DoS attack is abandoned?
+
+Some background: The scheduling algorithm takes into account the so-called compute allocation of canisters when it's trying to figure out which canister(s) should be executed next. If your canister has specified a compute allocation of X%, it roughly means that it will be scheduled for execution X% of rounds (i.e. with 50% allocation you should expect your canister will be triggered for execution every other round). Even if you don't set that, your canister still makes progress but there are no specific guarantees. The compute allocation that can be reserved by canisters on a subnet [is capped to 50%](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/config/src/execution_environment.rs?L213), to actually ensure that there's sufficient room for the best-effort (i.e. no compute allocation or equivalent to 0) canisters to make progress.
+
+So, if you want to really make sure that your canister is scheduled on a stricter frequency, you can consider setting a non-zero compute allocation (it costs extra cycles to reserve). Whenever the canister is triggered, its heartbeat will be the first that is executed (no matter how many other messages exist in its own queue).
+
+> What I need it for actually checks enough time has passed first so that it triggers something inside heartbeat only every eg 30 seconds, not every heartbeat.
+
+First, I'd recommend using timers instead if you only need this to happen every 30 seconds, they're much more efficient than the heartbeat. Timers are also put in the front of the queue and are executed before other messages.
+
+> (It doesn’t matter if it’s 22 seconds or 39 seconds in this case. I’m using the timestamp for a minimum time elapsed threshold, and it definitely needs to happen within let’s say 10 minutes: in that sense it is time-critical. If it takes eg 4 weeks the system would break)
+
+The timers work exactly like you describe. The time you set is used as the minimum elapsed threshold to trigger the timer. To iterate from the above: given that the compute allocation that can be reserved by all canisters in a subnet is 50%, that should give your canister enough room to execute frequently enough even if it's running on a best-effort basis. I'd expect that the 10 minutes mark you mention would never be hit -- you'd need a lot of other canisters with many messages each to exist to prevent yours from running within that period. And if you want to be extra sure, just set a small compute allocation (e.g. 1%) and then you can be guaranteed that your canister runs at least 1 every 100 rounds (so roughly once every 100 seconds given the usual block rate on a subnet).
+
+-------------------------
+
+blabagastered | 2023-01-27 11:06:22 UTC | #6
+
+Incredibly helpful. Many things I didn't know about.
+
+Where can I see a Motoko code snippet like this but for timer? https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/heartbeats
+
+How do I set compute allocation for a Motoko canister, and how do I estimate or understand cycles cost differences vs not setting any?
+
+If the canister, for simplicity, has a 50% allocation, does that mean that it will certainly be called every other block, or that a DoS attack would have to increase its output to ensure effective freezing? At a higher level: to what extent, assuming of course an adversarial situation, where eg the attacker will also attempt setting his own canisters to the highest possible allocation, does setting allocations solve the DoS attack vector for time-critical function executions?
+
+The aim is to understand what would happen (and protect against unacceptable outcomes) in an adversarial context rather than in a fair-use context.
+
+-------------------------
+
+dsarlis | 2023-01-27 11:24:51 UTC | #7
+
+> Where can I see a Motoko code snippet like this but for timer? [Internet Computer Content Validation Bootstrap](https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/heartbeats)
+
+I'm not sure if the Motoko support is fully rolled out yet. @claudio @ggreif can you weigh in here? And point to an example if it exists?
+
+> How do I set compute allocation for a Motoko canister
+
+This is independent of Motoko vs Rust. It's an option in dfx. See the [docs](https://internetcomputer.org/docs/current/references/cli-reference/dfx-canister#options-1) for more details.
+
+> how do I estimate or understand cycles cost differences vs not setting any?
+
+You can find the relevant cost [here](https://internetcomputer.org/docs/current/developer-docs/deploy/computation-and-storage-costs). See specifically "Compute Percent Allocated Per Second". If no compute allocation is set, there's no extra charge for your canister.
+
+> If the canister, for simplicity, has a 50% allocation, does that mean that it will certainly be called every other block, or that a DoS attack would have to increase its output to ensure effective freezing?
+
+It will be called every other block and the heartbeat/timer will be triggered first.
+
+> At a higher level: to what extent, assuming of course an adversarial situation, where eg the attacker will also attempt setting his own canisters to the highest possible allocation, does setting allocations solve the DoS attack vector for time-critical function executions?
+
+As long as you have secured a compute allocation for your canister, you will get the guarantee I mentioned (i.e. X% allocation will trigger its execution X out of 100 rounds). If a subnet has already reached the limit on how much compute allocation can be reserved (either legitimately or some adversary is trying to affect your canisters living in the same subnet), you can always go to another subnet. If you're worried that an adversary will try to fill up all IC subnets to prevent your canisters from running, well, that's a whole other story but I think this is quite unlikely to happen.
+
+-------------------------
+
+blabagastered | 2023-01-27 11:57:07 UTC | #8
+
+[quote="dsarlis, post:7, topic:18198"]
+See the [docs](https://internetcomputer.org/docs/current/references/cli-reference/dfx-canister#options-1) for more details.
+[/quote]
+
+Beware the docs say
+
+> This should be a percent in the range [0..100].
+
+rather than 50.
+
+Just to confirm: is 10M per second correct or is it per block?
+
+![image|690x120](upload://72gagZv7SmEgoZXbQLN9BOHCndl.png)
+
+
+[quote="dsarlis, post:7, topic:18198"]
+As long as you have secured a compute allocation for your canister, you will get the guarantee I mentioned (i.e. X% allocation will trigger its execution X out of 100 rounds)
+[/quote]
+
+Great. That's probably enough of a guarantee for my purposes. Are "rounds" blocks? If not, what are they exactly?
+
+I keep thinking of how things could be made to go wrong: even if a canister makes a call that on purpose doesn't return anything for 4 weeks, and say that deliberately-stuck function call also includes calls to my canister's public functions, the subnet still keeps going and my canister's execution is not affected, correct?
+
+[quote="dsarlis, post:7, topic:18198"]
+I’m not sure if the Motoko support is fully rolled out yet. @claudio @ggreif can you weigh in here? And point to an example if it exists?
+[/quote]
+
+I was just pointed this out: https://github.com/dfinity/motoko-base/blob/master/src/Timer.mo
+
+If there's a code snippet somewhere confirming correct usage it would be great.
+
+-------------------------
+
+ggreif | 2023-01-27 14:00:08 UTC | #9
+
+[quote="dsarlis, post:7, topic:18198"]
+I’m not sure if the Motoko support is fully rolled out yet. @claudio @ggreif can you weigh in here? And point to an example if it exists?
+[/quote]
+
+Timers are in `moc` since 0.7.5 and are present in `dfx` 0.13.0-beta.1! Have fun!
+
+(See the thread of https://forum.dfinity.org/t/heartbeat-improvements-timers-community-consideration/14201/138 for the complete discussion.)
+
+[Here is the documentation](https://github.com/dfinity/motoko/blob/master/doc/md/timers.md) which hasn't yet found its way into the portal, but will soon!
+
+-------------------------
+
+dsarlis | 2023-01-27 13:25:16 UTC | #10
+
+[quote="blabagastered, post:8, topic:18198"]
+Beware the docs say
+
+> This should be a percent in the range [0…100].
+
+rather than 50.
+[/quote]
+
+I'm not sure I follow. Yeah, the value of compute allocation for a canister is allowed to be a percent in the range 0...100. So, any value in between (including 50) would be valid.
+
+> Just to confirm: is 10M per second correct or is it per block?
+
+It is per second. On subnets where the block rate coincides to be 1 block/s, then you can also think of it as the per block value. Technical detail: the charging happens periodically based on the time that has passed since the last time the canister was charged (so definitely seconds is the base unit you need to care about).
+
+> Are “rounds” blocks? If not, what are they exactly?
+
+Consensus produces a new block, delivers it to the upper layers of the IC where execution happens and then we execute a "round" where we process messages from various canisters within some time limit which ideally matches the block rate (so we can execute as much as possible before the next block). Every new block delivered triggers a new round of execution.
+
+> I keep thinking of how things could be made to go wrong: even if a canister makes a call that on purpose doesn’t return anything for 4 weeks, and say that deliberately-stuck function call also includes calls to my canister’s public functions, the subnet still keeps going and my canister’s execution is not affected, correct?
+
+Correct. The problem you might see in that case is that your canister is not upgradable because of the outstanding callback but that's orthogonal and should not affect regular execution of your canister.
+
+-------------------------
+
+blabagastered | 2023-01-27 13:55:23 UTC | #11
+
+[quote="dsarlis, post:5, topic:18198"]
+The compute allocation that can be reserved by canisters on a subnet [is capped to 50%](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/config/src/execution_environment.rs?L213)
+[/quote]
+
+[quote="dsarlis, post:10, topic:18198"]
+I’m not sure I follow. Yeah, the value of compute allocation for a canister is allowed to be a percent in the range 0…100. So, any value in between (including 50) would be valid.
+[/quote]
+
+I'm not sure if I'm confused or what's going on.
+
+[quote="dsarlis, post:10, topic:18198"]
+Consensus produces a new block, delivers it to the upper layers of the IC where execution happens and then we execute a “round” where we process messages from various canisters within some time limit which ideally matches the block rate (so we can execute as much as possible before the next block). Every new block delivered triggers a new round of execution.
+[/quote]
+
+Without getting too deep into the weeds, do you see any space for DoS attacks in gaps that may arise from the fact that rounds need not coincide exactly with the block rate (and perhaps might diverge greatly under certain adversarial circumstances?)?
+
+Again very enlightening. Thank you.
+
+-------------------------
+
+blabagastered | 2023-01-27 14:14:02 UTC | #12
+
+[quote="dsarlis, post:10, topic:18198"]
+The problem you might see in that case is that your canister is not upgradable because of the outstanding callback
+[/quote]
+
+By the way, I don't expect to have this problem since for security reasons the canister will likely be non-upgradable / blackholed, but is there a solution being worked on? I saw talk about it on the forum at some point but don't know if there have been developments or whether it's something canisters will have to live with.
+
+-------------------------
+
+dsarlis | 2023-01-27 14:25:11 UTC | #13
+
+> The compute allocation that can be reserved by canisters on a subnet [is capped to 50%](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/config/src/execution_environment.rs?L213)
+
+This refers to the total allocation that can be claimed by all canisters on a subnet. Subnets have more than one cores available for execution, typically 4 (this is for update calls specifically). So, when we say that the total on a subnet is capped at 50% it means that 2 out of the 4 cores can be reserved. So, you could have 1 canister claiming 1 core (by setting its own compute to 100%) and others claiming the other core. Is it more clear now?
+
+> Without getting too deep into the weeds, do you see any space for DoS attacks in gaps that may arise from the fact that rounds need not coincide exactly with the block rate (and perhaps might diverge greatly under certain adversarial circumstances?)?
+
+We actually try to ensure that this does not happen. The limits we impose on canister execution strive to make it such that rounds take as close as possible to the time we have between blocks. It's not perfect but we continually improve the heuristics used for this. I'd consider it a bug if that happens (and we take these cases very seriously) and as such in your analysis I'd take it as something that should hold.
+
+> By the way, I don’t expect to have this problem since for security reasons the canister will likely be non-upgradable / blackholed, but is there a solution being worked on? I saw talk about it on the forum at some point but don’t know if there have been developments or whether it’s something canisters will have to live with.
+
+My team is the one driving a solution on this. We hope to provide something reasonable within the first half of the year.
+
+-------------------------
+
+blabagastered | 2023-01-27 16:15:34 UTC | #14
+
+[quote="dsarlis, post:13, topic:18198"]
+Is it more clear now?
+[/quote]
+
+Absolutely. I live at the application layer so I hadn't even heard of multiple cores.
+
+Glad you're working on updates. If some sort of security / defi working group arises I'd be interested in listening in.
+
+-------------------------
+
+blabagastered | 2023-01-27 16:24:16 UTC | #15
+
+[quote="ggreif, post:9, topic:18198"]
+[Here is the documentation](https://github.com/dfinity/motoko/blob/master/doc/md/timers.md) which hasn’t yet found its way into the portal, but will soon!
+[/quote]
+
+Perfect little snippet, thanks.
+
+
+```
+system func timer(setGlobalTimer : Nat64 -> ()) : async () {
+  let next = Nat64.fromIntWrap(Time.now()) + 20_000_000_000;
+  setGlobalTimer(next); // absolute time in nanoseconds
+  print("Tick!");
+}
+```
+
+-------------------------
+
+blabagastered | 2023-01-28 17:13:49 UTC | #16
+
+Can a canister adjust its compute allocation from within itself? eg use Timer to check for certain conditions, then increase / reduce compute allocation accordingly.
+
+If it can be done, how might one replace `print("Tick!");` here for that compute allocation adjustment to say 1%?
+
+
+```
+system func timer(setGlobalTimer : Nat64 -> ()) : async () {
+  let next = Nat64.fromIntWrap(Time.now()) + 20_000_000_000;
+  setGlobalTimer(next); // absolute time in nanoseconds
+  print("Tick!");
+}
+```
+
+-------------------------
+
+blabagastered | 2023-01-28 17:21:25 UTC | #17
+
+Separate issue; implications of the above still sinking in for me:
+
+On Discord (https://discord.com/channels/748416164832608337/748420568268800060/1068641481889435739), this scenario:
+
+> Say in the case someone calls function X while A is executing. 
+> A is executing, and inside it there are calls to B and C: 
+> - await B 
+> // here someone else calls X, not from inside A 
+> - await C 
+> return from A 
+> 
+> Would that run A, B, C, return A, enter X or 
+> 
+> would it run A, B, X, C, return from A 
+
+got this answer:
+
+> An await is an abstraction over a callback being executed later. What order stuff runs in depends on a lot of factors, especially subnets. But in the most pessimistic execution case, the latter; nothing prevents calling another method before the callback runs.
+
+So if we bring that back to the timer, and executing time-sensitive processes, we might have:
+
+Timer is executing, and inside it there are async calls to B, C, D, some inter-canister, some to other canisters (asume all canisters are well-behaved and don't delay return), some of which themselves call other canisters with async / await:
+
+- await B // maybe a intercanister call to a function that itself awaits a call in another canister
+// at this point someone else, not from inside Timer and from outside the canister, calls function X in our canister
+- await C // again may include async calls to other canisters within it
+return / exit from timer
+
+Doesn't the Discord answer say that X could be executed before C, and therefore before Timer finishes processing, and therefore before the time-critical process is finalised?
+
+If so, what approach or flow can be used to guarantee that the complete body of timer is executed first, including its async calls, or otherwise guarantee that the time-critical process in the body of timer is indeed finalised on time such that the system (in this case a defi protocol), which depends on that time-critical execution, won't malfunction?
+
+I sort of created a control flow system that sets a variable to false when certain things are being processed, and then checks that condition before executing most of the body of the rest of the canister's functions, but
+
+(a) is this the only way (and even _a way_ that works) and
+
+(b) ideally there would be a way doesn't even attempt executing other functions, partly because the fact that other functions are being kept from entering the if statement where most of the body is only guarantees that those things _don't_ happen, rather than guaranteeing that the complete body of timer _does_ happen (on time). 
+
+I expect there may be misconceptions in my framing.
+
+-------------------------
+
+blabagastered | 2023-01-31 17:53:15 UTC | #18
+
+I'm still using dfx 0.12.1. If I update to 0.13.0-beta is anything likely to break / do I need to make any manual changes other than running an update command?
+
+12 doesn't seem to let me do this sort of thing for manual import:
+
+
+```
+import { setTimer = setTimerNano; cancelTimer = cancel } = "mo:⛔";
+import { fromIntWrap } = "Nat64";
+```
+
+-------------------------
+
+dsarlis | 2023-01-31 18:14:14 UTC | #19
+
+The canister would need to be a controller of itself to be able to adjust its compute allocation (only controllers can update settings of the canister such as its compute allocation).
+
+-------------------------
+
+dsarlis | 2023-01-31 18:36:58 UTC | #20
+
+> Doesn’t the Discord answer say that X could be executed before C, and therefore before Timer finishes processing, and therefore before the time-critical process is finalised?
+
+Yes, indeed, if your timer performs further async calls to other canisters, then the IC cannot guarantee that X in your example wouldn't be executed before C. In other words, the scenario you describe is possible.
+
+> If so, what approach or flow can be used to guarantee that the complete body of timer is executed first, including its async calls, or otherwise guarantee that the time-critical process in the body of timer is indeed finalised on time such that the system (in this case a defi protocol), which depends on that time-critical execution, won’t malfunction?
+
+If your timer is performing downstream async calls, things become more complicated as you've started realizing.
+
+> I sort of created a control flow system that sets a variable to false when certain things are being processed, and then checks that condition before executing most of the body of the rest of the canister’s functions
+
+Yes, that's actually how I'd tackle the issue as well, essentially use a guard that prevents any other function from being run (or rather return early as you said) if I know that a time-sensitive task is still not complete to basically give every chance for this time-sensitive task to complete.
+
+> ideally there would be a way doesn’t even attempt executing other functions, partly because the fact that other functions are being kept from entering the if statement where most of the body is only guarantees that those things *don’t* happen, rather than guaranteeing that the complete body of timer *does* happen (on time).
+
+Not entirely sure I'm following your concern here. If you mean that you'd like some way to tell the system "look I have this super sensitive task that I need done, so drop on the floor everything else coming at my canister except for whatever helps me complete this task", then we don't have that I'm afraid.
+
+There were some ideas in the past to allow canisters to provide their own scheduling of messages, so in your case you could choose to give priority to the responses for B, C and D and delay any X as long as you need. This never really went further than a potential idea though.
+
+-------------------------
+
+blabagastered | 2023-01-31 19:44:07 UTC | #21
+
+[quote="dsarlis, post:20, topic:18198"]
+If you mean that you’d like some way to tell the system “look I have this super sensitive task that I need done, so drop on the floor everything else coming at my canister except for whatever helps me complete this task”
+[/quote]
+
+I do.
+
+Noted. I'll just crank allocation up and reduce other function's execution demands to a minimum. Only time will tell how far that takes us in terms of DoS attack prevention and time-critical execution guarantees.
+
+The natural question then is whether it's possible to obtain from within the canister the maximum allocation available (seeing that it presumably can't always be set to 100 if eg 2 other canisters are already set to 100 each on the same subnet) before attempting setting the value, and if not much or any allocation is available, as might be the case in moments of large market movements on a defi subnet where many canisters attempt at once to maximise their allocation, how might one prevent protocols and the funds in their custody from collapsing, especially when the "denial-of-increased-allocation attack" is executed together with a standard DoS attack that spams the canister's queue.
+
+More broadly, how do we prevent the attacker from doing exactly that at the time when he needs the time-critical execution to be delayed:
+
+The (for illustration) simplified steps for such an attack might be:
+
+- deploy 2 canisters on the subnet
+- increase their allocation to 100% each on some cost-effective basis for the attack's duration
+- DoS attack the defi canister to overwhelm its small allocation execution capacity
+
+One advantage for the attacker is that the defi canister has no idea when the attack might start, and therefore has no way (other than keeping it at a prohibitively high cost at all times, itself increased for the larger subnets that defi requires) of attempting securing a large allocation until after the attack has started, when it is by definition no longer possible to increase it.
+
+-------------------------
+
+ggreif | 2023-01-31 21:16:11 UTC | #22
+
+There were a few minor breaking changes, but even if your code won't compile, after fixing and compiling it should not cause problems. Feel free to upgrade.
+
+-------------------------
+
+dsarlis | 2023-02-01 09:04:13 UTC | #23
+
+> More broadly, how do we prevent the attacker from doing exactly that at the time when he needs the time-critical execution to be delayed:
+> ...
+
+In this example, I would point out that 2 canisters might have taken 2 cores of the subnet's available capacity but there are 2 more cores that can be used by the remaining canisters. In order for the attack to be effective, you would actually need to ensure that more canisters have "work to do" on top of yours to really slow it down. Sending your canister more and more requests doesn't necessarily prevent it from running -- if it's the only canister that has work to do, it'll keep getting scheduled even if it has a "best-effort" allocation (and your measures to ensure you process the timer sensitive tasks should help you complete them on time).
+
+So, in short, the DoS attack scenario you're afraid of would be very expensive for someone to pull off as it would need to involve more canisters to coordinate than just 2 canisters that max out their allocation. Of course, you can still argue that depending on the stakes (i.e. how popular and thus valuable your defi app has become), it might be something that's still tempting for someone with enough funds behind them but I don't see that as a very likely scenario.
+
+Finally, we are planning to eventually increase the number of cores available for execution of messages, probably to something like 10 cores or so. No specific ETA for this that I can offer you but it should also help bring down the likelihood of attacks like the one you described as it's gonna be even more expensive for someone to trigger all the right conditions to effectively block your canister from running.
+
+-------------------------
+
+blabagastered | 2023-02-01 10:52:13 UTC | #24
+
+[quote="dsarlis, post:23, topic:18198"]
+I would point out that 2 canisters might have taken 2 cores of the subnet’s available capacity but there are 2 more cores that can be used by the remaining canisters.
+[/quote]
+
+Wouldn't two 100s reach the capped allocation of 50% per subnet, hence not leaving any room for further allocation increases?
+
+[quote="dsarlis, post:23, topic:18198"]
+In order for the attack to be effective, you would actually need to ensure that more canisters have “work to do”
+[/quote]
+
+not "more canisters", but of course you'd make them busy programatically by making them call themselves or by aggressively calling them from the outside to compute heavy nonsense or otherwise delay execution, and you'd spam other (they can be already-existing, owned by others) canisters on the subnet to use up the other, "unallocated" 50% to prevent execution of the canister under attack.
+
+[quote="dsarlis, post:23, topic:18198"]
+Of course, you can still argue that depending on the stakes (i.e. how popular and thus valuable your defi app has become), it might be something that’s still tempting for someone with enough funds behind them but I don’t see that as a very likely scenario.
+[/quote]
+
+Any app with a TVL of more than a billion is somewhat attractive, and of course the IC aims for far more than that in its core defi apps. I certainly wouldn't consider working on one with an expected TVL lower than a billion. Indeed, as you correctly implicitly detect, one worries about this sort of thing if and only if one's serious about it.
+
+[quote="dsarlis, post:23, topic:18198"]
+No specific ETA for this that I can offer you but it should also help bring down the likelihood of attacks like the one you described as it’s gonna be even more expensive for someone to trigger all the right conditions to effectively block your canister from running.
+[/quote]
+
+It might be worth doing some sort of structured cost-benefit analysis for 1 million, 10 million, 100 million, 1 billion, 10 billion TVL, to know whether and under which conditions a protocol on the IC is capable of securely hosting those numbers, or otherwise get an idea of the max TVL it's currently and or foreseeably capable of securely managing, or alternatively perhaps reduce the complexity of the system to a point where such an analysis turns unnecessary.
+
+-------------------------
+
+dsarlis | 2023-02-01 12:42:07 UTC | #25
+
+[quote="blabagastered, post:24, topic:18198"]
+Wouldn’t two 100s reach the capped allocation of 50% per subnet, hence not leaving any room for further allocation increases?
+[/quote]
+
+Yes, but as you also said 
+
+> of course you’d make them busy programatically by making them call themselves or by aggressively calling them from the outside to compute heavy nonsense or otherwise delay execution, and you’d spam other (they can be already-existing, owned by others) canisters on the subnet to use up the other, “unallocated” 50% to prevent execution of the canister under attack
+
+So, what I meant is that it's not enough to only have the 2 canisters claiming the allowed allocation for the subnet, but you would also need more canisters to exist and keep them busy. Hence, why I said that the attack would be much more expensive to perform.
+
+> Any app with a TVL of more than a billion is somewhat attractive, and of course the IC aims for far more than that in its core defi apps. I certainly wouldn’t consider working on one with an expected TVL lower than a billion. Indeed, as you correctly implicitly detect, one worries about this sort of thing if and only if one’s serious about it.
+> It might be worth doing some sort of structured cost-benefit analysis for 1 million, 10 million, 100 million, 1 billion, 10 billion TVL, to know whether and under which conditions a protocol on the IC is capable of securely hosting those numbers, or otherwise get an idea of the max TVL it’s currently and or foreseeably capable of securely managing, or alternatively perhaps reduce the complexity of the system to a point where such an analysis turns unnecessary.
+
+Very good points. I think doing the analysis you said would certainly be interesting. Let me see if I can get something going on on that front.
+
+-------------------------
+
+blabagastered | 2023-02-01 13:52:30 UTC | #26
+
+
+[quote="dsarlis, post:25, topic:18198"]
+doing the analysis you said would certainly be interesting
+[/quote]
+
+and I'd argue strictly necessary for the existence of responsibly launched "serious" defi. In part because it could turn out to be unsafe, and in part because the fact that it could turn out being unsafe itself is likely to inhibit large fund transfers into the system. It's a bit chicken and egg, and to an extent no (solid theoretical) guarantees > no funds. And this itself (doubt can be enough) could inhibit "serious" devs from embarking on building such protocols in the first place.
+
+If the root is transparently healthy, good things may come.
+
+-------------------------
+
+free | 2023-02-02 08:33:13 UTC | #27
+
+It is definitely possible for a malicious third party to reserve the maximum possible amount of compute (2 out of 4 cores; or 5 out of 10); and flood the rest of the subnet with high load in order to make it as unlikely as possible for your canister to get scheduled; and flood your canister with noise, so even when it gets scheduled, it is likely to do useless work.
+
+I guess a defense in depth approach is needed here. The first step is ensuring a small (but large enough) compute allocation ahead of time. You don't need to grab 100% compute allocation just in case. If you want your heartbeat to run at least once every 30 seconds, 3% should be sufficient (make that 5%, to account for any drops in block rate under heavy load).
+
+Second, you'd need a way to prioritize useful work getting done within your canister. You could take the somewhat unwieldy approach you described (add a check at the top of every update call **and** after every await and bail out if the heartbeat has not executed within X seconds). Or the system could provide an equivalent way of either prioritizing some calls; or calls from the canister to itself; or based on some other criterion.
+
+Third (and this is, I believe, the hardest part) you'd want to be able to guarantee some amount of message throughput. Unless everything happens within your canister (which I doubt is the case with a DeFi app) It's no use for your canister to be able to process the right thing at the right time if whatever action it is trying to take as a result only happens arbitrarily late because the request was not delivered in time. I don't think that you as a canister developer/controller can do much about the latter, except maybe rent a subnet. Which may make sense if you're managing $1B in assets, but not while you are ramping up. One could again imagine system-provided solutions, such as multiple streams between a pair of subnets in order to provide quality-of-service guarantees for some of them, but this would definitely require serious effort to pull off. (And FWIW, we've seen virtually zero use of compute allocation thus far, so there's no good reason to assume significant use of messaging allocation if it was implemented. So it's unlikely for it to become a high priority feature any time soon.)
+
+-------------------------
+
+blabagastered | 2023-02-02 09:38:49 UTC | #28
+
+
+
+[quote="free, post:27, topic:18198"]
+make that 5%
+[/quote]
+
+Actually not terrible: 5% on a 34-node subnet would only cost 26 x 1000000 x 5 x 60 x 60 x 24 x 365 / (10^12) ~4099,68T cycles per year. Very doable.
+
+
+[quote="free, post:27, topic:18198"]
+the system could provide an equivalent way of either prioritizing some calls; or calls from the canister to itself; or based on some other criterion.
+[/quote]
+
+Something along these lines would help but as you sort of implicitly point out it doesn't exist (today).
+
+[quote="free, post:27, topic:18198"]
+guarantee
+[/quote]
+
+I agree this is the big problem,
+
+[quote="blabagastered, post:17, topic:18198"]
+(b) ideally there would be a way doesn’t even attempt executing other functions, partly because the fact that other functions are being kept from entering the if statement where most of the body is only guarantees that those things *don’t* happen, rather than guaranteeing that the complete body of timer *does* happen (on time).
+[/quote]
+
+In general, unless I'm being unduly stringent (please say so if it's not as threatening as it may seem), we probably need to find a way to produce such guarantees at least to a probabilistically satisfying standard that corresponds to the TVL we aspire to (as individual projects and as IC as a whole) before responsible and successful launches can happen. In a sense responsible meaning us (intra-IC) having conviction in its security, and successful meaning others having that conviction too.
+
+If that is so, and we want such launches within call it a year, are we on track? Or better said, if we aren't, what do we need to do to be on track?
+
+-------------------------
+
+free | 2023-02-02 09:44:50 UTC | #29
+
+Thing is, it's really hard to provide a guarantee of that kind. For one, the calls that the heartbeat handler makes, may take arbitrarily long to complete. There's no way the system can guarantee that the heartbeat handler will complete within N rounds if some downstream call it makes takes N+1 rounds (apart from timing out downstream calls, something we're looking into, but I'm not sure that's what you want here).
+
+Furthermore, the very guarantees that the protocol provide get in the way of a strong guarantee regarding heartbeat completion time. Even if the heartbeat handler only sends requests to the canister itself, those requests will get enqueued behind any other messages that the canister sent itself. And the protocol guarantees in-order delivery of requests. I imagine that one could shortcut said requests by bailing out early on; but there's no way for the system to guarantee that, the canister would have to do it. And this doesn't even consider requests sent to other canisters.
+
+I'm not saying what you want is impossible. But it would require fundamental changes to the protocol itself. Something that we're definitely exploring (e.g. by adding support for messages that trade off response delivery guarantees for timing out said messages/call contexts), but is unlikely to be a quick fix.
+
+-------------------------
+
+blabagastered | 2023-02-02 09:57:57 UTC | #30
+
+[quote="free, post:29, topic:18198"]
+I’m not saying what you want is impossible. But it would require fundamental changes to the protocol itself.
+[/quote]
+
+I don't claim it's possible, indeed I ask you these questions precisely because I don't know the answers, but if it's not possible it may be that (serious) defi is not possible on the IC. That would possibly be ok and not necessarily threaten the project as a whole, but it would be good to spell it out and decide we're going to do A and not B.
+
+Nothing is nor can be perfect, naturally, and the IC is a spectacular, ground-breaking machine, but for defi to exist on it we need to provide guarantees that are in effect, for all practical purposes and whether we like it or not no shortcuts allowed (however smart), comparable to those of other systems that host defi today.
+
+-------------------------
+
+free | 2023-02-02 09:58:42 UTC | #31
+
+Again, not saying it is impossible. And the protocol is evolving all the time, so as soon as DeFi dapps become a significant part of the IC, these changes are going to get made. Just (very likely) not in the next few months.
+
+In the meantime, the combination of private subnet (something that would require some, but not incredibly much work; and is definitely on the radar); and subnet splitting (something we are actively working on); would give a growing DeFi dapp the option of grabbing a subnet all to itself, after the fact. At which point, it would be pretty much up to the dapp itself to ensure it gets the throughput and latency it needs. Anything more elaborate than that will take time to build.
+
+-------------------------
+
+blabagastered | 2023-02-02 10:20:09 UTC | #32
+
+[quote="free, post:31, topic:18198"]
+At which point, it would be pretty much up to the dapp itself to ensure it gets the throughput and latency it needs.
+[/quote]
+
+Would this (or other planned improvements for the next 6-12 months) provide / enable guarantees comparable to existing systems, or only increase the throughput requirement of the attacker?
+
+[quote="free, post:31, topic:18198"]
+as soon as DeFi dapps become a significant part of the IC, these changes are going to get made
+[/quote]
+
+Isn't security likely a precondition of them becoming significant? The situation described is something like "you're welcome to use this defi protocol we built over the last several months. It's not secure today but it probably will be later if enough people use it and others like it".
+
+I have no view on the matter. I sincerely want it to work (I'm building on it). The questions are not of my choosing. They are there.
+
+-------------------------
+
+free | 2023-02-02 10:23:25 UTC | #33
+
+[quote="blabagastered, post:32, topic:18198"]
+Would this provide guarantees comparable to existing systems, or only increase the throughput requirement of the attacker?
+[/quote]
+
+AFAICT the only thing an attacker could do at that point would be to flood your subnet/canister with ingress messages. As long as that doesn't cause your canister to do stupid things such as sending out tons of requests to itself and other canisters (and thus DoS itself), even the existing simple input scheduler (which selects an ingress message, then a local canister message, then a remote canister message, round robin) would be sufficient to defeat a DoS attack via ingress messages. Or remote subnet canister messages, since you;d be guaranteed that at least one out of every 3 messages you'd be handling would be from your own subnet.
+
+So there (almost, modulo the two work items mentioned above) already exists a way of getting the guarantees that you want. It just isn't as granular as you would maybe like it to be (e.g. "give me 5% compute allocation and 5% messaging allocation"), so it's more expensive than it would be under ideal conditions.
+
+-------------------------
+
+blabagastered | 2023-02-02 10:57:54 UTC | #34
+
+Alright, I feel like there are a lot of subdependencies for everything to fall into place, and I just hope this high precision rocketship is indeed millimetrically calibrated for a safe and faraway landing.
+
+My unsolicited advice would be that if and when it can be shown with transparent clarity that the IC can and under which conditions (eg using your own subnet) host defi to guarantees comparable to those of existing systems, make it visible and encourage strong adversarial critiques from the (technically competent parts of the) broader crypto/defi ecosystem.
+
+This probably does mean at least that "blackholed" defi protocols are not possible today, unless they start with their own subnet, and therefore it might be good to tell people that upgradability is for now a requirement, so that it can be taken into account when designing individual systems.
+
+-------------------------
+

@@ -1,0 +1,222 @@
+atomikm | 2022-11-21 13:33:51 UTC | #1
+
+Hi!
+
+We currently have files used in our Unity app that are cached in the browser to allow for faster load times after the first load. 
+
+The files get cached in the browser correctly but the canister doesn't seem to re-validate the files correctly.
+
+This is the message that confirms that the file is cached in the browser:
+`[UnityCache] 'https://<CanisterID>.raw.ic0.app/ProdBuild/Build/ProdBuild.data.br' successfully downloaded and stored in the indexedDB cache`
+
+But when you reload the page, it doesn't seem to re-validate the file, so it displays the same message because it has to re-download the file again.
+
+When hosting on AWS, after the first load, this is the message that displays to let you know your file was re-validated and loaded from browser cache:
+
+`[UnityCache] 'https://gameurl.com/ProdBuild/Build/ProdBuild.data.br' successfully revalidated and served from the indexedDB cache`
+
+Is there a way to have the file be re-validated correctly when hosting in a canister?
+
+-------------------------
+
+NathanosDev | 2022-11-21 14:18:17 UTC | #2
+
+Hello!
+
+Is it possible for you to share some URLs of this Unity code hosted on the IC and on AWS?
+
+I'd like to try and debug this, compare how the two different hosting solutions are behaving and try to learn more about how this caching mechanism works, then I may be able to pin point what is preventing the cache from working on the IC.
+
+-------------------------
+
+atomikm | 2022-11-21 15:10:54 UTC | #3
+
+Hey Nathanos, 
+
+I DMed you the canister and AWS urls. If anyone else wants them feel free to reach out and I'll sent them privately :slight_smile:
+
+-------------------------
+
+NathanosDev | 2022-11-21 15:20:03 UTC | #4
+
+Thanks for sharing. So when I try the IC canister version, the files don't load and throw this error:
+```
+http_request.ts:307 Failed to fetch response: Error: Unsupported encoding: "br"
+    at http_request.ts:130:19
+    at http_request.ts:282:30
+```
+Are you also experiencing that error?
+
+-------------------------
+
+atomikm | 2022-11-22 05:23:08 UTC | #5
+
+I'm not experiencing that error. Are you using a browser that supports brotli compression? I use Chrome
+
+-------------------------
+
+atomikm | 2022-11-22 05:40:03 UTC | #6
+
+Oh I know why you're getting that error. You have to load the canister url using the "raw" keyword in the url. I'm not sure why, but it's been the case for all Unity projects on the IC. I think it's because the files are too large to be certified but I'm not sure. Now I'm wondering if it's because the default dfx asset canister doesn't support brotli compressed files (.br) for Certified Assets
+
+-------------------------
+
+NathanosDev | 2022-11-22 10:51:31 UTC | #7
+
+You're right, I was using the non-raw URL and it was failing because the service worker doesn't have support for decoding brotli compressed assets.
+
+The "raw" URL loads indefinitely in Chrome.
+In Firefox it loads and then runs into issues connecting to the server, but it's enough for me to debug the code a bit.
+
+So there's this custom file loading logic in a file called `ProdBuild.loader.js`, I assume this comes from Unity. It makes a request for the file to see if it has changed, if the file has not changed then the server should respond with a 304: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/304
+If it responds with a 304, then `ProdBuild.loader.js` will load the file from the cache, otherwise it expects the server to respond with a 200 and the file that was request.
+
+The problem is that the IC boundary nodes always respond with a 200 and never with a 304, even if the file has not been modified. Unfortunately, I don't think there's any way to change this behavior right now, but there are some projects in progress that are aimed at improving support for caching headers and this may solve the problem for you.
+
+I'll touch base with the boundary node team to see if they have anything else to add.
+
+-------------------------
+
+atomikm | 2022-11-22 13:24:59 UTC | #8
+
+Thank you for looking into it and for your detailed response. That's unfortunate that it's an issue with boundary nodes, and can't be configured. In the future, this would be very crucial for us to be able to run a game on the IC without long load times. Hoping for a solution in the near future for us to be able to configure this functionality :slight_smile: :crossed_fingers: Let me know what the boundary node team says
+
+-------------------------
+
+NathanosDev | 2022-11-23 10:26:06 UTC | #9
+
+So there was actually some work done previously to support `ETag` and the `If-None-Match` header in the asset canister, but then problems arise in how the response is verified. Currently the response is verified using the response body, so if the response body is not there then verification will fail. There is work under way to develop a new version of verification that will also verify headers, this would enable verification of responses that do not include a response body.
+
+For reference:
+- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/If-None-Match
+- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
+
+-------------------------
+
+CapuzR | 2023-08-06 02:07:44 UTC | #10
+
+Hi Nathan. Sorry for hijacking this post but given that you mentioned the issue I'm having here, I have to ask: Do you know if it's on the roadmap to add support for decoding brotli compressed assets on service workers?
+
+The asset canister I'm using already have support for Brotli compression and it certifies the assets. I was excited after finished the certification of the assets, ready to work with icp0.io (without the .raw.) jaja but hit with the "502 Error: Unsupported encoding: "br"" wall.
+
+For games on the IC is super important the brotli compression but also to be able to have custom domain but custom domains only works with "icp0.io" and brotli only works with ".raw.icp0.io".
+
+Thanks in advance for your help.
+
+-------------------------
+
+NathanosDev | 2023-08-07 09:33:08 UTC | #11
+
+Hey! Yes, we have it on our team's roadmap to find a solution for this. I can't say with certainty what the solution will be right now though. I need to do some more investigation to see what's possible.
+
+-------------------------
+
+sea-snake | 2023-08-07 09:52:15 UTC | #12
+
+The `502 Error: Unsupported encoding: “br”` shouldn't happen, as far as I know the certified assets canister does support `"identity", "gzip", "compress", "deflate", "br"`. 
+
+But if you upload the assets with DFX, they'll likely upload as gzip for JS files and identity for other files. Not sure if there's a DFX config to change that. You'll need to make sure files are uploaded with `br` encoding, the canister itself does not encode files, it only accepts files "as is" and the encoding that you tell the files are encoded in, it expects any form of content encoding to happen client side before the upload.
+
+Besides uploading files through DFX, you can also upload them by calling the endpoints directly or using a library like https://www.npmjs.com/package/@dfinity/assets, there's an example for gzip uploads, you can do something similar for br uploads.
+
+Edit:
+Issue seems to be with the service worker not supporting all encodings yet: https://github.com/dfinity/ic/blob/e8aa66f1bf45bf63ae49724942ff71b6b043330d/typescript/service-worker/src/sw/response/body-decoding.ts
+
+Support for this with e.g. https://www.npmjs.com/package/brotli should fix the issue. Not sure why the service worker needs to decompress responses in the first place instead of forwarding the response as is and letting the browser handle it.
+
+-------------------------
+
+NathanosDev | 2023-08-07 14:11:28 UTC | #13
+
+[quote="sea-snake, post:12, topic:16737"]
+forwarding the response as is and letting the browser handle it.
+[/quote]
+
+This is one of the solutions that I want to investigate. I'm not sure if it will work like that though since the browser will normally decode Brotli / gzip _before_ it reaches the service worker.
+
+-------------------------
+
+NathanosDev | 2023-08-08 11:12:54 UTC | #14
+
+I've made an attempt at forwarding the response through the service worker as-is without decoding it, but the browser does not handle the decoding at this point. The browser wants to decode the response _before_ it reaches the service worker, but this is not possible because the Brotli encoded body is wrapped in a Candid encoded canister response which is wrapped in the CBOR encoded network response.
+
+So the other option is to enable Brotli decoding in the service worker, which should work and should be trivial to implement, but the Brotli decoding library is _huge_: https://bundlephobia.com/package/brotli@1.3.3. The `681.9kb` minified size would more than double the size of the current service worker. The service worker is already way too big in my opinion.
+
+My first instinct was to try and lazy load this library, but the [importScripts](https://developer.mozilla.org/en-US/docs/Web/API/WorkerGlobalScope/importScripts) function of the service worker will eagerly load all scripts during the "install" phase of the service worker so that's no good. The dynamic [import()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/import) function that's available to standard JavaScript scripts is not working in Service Workers and there's ongoing debate as to how it should work:
+- https://github.com/w3c/webextensions/issues/212
+- https://github.com/w3c/ServiceWorker/issues/1585
+
+So how about a compromise? I could add build-time configuration for Brotli encoding to the service worker. This would mean that the default Dfinity hosted service workers will not use Brotli encoding, but those that need it could host their own service worker which they've configured to support Brotli. Any thoughts?
+
+-------------------------
+
+sea-snake | 2023-08-08 16:40:02 UTC | #15
+
+Apparently we don't even need libraries for gzip and deflate anymore, we can use the browser API instead https://developer.mozilla.org/en-US/docs/Web/API/DecompressionStream which can cut some payload size for the worker and is probably quite a bit faster. Sadly it seems like brotli is not supported yet here either but hopefully support will be added at some point.
+
+What about using post message to move processing the data to the dapp when needed? Anyone who wants to add support for e.g. brotli needs to have a lib in their dapp that listens to these messages, decodes them and returns the decoded data. Obviously the entry point of the dapp should not be brotli encoded in this example 😅
+
+-------------------------
+
+NathanosDev | 2023-08-09 11:49:26 UTC | #16
+
+> we can use the browser API instead [DecompressionStream - Web APIs | MDN ](https://developer.mozilla.org/en-US/docs/Web/API/DecompressionStream) which can cut some payload size for the worker and is probably quite a bit faster
+
+This is awesome! I just tried it out and it works really well. It reduced the filesize by 43kb, thank you for sharing that!
+
+> What about using post message to move processing the data to the dapp when needed? Anyone who wants to add support for e.g. brotli needs to have a lib in their dapp that listens to these messages, decodes them and returns the decoded data.
+
+This is something that can be done already without any changes to the service worker. Anyone taking that approach would also need to handle the verification of asset certificates, which there is a library for  here https://github.com/dfinity/response-verification. If anyone wants to attempt that I'm happy to assist.
+
+-------------------------
+
+sea-snake | 2023-08-09 17:03:10 UTC | #17
+
+But wouldn't the service worker still intercept fetch calls and throw an error before it even gets to the dapp that made the call and manually wants to verify the response?
+
+As far as I know there is no way to opt out of the service worker for specific fetch calls, besides manually making a canister call to the http request canister method.
+
+-------------------------
+
+NathanosDev | 2023-08-09 17:30:26 UTC | #18
+
+[quote="sea-snake, post:17, topic:16737"]
+manually making a canister call to the http request canister metho
+[/quote]
+
+This is what I understood you meant, which is why anyone doing this would also need to do response verification.
+
+If you had a different idea, how would you suggest the service worker allow fetch calls for brotli assets through without running response verification?
+
+-------------------------
+
+sea-snake | 2023-08-09 18:52:22 UTC | #19
+
+I can think of the following options:
+
+1.
+The dapp could send a postmessage to the service worker to tell it to no longer intercept any fetch calls. Then the dapp itself could register it's own fetch service worker instead that has e.g. brotli.
+
+2. 
+The service worker sends a post message with the encoded body to the dapp if a content type cannot be decoded, the dapp must process, decode and return this with a postmessage within a time frame else the service worker throws an error.
+
+Manually calling the canister method and going through the whole process isn't ideal since it complicates things that used to be simple like loading an html img tag or assets within a game engine. The latter could be done by e.g. monkey patching fetch though or maybe the game engine config.
+
+-------------------------
+
+NathanosDev | 2023-08-09 20:13:43 UTC | #20
+
+>  the dapp itself could register it’s own fetch service worker instead that has e.g. brotli
+
+Loading a service worker from a canister can be dangerous because it's impossible to validate the response since the browser performs that request/response cycle in a sandboxed environment. The safest way is to load it from a "trusted" server, like an HTTP Gateway, but then we're back to the idea of hosting your own custom-built service worker.
+
+> monkey patching fetch
+
+This can work for `fetch` calls made from JavaScript, but it won't work for `fetch` calls made from a browser, like those made from `img` tags. You need a service worker to intercept those calls, unfortunately.
+
+Allowing responses to pass through without decoding if they are encoded with an unsupported encoding could work for certain cases though. I think in particular for gaming that those brotli encoded assets will be fetched by JavaScript, not by the browser so it can work for those cases with the monkey patching.
+
+With response verification v2, the service worker could still perform response verification on the brotli encoded response without needing to decode it and allow it to pass through to the application without throwing an error and letting the application handle the decoding.
+
+-------------------------
+

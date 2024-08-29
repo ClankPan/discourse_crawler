@@ -1,0 +1,135 @@
+infu | 2023-08-08 21:30:22 UTC | #1
+
+There is something wrong with the search engines indexing this site, but I am not sure what exactly.
+
+I am usually (probably a bad habit) searching for "Dfinity Array" in my address bar (using Google) to quickly find the Motoko API reference. A few months ago all results disappeared. That could happen if URLs suddenly change or if the site stops responding when crawlers try to access it. Google search console <https://search.google.com/search-console/about> is a good tool to check if everything with your site is alright. It will notify you (even email you) if pages disappear.
+
+It took probably a month or so for the results to come back and yesterday they disappeared again. 
+I am not that concerned about not finding the API reference, but the search engine scores these pages have. It should be growing and not going down. Unless Google did something weird and the whole Internet got this problem, we shall investigate and see what's going on. 
+
+I've just checked this URL <https://internetcomputer.org/docs/current/references/ic-interface-spec> with random SEO tools and the results I get:
+![image|690x315, 75%](upload://dC2vFMQEQdM03xwbsNWSde0hfeS.png)
+![image|690x433, 75%](upload://fXbVO5DAa6Oc8I6Ep9KyI057oFU.png)
+
+As far as I understand internetcomputer.org is a NextJs Docusaurus site deployed in an asset canister.
+Perhaps there is something wrong with the service worker and boundary nodes providing crawler access.
+If so, then all such websites on the IC will loose their score and search engine visibility.
+
+-------------------------
+
+peterparker | 2023-08-09 04:56:33 UTC | #2
+
+I'll forward your question, but in my opinion, there are no SEO issues on the IC, and the boundary nodes are functioning as intended.
+
+I base my opinion on the fact that https://juno.build can be successfully crawled by Google, as shown in the screenshots. I also just re-ran a crawler test, and it was successful.
+
+Also, note that I'm using Docusaurus as well.
+
+Therefore, if there is a problem, I would say it is either scoped to the internetcomputer.org website or the HTTP agent that is used by seobility, the platform you used for testing, is not properly recognized by the boundary nodes. As I mentioned, I'll forward your question.
+
+![Capture d’écran 2023-08-09 à 06.50.09|690x463](upload://a5xTDTyEiJ1zVsr6SZ5tv0bV2sT.jpeg)
+![Capture d’écran 2023-08-09 à 06.49.23|690x463](upload://3YIL2VDNe9sbZU5edLu0rmuHUH4.jpeg)
+
+-------------------------
+
+rbirkner | 2023-08-09 08:20:34 UTC | #3
+
+Hey @infu 
+
+Thanks a lot for your report!
+
+I checked the user-agent that `seobility` is using and it is `SeobilityBot (SEO Tool; https://www.seobility.net/sites/bot.html)`. With the following command, you can check how the Boundary Nodes treat a request with such a user-agent:
+```
+curl -X GET \
+    --user-agent "SeobilityBot (SEO Tool; https://www.seobility.net/sites/bot.html)" \
+    https://internetcomputer.org/docs/current/references/ic-interface-spec
+```
+It correctly returns the webpage and `not` the service worker. The same for the user-agents used by SEO Site Checkup:
+```
+Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1 SeoSiteCheckup (https://seositecheckup.com)
+```
+and 
+```
+Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36 SeoSiteCheckup (https://seositecheckup.com)
+```
+However, I see that there are some errors when the request comes from the tool as when I issue the request with `curl` and the same `user-agent` myself. We will investigate what is going on and let you keep you updated.
+
+-------------------------
+
+infu | 2023-08-09 17:40:38 UTC | #4
+
+Serving different content based on the agent may be considered 'Content cloaking'. In our case it's done for good security reasons, but does Google care about that?
+![image|661x500, 75%](upload://jQQ7mhKq6TZnZ13pejNJVaPzsk.png)
+**How would Google penalize such sites?** Google considers cloaking to be a violation of their Webmaster Guidelines. If Google detects that a website is using cloaking, it can take action against that site, including:
+
+1. **Lowering its rankings:** This means that the site's pages may not rank as highly in search results, leading to decreased visibility and traffic.
+2. **Removing the website from Google's index:** In severe cases or repeated offenses, Google might de-index the website entirely, which means it won't appear in search results at all. 
+
+Perhaps @peterparker's site didn't get those special crawlers that test the site with different agents to go thru and that's why it's not being flagged and penalized. 
+
+Even if it doesn't get flagged as cloaking, pages will be penalized for being slower than usual.
+
+Can we get some info from the <internetcomputer.org> search engine console? It probably got warnings there. 
+Perhaps allow custom domains to go to the 'raw' version (since new boundary nodes will be running in secure enclaves - it doesn't sound like a high-security risk, when it comes down to searchable pages) An app can always forward to a more secure part where the service worker is required. Perhaps secure.internetcomputer.org. 
+AI is disrupting search engines, but it's unclear if they will become obsolete. They will probably stay popular for a long while.
+
+-------------------------
+
+rbirkner | 2023-08-10 17:11:59 UTC | #5
+
+Hey @infu 
+
+We figured it out and will roll out a fix in the coming hours. Thanks a lot for your report that actually triggered the entire investigation.
+
+I can quickly summarize what happened and we will provide more details later: The asset canister provides a certificate with the assets it serves. However, it only provides the certificate if the requests has a `accept-encoding` header that asks for identity. The SEO requests however only ask for `gzip, deflate, br`. Then, there is no certificate on the response and `icx-proxy` will just return a 500. This problem has existed in the asset canister for a while, but got only triggered with the last boundary node deployment.
+
+-------------------------
+
+rbirkner | 2023-08-30 08:15:39 UTC | #6
+
+Hi @infu 
+
+Sorry for taking so long, but now I finally want to provide more details on what went wrong:
+
+__What happened?__
+As you reported on August 8th, SEO was broken for _many_ sites hosted on the Internet Computer. When looking at our logs, we realized that it was actually broken since end of July, which coincided with a boundary node release. So, we thought we found "the culprit", but unfortunately, it was not that simple: it was a combination of a regression in the asset canister and a security fix on the boundary node.
+
+_Asset Canister Regression_
+The asset canister certifies all the assets it stores and serves a certificate alongside these assets in order to proof their authenticity. The service worker and icx-proxy (the service worker equivalent residing on the boundary node for SEO requests and raw) verify the certificate and reject any responses that don't check out.
+
+Response verification version 1 (the vast majority of asset canisters use it today) does not allow to certify multiple encodings (e.g., gzip, brotli, identity) at the same time, but only a single one. As a workaround, the asset canister provides certain assets gzipped, but serves the certificate for the identity encoding. Both the service worker and icx-proxy always check the certificate on the asset directly and on the unzipped version. If the certificate checks out for one of the two, the response is accepted.
+
+After all this background, I can finally get to the problem: As part of adding support for response verification v2, a regression was introduced: the asset canister would only return a certificate if the client would include the certified encoding (`identity`) as part of the "Accept-Encoding" header in the HTTP request.
+
+For the service worker, this was no issue, as it always requests: "Accept-Encoding: gzip, deflate, identity". Since, the service worker asks for `identity`, the asset canister always returned the certificate.
+
+However, most of the crawlers only use "Accept-Encoding: gzip, deflate, br". Since `identity` is missing, the asset canister didn't return a certificate and the response does not pass the verification step.
+
+This regression was introduced with `dfx 0.14.0`. However, it was "dormant" due to icx-proxy on the boundary nodes not enforcing the certificate verification. That leads me to the other piece in the puzzle.
+
+_Boundary Node Security "Fix"_
+Due to historical reasons, icx-proxy does not enforce certification for most requests. This means that if a response does not come with a certificate, it is just passed on to the client. However, if there is a certificate, it is verified and the response is rejected if it doesn't check out.
+
+In order to increase the security, we aim to enforce certification on all endpoints, but can't actually do that as many developers explicitly use raw to circumvent certification. As we are providing more and more libraries to help with certification, this might (and hopefully does) change.
+
+As a security fix, we started to enforce certification only on specific endpoints, which included the SEO requests. This triggered the asset canister regression to surface as responses from the asset canister to requests coming from crawlers and SEO bots, did not include the corresponding certificate and would therefore be rejected by icx-proxy, resulting in a 500 status code for the clients.
+
+__What we learned and fixed__
+
+As a first quick fix, we immediately reverted the security "fix" on the boundary nodes and disabled enforcing certification for SEO requests.
+
+In the meantime, the asset canister has been fixed and will be released with `dfx 0.15.0`. In addition, we have been working improving our end-to-end testing of the service worker/icx-proxy and the asset canister. Finally, we are setting up better monitoring for boundary node rollouts.
+
+Once the new, fixed asset canister is in wide use, we will think about enforcing certification again for SEO requests, but keep a close eye on the metrics.
+
+I hope my explanation shed some light on what happened and I just want to thank you, @infu, again for reporting your observations that really helped getting to the bottom of this. If you have any questions or something I explained is not clear, just let me know.
+
+-------------------------
+
+infu | 2023-08-30 08:28:38 UTC | #7
+
+Excellent, thank you. It seems the search results have now returned to their intended position.
+![image|690x125](upload://pXH8yca1oBUHTee6v2f1ToxOZyb.png)
+
+-------------------------
+

@@ -1,0 +1,242 @@
+josephgranata | 2023-04-11 05:15:05 UTC | #1
+
+I've been testing the **ic-stable-memory** Rust code that Sasha Vtyurin wrote.
+
+First, it's great to have stable data structures that are also performant, great job @senior.joinu!
+
+Here is the ic-stable-memory code:
+https://github.com/seniorjoinu/ic-stable-memory
+
+A couple questions:
+- I would like to add two new larger data types, one to hold images on RAM.
+- Another to load documents, in text format
+
+Then associate those documents to a key-value store.
+
+Any recommendations on how to build this functionality, especially to make sure it works fast, and does not get interrupted by the cycle limits the IC imposes on our code?
+
+Thanks!
+
+-------------------------
+
+senior.joinu | 2023-04-11 11:18:12 UTC | #2
+
+Hi @josephgranata,
+
+Thanks for your kind words. Feel free to ask me anything about stable structures.
+
+Considering your questions. This is entirely possible, but there are a couple of thing you have to worry about:
+### 1 Message size limit
+IC has a limited maximum message size (last year it was something around 2MB, maybe it has changed since then, idk). This means, that when you want to upload more data (a big file), you have to split it in chunks. You may reassemble these chunks back into a single file, once they reach your canister, but it is more likely that you would want them to be split forever, since then you would have to split them again each time a user requests one of these files (the message size limit works both ways around).
+
+This means that you'll probably have an internal data layout like this (expressed in stable data structures):
+```rust
+type FileId = u64;
+type ChunkId = u64;
+type Chunk = Vec<u8>;
+
+#[derive(CandidType, Deserialize, CandidAsDynSizeBytes, StableType)]
+struct File {
+  name: String,
+  path: String,
+  chunks: Vec<ChunkId>,
+}
+
+struct State {
+  files: SBTreeMap<FileId, SBox<File>>,
+  chunks: SBTreeMap<ChunkId, SBox<Chunk>>,
+}
+```
+
+### 2 Canister memory limit
+When your canister only uses heap-based (standard) collections, it can occupy at most 4GB of memory. When your canister uses stable collections, it can occupy at most 40GB of memory. There are two important points here:
+1. "At most" doesn't mean, that you're guaranteed with 40GB of memory per canister. You might get unlucky and get your canister deployed to a subnet which physically has only 1GB of memory left. In that case your canister will be granted with this 1GB and that's it. 
+2. Even if we were guaranteed with 40GB of memory per canister, it may still be not enough, especially if we're talking about an app that works with a lot of images/documents.
+
+So, please, think about scalability model of your app beforehand. Think about multi-canister approaches.
+
+In `ic-stable-memory` every stable collection method that may allocate additional memory returns a `Result` type. If the value is `Ok` - the allocation was successful (or there wasn't one) and you're good to go. But if the value is `Err` - this means that your canister is out of memory and you have to do something with it. For example, deploy a new canister and re-transmit all the traffic to it. 
+
+In practice it looks like that:
+```rust
+// using data structures from the previous code snippet
+
+fn create_file(file_id: FileId, name: String, path: String) {
+  let state: State = get_state();
+  let file = File::new(name, path);
+  let boxed_file = SBox::new(file).expect("out of memory");
+  
+  state.files.insert(file_id, boxed_file).expect("out of memory");
+}
+```
+In this example I'm just throwing an error when we reach the memory limit, but you can run any kind of program to resolve the situation.
+
+_____________
+
+Just try them out, play around. Try to solve your use-case with them. There is a lot of documentation about them - you can find everything linked in the repo. Also hit me with any questions about it here or on Github.
+
+-------------------------
+
+josephgranata | 2023-04-11 17:33:48 UTC | #3
+
+@senior.joinu Sasha, thank you so much for such a detailed answer, even with Rust code so I could follow your argument.
+
+I will definitely go ahead, and use your advice in order to build these two new stable structures.
+
+One follow-up question about Canister memory limits.
+I do understand that a multiple canister approach is best.
+
+However, is there a way to make an IC API call to request what is the size of the memory available in a canister? Knowing the RAM available for each canister would make it much easier to manage overall canister RAM storage.
+
+Have a wonderful day, and evening.
+
+-------------------------
+
+senior.joinu | 2023-04-11 19:20:58 UTC | #4
+
+You're welcome!
+
+I've discussed this feature with the guys, but it seems like such an API would be meaningless.
+Subnets are very flexible in a meaning that such information is updated too frequently. Imagine there is an API like this and you use it. For example, it returns 20GB. You think like: "okay, it seems like we have a couple of days before we're out of memory". 
+
+But then, in the same exact instant two more canisters get deployed to the same subnet and immediately allocate 10GB each (using `dfx canister update-settings --memory-allocation` API). And the subnet now out of memory.
+
+So, as I said, it seems like this API would not provide any real help.
+
+The best strategy, in my opinion is:
+* if you know that your canister is limited and can't in any scenario grow bigger than, for example, 5GB (this is very possible for some temporary data, that gets recycled once in a while) - then you should use `update-settings` API and set constant memory allocation and just be sure that your data will always fit in a single canister;
+* buf if your data is unbound and scales really fast, then you have to figure out the best mutli-canister scheme for your project and stick to it.
+
+-------------------------
+
+josephgranata | 2023-04-11 20:29:45 UTC | #5
+
+Sasha,
+
+I see, the memory available for a canister comes from a pool that is shared by all canisters in a subnet, so it can change quite frequently.
+
+Would it be possible then to find out what is the maximum memory available for a canister, and then pre-allocate that space for later use?
+
+That way we have a more reliable memory space for user assets, and we do not suddenly lose that RAM to other canisters in the subnet.
+
+If it's possible, can you give us a hint how to do it?
+
+-------------------------
+
+senior.joinu | 2023-04-11 20:33:24 UTC | #6
+
+You are correct. And this is exactly what this API `dfx canister update-settings --memory-allocation` does. There is also an option to pre-allocate space on canister creation - `dfx canister create --memory-allocation`. Note, that this API only allows you to pre-allocate up to 12GB of memory.
+
+There is no way to find out what is the maximum memory available for a canister that I know of, unfortunately.
+
+-------------------------
+
+josephgranata | 2023-04-11 20:36:20 UTC | #7
+
+Sasha,
+
+I just found the setting in the IC Docs. It seems this is the best way, request a large enough space, and manage a set of canisters with a controller canister to make sure there is always space for the application to function.
+
+Here is what I found:
+https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-create_canister
+
+12 GB is not a bad limit, and for a new DAPP it is a good place to start for sure.
+
+Thanks and good night in Europe!
+
+-------------------------
+
+Severin | 2023-04-12 07:24:34 UTC | #8
+
+[quote="josephgranata, post:7, topic:19378"]
+I just found the setting in the IC Docs. It seems this is the best way, request a large enough space, and manage a set of canisters with a controller canister to make sure there is always space for the application to function.
+[/quote]
+
+Just a heads-up: You will be charged for the reserved memory as if you were using it.
+
+-------------------------
+
+josephgranata | 2023-04-12 18:28:17 UTC | #9
+
+@Severin Yes, we did saw that too... it's a one time charge to reserve space paid in cycles. We did read that.
+
+One question about download traffic from the IC to a desktop computer, that traffic (Amazon calls it egress) is not charged now correct?
+
+-------------------------
+
+Severin | 2023-04-13 07:19:58 UTC | #10
+
+[quote="josephgranata, post:9, topic:19378"]
+it’s a one time charge
+[/quote]
+
+That's news to me, and quite surprising to me since it doesn't fit my mental model at all. Do you have a source for that?
+
+[quote="josephgranata, post:9, topic:19378"]
+One question about download traffic from the IC to a desktop computer, that traffic (Amazon calls it egress) is not charged now correct?
+[/quote]
+
+No, not at the moment, but discussions are ongoing on how to make pricing more fair. But if you plan on using update calls it will still become noticeable at some point, even with current pricing
+
+-------------------------
+
+josephgranata | 2023-04-14 17:46:18 UTC | #11
+
+@Severin the Cycles page includes some costs for storage, it is a hard page to fully understand but this is what I could calculate from there:
+
+URL: https://internetcomputer.org/docs/current/developer-docs/gas-cost
+
+|GB Storage Per Second|For storing a GB of data per second|127K / 13|127K|127K / 13 * 34|
+|---|---|---|---|---|
+
+So if a Trillion of Cycles equals 1 SDR, and 1 SDR is approximately USD$ 1.35 then we can calculate the cost of storing one gigabyte for one month on the IC would be approximately US$0.33 cents per month per Gigabyte on a 13 node subnet, and US$ 0.86 on a large 34 subnet.
+
+The math: 127,000 * 60 * 60 * 24 * 30 days in a month = 329184000000; which we divide by one trillion which is 10^12 = USD$ 0.33 cents for a 13 node subnet.
+
+I am sure there are other hidden costs, but those are the ones I notice.
+
+If there are any large ones I missed let me know, and yes you were right, it's not free to store the data, but at least it's affordable.
+
+Also it is no longer free to egress data, it seems it now has a low cost, but it has one:
+
+|Ingress Message Reception|For every ingress message received|1.2M / 13|1.2M|1.2M / 13 * 34|
+|---|---|---|---|---|
+|Ingress Byte Reception|For every byte received in an ingress message|2K / 13|2K|2K / 13 * 34|
+
+Thanks for your response :-) 
+
+Joseph
+
+-------------------------
+
+Severin | 2023-04-17 07:56:20 UTC | #12
+
+[quote="josephgranata, post:11, topic:19378"]
+USD$ 0.33 cents for a 13 node subnet
+[/quote]
+
+That calculation looks good to me. That's at least in the right oder of magnitude
+
+[quote="josephgranata, post:11, topic:19378"]
+I am sure there are other hidden costs, but those are the ones I notice.
+[/quote]
+
+No other cost to storage itself. Ingress is not free though (as you already pointed out yourself)
+
+[quote="josephgranata, post:11, topic:19378"]
+Also it is no longer free to egress data, it seems it now has a low cost, but it has one:
+
+|Ingress Message Reception|For every ingress message received|1.2M / 13|1.2M|1.2M / 13 * 34|
+| --- | --- | --- | --- | --- |
+|Ingress Byte Reception|For every byte received in an ingress message|2K / 13|2K|2K / 13 * 34|
+[/quote]
+That's ingress, no? Egress has no charge per byte, but calling the functions to get data out will cost a (very) little bit. If you go through update calls (more expensive than query calls) you'll pay ~590K per 2 MB of data (2MB response size limit IIRC), so 590k cycles * 500 (2MB messages per 1GB) = 0.0003 Trillion cycles
+
+-------------------------
+
+josephgranata | 2023-04-17 13:12:06 UTC | #13
+
+Severin, yes indeed that was the cost for ingress; egress for now has a low cost as you pointed out.
+
+-------------------------
+

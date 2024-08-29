@@ -1,0 +1,340 @@
+kristofer | 2024-07-09 20:33:55 UTC | #1
+
+Imagine your canister stores a list of objects in stable memory:
+
+```rust
+struct User {
+  id: [u8; 12],
+  name: String,
+  age: u8,
+  registeration_date: u64,
+  active: bool
+}
+```
+
+Your main index is based on the id and stored in a `StableBTreeMap`. Then, you realise you need to list users based on `registration_date`. So, you add an index, a `Log` or perhaps another map. But.. doing some more wireframes you realise you need the following:
+
+`Show all active users with an age over 18 sorted by name`. And oh, you have 10K users, so it would be good to do some pagination of the query results. Searching would be nice as well.
+
+Now, adding another index isn't enough. 
+
+I'd be interested to hear if someone has any good ideas how to solve patterns like this? It would be easy to dismiss the whole thing, saying that the core canister of an app should not handle arbitrary queries like this. It would risk bloating core canisters. Core canisters should resemble smart contracts and not be built for the frontend performance/UX needs. But if the core canisters doesn't handle those queries, then who?
+
+One option would be to add "indexing/query canisters" to the project. Using some pubsub setup, those canisters would stay up to date with the core canisters and then expose graphql endpoints on the http interface or something. This sounds like a lot of work.
+
+If we were building an ETH application, the frontend would be hosted on Vercel and queries would be made possible by creating indexes on https://thegraph.com. Next.js, running on Vercel would also cache queries, allowing for loads of traffic if needed. 
+
+Is someone building "The Graph" for IC?
+
+-------------------------
+
+skilesare | 2024-07-10 00:33:40 UTC | #2
+
+Yesish.
+
+Component 1: ICRC3 Logs -> output your data
+Component 2: EventUtility -> pubsub the log to an indexing canister
+Component 3: CanDB that speaks ICRC3 and indexes everything -> a few iterations laying around.
+
+We have a few key pieces to pull together, but the hope is that it will be as easy as using an ICRC3 component like https://github.com/PanIndustrial-Org/icrc3.mo, make sure you have an indexing canister that has a subscription and that the rest will "just work".
+
+-------------------------
+
+kristofer | 2024-07-10 07:49:45 UTC | #3
+
+Not sure I follow 100%, but I'll try to interpret. Are you saying that:
+
+If canisters output their logs in some standardised format (ICRC3), those logs can be subscribed to  by an indexing canister. That indexing canister runs CanDB (or some other IC adapted database tech) to make the data queryable. 
+
+Something like this:
+
+![image|690x457](upload://anO5HydpEdxo8NKj6S0q7t9jia7.png)
+
+This would be a great setup. But so far, none of the components exist, right? Other than at the drawing board.
+
+Pieces yet to be built/defined:
+- The standardised log format
+- The pubsub mechanism
+- The db to index the data
+- The graphql (or other) engine to process incoming queries
+
+A project that wants to offer a good user experience either have to custom build all this for their project or resort to Web2 indexing solutions. 
+
+Web2 indexing, I believe, currently is the easiest way forward. And in terms of decentralisation, it is **ok**. We need to think in terms of "appropriate decentralisation". If you host your IC project frontend on Vercel and a read only copy of your data on Supabase, is that an issue as long as you provide links/proofs back to the source of truth in the canister?
+
+This could look something like this:
+
+![image|603x500](upload://ahg2RM4lxc2TAM5HUjGZZPxRFDg.png)
+
+The reason I am poking at this now is that I am at a cross road with my project [C–ATTS](https://catts.run/). I need to decide how to proceed. I need to support text searches on multiple fields as well as indexing on a few fields. So, I need to make a choice to either stick with an IC maxi architecture or go with a more heretical mix of IC and Web2 components. 😂
+
+Does anyone know how Open Chat or DSCVR have structured their apps? They do support freeform search etc.
+
+I'd be curious to hear some thoughts from @lastmjs on this topic. Could Azle be part of the solution?
+
+-------------------------
+
+skilesare | 2024-07-10 14:54:46 UTC | #4
+
+* The standardised log format: Exists via ICRC-3 and each new standard should be defining it's block types
+* The pubsub mechanism - We are defining this and building implementations in the Events Utility WG. We have a meeting today! https://forum.dfinity.org/t/technical-working-group-inter-canister-event-utility-working-group/29048/18
+* The db to index the data - Some work has been done. cc: @ferMartz and @icme . I think the remaining work is to figure out how to make the index creation dynamic according to the ICRC3 block structure.
+* The graphql (or other) engine to process incoming queries - CanDB has a bit of a query language, but it would be great if there was a kind of graphql query -> canDB client execution component. 
+
+An external web2 indexing would certainly be easier as you could just keep querying the icr3_get_blocks endpoint, but then if you need to get that stuff from inside the IC you'd have to use HTTP outcalls.
+
+-------------------------
+
+kristofer | 2024-07-10 20:23:12 UTC | #5
+
+Thanks. It sounds like an offchain indexing solution is the best bet at the moment and I would assume that is how projects like open chat and dscvr solve their query needs. But again, I believe an architecture like that can definitely be *decentralised enough* as long as you make links and proofs to the onchain source of truth available.
+
+-------------------------
+
+icme | 2024-07-10 22:22:45 UTC | #6
+
+[quote="kristofer, post:1, topic:32975"]
+One option would be to add “indexing/query canisters” to the project. Using some pubsub setup, those canisters would stay up to date with the core canisters and then expose graphql endpoints on the http interface or something. This sounds like a lot of work.
+[/quote]
+
+
+
+CanDB is essentially a flexible NoSQL data store, with a dynamic partitioning scheme, where each partition auto-scales (spins up a new canister) when it's heap reaches a certain capacity). It's modeled off of DynamoDB (partition & sort key queryability).
+
+At the same time, what you really want here is a bunch of different BTrees, with a root (source of truth) BTree, and then a bunch of indices on that BTree.
+
+While CanDB utilizes a sharding (dynamic canister partitioning scheme) strategy to achieve scale, once 64-bit wasm and Motoko's orthogonal persistence feature (400GB stable heap memory) comes out, it might make sense to extend that library and condense all of this into a single canister (both root data structure and dynamic indices).
+
+If you choose to have a bunch of different read replicas, then coordinating them all becomes a pain and isn't atomic, which is one of the benefits of the IC (two people on different sides of the earth calling the same API with the same inputs will always receive the same output). There's a ton of complexity involved in keeping denormalized data in sync, which can affect downstream services and applications that consume that data in unexpected ways.
+
+@kristofer a question for you. What use cases/services would you like to power this with? 
+
+How much data do you want to add, how many different types of indices would you want, and how performant & dynamic should the process of adding/removing an index be?
+
+-------------------------
+
+kristofer | 2024-07-12 18:04:56 UTC | #7
+
+[quote="icme, post:6, topic:32975"]
+it might make sense to extend that library and condense all of this into a single canister (both root data structure and dynamic indices).
+[/quote]
+
+Agreed. There will still be situations though where the presentation and query needs of the frontend don't really make sense to the backend.
+
+The frontend wants to optimise and be like: *We want an endpoint where we can get all usernames together with profile picture links only. Oh, and we need that linked object, the users roles and permissions to be included with each user.*
+
+Even if this query *could* be indexed and served by the core "protocol canister", it makes no sense from an architecture standpoint. 
+
+[quote="icme, post:6, topic:32975"]
+How much data do you want to add, how many different types of indices would you want, and how performant & dynamic should the process of adding/removing an index be?
+[/quote]
+
+I am primarily considering the needs of my project, [C–ATTS](https://catts.run/), but I also believe this to be an interesting and important conversation for IC in general. Part of the promise of IC is that *on IC you can not only host your smart contracts, but also the rest of your application*. If that promise is to be fulfilled, there needs to be scaling solutions and design patterns that allow you to have some layers of separation between smart contracts and frontend.
+
+For C–ATTS, the needs are pretty basic. One of the main data types are called *recipe*. Recipes describe what goes into a composite attestation - the queries and the processing logic. For the context of this conversation, they are a bit like npm packages. And need the same treatment in the UI.
+
+Queries:
+- Create(id)
+- Update(id)
+- Get by id
+- Get by name
+- List, sorted by creation date
+- List, sorted by name
+- Search by name and description (+ more fields), list by *relevance*/name/creation date/number of runs
+- And.. pagination etc on all the listing/search queries
+
+I probably have missed some need. From a web2 perspective, nothing fancy. All but the search fits into the canister quite nicely. 
+
+I just realised one of these UI special needs cases. When listing items, I want those query results only to include what is needed for the listing. Name, description, creation date, etc. I don't need what makes up 90% of the object size: graphql queries, JS processing logic etc. So, I would want..
+
+`recipe_list()` and `recipe_list_condensed()`.
+
+Things start to get messy already with one data type. 😂
+
+If IC is going to fully fulfil the promise of onchain hosted apps, we need to be able to run indexers and databases separate from the core canisters. And ideally, we need caching, similar to what Next.js offers. None of this is impossible to build of course 😀
+
+-------------------------
+
+icme | 2024-07-13 22:53:07 UTC | #8
+
+[quote="kristofer, post:7, topic:32975"]
+* Create(id)
+* Update(id)
+* Get by id
+* Get by name
+* List, sorted by creation date
+* List, sorted by name
+[/quote]
+
+These are all easily doable on the IC, using a BTree with indexes (including the pagination part)!
+
+[quote="kristofer, post:7, topic:32975"]
+Search by name and description (+ more fields), list by *relevance*/name/creation date/number of runs
+[/quote]
+
+- name -> doable (see above)
+- creation date -> doable (see above)
+- relevance -> use an index
+- number of runs -> use an index
+
+It's easier to do this if you define your data model first before building. If you want to dynamically add more indexes over time, it's doable but you'll need to write index migrations, which is a headache.
+
+[quote="kristofer, post:7, topic:32975"]
+Search
+[/quote]
+
+Search is a loaded term :sweat_smile: 
+
+
+
+Are you ok with prefix search? (something like this in SQL)
+```
+SELECT * FROM Employees
+WHERE name LIKE 'Joh%'
+ORDER BY name
+LIMIT 10 OFFSET 0;
+```
+
+This can be accomplished on the IC by using a sorted tree (BTree), with index entries the point back to the original data record.
+
+If you're looking for substring search (i.e. `%Joh%`), then I don't believe this is easily achievable on the IC.
+
+And if you're looking for elastic search, you can build a quick and dirty version of it but it won't compare to the optimizations that Elastic makes on top of Lucene. That type of search requires tons of indices and is incredibly expensive to run (even on Web2).
+
+If I might recommend an intermediate solution, maybe start with the prefix search. With text keys, the BTree will support that type of search (since it's a sorted tree) out of the box.
+
+-------------------------
+
+icme | 2024-07-13 22:42:34 UTC | #9
+
+[quote="kristofer, post:7, topic:32975"]
+I just realised one of these UI special needs cases. When listing items, I want those query results only to include what is needed for the listing. Name, description, creation date, etc.
+[/quote]
+
+Now we're talking about multiple conditions. Agreed, it starts to get messy. There are advanced NoSQL data modeling techniques to support querying relational data. It just takes a bit of thought beforehand to plan out the queries that you're going to support in your application.
+
+Even on web2 once you reach a certain scale these dynamic queries break down.
+
+SQL is great for getting up and running quickly, but I've seen numerous cases where all of a sudden performance starts to degrade on a specific query until you put an index on it. This article outlines why in general, [relational databases don't scale well](https://www.alexdebrie.com/posts/dynamodb-no-bad-queries/#why-relational-databases-dont-scale). Add instruction limits on top of that, and even with deterministic time slicing my opinion is that NoSQL data stores are more optimized for the Internet Computer.
+
+This where the transition to NoSQL comes in - companies that operate at scale like AWS almost exclusively require that their teams use NoSQL databases, which requires one to intentionally design their application's query patterns and indices, and choose the right DB for the job (key-value, graph, etc.). As an example, DynamoDB supports over [120 million txns/sec (Amazon Prime Day 2023)](https://aws.amazon.com/blogs/aws/prime-day-2023-powered-by-aws-all-the-numbers/).
+
+Many data scientists prefer SQL as it allows them to run ad-hoc queries over a data warehouse like [Amazon Redshift](https://aws.amazon.com/redshift/). This works well for data analysis, but it's a different use case (data analysis over TB/PB of data vs. serving data to users), and I'm not sure if the IC is optimized for that use case, at least right now.
+
+I believe that the amount of data stored on the Internet Computer (4.64TB) is an order of magnitude larger than that stored on Ethereum (~245GB). If we're then talking the data stored on the graph, that's probably a much smaller number (tens of GB?). [Thegraph docs say it uses a PostgreSQL database](https://thegraph.com/docs/en/operating-graph-node/#postgresql-database) to store this relational data. I could be wrong, but I don't believe that Thegraph goes through any sort of consensus, and so dynamic joins over tens of GB is no problem.
+
+If atomicity isn't important/the goal, then I might recommend the solution you've hinted at where you have the core DB in a canister + publish CRUD changes to read-only canister indexes approach with composite query APIs in those canisters on top of those indices. Then you can setup up infra for creating + dynamically backfilling those index canisters on the fly, without impacting the core DB canister.
+
+If atomicity is important, then you'd want to have all the index creation/updating be in the same canister as the core DB. Only issue you run into there is that your indices aren't as modular (have to be more careful around state persistence during upgrades).
+
+-------------------------
+
+kristofer | 2024-07-16 07:38:21 UTC | #10
+
+[quote="icme, post:8, topic:32975"]
+If you want to dynamically add more indexes over time, it’s doable but you’ll need to write index migrations, which is a headache.
+[/quote]
+
+Yes, this is one of the aspects i am considering, knowing that I don't know how the app will evolve over time. 
+
+[quote="icme, post:8, topic:32975"]
+Are you ok with prefix search? (something like this in SQL)
+[/quote]
+
+Prefix search definitely is _ok_ in a first version of the app. Later, full text weighted searches on many fields would be great. But, same as in web2 development, that would have to be done in a separate service.
+
+[quote="icme, post:9, topic:32975"]
+If atomicity isn’t important/the goal, then I might recommend the solution you’ve hinted at where you have the core DB in a canister + publish CRUD changes to read-only canister indexes ..
+[/quote]
+
+In many parts of the application, atomicity is not crucial. I must be able to trust there is eventual consistency though. This doesn't have to be super quick in many cases. If user A adds a recipe, it is ok for it to show for user B, not immediately, but after 5 mins.   
+
+I believe there to be an interesting design pattern (and a potential project) hidden here, a solution that achieves the following:
+
+- **Separation of concerns.** Apps will want to keep their main canisters focused on the primary business logic and data, not the ever changing needs of the presentation layer.
+- **Scaling.** Apps will need to scale. Off chain scaling solutions will be needed for the most sucessful apps but even small to medium sized apps will need scaling. Ideally that scaling solution is onchain.
+- **Caching.** Apps will want caching of queries. Many users running the same expensive dynamic query on a mostly static data source is not a good architecture.
+- **Transformations.** Apps will want to transform the query results. Solutions like [htmx](https://htmx.org/) is starting to see some adoption. In that case the frontend would expect to get html back from the server instead of some json api payload. 
+
+The implementation could be something like:
+
+- The app canister maintains an audit log of changes. 
+- This log is made available through query functions named according to *a standard*.  
+- To support the app canister in creating the log in the correct format, there is a support library.
+- An indexing canister is configured to poll the audit log at an interval. This canister can create any number of indexes based on the audit log. Most likely, these indexes and associated data are stored in NoSQL data structures.
+- The indexing canister is a project specific canister. 
+- The indexing canister is not only an indexing canister. It has access to a number of server framework components: Guards, middleware, interceptors, caching, etc.
+- The indexing canister uses these framework components to define endpoints that meet the custom needs of the frontend. 
+
+I guess this project would be the [Nest.js](https://docs.nestjs.com/) framework for IC, plus the ability to "subscribe to" data from any number of "app canisters".
+
+Not something you whip up in an afternoon, but would be a fun build!
+
+-------------------------
+
+lastmjs | 2024-07-17 13:14:39 UTC | #11
+
+Shouldn't a traditional database like SQLite or Postgres be used to solve this?
+
+I think traditional databases are the answer. We have SQLite working well in Azle, off-the-shelf sql.js.
+
+I also built Sudograph which was a general-purpose GraphQL database. You would define your schema and many of these complex queries and mutations were generated for you.
+
+I think the answer should be using traditional databases in your canister. If ICP has shortcomings here, we should improve ICP.
+
+I am very optimistic on getting traditional databases to work well on ICP.
+
+-------------------------
+
+lastmjs | 2024-07-17 13:19:20 UTC | #12
+
+Also in Azle you should be able to slap GraphQL on top of SQLite, all off-the-shelf from npm.
+
+Instruction limits will be the worst part, since they're relatively low right now.
+
+-------------------------
+
+lastmjs | 2024-07-17 13:20:29 UTC | #13
+
+If you do hit the instruction limit, if you could please post about it here so that we can continue to build the case for increasing these fundamental limits: https://forum.dfinity.org/t/i-just-hit-the-instruction-limit/27700
+
+-------------------------
+
+kristofer | 2024-07-18 21:20:31 UTC | #14
+
+Yep, solid database support would go a long way! But then there are also the issues more related to app architecture. It is not a great architecture choice to use the same canister for your mission critical business logic/data as the one you use for the noisy needs of various frontends. We will need solutions for syncing state between "main canisters" and "edge canisters" that perform specific tasks. One canister manages the freetext search index, another takes care of all special queries the Android app needs, and so on. 
+
+With no restrictions on instruction limits, the Nest.js for IC could actually be .. Nest.js. :) If the hard cap on instructions remain, we need some compact app framework built specifically for IC in Rust as well.  
+
+I don't think the syncing issue needs to be super hard. I recently spent an evening setting up sync between two SQLite dbs. One running in the browser and one running in the canister. The canister publishes a change/audit log that the browser db polls. Felt.. fairly straight forward, but I guess there are hidden difficulties once you start to look closer at it, risks of the dbs coming out of sync, issues with atomicity and idempotency..
+
+https://github.com/kristoferlund/ic-sqlite-chat
+
+-------------------------
+
+lastmjs | 2024-07-18 21:23:57 UTC | #15
+
+[quote="kristofer, post:14, topic:32975"]
+With no restrictions on instruction limits, the Nest.js for IC could actually be … Nest.js. :slight_smile: If the hard cap on instructions remain, we need some compact app framework built specifically for IC in Rust as well.
+[/quote]
+
+Nest.js is working right now: https://github.com/demergent-labs/azle/tree/main/tests/end_to_end/http_server/nest
+
+-------------------------
+
+kristofer | 2024-07-18 21:47:40 UTC | #16
+
+NICE! I want to try somethig using this setup:
+
+![image|427x500](upload://65aQxzaq9WJGPMz5M4ZEOzXNeko.png)
+
+-------------------------
+
+lastmjs | 2024-07-18 23:53:43 UTC | #17
+
+I don't want to discourage experimentation, but this seems unnecessarily complicated. Why not just use one canister to do it all? You can separate the canister logically within itself with a nice structure, not sure why you need to do complicated syncing unless it's for scalability reasons, but are many really at that point?
+
+Single canister maxi unless it's necessary.
+
+-------------------------
+

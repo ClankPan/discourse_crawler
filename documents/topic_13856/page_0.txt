@@ -1,0 +1,157 @@
+martin_DFN1 | 2022-06-17 00:46:09 UTC | #1
+
+# Summary
+
+On June 8, 2022 two users on the developer forum reported being unable to access the IC ( “Internal Server Error. Failed to fetch response: TypeError: Failed to fetch”).
+
+DFINITY engineers looked at the logs of the boundary node (BN) machines and found that the Marseille BN was down, and on other machines the filesystems containing the logs were close to overflowing. DFINITY Engineers reproduced the errors by filling the file system.
+
+The overflow was caused by a Journalbeat bug [JB-23627](https://github.com/elastic/beats/issues/23627) which causes the log shipper journal-beat to go into a log spewing loop that fills up all available log disk space when it encounters “log corruption”. To fix this a workaround was deployed (a cron job to restart journalbeat) and cleared out the overflowing file system. That destroyed the existing log files and with them some of the data that would have been useful for post-mortem analysis. The Journalbeat bug is fixed in version 7.13.0, but this version is not applied to Equinix boundary nodes infrastructure (7.5). In the new VMs the version is 7.14, so the problem should not exist any more in the new BN-VMs.
+
+Since the Cloudflare health check only exercises the replica status method which does not rely on caching (and in turn on the filesystem) this problem did not cause a failover which would have directed users to the next BN.
+
+A parallel [Plug wallet issue](https://medium.com/plugwallet/plug-post-mortem-06-22-a3c3a3a95dbf) (triggered by a low IC finalization rate) that caused a “Too Many Requests Error” made this problem look bigger than it was.
+
+# Timeline (PST)
+
+May 22, 2022 Journalbeat log spewing problem was first encountered and manually fixed.
+
+June 8, 2022 02:04 PST the Marseilles BN went down causing the outage. The error was not caught by the load balancer monitoring.
+
+Jun 8 10:38AM PST An engineer noticed reports like [Is the network down for anyone else? - Developers](https://forum.dfinity.org/t/is-the-network-down-for-anyone-else/13613)
+
+Jun 8 11:05AM PST A Slack thread was started and investigation was launched.
+
+Jun 8 11:05AM PST The issue was isolated and resolved by manually failing over to another boundary node. Then restarting the journalbeat service and deleting the logs filling up the file system brought the original node back.
+
+Jun 8 1:30AM PST Dfinity was status green, after confirming operational status.
+
+Jun 11 17:00 PST The team reproduced the problem on ic0.dev
+
+Jun 12 21:54 PST It was discovered that the BN1 (Boston) boundary node’s monitoring was misconfigured.
+
+# Impact
+
+Regions around the Atlantic ocean (Eastern US, Western Europe, Latin America served by BO1, LN1 and MR1) were cut off from accessing IC boundary nodes. The outage happened from around June 8, 3AM to 10:30AM PDT. All the principles served by those BNs were affected. This said the actual impact is hard to gauge because logs and metrics were lost due to the disk space overflow.
+
+# What went wrong?
+
+* Patches were applied manually in the past and thus forgotten in newer deployments.
+* “Disk full” alerts were not configured correctly.
+* The disk space for logging and caching was shared and undersized.
+* Confusion around a parallel outage at Plug.
+* It is hard to gauge impact from the current logging and metrics coverage.
+* The heartbeat check does not cover all the components of the BN.
+
+# What went right?
+
+* The team detected the outage quickly.
+* The fix was applied very quickly; 30 minutes after detection.
+* The new BoundaryOS already has all the fixes incorporated.
+
+# Technical Details
+
+### [JB-23627](https://github.com/elastic/beats/issues/23627) + Nginx Caching + Cloudflare Failover
+
+2 boundary nodes serving live traffic were hit by a known journal-beat bug JB2367. The fallout of the bug is excessive logging leading storage to run out of space. The exact time required to hit out-of-space conditions depends on the provisioned log partition size.
+
+#### Nginx Caching
+
+Boundary nodes employs NGINX caching for query responses. The query results from replicas are populated into an on-disk cache and have a TTL of 1 sec. Unfortunately, NGINX is designed to fail reponses with an HTTP 500 error code if the cache population fails. The cache population failed as machine ran out of disk space due to JB-23627. Most IC-Dapps are a mix of query and updates. If queries fail most dapps start to fail.
+
+#### Cloudflare failover
+
+The boundary node are stateless and are configured to be fault tolerant & highly available. The fault tolerance mechanism employs a heart beat to detect service disruptions from a particular boundary node. Cloudflare initiates a heartbeat from multiple datacenters every 30 seconds. This probes for boundary node health by posting a GET request at https://ic0.app/api/v2/status. This request is passed straight through to a replica node. Hence, the journalbeat bug resulting disk full did not affect the heartbeat.
+
+Along with the above issue the Boston BN’s monitoring was also misconfigured on Cloudflare. Boston was using the ic0.dev monitoring configuration - different from the other production nodes. This issue however didn’t cause any outage as the disk full did not trigger the failover system.
+
+All of the above behavior was reproduced in local development environment.
+
+## Have we seen this before?
+
+Yes, in an incident on May 22, 2021. The issue was fixed at the time by manually deploying the cron job to restart journalbeat. When new nodes were deployed this change was not applied.
+
+## Where did the gap locate?
+
+This was due to a process failure, as patches to the infrastructure were not version controlled but applied manually. When DFINITY engineers deployed new nodes this step was forgotten.
+
+## Is it possible to catch this in a test/staging environment?
+
+It would be possible to create tests for this. There are no (yet) tests for Cloudflare failover, and none for disk-full conditions. It would be possible to reproduce this in a test environment. A test could execute a command filling the disk.
+
+# What have we learned from this?
+
+* Boundary nodes deployments have to have audit trails and versioning. The Boundary VM project (which is almost complete) will enable this.
+* Alerts we believed to be there were not configured. We need to test alerts after deployment.
+* A configuration management system with source-controlled code and automated procedures is essential for running the IC. This is being done with the BN-VM effort.
+
+# Action items
+
+|Priority|Summary|
+| --- | --- |
+|P0|Incident Resolved. [DONE]|
+|P0|Apply mitigation for all production boundary nodes that are taking active load. [DONE]|
+|P0|Disk Full alerts missing on boundary nodes|
+|P0|Logrotate on boundary VMs.|
+|P0|Increase /var partition space|
+|P0|Update journal beat the latest version which has a fix to JB-23627|
+|P1|Improvements to heartbeat mechanism. Not only replica connectivity but also BN components have to be checked.|
+
+-------------------------
+
+justmythoughts | 2022-06-17 16:27:11 UTC | #2
+
+Thanks for the great post-mortem.
+
+Looking at this
+
+[quote="martin_DFN1, post:1, topic:13856"]
+This was due to a process failure, as patches to the infrastructure were not version controlled but applied manually. When DFINITY engineers deployed new nodes this step was forgotten.
+[/quote]
+
+And then keeping in mind that the issue had happened previously, but no tests were put in place after the original bug.
+
+[quote="martin_DFN1, post:1, topic:13856"]
+Yes, in an incident on May 22, 2021. The issue was fixed at the time by manually deploying the cron job to restart journalbeat. When new nodes were deployed this change was not applied.
+[/quote]
+
+[quote="martin_DFN1, post:1, topic:13856"]
+There are no (yet) tests for Cloudflare failover, and none for disk-full conditions.
+[/quote]
+
+Engineers make configuration mistakes all the time, but it’s probably a good rule of thumb to have scripts/tests for the monitoring and dev/prod configurations, as well as to put in place a human fail-proof mechanism anytime a part of the IC goes down (after the error occurs, so that the same issue won’t happen again).
+
+It’s a good thing no one really detected it for 8 hours, but monitoring misconfig bugs can be scary.
+
+[quote="martin_DFN1, post:1, topic:13856"]
+Since the Cloudflare health check only exercises the replica status method which does not rely on caching (and in turn on the filesystem) this problem did not cause a failover which would have directed users to the next BN.
+[/quote]
+
+What do the alarms for the BNs looks like? I would have imagined that a failed health check would trigger an alarm and page an engineer
+
+-------------------------
+
+martin_DFN1 | 2022-06-21 17:14:25 UTC | #3
+
+We have in the last months vastly improved the capability to write system-level integration tests. These things are incredibly difficult to build, super slow to set up and run, and expensive to maintain. At the same time, we want to improve unit test coverage, develop new features and maintain the old code. It's a bandwidth problem and often politics decide what we work on (like people on the forum push for their fave capability).
+We use Pager Duty alerts. PD allows all kinds of messaging. 
+When first building the Cloud Flare health check we made sure that a simple query goes all the way to the replica and back. We are now finding other sub-systems that need to be checked and this will be added.
+
+-------------------------
+
+justmythoughts | 2022-06-21 17:36:31 UTC | #4
+
+[quote="martin_DFN1, post:3, topic:13856"]
+We have in the last months vastly improved the capability to write system-level integration tests. These things are incredibly difficult to build, super slow to set up and run, and expensive to maintain.
+[/quote]
+
+Amen, writing and maintaining integration tests is a bear. Good to hear that the capability to write them is being improved.
+
+[quote="martin_DFN1, post:3, topic:13856"]
+We use Pager Duty alerts. PD allows all kinds of messaging.
+[/quote]
+
+:+1: (fan of Pagerduty)
+
+-------------------------
+

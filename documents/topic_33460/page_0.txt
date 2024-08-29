@@ -1,0 +1,257 @@
+Jesse | 2024-07-21 12:03:31 UTC | #1
+
+Yesterday, my Dapp’s ECDSA signed HTTPS requests stopped working all of a sudden without any changes to the code. I checked the subnet’s Node Machine Statuses and see that there’s one Node machine with a status that’s coming back as `degraded`. I suspect this to be the cause of the failed HTTPS requests. 
+
+Can someone confirm or dispel this as the cause? 
+
+If it is indeed the cause of the problem, can someone explain why a single node machine being in degraded status would cause this issue? I would expect that 12 node machines would still be able to achieve consensus if 7/12 nodes are in agreement.
+
+-------------------------
+
+tim1 | 2024-07-22 09:28:00 UTC | #2
+
+One degraded machine should not affect https outcalls given that there are 2f+1 (9/13) equivalent responses from healthy nodes. 
+
+To investigate the issue I need some more information: 
+
+- On which subnet is your canister?
+- What is the outcalls destination?
+- If public can you give me a GitHub link to your canister? Specifically, I'm interested int he transform function.
+
+-------------------------
+
+Jesse | 2024-07-22 11:02:18 UTC | #3
+
+[quote="tim1, post:2, topic:33460"]
+On which subnet is your canister?
+[/quote]
+
+The canister is on this subnet: `4ecnw-byqwz-dtgss-ua2mh-pfvs7-c3lct-gtf4e-hnu75-j7eek-iifqm-sqe`
+
+[quote="tim1, post:2, topic:33460"]
+What is the outcalls destination?
+[/quote]
+
+The destination of the outcalls is to the NNS's governance canister. The outcall is calling the `manage_neuron` function in an attempt to refresh a neuron's data that is controlled by the canister. 
+
+[quote="tim1, post:2, topic:33460"]
+If public can you give me a GitHub link to your canister? Specifically, I’m interested int he transform function.
+[/quote]
+
+the code isn't public just yet, but here is the definitiion of the transform function that I've been using,
+
+```
+public query func transformFn({ response : IC.http_response; }) : async IC.http_response {
+        let transformed : IC.http_response = {
+        status = response.status;
+        body = response.body;
+        headers = [];
+    };
+    transformed;
+};
+```
+
+-------------------------
+
+tim1 | 2024-07-22 12:18:24 UTC | #4
+
+I just checked the metrics and I don't see anything unusual. So some more questions:
+
+- How often do you do these requests? Is the failure rate 100%?
+- Do you know when it stopped working?
+- Do you have any error message?
+
+-------------------------
+
+Jesse | 2024-07-22 13:35:45 UTC | #5
+
+to give a bit more context, the dapp I've created is a DAO that allows users to gain voting power within the DAO by contributing to the DAO's canister-controlled neuron. 
+
+[quote="tim1, post:4, topic:33460"]
+How often do you do these requests? Is the failure rate 100%?
+[/quote]
+
+I use this function anytime a user contributes ICP to the DAO's neuron in order to gain voting power. so This function is used fairly often, maybe 1 - 3 times a day. As of now, the failure rate is 100%. previously, it never failed.
+
+[quote="tim1, post:4, topic:33460"]
+Do you know when it stopped working?
+[/quote]
+
+I noticed it stopped working on saturday (2 days ago)
+
+[quote="tim1, post:4, topic:33460"]
+Do you have any error message?
+[/quote]
+
+I just added some error logs. this is the error I'm getting is either:
+
+`Canister http request timed out.` 
+
+or 
+
+`No consensus could be reached. Replicas had different responses. Details: request_id: 529145, timeout: 1721653809154749668, hashes: [bbb0cb16bbbbee08f9000fdd5495d9a7b49bff763e7624129070e563cee60456: 6], [94bcdc1731e17c0cc50990aa128efb90abde82b72baea217ed0916d72244db0e: 5].`
+
+or 
+
+`Reject text: IC0503: Error from Canister ...: Canister called `ic0.trap` with message: arithmetic overflow.
+Consider gracefully handling failures from this canister or altering the canister to handle exceptions.`
+
+I should mention, I do have several instances of this same Dapp deployed to several different subnets. the other instances all function just fine.
+
+-------------------------
+
+tim1 | 2024-07-23 09:32:17 UTC | #6
+
+Thanks this is helpful information. I'm still trying to figure out what is happening. To better correlate things to our metrics I still need some more details:
+
+- Can you give me the canister id? 
+- If you have an exact time of the failures this would also be very helpful.
+- Can you post a code snippet where you do the https outcall?
+- You are using motoko right? 
+- Do you also have the exact url you are using?
+- Is the overflow error the response of the outcall?
+-
+
+-------------------------
+
+Jesse | 2024-07-23 09:58:46 UTC | #7
+
+[quote="tim1, post:6, topic:33460"]
+Can you give me the canister id?
+[/quote]
+the canister ID is: ukk5v-3yaaa-aaaam-ach6q-cai
+
+[quote="tim1, post:6, topic:33460"]
+You are using motoko right?
+[/quote]
+I do use Motoko. that is correct.
+
+[quote="tim1, post:6, topic:33460"]
+Is the overflow error the response of the outcall?
+[/quote]
+
+I believe so, I can verify in just a bit.
+
+[quote="tim1, post:6, topic:33460"]
+Do you also have the exact url you are using?
+[/quote]
+
+the URLs are:
+https://icp-api.io//api/v2/canister/rrkah-fqaaa-aaaaa-aaaaq-cai//read_state
+
+and 
+
+https://icp-api.io//api/v2/canister/rrkah-fqaaa-aaaaa-aaaaq-cai//call
+
+[quote="tim1, post:6, topic:33460"]
+If you have an exact time of the failures this would also be very helpful.
+[/quote]
+
+I don't have the exact times of the failures, but I am about to resume investigating the issue, so within the a few minutes, I'll be able to give you the time of my most recent attempt.
+
+[quote="tim1, post:6, topic:33460"]
+Can you post a code snippet where you do the https outcall?
+[/quote]
+
+there is quite a bit of code that is responsible for performing the ECDSA signed HTTPS outcalls to the governance canister. here are the snippets:
+
+This is the function that makes the call and below it, are the definitions of the functions that this function references.
+
+```
+public func getNeuronData(input: TreasuryTypes.GetNeuronDataInput): async TreasuryTypes.GetNeuronDataOutput{
+        let {args; selfAuthPrincipal; public_key; transformFn; method_name} = input;
+        let sender = selfAuthPrincipal;
+        let canister_id: Principal = Principal.fromText(Governance.CANISTER_ID);
+        let request = EcdsaHelperMethods.prepareCanisterCallViaEcdsa({sender; public_key; canister_id; args = to_candid(args); method_name;});
+        let {envelopeCborEncoded} = await EcdsaHelperMethods.getSignedEnvelope(request);
+        let headers = [ {name = "content-type"; value= "application/cbor"}];    
+        let {request_url = url; envelope_content} = request;
+        let body = ?Blob.fromArray(envelopeCborEncoded);
+        let method = #post;
+        let max_response_bytes: ?Nat64 = ?Nat64.fromNat(1024 * 1024);
+        let transform = ?{ function = transformFn; context = Blob.fromArray([]); };
+        let ic : IC.Self = actor("aaaaa-aa");
+        let http_request = {body; url; headers; transform; method; max_response_bytes};
+        Cycles.add<system>(20_949_972_000);
+        let {status; body = responseBody; headers = headers_;} : IC.http_response = await ic.http_request(http_request);
+        let response = { status; body = responseBody; headers = headers_; };
+        let envelopeContentInMajorType5Format = EcdsaHelperMethods.formatEnvelopeContentForRepIndHash(envelope_content);
+        let {ingress_expiry} = envelope_content;
+        let requestId: Blob = Blob.fromArray(RepresentationIndependentHash.hash_val(envelopeContentInMajorType5Format));
+        return {response; requestId; ingress_expiry;};
+    };
+```
+
+```
+public func prepareCanisterCallViaEcdsa(arguments: PrepareCanisterCallViaEcdsaArgs): CanisterEcdsaRequest {
+        let {canister_id; sender; method_name; args; public_key} = arguments;
+        let arg = Blob.toArray(args);
+        let request_url : Text = IC_URL # "/api/v2/canister/" # Principal.toText(canister_id) # "/call";
+        let key_id = { name : Text = "key_1"; curve : IC.ecdsa_curve = #secp256k1};
+        let ingress_expiry : Nat64 = Nat64.fromNat(Int.abs(Time.now())) + (3 * 60 * 1_000_000_000);
+        let envelope_content : EnvelopeContent = { ingress_expiry; canister_id; method_name; arg; sender};
+        return { request_url; envelope_content; key_id; public_key = Blob.toArray(public_key) };
+    };
+```
+
+```
+public func getSignedEnvelope(request : CanisterEcdsaRequest) : 
+    async {envelopeCborEncoded: [Nat8]}{
+        let {envelope_content; key_id; public_key} = request;
+        let envelopeContentInMajorType5Format = formatEnvelopeContentForCborEncoding(envelope_content);
+        let {message_hash;} = getMessageHashForEcdsaSignature(formatEnvelopeContentForRepIndHash(envelope_content));
+        Cycles.add<system>(25_000_000_000);
+        let { signature } = await ic.sign_with_ecdsa({ message_hash; derivation_path = []; key_id;});
+        let envelopeAsMajorType : Value.Value = #majorType5([
+            (#majorType3("content"), #majorType5(envelopeContentInMajorType5Format)),
+            (#majorType3("sender_pubkey"), #majorType2(public_key)),
+            (#majorType3("sender_sig"), #majorType2(Blob.toArray(signature)))
+        ]);
+        let envelopeCborEncoded : [Nat8] = switch(Encoder.encode(envelopeAsMajorType)) {
+            case (#err(e)) {throw Error.reject("envelope encoding falied") };
+            case(#ok(encoding)) {encoding};
+        };
+        return {envelopeCborEncoded};
+    };
+```
+```
+public func formatEnvelopeContentForRepIndHash(envelope_content: EnvelopeContent) : RepresentationIndependentHash.Value {
+        let { ingress_expiry; sender; canister_id; method_name; arg } = envelope_content;
+
+        let envelopeContentInRepIndHashableFormat = ([
+            ("request_type", #Text("call")),
+            ("ingress_expiry", #Nat(Nat64.toNat(ingress_expiry))),
+            ("method_name", #Text(method_name)),
+            ("sender", #Blob(Principal.toBlob(sender))),
+            ("canister_id", #Blob(Principal.toBlob(canister_id))),
+            ("arg", #Blob(Blob.fromArray(arg)))
+        ]);
+
+        return #Map(envelopeContentInRepIndHashableFormat);
+    };
+```
+```
+public func hash_val(v : Value) : [Nat8] {
+    encode_val(v) |> Sha256.sha256(_)
+  };
+
+  func encode_val(v : Value) : [Nat8] {
+    switch (v) {
+      case (#Blob(b))   { Blob.toArray(b) };
+      case (#Text(t)) { Blob.toArray(Text.encodeUtf8(t)) };
+      case (#Nat(n))    { leb128(n) };
+      case (#Int(i))    { sleb128(i) };
+      case (#Array(a))  { arrayConcat(Iter.map(a.vals(), hash_val)); };
+      case (#Map(m))    {
+        let entries : Buffer.Buffer<Blob> = Buffer.fromIter(Iter.map(m.vals(), func ((k : Text, v : Value)) : Blob {
+            Blob.fromArray(arrayConcat([ hash_val(#Text(k)), hash_val(v) ].vals()));
+        }));
+        entries.sort(Blob.compare); // No Array.compare, so go through blob
+        arrayConcat(Iter.map(entries.vals(), Blob.toArray));
+      }
+    }
+  };
+```
+
+-------------------------
+

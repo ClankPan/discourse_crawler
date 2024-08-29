@@ -1,0 +1,161 @@
+peterparker | 2022-10-21 09:24:34 UTC | #1
+
+Assuming I have deployed a following canister written Motoko:
+
+```
+actor Main {
+   private stable let hello: Text = "World";
+}
+```
+
+can I retrieve its stable memory if I migrate it to a canister written in Rust?
+
+```
+#[post_upgrade]
+fn post_upgrade() {
+    let (hello,): (String,) = storage::stable_restore().unwrap();
+}
+```
+
+I am trying to achieve this in a bit more complexe sample repo which also contains an hashmap (https://github.com/peterpeterparker/motoko_to_rust_migration) but when I upgrade the wasm, I get an error trying to unwrap the stable memory as above.
+
+> Error: Call was rejected:
+  Request ID: 3440578dbdc2ddad543f1a37b6e89ab15f4822f9f3461d5b3b3b6e2c993e5c25
+  Reject code: 4
+  Reject text: Canister qoctq-giaaa-aaaaa-aaaea-cai trapped explicitly: Panicked at 'called `Result::unwrap()` on an `Err` value: "Custom(Cannot parse header 410000004449444c086c02cba4b6ed0406d0dafcca07016e026d036c02007101046c029f93c60271f1fee18d03056d7b6e076c01cba4b6ed047101000105446176696401000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+
+-------------------------
+
+frederikrothenberger | 2022-10-21 09:58:09 UTC | #2
+
+So what is happening here is that the Candid decoder encounters unexpected bytes. Motoko apparently appends 4 bytes of data to stable memory before candid starts (I would assume, this is information about length of the stable memory data)?
+
+So given the error message:
+
+`41000000`: The unexpected part, probably injected by Motoko?
+
+`4449444c086c02cba4b6ed0406d0dafcca07016e026d036c02007101046c029f93c60271f1fee18d03056d7b6e076c01cba4b6ed04710100010544617669640100`: the actual candid.
+
+Decodes to 
+```
+(
+  record {
+    1_303_220_811 = opt record { 1_303_220_811 = "David" };
+    2_036_280_656 = opt vec {};
+  },
+)
+```
+
+The remaining (unused) stable memory:
+
+`0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...`
+
+-------------------------
+
+peterparker | 2022-10-21 10:05:44 UTC | #3
+
+Thanks Frederik! The record you decoded matches the memory I expect in my sample repo.
+
+So if I get it right, the root cause of the issue are these 4 bytes of data added by Motoko. Is that an issue or a feature? is there a workaround?
+
+-------------------------
+
+frederikrothenberger | 2022-10-21 10:15:56 UTC | #4
+
+Ok, I have double checked. It is the length of the candid encoded state.
+
+So it is a feature: What you need to do is to decode the first 4 bytes to `u32` (from little endian). This will give you the lenght of the candid part.
+
+Then read the subsequent `length` many bytes and decode this as candid. But I think you need to do this manually and not using `stable_restore`. But I'm not familiar with that particular part of the `cdk`.
+
+-------------------------
+
+peterparker | 2022-10-21 10:21:02 UTC | #5
+
+"Why make it simple when it can be complicated" TM
+
+Thanks a lot Frederik 🙏. I have no idea how to do that but will have a look now.
+
+-------------------------
+
+senior.joinu | 2022-10-21 11:47:25 UTC | #6
+
+```
+#[post_upgrade]
+fn post_upgrade() {
+    let mut stable_length_buf = [0u8; std::mem::size_of::<u32>()];
+    ic_cdk::api::stable::stable_read(0, &mut stable_length_buf);
+    let stable_length = u32::from_le_bytes(stable_length_buf); // maybe use from_be_bytes, I don't remember what endianess is candid
+
+    let mut buf = vec![0u8; stable_length as usize];
+    ic_cdk::api::stable::stable_read(std::mem::size_of::<u32>() as u32, &mut buf);
+
+    let (hello,): (String,) = candid::decode_args(&buf).unwrap();
+}
+```
+
+This should work. Let me know if it doesn't.
+
+-------------------------
+
+peterparker | 2022-10-21 11:54:12 UTC | #7
+
+Oh gosh, I've been searching how to decode the bytes since two hours now, thanks for the post. Let me try!
+
+P.S.: for the memory I found a shorter version too, not sure it will work, will try both
+
+```
+// or to skip some bytes at the begin -> https://docs.rs/ic-cdk/0.3.2/src/ic_cdk/api/stable.rs.html#64
+let bytes: Vec<u8> = api::stable::stable_bytes();
+```
+
+-------------------------
+
+rossberg | 2022-10-21 12:03:59 UTC | #8
+
+@frederikrothenberger, you should put on a loud screaming warning sticker here. The format of saved stable variables is entirely an implementation detail of the Motoko compiler, and could change with any release. Including the fact that it is using Candid at all. ;)
+
+-------------------------
+
+peterparker | 2022-10-21 12:24:30 UTC | #9
+
+If candid cannot be use to preserve the state while upgrading a canister written in Motoko and then Rust, is there another solution?
+
+-------------------------
+
+peterparker | 2022-10-23 10:30:11 UTC | #10
+
+YEAH it worked out 🥳.
+
+Loosed quite some time until I figured out that all types that are converted back from Candid in the post upgrade are optional (Rust) even if in the pre upgrade (Motoko) these are mandatory but, it worked out with your code @senior.joinu
+
+-------------------------
+
+frederikrothenberger | 2022-10-21 15:43:56 UTC | #11
+
+Yes, of course. But I would assume that one would not migrate multiple times from Motoko to Rust. ;-)  And people are expected to test their upgrades before actually doing them.
+
+-------------------------
+
+peterparker | 2022-10-26 19:38:33 UTC | #12
+
+So, it works in a sample repo. It does not in a concrete repo 😫. Not sure yet why. I guess it has to do with the fact that the struct has few more fields but, decoding the candid in rust gets `null` as value for the stable variable I am looking for instead of a valid vector of data.
+
+-------------------------
+
+peterparker | 2022-10-27 12:17:08 UTC | #13
+
+Took me at least the creation and migration of 100 canisters to finally figure out that my issue is most probably linked to the deserialization of the Motoko [Int](https://internetcomputer.org/docs/current/references/motoko-ref/Int). I try to map it currently to `u64` but because types do not match, the candid `decode_args` just silently ignore the error and map to `null`.
+
+Now the question is what type should I use...
+
+p.s.: I use an `Int` in Motoko because I have a timestamp in my structs assigned with `Time.now()`
+
+-------------------------
+
+peterparker | 2022-10-27 12:26:26 UTC | #14
+
+Ok it has be deserialized to `candid::Int`
+
+-------------------------
+

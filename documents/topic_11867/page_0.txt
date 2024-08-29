@@ -1,0 +1,143 @@
+h1teshtr1path1 | 2022-04-04 16:19:12 UTC | #1
+
+What are the factors in which time of update function calls is dependent? 
+Size of update data sending via function? 
+ Complexity of operations we are doing inside function? 
+And what are some other factors that can effect ? 
+
+Say update calls works on synchronous behaviour, still is is possible that they get timeout if there is a large queue of update calls? Is there any time limit after which canister rejects the call? 
+And what’s the limit over size of data for single update call?
+
+
+Also , i need to know what will be the best if i want to have multiple update calls say 1000, I figured out two methods : 
+Method 1 : to make a map canister and use that canister to update data in all canisters , but that will be having cross canister calls (so how it will effect time)?
+Method 2 : to give acces of all canisters to frontend , and do update on each canister ?
+
+I just want to know what will be best for parallel update call?
+
+-------------------------
+
+PaulLiu | 2022-04-05 18:14:01 UTC | #2
+
+Good questions! I can only speak of the current implementation, since there is an on-going work to change how update call is executed ([Deterministic Time Slicing](https://forum.dfinity.org/t/deterministic-time-slicing/10635)).
+
+First of all, update calls addressing the same canister is only executed sequentially. So there is no parallelism there. They are executed one by one.
+
+Secondly, there is (or should be) a limit to every aspect of execution, in order to prevent DoS attacks. Messages that are not immediately executed will be queued, and there is a size limit to the queue, so messages may end up being rejected if the queue is full. Messages that are already accepted by consensus may eventually be rejected at the execution layer, e.g., insufficient cycle balance, or execution running over block cycle limit, or the canister has been stopped, etc. Update calls are also subject to message size limit, about 2MB, which applies to both ingress  (sent from user) and inter-canister  (both xnet and on the same subnet).
+
+[quote="h1teshtr1path1, post:1, topic:11867"]
+Method 1 : to make a map canister and use that canister to update data in all canisters , but that will be having cross canister calls (so how it will effect time)?
+Method 2 : to give acces of all canisters to frontend , and do update on each canister ?
+[/quote]
+
+It sounds like you have more than one target canisters here. Then yes, different canisters may process their own message queues independent of each other.  So method 1 and 2 are "almost" equivalent. However, in practice, if the canisters you want to call are all in the same subnet, then there is also a block size limit (1000 msgs/block and 4MB total size) & block execution time limit (7 billlion cycles) that you need to consider. Inter-canister messages on the same subnet may be executed much more efficiently than those going across subnets, but then you will likely hit those subnet limits if you have a lot of messages.
+
+Spread your canisters across multiple subnet is the only way to scale out beyond a single subnet's capacity. Whether it makes sense to do that depends on whether your canisters need to frequently communicate with each other (because not all calls can be equivalently done from the user frontend). If not, then I'd say Method 2 + multiple subnet is a better choice with more parallelism.
+
+BTW, the actually numbers of the above mentioned limits are subject to change too. They all have a default value in the [IC source code](https://github.com/dfinity/ic/), but their values can be adjusted through proposals, and may vary from one subnet to another. I can only speak from my best knowledge. You can use a tool called [ic-admin](https://github.com/dfinity/ic/tree/master/rs/registry/admin) to check for yourself (`ic-admin --nns-url https://ic0.app get-subnet <subnet-id>`).
+
+-------------------------
+
+jzxchiang | 2022-04-17 06:08:43 UTC | #3
+
+> Spread your canisters across multiple subnet is the only way to scale out beyond a single subnet’s capacity.
+
+Is it even possible to pick which subnet you deploy your canister onto? My understanding was that that wasn't available yet.
+
+-------------------------
+
+PaulLiu | 2022-04-06 03:17:16 UTC | #4
+
+[quote="jzxchiang, post:3, topic:11867"]
+Is it even possible to pick which subnet you deploy your canister onto? My understanding was that that wasm’t available yet.
+[/quote]
+
+There isn't a direct way to specify, but if you create it by burning ICP (either `dfx ledger create-canister`, or nns.ic0.app), the system will pick a random subnet for the new canister.
+
+-------------------------
+
+h1teshtr1path1 | 2022-04-06 04:01:59 UTC | #5
+
+[quote="PaulLiu, post:2, topic:11867"]
+However, in practice, if the canisters you want to call are all in the same subnet, then there is also a block size limit (1000 msgs/block and 4MB total size) & block execution time limit (7 billlion cycles) that you need to consider.
+[/quote]
+
+Whats this line means exactly ? Like if due to some default way of creating new canisters , all the canisters get existed on same subnet, then ? 
+(1000msgs/block and 4mb size ) for what ? After 1000msgs/block canisters get freezed or something?
+
+-------------------------
+
+PaulLiu | 2022-04-06 04:43:26 UTC | #6
+
+[quote="h1teshtr1path1, post:5, topic:11867"]
+Like if due to some default way of creating new canisters , all the canisters get existed on same subnet
+[/quote]
+
+If you create a canister through your cycle wallet canister, then the new canister is on the same subnet as your cycle wallet.
+
+If you create a canister through `dfx ledger --network=ic create-canister` command, then it gets randomly assigned to an available subnet.
+
+[quote="h1teshtr1path1, post:5, topic:11867"]
+(1000msgs/block and 4mb size ) for what ?
+[/quote]
+
+It means a block will pack at most 1000 messages in it. If there are more messages in the mempool, they will have to be packed in a future block. Also a block can be at most 4MB size, so depending on size of each message, a block may actually contain less than 1000 messages.
+
+This essentially limits the throughput of how many messages a subnet can handle per second (if we assume a typical subnet executes 1 block per second). So if you plan to send more than 1000 messages to a subnet per second, your messages will spend more time in the mempool before they are packed into a block and then executed, because the throughput limit has been reached.
+
+Also, depending on the actual computation, a single canister may or may not be able to execute 1000 messages per second. If these 1000 messages are meant for multiple canisters, due to parallel execution, there may be a chance that all of them are executed within 1 second.
+
+Further more, results of these 1000 ingress messages will have to be hashed (together with 5-minutes worth of ingress message history) every second to give certified output, which also takes time. This is actually a known bottleneck that could be optimized further. I think we managed to hit around 700 (trivial) msgs/s in benchmarking without slowing down a subnet too much.
+
+Anyway, what I am trying to say is, there are limits applied to almost everything from networking to block making to consensus to messaging to execution, in order to prevent DoS attack. So if your application really requires high-throughput, the only way forward is to (1) scale to multiple subnets and (2) avoid sending inter-canister messages across subnets (in other words, use ingress if you can).
+
+-------------------------
+
+PaulLiu | 2022-04-06 04:49:53 UTC | #7
+
+I should add another note that inter-canister update call will always get a reply (either a success or an error when it failed to deliver, or was rejected by the target canister). This is a system level guarantee of the Internet Computer blockchain. Ingress messages do not enjoy this guarantee. Depending on what type of application you are building, this guarantee may or may not be critical in making the architecture choice between ingress and inter-canister messages.
+
+-------------------------
+
+cryptoschindler | 2022-04-07 08:43:29 UTC | #8
+
+[quote="PaulLiu, post:2, topic:11867"]
+First of all, update calls addressing the same canister is only executed sequentially. So there is no parallelism there. They are executed one by one.
+[/quote]
+
+This this hold for `await`s in motoko? I thought that would interleave execution and potentially allow other upgrades to be proceeded?
+
+-------------------------
+
+h1teshtr1path1 | 2022-04-07 09:23:45 UTC | #9
+
+No , there will always be an update calls queue , which will get processed sequentially.
+
+-------------------------
+
+cryptoschindler | 2022-04-07 09:38:50 UTC | #10
+
+> A function that does not `await` in its body is guaranteed to execute atomically - in particular, the environment cannot change the state of the actor while the function is executing. If a function performs an `await` , however, atomicity is no longer guaranteed. Between suspension and resumption around the `await` , the state of the enclosing actor may change due to concurrent processing of other incoming actor messages. It is the programmer’s responsibility to guard against non-synchronized state changes. A programmer may, however, rely on any state change prior to the await being committed.
+
+Maybe I'm misunderstanding it, but to me this reads as if concurrent processing of messages is possible.
+
+https://smartcontracts.org/docs/language-guide/actors-async.html#_using_await_to_consume_async_futures
+
+-------------------------
+
+AdamS | 2022-04-07 15:06:32 UTC | #11
+
+That is a difference between the programmer's intuitive view of the update call vs the IC's technical view of it. Your update function calls another canister's update function, and then when that update function replies, one of your callbacks is called as another update. You may perceive it as one single logic flow, especially since async/await can be used to make the code written as one single function, but it is two instances of an update operation, not one. (I do not actually know one way or the other whether these can be interleaved with something else, but if they can, that's why it doesn't mean messages can be concurrently processed).
+
+-------------------------
+
+cryptoschindler | 2022-04-07 20:05:36 UTC | #12
+
+[quote="AdamS, post:11, topic:11867"]
+(I do not actually know one way or the other whether these can be interleaved with something else, but if they can, that’s why it doesn’t mean messages can be concurrently processed).
+[/quote]
+
+Isn't this a contradiction? Maybe I have a wrong understanding of the the word "interleaved"
+
+-------------------------
+

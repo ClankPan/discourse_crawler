@@ -1,0 +1,487 @@
+Sherlocked | 2022-07-29 15:03:57 UTC | #1
+
+# DIP20 Community Proposal
+
+Today, we [(PsychedelicDAO)](https://psychedelic.ooo) are opening up a conversation with the greater community to align ourselves on the [DIP20 token standard](https://github.com/Psychedelic/DIP20), a battle tested implementation of ERC20 for the Internet Computer. 
+
+## Community Asks
+
+Over the past two weeks, we’ve been chatting with various community members seeking input on how we can improve DIP20 to further align with the IC community, while still keeping its simple to use core relatively the same.
+
+The most common asks were:
+
+* Namespaced Method Signatures
+* Notify Interface
+* Subaccount Support
+
+As a result, we are creating a proposal for implementing some of these asks, and to open the floor to input from the community at large.
+
+## Improvement Proposal
+
+Let’s go over each of the community asks, outline what they would entail, and give our thoughts about implementing them.
+
+### Namespaced Method Signatures
+
+**What:** Adding a suffix or prefix to all DIP20 methods to make them unique. This allows a single canister to implement multiple standards into its public API.
+
+ex: Instead of `transferFrom`, the method would be named `transfer_from_dip20`
+
+**Our Thoughts:** We are **for** adding namespacing to DIP20 as it enables services to have maximum interoperability.
+
+The difficult part of adding namespacing to DIP20 is that it will inevitable cause a mismatch between some services and tokens during the upgrade process. Some tokens might upgrade while services might try to call the old non-namespaced functions, and vice versa.
+
+Our plan to avoid as much mismatch as possible is to:
+
+1. Update our documentation & communicate with the community that DIP20 and canisters adhering to it will be changing to namespaced signatures.
+2. Create a legacy wrapper that tokens can implement so that services still making deprecated function calls are routed to the new namespaced functions.
+
+We would love to hear if the community has other ways that we could alleviate these growing pains.
+
+### Notify Interface
+
+**What:** DIP20 currently implements `approve` / `transferFrom`, an interface where users approve a balance that services can spend on their behalf. Notify is similar, using `transferNotify` a user or service would specify the destination they’d like to transfer their tokens to and a destination that they’d like to notify about this transfer. These two interfaces have similar purposes and for that reason are generally not implemented at the same time.
+
+**Our thoughts:** We are **against** adding notify to DIP20. The asynchronous nature of the IC brings up some concerning attack vectors in notify. For example, you could spam transfers with a notify to a canister that purposefully takes a long time to respond, effectively DDOSing the canister.
+
+Additionally, if notify fails then services have effectively lost track of users funds, unless they are running expensive tracking mechanisms like a heartbeat. This does not occur with `approve` / `transferFrom` as tokens always stay in a user's balance until spent by the service. 
+
+In conclusion, we are not against the concept of notify, but dont think that anyone (ourselves included) have found the right implementation for it on the IC yet, and therefore are going to stick with `approve` / `transferFrom` for the time being. We are happy to be proved wrong, if anyone has implementations that are simple, cost effective, and void of attack vectors, we would be glad to hear them!
+
+### Subaccount Support
+
+**What:** Subaccounts (Account IDs) are secondary identifiers on the IC where your principal ID (or canister ID) is hashed with an array of bits to produce a unique and arguably private identifier. DIP20 currently operates using principal ID’s only – this change would allow identification support for Account IDs everywhere in the standard (eg: ledger, transfer calls, etc).
+
+This feature is mainly being asked for in order to cut down the magnitude of potential attack vectors in token canister code. The example given by community member @skilesare is that services holding tokens on behalf of users would be able to hold each unique user’s balance in a separate balance by creating new sub-accounts derived from the services canister ID. Thus, an attacker would only be able to access up to the max value of a single account, rather than overflowing to the balance of the entire service. 
+
+**Our Thoughts:** We have **mixed thoughts** regarding subaccounts. 
+
+Our critiques of sub-accounts are as follows:
+
+1.  The concepts of ‘Subaccounts’ on the IC can be a bit confusing for outsiders – on most chains subaccounts are heuristically derived key pairs, while on the IC they are not but are sometimes passed off as secure/anonymous identities.
+
+2.  Client side code can become a bit cumbersome when you need to understand the cryptography behind calculating sha224 hash of a principal ID + account bits.
+
+3. Ledger bloat from increasing the amount of accounts required from each service.
+
+**Our Proposal:** Right now, subaccounts are being derived at the application level. We propose adding a protocol level mechanism for canisters to derive more IDs (with or without the need to deploy more canisters), similar to the way that new principals can be derived and managed by wallets with BIP44 & BIP32.
+
+We propose this is done by allowing a canister to make inter-canister calls with different principal IDs. Let’s say canister A is making a call to canister B, when canister B runs ic::caller() on A, we could get different Principal IDs for canister A.
+
+To do so we propose introducing a new IC system api called `ic0.call_set_derivation` in the WASM runtime, which could be used by canister A, to indicate it wants to make the call to canister B using its different account. The api call will become a member of the already existing IC system api calls:
+
+```
+ic0.call_new :                                                              // U Ry Rt H
+  ( callee_src  : i32,
+    callee_size : i32,
+    name_src : i32,
+    name_size : i32,
+    reply_fun : i32,
+    reply_env : i32,
+    reject_fun : i32,
+    reject_env : i32
+  ) -> ();
+ic0.call_on_cleanup : (fun : i32, env : i32) -> ();                         // U Ry Rt H
+ic0.call_data_append : (src : i32, size : i32) -> ();                       // U Ry Rt H
+ic0.call_cycles_add : (amount : i64) -> ();                               // U Ry Rt H
+ic0.call_cycles_add128 : (amount_high : i64, amount_low: i64) -> ();      // U Ry Rt H
+ic0.call_perform : () -> ( err_code : i32 );                                // U Ry Rt H
+```
+
+This would be easy for developers to understand from other ecosystems, leave us with only a single ID to deal with, clean up client side code, and be very useful for canister based wallets once we have tECDSA.
+
+<hr>
+
+That’s all for today 👋 We look forward to see some thoughtful community discussion – critiques and questions are welcomed and encouraged! We'll be continuing this discussion in Psychedelic TownHall 02 today @ 1pm, you can get notified or join [here](https://twitter.com/psychedelicDAO/status/1552013762097565697?s=20&t=ASPTwU6HXKc_RvN3ZVrSKw).
+
+-------------------------
+
+skilesare | 2022-07-30 14:01:14 UTC | #2
+
+I wanted to comment a bit on the sub accounts mentioned above. I had a great meeting with the psychedelic guys where we talked through this and the nuances of creating services on the Internet computer. Currently canisters only have one ID that they can be known by. For a token standards this means that if you don’t have a sub account you have to keep all of your users funds in one account. This exposes your contract to any number of different attack vectors where if a user can cause an arithmetic error they can drain the entire canister account. 
+
+If a canister had a way to make calls to other canisters using derived IDs that were crypto-graphically secure, they could just use the derived id to store tokens. Further, since the canister is in control of the id they can use the id in other devices that keep things tied to the users’s context in that service. This improves composability of services.
+
+This feature goes beyond tokens. If a canister is going to consume any third-party service, it would be a good practice to keep different users data under different principal IDs. It reduces the amount of code developer has to write because they can rely on the cryptographic security at the principal ID and don’t have to keep another ledger of statuses inside of the canister. 
+
+I’d be happy to answer any questions about this and talk through it with anyone that has concerns or questions. It doesn’t mean you can’t have your own implementation of a sub ID for increased privacy, but it reduces the number of attack vectors on users funds and data “for free”.(it may not be free at the protocol level as id imagine the replica would need to route messages somehow and that might slow things down….although I don’t Think an extra 29 bytes in an “as” field would disrupt things too much.)
+
+It is also compatible with icrc-1 in that you can always pass a null sub account.
+
+-------------------------
+
+lastmjs | 2022-08-02 15:40:53 UTC | #3
+
+[quote="Sherlocked, post:1, topic:14611"]
+The api call will become a member of the already existing IC system api calls:
+[/quote]
+
+Can you add the full signature for `ic0.call_set_derivation` to the interfaces above so that we can review it?
+
+-------------------------
+
+PaulLiu | 2022-08-02 19:44:29 UTC | #4
+
+[quote="Sherlocked, post:1, topic:14611"]
+We propose this is done by allowing a canister to make inter-canister calls with different principal IDs. Let’s say canister A is making a call to canister B, when canister B runs ic::caller() on A, we could get different Principal IDs for canister A.
+[/quote]
+
+Canister IDs primarily facilitate message communication. We need a way to address the receiver, and a way to authenticate as the sender. How do you envision that this "multiple (sub) principals per canister" would work for the receiver side? Do all messages get routed to the main canister id? Or are they just dropped?
+
+Suppose canister B receives a call, and its sender is A'. Now B replies to the call, and the sender should get a reply. But the sender in this case has a main principal A which is not equal to A'. Should the system be aware of this relation (many-to-one function) that is A' -> A?
+
+Then it really starts to look like implementing name spaces in the principal, something that the initial design has deliberately kept minimal at system level (because applications only need to know principals as opaque blobs).
+
+Then is it not just an alternative DNS in disguise? 
+
+I think this quickly becomes quite a topic on its own, with far reaching impacts than subaccounts, which is only used by ledgers.
+
+-------------------------
+
+skilesare | 2022-08-02 20:17:24 UTC | #5
+
+[quote="PaulLiu, post:4, topic:14611"]
+I think this quickly becomes quite a topic on its own, with far reaching impacts than subaccounts, which is only used by ledgers.
+[/quote]
+
+It is currently only used by ledgers.  I think that we'll reach a pattern for canister data management that includes a separation of concerns where all kinds of user data will want to be stored under different principles.
+
+I agree that it gets complicated and you all know what is going on under the hood way better than I do.
+
+I think that a simple implementation would be to have msg.caller and msg.as where msg.as must be a derivable principal from msg.caller. This way the canister is still known for sending messages back, but the canister can choose to honor the 'as' identity as an implementation detail.
+
+In code you could do:
+
+```
+public shared(msg) func tell(val : Text) : async Text {
+    let service = actor("someactor");
+
+    ExperimentalIC.as(Principal.hash(msg.caller));
+    service.log_message(val); // is msg.caller would be "this" and msg.as would be the derived principal.
+      
+    return val;
+  };
+
+-------------------------
+
+qti3e | 2022-08-02 20:59:35 UTC | #6
+
+The signature can vary based on the data type we chose for the derivation key, here are some that can work:
+
+## u64 as derivation key:
+```
+ic0.call_set_derivation : (key: u64) -> ();
+```
+
+## fixed array (maybe 32-bytes)
+```
+ic0.call_set_derivation : (src: i32) -> ();
+```
+The canister can provide the memory address containing a fixed-size derivation key.
+
+## dynamic array
+```
+ic0.call_set_derivation : (src: i32, size: i32) -> ();
+```
+Just like `ic0.certified_data_set`
+
+---
+
+Any of these signatures could potentially work, depending on what the technical limitation could be one could be chosen, we welcome the foundation to decide the specifics of the implementation since they know the limitations best.
+
+-------------------------
+
+qti3e | 2022-08-02 21:06:16 UTC | #7
+
+I imagine it's alright if the subnet hosting canister A, provides the canister id of A in the message along with the derivation key that should be used for that message, and then the execution environment for canister B will provide the `msg.caller` as `A' = H(A . K)` to the canister B, there is no need to hide that the message is coming from canister A on the subnet level.
+
+-------------------------
+
+qti3e | 2022-08-02 21:19:05 UTC | #8
+
+And the Principal ID generated for canister A using derivation key K, could be created as a `derived id` which is already implemented on the IC.
+
+> *Derived ids*
+>
+> These have the form `H(|registering_principal| · registering_principal · derivation_nonce) · 0x03` (29 bytes).
+>
+>These ids are treated specially when an id needs to be registered. In such a request, whoever requests an id can provide a `derivation_nonce`. By hashing that together with the principal of the caller, every principal has a space of ids that only they can register ids from.
+
+we can use the actual id of the sender canister `A` as `registering_principal` and `K` as the derivation_nonce`.
+
+ref: https://internetcomputer.org/docs/current/references/ic-interface-spec/#principal
+
+-------------------------
+
+PaulLiu | 2022-08-02 22:28:36 UTC | #9
+
+If A' is a hash, then a canister can only reply to a message sent by caller A', but one cannot send a message addressed to A' because there is no routing information. Is this what you are suggesting?
+
+-------------------------
+
+qti3e | 2022-08-02 22:47:09 UTC | #10
+
+Yes, there is no need to be able to initiate calls from the outside to a canister id A', just like you can not send a message to the principal id of Alice, A is a valid canister id, A' however is a principal id viewed by the canister B as the caller. But the subnet can still route the reply to that message because it still knows the canister id `A`.
+
+The wasm module however doesn't know A. It just views A' as the caller.
+
+-------------------------
+
+PaulLiu | 2022-08-03 04:00:00 UTC | #11
+
+Thanks for the clarification! Now I understand better what this proposal is about.
+
+Just throw some other ideas out there (unrelated to token standard, but related to caller id): the ability to masquerade as a different caller comes up in other contexts too. For example, sometimes a user wants to delegate some action to a canister, almost as if he/she wants a canister to act on their behalf. IC already supports canister signatures and delegation, but they are not first class (i.e. you can only attach them to an ingress message, but canisters can't use these delegations directly). I wonder if there is a general theme here to be explored...
+
+-------------------------
+
+mariop | 2022-08-03 09:26:23 UTC | #12
+
+[quote="Sherlocked, post:1, topic:14611"]
+**What:** Adding a suffix or prefix to all DIP20 methods to make them unique. This allows a single canister to implement multiple standards into its public API.
+
+ex: Instead of `transferFrom`, the method would be named `transfer_from_dip20`
+[/quote]
+
+Can you use prefix instead of suffix for namespacing? The wg has decided to use prefixes, as it's commonly used in programming languages and APIs, and it would be good for the ecosystem to have a consistent way of doing namespacing. The [ICRC-1 fungible token standard ](https://github.com/dfinity/ICRC-1), for instance, is using prefixes.
+
+I would argue that
+
+```
+dip20_transfer
+icrc1_transfer
+```
+
+is better than
+
+```
+transfer_dip20
+icrc1_transfer
+```
+
+-------------------------
+
+roman-kashitsyn | 2022-08-03 08:36:02 UTC | #13
+
+[quote="Sherlocked, post:1, topic:14611"]
+1. Client side code can become a bit cumbersome when you need to understand the cryptography behind calculating sha224 hash of a principal ID + account bits.
+[/quote]
+
+Note that subaccounts don't imply cryptography. The ICP ledger design relied on the "account identifier" concept (a hash of the principal and subaccount), but time showed it was not a great design choice. Storing principals and subaccounts in plain text eliminates the need for extra libraries on the client and opens up new ways to interact with the ledger.
+For example, we can fetch the transactions and index them by the account owner in a helper index canister. This way, even if the client forgets its subaccounts, the ledger still has them.
+
+[quote="Sherlocked, post:1, topic:14611"]
+2. Ledger bloat from increasing the amount of accounts required from each service.
+[/quote]
+
+The space requirements aren't significantly different compared to the need to store approved amounts.
+Each approval is a `(<29-byte principal>, <29-byte principal>, <64-bit integer>)` entry in the approval table.
+Each subaccount is a `(< 29-byte principal>, <32-byte subaccount>, <64-bit integer>)` entry in the balances table (and we can save on the storage if the subaccount has the default value).
+For each subaccount-based interaction, there is an equivalent `approve/transferFrom` interaction that results in more or less the same space consumption on the ledger.
+
+[quote="Sherlocked, post:1, topic:14611"]
+**Our Proposal:** Right now, subaccounts are being derived at the application level. We propose adding a protocol level mechanism for canisters to derive more IDs (with or without the need to deploy more canisters), similar to the way that new principals can be derived and managed by wallets with BIP44 & BIP32.
+[/quote]
+
+That's a clever idea! We have discussed this idea internally for at least half a year. As you mentioned, the interface spec has a notion of derived id, but we don't have any use for these ids at the moment. We were thinking about incorporating derived ids into the ledger design.
+
+Overall, I'm not in favor of this idea:
+
+1. Derived IDs are only _slightly_ better than AccountIds. These concepts are almost identical and share a few disadvantages: (1) the lack of transparency and (2) the inability of the client to recover its state from the transaction log.
+2. We are extending the protocol to solve a problem we can easily solve on the application level. Our general policy is to avoid such ad-hoc changes and focus on features we can solve only on the system level, such as deterministic time slicing.
+3. Canisters can abuse the ability to masquerade their identity to bypass rate-limiting mechanisms.
+
+-------------------------
+
+Embark | 2022-08-03 12:42:49 UTC | #14
+
+Dear colleagues, I am looking for a way that the minter canister is notified when a transaction happens including the receiver address: Would this still be possible after transferNotify is removed?
+
+-------------------------
+
+roman-kashitsyn | 2022-08-03 14:47:22 UTC | #15
+
+What a stimulating discussion!
+
+The analogy between derived IDs and account identifiers helped me realize that there is a way for each DIP-20 implementation to be compatible with [ICRC-1](https://github.com/dfinity/ICRC-1). The trick is to push the principal derivation inside of the DIP-20 ledger canister, similarly to how the ICP ledger will do that:
+```
+icrc1_transfer({from_subaccount, to_principal, to_subaccount, amount}) =
+  process_dip20_transfer(from = derived_id(caller, from_subaccount),
+                         to = derived_id(to_principal, to_subaccount),
+                         amount = amount) /* mod error handling */
+
+icrc1_balance_of({owner, subaccount}) = dip20_balance_of(derived_id(caller, from_subaccount))
+```
+We could also use the original principal if the subaccount part is the default.
+
+-------------------------
+
+skilesare | 2022-08-03 18:11:28 UTC | #16
+
+[quote="PaulLiu, post:11, topic:14611"]
+the ability to masquerade as a different caller comes up in other contexts too.
+[/quote]
+
+Yes! We've been exploring the options here, especially when it comes to automating tasks onchain where  a user would want things to happen based on events, but isn't around to sign the message.  One thing we've identified that we need is query delegation so a user can 'be a canister' for update calls(canister is always on), but can query as that canister when navigating around the internet(query calls).
+
+-------------------------
+
+infu | 2022-08-15 09:34:01 UTC | #17
+
+Their token standard resistance looks like a classic moat building and also slows down SNS and everyone else to their advantage. Basically creating a mess so their solutions can be first again. Offering to solve problems by requiring low-level protocol change, sounds like they just want to excuse themselves with "We asked for features and Dfinity didn't deliver, so we are going to stick to ours". The problems they are solving with this are not existing - "subaccounts being confusing for outsiders"
+
+-------------------------
+
+skilesare | 2022-08-06 12:19:38 UTC | #18
+
+[quote="infu, post:17, topic:14611"]
+Offering to solve problems by requiring low-level protocol change, sounds like they just want to excuse themselves with “We asked for features and Dfinity didn’t deliver, so we are going to stick to ours”.
+[/quote]
+
+It should be noted that the proposal they made about the ability for canisters to call as another id was developed jointly(with me) in direct response to my concerns about data/financial safety and separation of concerns in a very collaborative fashion. It has implications beyond just the token standard.  It has a lot of merit and I hope you’ll consider it despite your feelings about their other methodologies.
+
+We can’t go back in time, but given a blank slate I think we’d redesign with users and canisters able to make unlimited acccounts and leave sub accounts behind.  As you alluded to though, the ship has sailed at this point. Unless we just did a hard fork of ICP and required everyone to claim their neurons and accounts into a raw principal(but then blackholed canisters would never be able to upgrade).
+
+-------------------------
+
+infu | 2022-08-06 12:35:25 UTC | #19
+
+[quote="skilesare, post:18, topic:14611"]
+ability for canisters to call as another id
+[/quote]
+
+I don't have a problem with that proposal, looks like it's going to bring new functionality. It's just not something we have right now to make a standard with. It will probably take a lot of time to get it going. It may bring bugs, it's untested. It will allow new attacks, like canisters to DoS attack other canisters and fill their memory if they store Principals.
+
+-------------------------
+
+infu | 2022-08-06 14:02:34 UTC | #20
+
+[quote="qti3e, post:7, topic:14611"]
+A' = H(A . K)
+[/quote]
+@skilesare 
+Canister Principals are sequential ids, not 28-byte public keys, so in reality, the resulting caller will be K1 = H(12000, 123) 
+Doesn't look very secure to me. A question to cryptographers maybe. How hard it is to find Y and X for which K1 = K2 = H(12000+Y, X). That will result in another canister spoofing the same caller
+
+-------------------------
+
+skilesare | 2022-08-06 15:30:07 UTC | #21
+
+I think using the proper hash function it would be as impossible to find a match as it is to find the key for a bitcoin address(the way metamask derives derivative addresses and they are always the same).  I guess it restricts the search space a bit knowing that all the keys are knowable, but if the core crypt is good it should be at least pre-quantum secure.  If we do it we might as well try for post-quantum as well.
+
+
+As far as DoS, I think this can be solved by the message still containing the principal id of the canister but also having an "as" field that is an alt id and derivation.  That way we can add a msg.source : ?Principal that would be the root principal if available.  That way you can still check against DoS from a canister.
+
+-------------------------
+
+mparikh | 2022-08-06 19:07:04 UTC | #22
+
+I read this amazing medium post. A couple of quick statements to reinforce my learning (feel free to refute it) & then a question.
+
+A user can manifest himself/herself as a wallet (kind of like a polymorphic function taken to extreme) when interacting with a properly constructed dapp frontend by utilizing his/her identity on that dapp.
+
+Further there is no need to centralize any assets on wallets.(i.e. wallets are obsolete).
+
+Are there any triplets of such dapps that are doing this today? If not, why not?
+
+-------------------------
+
+infu | 2022-08-07 09:40:28 UTC | #23
+
+[quote="mparikh, post:22, topic:14611"]
+A user can manifest himself/herself as a wallet (kind of like a polymorphic function taken to extreme) when interacting with a properly constructed dapp frontend by utilizing his/her identity on that dapp.
+[/quote]
+
+True. Actually user owned identitiy - I haven't looked into a lot may be a great idea. It will require a new protocol Frontend-to-Frontend (F2F) for communication. I was just about to propose it, I will add that case too.
+
+Currently, dapps working this way only rely on transferring between addresses, but with this F2F protocol, there will be other signing/transactions possible. I will send you a link in DM
+
+-------------------------
+
+Iceypee | 2022-08-11 22:27:54 UTC | #24
+
+Hey I was wondering, the balances on the Dip20 are only stored on a single canister. I haven’t done the precise math but by my estimates of the bytes in a hash of a principal it seems there’s under a billion balances till the canister freezes at 4gb. Is there any solution to this atm?
+
+-------------------------
+
+bjoern | 2022-08-29 13:11:28 UTC | #25
+
+Just wanted to add that, from a pure protocol perspective, introducing derived ids as a method of allowing a caller (either canister or user) to call canisters with different `msg.caller` principals seems manageable. Just like self-authenticating ids, those derived ids could be used only for making calls but not for receiving them.
+
+I guess I'd appreciate a response to @roman-kashitsyn's point here, but I assume the proposers @skilesare and @Sherlocked are aware:
+
+[quote="roman-kashitsyn, post:13, topic:14611"]
+Derived IDs are only *slightly* better than AccountIds. These concepts are almost identical and share a few disadvantages: (1) the lack of transparency and (2) the inability of the client to recover its state from the transaction log.
+[/quote]
+
+It also isn't clear to me yet how implementing the mechanism in the platform instead of the application layer resolves the issues pointed out by @Sherlocked, such as:
+
+* improving security for a canister holding tokens on behalf of users – I fail to see how a platform-level and an application-level solution differ in this regard
+* client-side code being more cumbersome – wouldn't you (in many cases) still have to implement the computation on the client side; not necessarily when sending a message but for computing an address something has to be sent to?
+
+-------------------------
+
+skilesare | 2022-08-29 13:31:55 UTC | #26
+
+We are going to need a bigger boat. :slight_smile: 
+
+There are a few possible strategies here, and it will be a fun problem to try to solve. The first one to come to mind is having a swarm that keeps the root up to date and has balances and witnesses. This would slow throughput but would give you much more space.
+
+-------------------------
+
+skilesare | 2022-08-29 13:42:33 UTC | #27
+
+[quote="bjoern, post:25, topic:14611"]
+Just like self-authenticating ids, those derived ids could be used only for making calls but not for receiving them.
+[/quote]
+
+I think you’d want them as a secondary piece of dats(or to have a secondary piece that does hold the canisterid.
+
+[quote="roman-kashitsyn, post:13, topic:14611"]
+the inability of the client to recover its state from the transaction log.
+[/quote]
+
+Can you give more detail on this disadvantage?
+
+
+
+
+[quote="bjoern, post:25, topic:14611"]
+improving security for a canister holding tokens on behalf of users – I fail to see how a platform-level and an application-level solution differ in this regard
+[/quote]
+
+It goes beyond holding tokens and extends to all kinds of data. When you start having proxy canisters and complsable services, having data/ tokens all held by the same principal increases the risk of certain exploits.
+
+Imagine a library management canister that helps user organize their videos on a third party video canister.  If that device wants to rent/buy/snipe for a particular video it will have to do so with only one canister id. It will look to the video canister like the management canister has thousands of entries. The management canister could mange that at an application level, but a protocol pathway makes things much easier.
+
+The most obvious example is t-ecdsa. By allowing multiple derivations a canister can securely hold balances for multiple users. If every canister only got one private key there would be a lot you could build, but it would be harder and more dangerous to do so.
+
+[quote="bjoern, post:25, topic:14611"]
+client-side code being more cumbersome – wouldn’t you (in many cases) still have to implement the computation on the client side; not necessarily when sending a message but for computing an address something has to be sent to?
+[/quote]
+
+I’ve been handling this with a get_invoice query that does the calculation and tells the client what address to use.
+
+-------------------------
+
+bjoern | 2022-09-16 11:59:28 UTC | #28
+
+[quote="skilesare, post:27, topic:14611"]
+I think you’d want them as a secondary piece of dats(or to have a secondary piece that does hold the canisterid.
+[/quote]
+
+But that would only appear on the protocol layer, wouldn't it? On the application layer, one would only see a new principal that may or may not be related to any other principal.
+
+[quote="skilesare, post:27, topic:14611"]
+Imagine a library management canister that helps user organize their videos on a third party video canister. If that device wants to rent/buy/snipe for a particular video it will have to do so with only one canister id. It will look to the video canister like the management canister has thousands of entries. The management canister could mange that at an application level, but a protocol pathway makes things much easier.
+[/quote]
+
+Ok, I understand that it's a safety mechanism when building a canister that holds permissions for multiple users. But still, this _could_ be built as part of the application-layer protocols – and the security should be the same. (Instead of setting the derivation when sending the message, the canister would set an additional parameter in the call.)
+
+[quote="skilesare, post:27, topic:14611"]
+I’ve been handling this with a get_invoice query that does the calculation and tells the client what address to use.
+[/quote]
+
+Right, but you can do this with account ids in the same way that you can do it with derived ids.
+
+-------------------------
+

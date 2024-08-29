@@ -1,0 +1,282 @@
+Litzi | 2020-09-02 08:00:56 UTC | #1
+
+I'm struggling on how to handle possibly undefined data types. The function `getIssue` uses `Array.find` to lookup the desired Issue by comparing `issue.id == issueId` and returns the object if it exists.
+
+In the function `addDebate`, I want to append a new type of `Debate` only in case the `Issue` given by the id `issueId` exists.
+
+I've tried different approaches, but it looks like I'm missing some fundamental understanding on how to handle `?OptionalType`s in motoko. Any hint is highly appreciated. 
+
+
+    actor IssueAssistant {
+
+      var issues : [Issue] = [];
+      var issueId : Nat = 1;
+
+      public query func getIssue (issueId : Nat) : async ?Issue {
+        Array.find<Issue>(issues, func x { x.id == issueId });
+      };
+
+      public func addDebate (issueId : Nat, newThesis : Text) : async () {
+        var issue = await getIssue(issueId);
+
+        let debate = {
+          id = 1;
+          thesis = newThesis;
+        };
+        switch (issue) {
+          case null return;
+          case Issue Array.append<Debate>(issue.debate, [debate]);
+          //                               ^^^^^ expected object type, but expression produces type ?Issue/219Motoko
+        }
+      };
+    };
+
+-------------------------
+
+kritzcreek | 2020-09-02 10:14:22 UTC | #2
+
+There are a few things playing together here.
+
+When you're pattern matching an optional you handle 2 cases. One is `null` and the other is `?(value)` where `value` now is the non-optional value. So we'd need to change your
+```
+switch (issue) {
+  case null return;
+  case Issue Array.append<Debate>(issue.debate, [debate]);
+}
+```
+
+into
+```
+switch (issue) {
+  case null return;
+  case (?actualIssue) Array.append<Debate>(actualIssue.debate, [debate]);
+}
+```
+
+The second issue is that [`Array.append`](https://sdk.dfinity.org/docs/base-libraries/array#value.append) returns an Array. It doesn't modify the array in place, so what you'd need to instead is reassign the value to your issues variable:
+```
+switch (issue) {
+  case null return;
+  case (?actualIssue) {
+    issues := Array.append<Debate>(actualIssue.debate, [debate]);
+  }
+}
+```
+
+Now this is a somewhat common pattern. Performing some side-effect based on whether an optional is present or not so the [`base` library has the `iterate` function](https://sdk.dfinity.org/docs/base-libraries/option#value.iterate) to capture that. The final version I'd suggest would be:
+
+```
+Option.iterate(issue, func(actualIssue : Issue) {
+   issues := Array.append<Debate>(actualIssue.debate, [debate]);
+}
+```
+
+-------------------------
+
+Litzi | 2020-09-02 10:35:46 UTC | #3
+
+Thanks for your help. But sadly this looks wrong to me:
+```
+Option.iterate(issue, func(actualIssue : Issue) {
+   issues := Array.append<Debate>(actualIssue.debate, [debate]);
+}
+```
+
+I'm trying to append the `Debate` to the `actualIssue.debate : [Debate]` which does not return the initial `Array` of `Issues`.
+
+I would the expect something like:
+
+```
+actualIssue.debate : [Debate] := Array.append<Debate>(actualIssue.debate, [debate]);
+```
+
+-------------------------
+
+morrolan | 2020-09-02 10:35:58 UTC | #4
+
+Oh, that's nice. On that topic - the [documentation](https://sdk.dfinity.org/docs/base-libraries/option) of the `Option` module seem to have an error, it advocates the following pattern:
+
+```
+let int1orZero : Int = switch(optionalInt1) {
+  case null 0;
+  case ?(int) int;
+};
+```
+
+Ie `?(int)` instead of `(?int)` - which causes a syntax error. Threw me off a bit. ;)
+
+-------------------------
+
+Litzi | 2020-09-02 10:40:25 UTC | #5
+
+I'm still kinda lost. Sorry. The final expression should look something like this?
+
+```
+switch (issue) {
+  case null return;
+  case (?actualIssue) {
+    actualIssue.debate := Array.append<Debate>(actualIssue.debate, [debate]);
+  } 
+}
+```
+
+-------------------------
+
+morrolan | 2020-09-02 10:45:21 UTC | #6
+
+That, or using `Option.iterate` which @kritzcreek mentioned:
+
+```
+Option.iterate(issue, func(actualIssue : Issue) {
+   actualIssue.debate := Array.append<Debate>(actualIssue.debate, [debate]);
+}
+``` 
+Which allows you to get rid of the `switch` statement, as you only care about the case of `issue != null`.
+
+-------------------------
+
+Litzi | 2020-09-02 10:48:17 UTC | #7
+
+This gives me the error:
+```
+public func addDebate (issueId : Nat, newThesis : Text) : async () {
+  var issue = await getIssue(issueId);
+
+  let debate = {
+    id = 1;
+    thesis = newThesis;
+  };
+  Option.iterate(issue, func(actualIssue : Issue) {
+    actualIssue.debate := Array.append<Debate>(actualIssue.debate, [debate]);
+    // => expected mutable assignment target
+  });
+};
+
+```
+
+-------------------------
+
+kritzcreek | 2020-09-02 10:53:10 UTC | #8
+
+Thanks for letting me know :D As you can tell it throws me off as well... ;)
+
+-------------------------
+
+Litzi | 2020-09-02 10:54:58 UTC | #9
+
+I'm feeling like I've never programmed before :sweat_smile:
+
+-------------------------
+
+morrolan | 2020-09-02 10:58:27 UTC | #10
+
+That seems like a descriptive error message. :slight_smile:
+
+You're trying to reassign `actualIssue.debate`, but `Issue.debate` is defined as an immutable variable.
+Intuitively one might change `Issue.debate` to be mutable, but then it'd fail to compile as `getIssue` above must return an immutable data structure.
+
+Bunch of approaches one could take here. One could create a new `Issue` and replace the existing one in the `issues` array.
+Alternatively one could make `Issue.debate` mutable, and make `getIssue` return an immutable copy thereof.
+
+-------------------------
+
+Litzi | 2020-09-02 11:03:20 UTC | #11
+
+[quote="morrolan, post:10, topic:1213"]
+That seems like a descriptive error message
+[/quote]
+
+Agree 100%
+
+So I need to declare the type as mutable in `types.Debate`? Or when the `Issue` gets created?
+
+-------------------------
+
+Litzi | 2020-09-02 11:13:01 UTC | #12
+
+Ending up doing this as a first try:
+
+```
+public func addDebate (issueId : Nat, newThesis : Text) : async () {
+  var issue = await getIssue(issueId);
+
+  Option.iterate(issue, func(actualIssue : Issue) {
+    issues := Array.filter<Issue>(issues, func (i : Issue) {i.id == issueId});
+    let debate = {
+      id = 1;
+      thesis = newThesis;
+    };
+    let newIssue = {
+      id = actualIssue.id;
+      description = actualIssue.description;
+      debate = Array.append<Debate>(actualIssue.debate, [debate]);
+      //                                                 ^^^^^^ expression of type [Debate/382] cannot produce expected type {id : Nat; thesis : Text}
+    }
+  });
+};
+
+```
+
+-------------------------
+
+morrolan | 2020-09-02 11:18:00 UTC | #13
+
+You could - but then you'd have to make sure that `getIssue` returns an immutable version thereof. Motoko enforces that any data leaving an actor by means of its public methods must be immutable.
+
+Generally I'd probably go about it a slightly different way - but do take it with a grain of salt, it's not as if I had years of experience with Motoko. ;)
+- Leave the `issue` type immutable as-is
+- Use a mutable hash map instead of an array for storing issues. This:
+  - Makes the data structure mirror the business logic of the issue's ID (I assume!) being unique
+  - Provides constant-time lookups of an issue by its ID - as opposed to an array's `O(n)`
+- When adding a debate, create a new issue containing said debate (based on the existing issue), and replace the old issue in the hash map
+
+Edit: Bit unsure about that snippet you just posted. Specifically:
+```
+issues := Array.filter<Issue>(issues, func (i : Issue) {i.id == issueId}
+```
+
+This will replace `issues` with an array containing only the issue you are currently adding a debate for, surely? Ie drop all other issues?
+
+-------------------------
+
+Litzi | 2020-09-02 11:18:58 UTC | #14
+
+Oh, yea sure. Intention was this. Just wasted at the moment
+
+```
+issues := Array.filter<Issue>(issues, func (i : Issue) {i.id != issueId}
+```
+
+-------------------------
+
+matthewhammer | 2020-09-08 18:59:11 UTC | #15
+
+[quote="Litzi, post:1, topic:1213"]
+I’m struggling on how to handle possibly undefined data types
+[/quote]
+
+Your example code has me wondering about the bigger design of the data model (involving the types `Issue` and `Debate`)?  How do these entities relate? (one to one, one to many, many to many? something else?)
+
+I have an ongoing experiment in Motoko where I'm trying to accomodate any answer to the questions above, even if they change over time, as the application evolves.  To be as flexible as possible, I'm advocating a general model based on graphs (nodes and edges for data and its relationships):
+
+https://github.com/matthewhammer/motoko-graph
+
+For your example, I'd use a graph node to represent each `Issue` and each `Debate`, and use an edge to relate them, as needed.
+
+I lost some time being on vacation last week, but I have a PR that shows a basic data model for a simple grocery marketplace ("farm to table", via the ICP).  For example, here's some "seed data" for this model:
+  https://github.com/matthewhammer/motoko-graph/pull/4/files#diff-ac9f94958766d3e2e1897ab3296d9533R4
+
+Still a work in progress, but ongoing.
+
+If any of this seems relevant (or not), I'm happy to discuss further.
+
+-------------------------
+
+Litzi | 2020-09-08 19:22:04 UTC | #16
+
+Issue and debate should have one to many relationship. The Debate should have two one to many relations to itself to form pros and cons which are opening a next level of debate. The idea is basically to mimic the functionality of https://www.kialo.com/the-existence-of-god-2629
+
+motoko-graph looks very nice. Was thinking a lot about the requirement to build a graphql implementation to make data querying more convenient. Feels very painful at the moment for more complex domain models.
+
+-------------------------
+

@@ -1,0 +1,286 @@
+skilesare | 2024-07-24 14:16:15 UTC | #1
+
+**ICRC-86** is a simple standard that allows for the manual and/or automatic claiming of a domain on the Internet Computer.  It initially supports claiming ICANN domains and proposed agreeing on a standard for decentralized domain claiming.
+
+Why?
+
+We've encountered a number of places where namespaces are convenient, user friendly(muche easier to remember www.google.com than it's IP address), and promote interoperability on the IC.  One risk of namespaces is 'name jacking' and or 'name-squatting' where domains are claimed that others may have a legal or common claim to.  When others take these names and attempt to use them it can make scams easier and frustrate legitimate use.
+
+How?  It is pretty simple. To claim an ICANN domain you request a code and then you put that code in your DNS. An authorized entity can then approve you as the owner and/or we can build an HTTPoutcall interface to query a range of DNS services to confirm the owner of a domain has registered the random code in their DNS. This is similar to what is used for registering custom domains with boundary nodes, but moves it on chain.
+
+What does it look like? If you want to, for example, broadcast an event in the new Event Utility that the Event utility WG is working on, you may want to label that event "com.mynetwork.user234.message".  How will the system know who should control that namespace?  ICRC-86 enables the owner of mynetwork.com to register ownership of the domain and thus no one else can register events with "com.mynetwork.*" namespaces.
+
+Draft: https://github.com/dfinity/ICRC/issues/86
+
+Initial Test Implementation: https://github.com/icdevsorg/ovs-ledger/blob/a8c42cbcd9f58a35656baadcdf02e2e35e9267ad/src/Token.mo#L1088
+
+|ICRC|Title|Author|Discussions|Status|Type|Category|Created|
+|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
+|86|Domain Claim Standard|Austin Fatheree (@skilesare),| |Draft|Standards Track||2024-07-20|
+
+
+# ICRC-86: Domain Claim Standard
+
+ICRC-86 is a standard for claiming and managing the right control a domain and its underlying namespaces on the Internet Computer. 
+
+## Introduction
+
+Domain are consist of a Top-level domain prefix and a series of more specific specifiers.  For example, com.foo, org.dfinity, com.github.skilesare.repos. The goal of ICRC-86 is to sync control of official TLD controlled by ICANN as well as provide domain names that are under decentralized control.
+
+### Data Structures
+
+#### Domains
+
+Domains are represented by a `vec text` in the reverse order of a typical web address. For example, subdomain.foo.com would be ["com","foo","subdomain"].
+
+Undecorated position 0 items are assumed to be standard ICANN TLDs and should be vetted against the ICANN system.
+
+Decentralized TLDs managed by the ICRC-86 system are decorated with an underscore at the end. For example: ["icp_","foo","subdomain"] would be managed by the server and validation would follow a different pathway than ICANN TLDs.
+
+#### DomainClaimRequest
+
+A request structure is used when a user or a project claims a domain for participating in the cycle sharing.
+```motoko
+type DomainClaimRequest = {
+  domain: vec text;
+  controllers: vec principal;
+  gateAccount: opt Account
+  validationCode: opt text; //will be null for initial requests; provide this when automated authentication is available and DNS can be read
+};
+```
+#### DomainClaimResponse
+Defines the possible responses to a domain claim request.
+```candid
+type DomainClaimResponse = variant {
+  ValidationRequired: {
+    controllers: vec principal;
+    existingControllers: vec principal;
+    domain: vec text;
+    validation: text;
+  };
+  Ok: {
+    controllers: vec principal;
+    domain: vec text;
+  };
+  RecordExists: {
+    controllers: vec principal;
+    domain: vec text;
+  };
+  Err: variant {
+    ValidationGateFailed;
+    ValidationRecordNotFound;
+    ValidationRecordNotApproved;
+    Unauthorized;
+  };
+};
+```
+#### DomainApprovalRequest
+Used by an administrative system to approve a previously claimed domain.
+```candid
+type DomainApprovalRequest = {
+  domain: vec text;
+  validationCode: text;
+};
+```
+#### DomainApprovalResponse
+Possible responses to a domain approval request.
+```candid
+type DomainApprovalResponse = variant {
+  Ok;
+  Err : variant {
+    #ValidationRecordNotFound;
+    #ValidationSucceededButTransferError : record { message: text };
+  };
+};
+```
+
+### Update Functions
+
+#### icrc86_claim_domain
+
+This function allows a user or a project to claim a domain for managing their domains within the system. The claim request includes the domain identifier, a set of controlling principals, and a validation code for cases where automated verification is required.
+
+Initial requests for a validation code are made with the validationCode property null.  This provided code can then be used to verify that the requested owner owns the indicated domain.
+
+**Parameters:**
+- `request`: DomainClaimRequest
+
+**Returns:**
+- `DomainClaimResponse`: The response can be one of several options indicating the status of the claim, such as validation needed, success, existing record, or errors related to the claiming process.
+
+#### icrc86_approve_domain
+
+This function is used to approve a previously claimed domain. It is typically called by an administrator or automated system after verifying the claimant's request. Ideal implementations should automate this by reading DNS via HTTPs outcalls.
+
+**Parameters:**
+- `request`: DomainApprovalRequest
+
+**Returns:**
+- `DomainApprovalResponse`: Indicates whether the approval was successful, or details about any errors or issues encountered during the approval process.
+
+### Query Functions
+
+#### icrc86_domain_look_up
+
+This query function is designed to look up the information about a specific domain to determine if it has been claimed, by whom, and any related account information. It acts as a critical tool for transparency within a ICRC-86 system, allowing participants to verify ownership and claim status of namespaces.
+
+**Parameters:**
+- `domain`: vec{vec text}; - the domain identifiers for which information is requested.
+
+**Returns:**
+- `vec (opt vec principal, opt DomainValidationRecord)`: Returns an optional account that has claimed the domain and optionally details of the validation state. This includes the validation code, controllers associated, whether it is approved, and the timestamp of the claim or approval status. If the domain has not been claimed or found, returns `null`.
+
+#### icrc86_namespace_look_up
+
+This query function is designed to look up the highest resolution information about a specific fully qualified namespace to determine the controllers.
+
+**Parameters:**
+- `namespaces`: vec {vec text}; - the fully qualified namespaces for which information is requested.
+
+**Returns:**
+- `vec { record { domain: vec text; controllers: vec principal}}`: Returns the list of highest resolution controllers.
+
+
+For example:
+
+A request for `vec {"com"; "foo"; "listframework"; "v1";}` might return the following if there is a record for `"com"; "foo"; "listframework"` but not `"com"; "foo"; "listframework"; "v1"`.
+
+```
+{
+  domain: vec {"com"; "foo"; "listframework";};
+  controllers vec {"principala", "principalb"}
+}
+```
+
+### Block Schemas
+
+
+### Block Schema for "86DomainApproved"
+
+This block type logs when a domain is approved in an ICRC-86 system.
+
+```shell
+{
+  "btype": "86DomainApp",
+  "tx": {
+    "domain": "Array(text)",
+    "approvedBy": "Blob", //approver
+    "ts": "Nat",
+    "controllers" : "Array(Blob)
+  }
+}
+```
+
+**Description:**
+- **btype**: String identifier for the block type (`"85App"`).
+- **domain**: The text identifier of the domain that is approved.
+- **approvedBy**: The principal ID of the user or system that approved the domain.
+- **ts**: Timestamp when the approval was registered.
+- **controllers**: Principals that now control the domain
+
+### Block Schema for "86DomainRequested"
+
+This block type captures requests for domain registrations in the ledger, which is crucial for initializing new projects or participants.
+
+```shell
+{
+  "btype": "85DomainReq",
+  "tx": {
+    "domain": "Array(Text)",
+    "requestedBy": "Blob",
+    "controllers" : "#Array(Blob)
+    "ts": "nat",
+    "validation": "text"
+  }
+}
+```
+
+**_description:**
+- **btype**: String identifier for the block type (`"85DomainReq"`).
+- **domain**: The vec of text identifier of the domain requested.
+- **requestedBy**: The principal ID of the user or system requesting the domain.
+- **controllers**: Target Controllers for the 
+- **requestedAt**: Timestamp when the request was made.
+- **validation**: The Validation key produced for the validation
+
+### icrc10_supported_standards
+
+An implementation of ICRC-86 MUST implement the method `icrc10_supported_standards` as put forth in ICRC-10.
+
+The result of the call MUST always have at least the following entries:
+
+```candid
+record { name = "ICRC-86"; url = "https://github.com/dfinity/ICRC/ICRCs/ICRC-86"; }
+record { name = "ICRC-10"; url = "https://github.com/dfinity/ICRC/ICRCs/ICRC-10"; }
+```
+
+## Future features
+
+Initial implementations may rely on administrators or third-party systems to detect, approve, and maintain validations of control. Eventually, an automated system for ICANN lookups should be implemented.
+
+-------------------------
+
+jennifertran | 2024-07-24 23:40:28 UTC | #2
+
+Is the assumption that the domain provider must implement ICRC-86?
+
+-------------------------
+
+Kepler | 2024-07-25 13:56:25 UTC | #3
+
+Thanks for putting this together @skilesare. 
+
+This topic was briefly addressed when we started discussing CNS (https://forum.dfinity.org/t/technical-working-group-naming-system/21236/38), which is paused now. 
+
+There is some [initial spec](https://docs.google.com/document/d/1ylP1o4yT_urgA7kvKAT31fOQHSIpDVV5ZCMEKRPpMTA/edit) already that contains the claim option for ICANN domain names into a registry canister that would implement the CNS spec.
+
+Preferably i would encourage to align this ICRC standard with the CNS spec so that we converge into compliance instead of diverging.
+
+We've recently started to talk about CNS again since some engineering resources might become available in the next few months to resume the work there.
+
+wrt to claiming domains do you already have some use cases that this feature would help solve?
+
+-------------------------
+
+skilesare | 2024-07-25 14:56:42 UTC | #4
+
+@kepler This standard should not conflict with the CNS spec and should use that spec when proving ownership of a name owned by a decentralized name service.
+
+The ICRC-86 specification is focused on providing proof of ownership of a **previously** registered domain.
+
+In a number of ICRC standards we've begun using namespaces as identifiers for 'things'. In ICRC-75 those things are the namespace of a list on a canister. In ICRC-72 those namespaces are the names of immutable events in a potentially IC-wide pub/sub utility.
+
+ICRC-86 is a way for those services to let users prove that they have the rights to a namespace and for consuming services to ensure that a list or event scoped to a namespace is under the control of an entity that owns the root domain of the namespace.  Thus the com.foo-dao.memeber.membership_change event can only be used by a user that controls foo-dao.com.
+
+When you 'claim' a domain with ICRC-86 you are just proving that you already own it.  If you are using a decentralized DNS server to establish ownership, that would be a different process and covered by the CNS spec.
+
+-------------------------
+
+skilesare | 2024-07-25 15:02:27 UTC | #5
+
+No, the assumption is that if you would use ICRC-86 if want to provide the users of a service/utility/dao that a particular namespace is under the control of a domain owner.
+
+There is probably space for a 'centralized' utility here that other services can trust and thus once you've proven to utility canister dkjfldfj-jaljdlkjf-aldkfjll-cai that you owner foo.com, anyone else should be able to just query the ownership of that domain for proof, but until we have the at service deployed as a trusted canister, this allows any service to provide the 'domain-ownership' dance from their service.
+
+For example on the OVS ledger, we let developers share cycles to a domain 'com.foo.library.cool_crypt_library'.  Since we have implemented ICRC-86, developers can be sure that only developers that control foo.com can retrieve those cycle payments.
+
+(This could be done in real time with httpoutcalls, but proving that every time would be expensive in cycles. ICRC-86 let's you do it once)
+
+-------------------------
+
+HinzaAsif | 2024-08-01 10:12:09 UTC | #6
+
+Kepler, hope you are doing well. 
+I am facing to Issuing in Domain Binding.
+Can you help me.
+
+Regards
+
+-------------------------
+
+Kepler | 2024-08-05 10:06:49 UTC | #7
+
+@HinzaAsif are you referring to a custom domain as explained [here](https://internetcomputer.org/docs/current/developer-docs/web-apps/custom-domains/using-custom-domains)?
+
+-------------------------
+

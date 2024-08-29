@@ -1,0 +1,159 @@
+lastmjs | 2023-10-02 15:32:54 UTC | #1
+
+We've upgraded from dfx 0.14 to dfx 0.15, and our http_request tests are now failing with this warning possibly connected:
+
+```bash
+version: 0.8.1
+ Oct 02 15:02:22.822 WARN Internal Error during request:
+LookupPathAbsent(
+    [
+        726571756573745F737461747573,
+        333584BFCC33E229B53D12A272BA8F2C497B04485FA118489D23AE77D738FBCA,
+        737461747573,
+    ],
+)
+```
+
+Any insight into what this might mean?
+
+-------------------------
+
+frederikrothenberger | 2023-10-02 15:45:37 UTC | #2
+
+I think `dfx` has some artificial delay in processing requests and maybe that changed in dfx 0.15. @Severin might give some insight about that.
+
+The response you're seeing is a response saying that the system does not yet know about the particular request you are polling for. This happens for a brief period of time before the replica that received the ingress message has distributed it to the whole subnet. I.e. it is an expected response an you should just keep polling. Eventually the request id will become known and the system will provide its status.
+
+-------------------------
+
+lastmjs | 2023-10-02 16:09:57 UTC | #3
+
+[quote="lastmjs, post:1, topic:23461"]
+```
+version: 0.8.1
+ Oct 02 15:02:22.822 WARN Internal Error during request:
+LookupPathAbsent(
+    [
+        726571756573745F737461747573,
+        333584BFCC33E229B53D12A272BA8F2C497B04485FA118489D23AE77D738FBCA,
+        737461747573,
+    ],
+)
+```
+
+Any insight into what this might mean?
+[/quote]
+
+Alright I will put in some waits into our automated tests and see if that helps.
+
+-------------------------
+
+lastmjs | 2023-10-02 16:57:29 UTC | #4
+
+Waiting between requests did not fix the problem.
+
+We have automated tests for the Azle version of this Motoko example: https://github.com/dfinity/examples/blob/master/motoko/http_counter/src/main.mo
+
+We basically just call into the methods and check that the responses are what we should be.
+
+I'm not getting intermittent "Internal Server Error" on the same exact requests as before.
+
+dfx 0.14 works just fine, dfx 0.15 fails intermittently
+
+-------------------------
+
+lastmjs | 2023-10-02 17:00:25 UTC | #5
+
+The only thing I see in the release notes for 0.15.0 that seem applicable might be " fix!: http_request_streaming_callback and get_chunk now require the sha256 parameter to be set", but seems like it shouldn't apply to this situation.
+
+-------------------------
+
+lastmjs | 2023-10-02 17:06:10 UTC | #6
+
+I'm getting the same behavior when manually making requests on the Motoko example: https://github.com/dfinity/examples/blob/master/motoko/http_counter/src/main.mo
+
+Something has broken.
+
+-------------------------
+
+lastmjs | 2023-10-02 17:14:16 UTC | #7
+
+On dfx 0.15.0 using that example in Motoko or the equivalent in Azle, this fails intermittently with an "Internal Server Error":
+
+```bash
+curl --silent -X POST "bd3sg-teaaa-aaaaa-qaaba-cai.localhost:8000" --resolve "bd3sg-teaaa-aaaaa-qaaba-cai.localhost:8000:127.0.0.1"
+```
+
+This is logged every time from the replica:
+
+```bash
+ Oct 02 17:13:56.620 WARN Internal Error during request:
+LookupPathAbsent(
+    [
+        726571756573745F737461747573,
+        5947AD1B3383ED69466E3CD5184709DBA782378DD8FD20C668A18276BED0F986,
+        737461747573,
+    ],
+)
+```
+
+-------------------------
+
+Severin | 2023-10-03 07:18:59 UTC | #8
+
+I can't replicate it by hand :frowning_face: Do you have an estimate how often this happens? Also, does it happen with any other functions too? I don't think there's any special treatment for http_request in the replica.
+
+[quote="lastmjs, post:5, topic:23461, full:true"]
+The only thing I see in the release notes for 0.15.0 that seem applicable might be " fix!: http_request_streaming_callback and get_chunk now require the sha256 parameter to be set", but seems like it shouldn’t apply to this situation.
+[/quote]
+
+This changelog entry refers to something in the asset canister. To me it looks like the error comes from the replica, and not the asset canister because the error also happens in the `motoko/http_request` example which doesn't use an asset canister.
+
+[quote="lastmjs, post:7, topic:23461"]
+This is logged every time from the replica:
+
+```
+ Oct 02 17:13:56.620 WARN Internal Error during request:
+LookupPathAbsent(
+    [
+        726571756573745F737461747573,
+        5947AD1B3383ED69466E3CD5184709DBA782378DD8FD20C668A18276BED0F986,
+        737461747573,
+    ],
+)
+```
+[/quote]
+Do you get any other errors, even if not all the time? And could you maybe try to set the replica log level to something more verbose? For that you have to set `<network name>.replica.log_level` to `info` in `networks.json`, like [here](https://github.com/dfinity/sdk/blob/master/e2e/tests-dfx/start.bash#L141)
+
+-------------------------
+
+lastmjs | 2023-10-03 11:20:47 UTC | #9
+
+[quote="Severin, post:8, topic:23461"]
+I can’t replicate it by hand :frowning_face: Do you have an estimate how often this happens?
+[/quote]
+
+It happens very often, if I keep executing the curl command it's easy to get the error. Seems maybe 20-30% of the time, if you curl 20-30 times I would imagine you'll get the error.
+
+-------------------------
+
+lastmjs | 2023-10-03 11:22:00 UTC | #10
+
+[quote="Severin, post:8, topic:23461"]
+Also, does it happen with any other functions too? I don’t think there’s any special treatment for http_request in the replica.
+[/quote]
+
+We have almost 70 automated tests with examples like this, it's only in this example so far that any error like this has shown up.
+
+-------------------------
+
+lastmjs | 2023-10-03 11:22:45 UTC | #11
+
+[quote="Severin, post:8, topic:23461"]
+And could you maybe try to set the replica log level to something more verbose? For that you have to set `<network name>.replica.log_level` to `info` in `networks.json`, like [here](https://github.com/dfinity/sdk/blob/master/e2e/tests-dfx/start.bash#L141)
+[/quote]
+
+I can try this out and let you know, strange that you can't get it to reproduce.
+
+-------------------------
+

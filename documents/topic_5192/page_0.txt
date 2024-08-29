@@ -1,0 +1,435 @@
+ayman | 2021-06-15 02:04:29 UTC | #1
+
+I am building a native iOS app, and am very interested in using IC. So far I could not find a straightforward way to communicate from my frontend interface to the canisters on IC. I've tried sending an http request based on the document describing the HTTS interface (https://sdk.dfinity.org/docs/interface-spec/index.html#http-interface), but there are some ambiguous points. Is this http interface meant to be used within the agnet-js client only? Is there a working example of how to construct an http request? I strongly believe that supporting mobile development is critical to the success of IC!
+
+-------------------------
+
+jzxchiang | 2021-06-15 02:25:28 UTC | #2
+
+Agreed on the last point!
+
+I'm trying to use the agent js library with React Native. Apparently it should work. That code is open source on github so you could take a look at how it constructs the actual HTTP request (that wraps the Candid function call).
+
+-------------------------
+
+ayman | 2021-06-15 02:39:06 UTC | #3
+
+Have you had any luck using the js library with React Native? I'm hoping to avoid using React Native, but I would resort to it if it's the only path to communicate with the IC canisters.
+
+-------------------------
+
+jzxchiang | 2021-06-15 02:40:22 UTC | #4
+
+I'll let you know once I try (in a couple weeks or less). Apparently, Flutter works too if you don't like RN.
+
+-------------------------
+
+neeboo | 2021-06-15 02:56:56 UTC | #5
+
+For flutter devs, you can try our library
+
+[agent_dart](https://pub.dev/packages/agent_dart)
+
+It's in alpha stage, but you can try anyway. All the apis are similar to `agent-js`, 
+documents are coming! Stay tuned
+
+-------------------------
+
+ayman | 2021-06-15 03:16:58 UTC | #6
+
+I'll give it a try for sure although I have no experience with Flutter!
+
+-------------------------
+
+neeboo | 2021-06-15 03:17:59 UTC | #7
+
+For native coder, I think we have to wait for swift/kotlin library published somehow
+
+-------------------------
+
+PaulLiu | 2021-06-15 04:46:33 UTC | #8
+
+I have some examples of sending raw ingress message through http POST https://github.com/ninegua/ic-qr-scanner/blob/main/src/bare-agent.js
+
+It is quite simple actually if you know how to craft an ingress message before sending it.
+
+-------------------------
+
+ayman | 2021-06-15 05:28:55 UTC | #9
+
+Thank you for the example! I've tried constructing an http request in Swift in a way similar to your example, but on a local host and with an anonymous sender. I got a reject error concerning not finding the canister. My guess it's because the request expects the canister_id to be a blob. Not sure how to retrieve the canister_id as a Principal type outside agent-js.
+
+-------------------------
+
+jzxchiang | 2021-06-16 22:37:43 UTC | #10
+
+So I'm trying the @dfinity/agent JS library with RN right now and I'm running into an issue. Documented in https://forum.dfinity.org/t/dfinity-agent-not-working-with-react-native/5262.
+
+-------------------------
+
+kpeacock | 2021-06-16 22:59:37 UTC | #11
+
+Fwiw, I track work for agent-js in GitHub, and React Native support is an open task for me. https://github.com/dfinity/agent-js/issues. I'll respond to the other thread directly though
+
+-------------------------
+
+jzxchiang | 2021-06-16 23:05:14 UTC | #12
+
+Sounds good. Is there a place I can list all the issues I've encountered so far?
+
+-------------------------
+
+kpeacock | 2021-06-16 23:07:39 UTC | #13
+
+Yes, you can create new issues directly in that GitHub page. I'm also happy to review and approve pull requests from the community, if you're feeling generous 😊
+
+-------------------------
+
+jzxchiang | 2021-06-21 07:23:56 UTC | #14
+
+OK I finally got the `@dfinity/agent` JS library working with React Native for both iOS and Android (at least for the emulators).
+
+The process is quite involved, so it's definitely not a straightforward integration like it is for web.
+
+There are two core issues with using the agent JS library with RN:
+   
+1) RN doesn't provide direct access to the underlying byte stream for HTTP responses. Since canister responses are CBOR-encoded and therefore binary, reading those responses in JS land isn't supported by RN out of the box.
+2) The agent JS library relies on a bunch of JS APIs that aren't available in the default JS implementation shipped with RN apps. This is complicated by the fact that RN apps running on iOS actually use a different JS engine than RN apps running on Android.
+
+Problem 1 can be solved by replacing the default `fetch()` implementation with the one offered by `react-native-fetch-api`. (`rn-fetch-blob` does not work.) You'll then need to patch both that fetch library as well as the `@dfinity/agent` in your node_modules to configure it to work correctly, since it won't work off the shelf. Basically, you need to make the fetch library pass base64-encoded bytes instead of blobs over the RN bridge.
+
+Problem 2 is solved once these JS APIs are made available:
+- TextEncoder
+- ReadableStream
+- Buffer
+- BigInt
+- WebAssembly
+
+The first two can be polyfilled using `react-native-polyfill-globals`, which incidentally is also the same library that polyfills the Fetch API implemented by the aforementioned `react-native-fetch-api`.
+
+Buffer can be polyfilled using `buffer` and an explicit `global.Buffer = buffer` assignment.
+
+The last two are the trickiest and the biggest pain in the ass. You could polyfill them using standard JS libraries like `big-integer`  and `webassemblyjs`, but it won't work because they'll be too slow (or throw some cryptic errors). I've tried a bunch of polyfill libraries and none were performant enough for the BLS signature validation that is necessary for processing IC canister responses. (The one exception is `JSBI` as a polyfill for `BigInt`, which ran fast  but required me to literally rewrite huge portions of the `@dfinity/candid` source. So not technically a drop-in polyfill.)
+
+One thing I forgot to mention is that both `BigInt` and `WebAssembly` are supported on iOS but are NOT supported on Android. This is because RN uses the JavaScriptCore that ships with iOS devices, but RN bundles an older version of JavaScriptCore in the app itself for Android devices. And Apple pretty diligently updates their JavaScriptCore with new features on a regular basis. To get around this, I bundled a relatively new version of v8 instead of RN's default JSC for Android, since v8 supports `BigInt` and `WebAssembly` if you use the JIT-enabled v8. Here is the catch: it executes wasm too slowly. The BLS signature validation wasm module hung for a few minutes before I killed it. I don't know why v8 executed it slowly but iOS's JSC was able to run it fast (under a second). To get around this, I manually converted the wasm bytes into JS code using `wasm2js` and patched the `@dfinity/agent` library again to run that JS code in lieu of wasm for validating BLS signatures. This reduced the execution time to under a second for Android, matching iOS. Now, update calls takes <5 seconds on both of my emulators, which I can work with.
+
+Feel free to DM me if you'd like more details on how to get a RN mobile app set up to communicate with IC canisters. Hope this helps (if it hasn't scared you away already).
+
+-------------------------
+
+ComputerInternetMan | 2021-06-21 19:11:45 UTC | #15
+
+This is marvelous work.
+
+-------------------------
+
+kpeacock | 2021-06-21 19:39:19 UTC | #16
+
+This is really fantastic, @jzxchiang! I'd like to work with you to avoid needing to modify `node_modules` anywhere, and maybe we can release a package with the necessary polyfills and setup groundwork to make this easier for everyone
+
+-------------------------
+
+ayman | 2021-06-21 21:26:15 UTC | #17
+
+Awesome work! I was able to get React Native work on the iOS side with using Buffer and `react-native-polyfill-globals` with `patch-package`. I tried following this approach to access the `@dfinity/agent` via JavaScriptCore in iOS, but was not successful. I used webpack to bundle the packages and loaded the bundled file with JSCore. I'm not sure why, even though React Native also uses JSCore. I would much rather access agent-js library this way than via React Native. I have no use for React Native. Any suggestion on getting JSCore to work?
+
+-------------------------
+
+jzxchiang | 2021-06-21 21:55:27 UTC | #18
+
+Are you using the agent-js lib in a mobile web app, if not RN? What's the error you're seeing?
+
+-------------------------
+
+ayman | 2021-06-21 22:07:52 UTC | #19
+
+I'm trying to use agent-js lib in a native iOS app. JavaScriptCore library allows you to evaluate JavaScript code from within Swift based apps. I created a simple JS file that imports `@dfinity/agent` to be my API gateway. I bundled that file with webpack as I've mentioned. The error I see  is:
+**ReferenceError: Can\'t find variable: self"**
+and the stackt race info:
+
+**__webpack_require__**
+
+**./node_modules/iso-url/index.js**
+
+**__webpack_require__**
+
+**./node_modules/borc/src/decoder.js**
+
+**__webpack_require__**
+
+**./node_modules/borc/src/diagnose.js**
+
+**__webpack_require__**
+
+**./node_modules/borc/src/index.js**
+
+**__webpack_require__**
+
+**./node_modules/@dfinity/agent/lib/esm/request_id.js**
+
+**__webpack_require__**
+
+**./node_modules/@dfinity/agent/lib/esm/auth.js**
+
+**__webpack_require__**
+
+**./node_modules/@dfinity/agent/lib/esm/agent/http/index.js**
+
+**__webpack_require__**
+
+**./node_modules/@dfinity/agent/lib/esm/agent/index.js**
+
+**__webpack_require__**
+
+**./node_modules/@dfinity/agent/lib/esm/actor.js**
+
+**__webpack_require__**
+
+**./node_modules/@dfinity/agent/lib/esm/index.js**
+
+**__webpack_require__**
+
+-------------------------
+
+ehsan6sha | 2021-07-05 18:56:10 UTC | #20
+
+Hi
+Thanks for great answer. Can you elaborate on what was your final workaround for BigInt issue and the whole connection between mobile app and canister? I am on the same boat and do not want to re-invent the wheel as it seems you got it working
+
+-------------------------
+
+jzxchiang | 2021-07-05 19:34:09 UTC | #21
+
+OK so quick disclaimer: I'm not using Expo so not 100% how or if this will work.
+
+BigInt should be available on iOS (at least iOS 14), but the issue is Android. The problem is that the default JSC bundled with an Android RN app doesn't support BigInt AFAIK. I'm currently using [v8](https://github.com/Kudo/react-native-v8) instead of JSC for Android. Make sure you enable JIT if you care about performance (see the docs).
+
+You'll probably hit errors with BigInt syntax for iOS and/or Android:
+
+1. The exponentiation ** operator might not be supported. You'll have to manually patch the `@dfinity/agent` library to replace the ** code (in 6 files) with hardcoded static values.
+2. The BigInt `...n` literal syntax (e.g. `128n`) might not be supported. You'll also need to replace that with the BigInt constructor (e.g. `128n` becomes `BigInt(128)`).
+
+Some of these errors only happened when I built my RN app in release mode, so you might not see them initially... but they are there.
+
+Oh yeah, after you solve BigInt, you'll need to deal with WebAssembly. :sweat_smile:
+
+-------------------------
+
+ehsan6sha | 2021-07-06 17:17:11 UTC | #22
+
+Thank you. Trying to implment this in expo.
+
+-------------------------
+
+kpeacock | 2021-07-06 17:20:09 UTC | #23
+
+For some more discussion: https://github.com/expo/snack/issues/161
+
+-------------------------
+
+jzxchiang | 2021-10-15 01:18:37 UTC | #24
+
+Somewhat unrelated, but does anyone know the best way to debug WebAssembly (called from JavaScript)?
+
+I'm trying to get the BLS signature validation wasm code working in React Native on Android v8 (using react-native-v8). If this works, it would make `agent-js` viable on RN without needing a separate Rust native module, which would be huge for the ecosystem.
+
+-----
+
+So I'm running it on v8 version 9, so WebAssembly is supported. When I call `WebAssembly.validate` on the wasm byte buffer, it returns true so good so far.
+
+But when I call `await WebAssembly.instantiate` on the same buffer, it hangs and never completes. I've tried replacing the wasm with a super short buffer (i.e. just two instructions) but it also hangs. `await WebAssembly.compile` hangs as well.
+
+No error message, no debug log, nothing.
+
+To any WebAssembly experts, how would you debug this? Have you possibly seen anything like this before?
+
+Thanks!
+
+-------------------------
+
+Safik | 2021-10-15 18:46:54 UTC | #25
+
+At the moment, has anyone tried to port the agent to kotlin or java? Is there an example of what you are doing? I am faced with a similar task. Need a working agent on Android.
+
+-------------------------
+
+Ori | 2021-10-17 11:44:04 UTC | #26
+
+There was this some time ago, from @senior.joinu  : https://github.com/seniorjoinu/candid-kt
+
+-------------------------
+
+senior.joinu | 2021-10-17 14:21:38 UTC | #27
+
+I promise, I'll update it to current version of the IC one day.
+
+There is just too much other work :c
+
+-------------------------
+
+Safik | 2021-10-18 08:38:50 UTC | #28
+
+It is not even possible to build it yet. All because of the version of better-parse:0.4.0. It has been removed from the maven. I tried it on the versions above, but it falls into errors.(Exception in thread "main" java.lang.NoClassDefFoundError: com/github/h0tk3y/betterParse/grammar/Grammar). I made a request to the author to add version 0.4.0 to the maven. This version was in jcenter as an artifact, but there are problems with it.
+
+-------------------------
+
+jzxchiang | 2021-11-23 19:56:51 UTC | #29
+
+Latest update is that `WebAssembly` is now supported on Android with some caveats. See [here](https://forum.dfinity.org/t/icdevs-org-bounty-0-react-native-agent/8007/15?u=jzxchiang) for details.
+
+-------------------------
+
+aleacevedo | 2022-01-04 19:51:32 UTC | #30
+
+Hey man, before all thank u so much for taking the time for that excellent and detailed explanation. Right know with my team we are trying to use agent-js on RN and we already fixed every problem you mention but we are keep having problems with WebAssembly. We are aiming to iOS 14+ so we should be able to run WebAssembly without problem BUT we didnt have any luck. It works on the simulator with iOS 15.2 without problems, but when we test it on iPhone with iOS 15.0 we are getting `ReferenceError: Can't find variable: WebAssembly` Before this we tried use wasm2js but again, for the simulator it works just fine, but into the iPhone it takes an eternity, almost 5 minutes. Do u have any  idea or tip to give us? Did u try it on iPhone already?
+
+-------------------------
+
+jzxchiang | 2022-01-04 20:09:41 UTC | #31
+
+Hmmm that's really weird. WebAssembly should definitely be supported in the JSC that ships with iOS starting from v14. [Should](https://webkit.org/blog/11989/new-webkit-features-in-safari-15/) also be supported in v15...
+
+I've only tried on my iOS 14 iPhone device... haven't tried on iOS 15 yet.
+
+Are you sure you're using JSC, not Hermes? Can you also share your RN version?
+
+-------------------------
+
+aleacevedo | 2022-01-07 14:36:55 UTC | #32
+
+Hey, thanks for your answer, about Hermes I am sure we are no using it because I have this line into Podfile `:hermes_enabled => false` and I understand that if we are not using hermes by default we are using JSC, right?
+
+We are using version 0.66.3 of RN
+
+-------------------------
+
+jzxchiang | 2022-01-07 22:06:08 UTC | #33
+
+That's really weird. It should be using JSC then.
+
+If it works on your iOS 15 simulator but not your iOS 15 device, then I can't think of what could be the reason for the discrepancy. It [should](https://github.com/react-native-community/jsc-android-buildscripts/issues/113#issuecomment-540992345) work on both device and simulator. Do you have another iPhone you can try it on? Maybe double check the WebKit version on your iPhone? (No idea how to do that myself)
+
+-------------------------
+
+aleacevedo | 2022-01-08 10:00:21 UTC | #34
+
+Yep, we are exactly in the same mood right know. We only can think in an error on project configuration, but we don't know why in the simulator run. Maybe is something related with react-native command vs xcode I don't have any idea
+
+-------------------------
+
+cryptoschindler | 2022-01-09 11:49:38 UTC | #35
+
+I reported the same issue to the guys over at distrikt:
+[quote="aleacevedo, post:30, topic:5192"]
+getting `ReferenceError: Can't find variable: WebAssembly`
+[/quote]
+
+maybe @awrelll knows how to solve this?
+
+-------------------------
+
+rdobrik | 2022-01-24 21:26:15 UTC | #36
+
+While using WebAssembly in mobile apps is a good workaround , I believe native libraries are way to go. Simplifies entire development process. We developed   native Java Agent. https://github.com/ic4j. But to make it complete we will also need IOS counterpart. Any kick ass Swift/ObjectiveC developer up for that? I know from my experience it's not easy task, I basically spent weeks in Rust debugger to understand ICP protocol, debugging Rust Agent code. So I can provide help if needed (while I did some work with Swift I do not feel competent to write professional library). We received grant for our project from Dfinity, so there is a good chance to receive one for iOS native library. We are also working on professional documentation and more samples, so that can be eventually reused.
+
+-------------------------
+
+jzxchiang | 2022-01-24 23:09:29 UTC | #38
+
+Are you still facing this issue with iOS 15?
+
+I took a look, and I believe it *might* be due to Apple banning JIT on native iOS apps (WebView and Safari are exceptions). Why it was allowed in iOS 14 but not iOS 15 I have no idea.
+
+I think we might need to go without WebAssembly for BLS signature validation. I spent an hour or two over the weekend doing some research, and I think the process is more straightforward than I had thought:
+
+1. Take BLS Rust code from [agent_dart](https://github.com/AstroxNetwork/agent_dart/tree/main/rust) (same code used by [agent-js](https://github.com/dfinity/agent-js/tree/main/packages/agent/src/vendor/bls)), and compile it into a .a (or .so) library using `cargo build --lib`
+2. Create a [native module in RN](https://reactnative.dev/docs/native-modules-intro) that exposes a JavaScript interface that when called will call the compiled BLS library in native side
+a. In Android, use Java Native Interface (JNI) to load the .a or .so library so it can be called by Java code
+b. In iOS, no need for this because Objective-C can call C directly without any special setup
+3. Patch the `agent-js` library to remove the BLS wasm code and instead call your newly created native module’s JavaScript interface
+
+It should be no more than a day’s work, but I’ve never actually done something like this before, so there are probably a bunch of hidden gotchas.
+
+-------------------------
+
+jzxchiang | 2022-06-20 00:32:16 UTC | #39
+
+FYI I tried this for Android earlier today and it works. This means I can do BLS signature verification on React Native + Android using Rust and without going through WebAssembly. It's also faster than with WebAssembly.
+
+I'll try with iOS tomorrow.
+
+EDIT: It works for iOS too. Was quite painful not gonna lie...
+
+-------------------------
+
+neeboo | 2022-06-20 05:19:45 UTC | #40
+
+See plug's [mobile app repo](https://github.com/Psychedelic/plug-mobile), they use agent-rs directly. Maybe it's another choice
+
+-------------------------
+
+TusharGuptaMm | 2023-07-27 21:42:01 UTC | #41
+
+Hi Neeboo,
+
+We have been using agent_dart for our Flutter mobile application, which worked like a charm until recently.
+
+We are aware of the recent changes for calling API endpoints and verified that we are using URLs as advised in the below post i.e. ".ic0.app" 
+
+https://forum.dfinity.org/t/staged-rollout-of-boundary-node-security-upgrades-that-might-impact-dapps-action-may-be-required/20903
+
+Our API calls are throwing the below exception. Any pointer on what can be the potential fix?
+
+Exception has occurred.
+"Server returned an error:
+  Code: 307 (Temporary Redirect)
+  Body: <html>
+<head><title>307 Temporary Redirect</title></head>
+<body>
+<center><h1>307 Temporary Redirect</h1></center>
+<hr><center>nginx/1.21.3</center>
+</body>
+</html>
+
+-------------------------
+
+raymondk | 2023-07-27 22:07:17 UTC | #42
+
+@TusharGuptaMm can you give the exact url that you're making requests to?
+
+-------------------------
+
+TusharGuptaMm | 2023-07-28 16:08:00 UTC | #43
+
+@raymondk, 
+
+I identified the source of the problem as my oversight in overlooking the boundary security upgrade documentation. Following the recommendation, we made changes to the main base-domain in the request URL, but unintentionally left the canister id in the subdomain, which caused the request to be redirected incorrectly. 
+
+The original problematic URL was: https://<canister_id>.ic0.app/api/v2/canister/<canister-id>/query
+
+However, we successfully resolved the issue by using the correct URL:
+
+https://ic0.app/api/v2/canister/<canister-id>/query
+
+Thank you for your valuable support!
+
+-------------------------
+
+neeboo | 2023-07-28 16:51:47 UTC | #44
+
+Please do use latest branch which is 1.0.0-dev.15
+
+-------------------------
+
+TusharGuptaMm | 2023-07-28 16:53:04 UTC | #45
+
+Yes Sir! Thank you for your help. Sent same message on Astrox discord after I found the resolution.
+
+-------------------------
+
+kpeacock | 2023-10-04 17:31:58 UTC | #46
+
+We are evaluating using `@noble/hashes` for a pure-js BLS verification library, which will make React Native development much less painful
+
+-------------------------
+

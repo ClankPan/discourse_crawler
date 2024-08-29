@@ -1,0 +1,88 @@
+NimaRa | 2024-05-15 17:39:38 UTC | #1
+
+Hi! I have a Rust canister that uses the [alloy-rs](https://github.com/alloy-rs/) crate to import Ethereum RPC types with the sol! macro.
+
+On deploying the canister and generating the WASM for it using the `cargo build --release --target wasm32-unknown-unknown --features export-api` command, the following error is thrown:
+
+```
+Failed during wasm installation call: The replica returned a rejection error: reject code CanisterError, reject message Error from Canister CANISTER_PID: Canister's Wasm module is not valid: Wasm module has an invalid import section. Module imports function '__wbindgen_describe' from '__wbindgen_placeholder__' that is not exported by the runtime..
+This is likely an error with the compiler/CDK toolchain being used to build the canister. Please report the error to IC devs on the forum: https://forum.dfinity.org and include which language/CDK was used to create the canister., error code None
+```
+
+These are my Cargo.toml dependencies:
+```
+[dependencies]
+ic-exports = { git = "https://github.com/infinity-swap/canister-sdk", package = "ic-exports", tag = "v0.15.x" }
+ic-storage = { git = "https://github.com/infinity-swap/canister-sdk", package = "ic-storage", tag = "v0.15.x" }
+ic-canister = { git = "https://github.com/infinity-swap/canister-sdk", package = "ic-canister", tag = "v0.15.x" }
+candid = "0.10"
+serde = "1.0.199"
+serde_bytes = "0.11.12"
+ethers-core = "2.0.14"
+hex = "0.4.3"
+serde_json = "1.0.117"
+num-traits = "0.2"
+alloy = { git = "https://github.com/alloy-rs/alloy", rev = "5fbf57b", features = [
+    "contract",
+    "rlp"
+] }
+```
+
+I have reviewed the two other similar topics in the forum that have faced the same issue, however the solutions mentioned in those topics are related to individual crates and do not work in this case. What could potentially be the issue here? Thank you for your help :)
+
+-------------------------
+
+AdamS | 2024-05-15 19:45:16 UTC | #2
+
+Does this still occur if you add `default-features = false` to the alloy dependency object?
+
+-------------------------
+
+lwshang | 2024-05-15 23:52:31 UTC | #3
+
+```
+Module imports function '__wbindgen_describe' from '__wbindgen_placeholder__' that is not exported by the runtime.
+```
+This error implied that the `wasm-bindgen` crate was introduced into your project as an indirect dependency.
+`wasm-bindgen` is only for Wasm runtime in browsers (to interact with the JS engine). This is not the case for the ICP.
+
+You can verify it by:
+```
+$ cargo tree --target wasm32-unknown-unknown -i wasm-bindgen
+wasm-bindgen v0.2.92
+├── js-sys v0.3.69
+│   └── wasm-bindgen-futures v0.4.42
+│       └── alloy-transport v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba)
+│           ├── alloy-contract v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba)
+│           │   └── alloy v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba)
+│           │       └── alloy-demo v0.1.0 (/Users/lwshang/Projects/lab/alloy-demo)
+│           ├── alloy-provider v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba)
+│           │   └── alloy-contract v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba) (*)
+│           ├── alloy-rpc-client v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba)
+│           │   └── alloy-provider v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba) (*)
+│           └── alloy-transport-http v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba)
+│               └── alloy-rpc-client v0.1.0 (https://github.com/alloy-rs/alloy#5fbf57ba) (*)
+└── wasm-bindgen-futures v0.4.42 (*)
+```
+
+Turning off some features of the `alloy` crate might work.
+
+This works:
+```toml
+alloy = { git = "https://github.com/alloy-rs/alloy", default-features = false, features = [ "rlp" ] }
+```
+
+But this doesn't:
+```toml
+alloy = { git = "https://github.com/alloy-rs/alloy", default-features = false, features = [ "contract" ] }
+```
+
+The `"contract"` feature introduces the `wasm-bindgen` crate because of this line https://github.com/alloy-rs/alloy/blob/35cbf35164f31d2de1b84b2a8a9986e5b9b1560f/crates/transport/Cargo.toml#L27.
+
+This is a problem in the `alloy` project. It assumes that `wasm-bindgen` can always be used for `wasm32` target which is not the case.
+
+## Update
+There is already a [GitHub issue](https://github.com/alloy-rs/alloy/issues/700) for this problem. It seems that the alloy team has a plan to fix it.
+
+-------------------------
+

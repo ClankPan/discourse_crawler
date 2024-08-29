@@ -1,0 +1,818 @@
+skilesare | 2023-03-07 21:53:19 UTC | #1
+
+Could we get something like this in motoko?
+
+```
+let z : ?Text = when(x, #text(val)){val.value});
+```
+
+It would basically return x if the pattern matches and null if it doesn't?  Or maybe there is another way to do this.  I was experimenting on the playground below and almost got there but a trap keeps me from failing well and try/catch doesn't seem to catch it.
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=2252837445
+
+Is there a way to capture this error and continue?  
+
+Method: say (query)
+"Status": "rejected"
+"Code": "CanisterError"
+"Message": "IC0503: Canister 475h5-dyaaa-aaaab-qac4a-cai trapped explicitly: pattern failed"
+
+I've tried a try/catch, but that doesn't seem to be working and I suspect I can only use that in an async function.  How do you ignore recover from this in motoko?
+
+I also tried:
+I also tried
+
+```
+private func test((#text(val) or #nat(val2): testtype)) : Text {
+      return val.value;
+  };
+
+````
+But it didn't like variables with additive patterns or something like that.
+
+-------------------------
+
+chenyan | 2022-06-01 22:44:44 UTC | #2
+
+```
+    let z = switch(x) {
+        case (#text(val)) {?val.value};
+        case _ {null}
+    };
+```
+
+-------------------------
+
+skilesare | 2022-06-01 22:55:43 UTC | #3
+
+Yeah. Switch statements. But when you use these in production they get insane. I had direct criticism yesterday from a code auditor that the code was extremely hard to read due to the nested switch statements.  They are very hard to manage when you want to get information back to the user and not just throw/assert.
+
+-------------------------
+
+paulyoung | 2022-06-01 23:25:42 UTC | #4
+
+I would suggest writing switch statements once and then using them elsewhere.
+
+Something like this, or variations thereof:
+
+```
+module Foo {
+  public type Foo = {
+    #nat : Nat;
+    #text : Text;
+  };
+
+  public func nat(foo : Foo) : ?Nat {
+    switch(foo) {
+        case (#nat(value)) ?value;
+        case _ null;
+    };
+  };
+  
+  public func text(foo : Foo) : ?Text {
+    switch(foo) {
+        case (#text(value)) ?value;
+        case _ null;
+    };
+  };
+};
+```
+
+```
+let y : ?Nat = Foo.nat(#nat(42)); // ?42
+let z : ?Text = Foo.text(#text("Hello")); // ?"Hello"
+```
+
+~~Not sure how useful it is for the use case you have in mind since you can’t construct things like this anyway:~~
+
+EDIT: Silly mistake, this works fine and should address your concern:
+
+```
+let x : ?Text = Foo.nat(#text("Hello"));  // null
+```
+
+-------------------------
+
+icme | 2022-06-02 00:29:08 UTC | #5
+
+Paul's solution above is pretty good (I would probably use that), but to add on there are some pretty nifty helper functions in https://github.com/dfinity/motoko-base/blob/master/src/Option.mo if you're looking just to see that a value exists and not necessarily to unwrap that value. Depending on your use case and the number of types you're trying to narrow down, you may not even need a variant/switch statement in the first place.
+
+Specifically, [Option.get<T>()](https://github.com/dfinity/motoko-base/blob/master/src/Option.mo#L33) favors a pattern that produces the value or a default, and [Option.isSome<T>()](https://github.com/dfinity/motoko-base/blob/master/src/Option.mo#L33) is essentially the `exists()` pattern.
+
+-------------------------
+
+skilesare | 2022-06-02 02:05:36 UTC | #6
+
+Yep....I've started to use some of those in certain situations and they are great help.  The Option.get is frustrating because if you any kind of complex type you have to create a "default" for it. Not a big deal, but if the type is complex things like equivalence become difficult.
+
+I would love something like Option.get(x, return #error("some error"), but you can't do that because the second parameter is executed before being passed to the function.
+
+Using @paulyoung 's I could do
+
+```
+let x = if(Foo.nat(y) != null){return Foo.nat(y);}ele {return #error("some error"};
+```
+
+but that is almost as hard as having to read as scrolling up to figure out what .nat does.  I'm interested in trying to increase the amount of information conveyed to the reader with the fewest bits possible and about 80% of the solution is boilerplate.
+
+If I've tested if something is null and reacted to it I probably want to use the unwrapped version elsewhere in my code.  So I end up with this pattern everywhere:
+
+```
+let x :Nat = switch(x){
+     case(null){ return #error("x was null, try again")};
+     case(?x){x};
+}
+```
+I've highlighted the cruft that conveys no information:
+
+![image|690x181](upload://6UfiY8WODUpAkz1F2l7cPjtJlZH.png)
+
+Something like the following would make the language much more elegant
+```
+              //unwrap the variable unless it nulls out; if it nulls out then execute the block
+let x : Text = take(x!){return #error("x was null, try again)};
+```
+
+and
+
+```
+               //match the var to the pattern and execute the block; else return null
+let x : ?Text = match(x,#variant(val)){val;}
+```
+
+together
+
+```
+let x : Text = take(match(x, #variant(val){val}){ return #error("x was null, try again)};
+```
+
+-------------------------
+
+paulyoung | 2022-06-02 02:39:30 UTC | #7
+
+[quote="skilesare, post:6, topic:13427"]
+I would love something like Option.get(x, return #error(“some error”), but you can’t do that because the second parameter is executed before being passed to the function.
+[/quote]
+
+I’m a bit confused about the types involved in your example. What is the type of `x`? I imagine the problem isn’t to do with evaluation but rather with type checking.
+
+-------------------------
+
+paulyoung | 2022-06-02 02:42:52 UTC | #8
+
+[quote="skilesare, post:6, topic:13427"]
+```
+              //unwrap the variable unless it nulls out; if it nulls out then execute the block
+let x : Text = take(x!){return #error("x was null, try again)};
+```
+[/quote]
+
+Are you trying to early return from some function scope here? Otherwise it looks like you’re trying to unify `Text` and ` { #error : Text }`
+
+-------------------------
+
+paulyoung | 2022-06-02 02:45:43 UTC | #9
+
+[quote="skilesare, post:6, topic:13427"]
+I’m interested in trying to increase the amount of information conveyed to the reader with the fewest bits possible and about 80% of the solution is boilerplate.
+[/quote]
+
+I started a general purpose package based on well established principles to do exactly this a while back but wasn’t satisfied with the outcome.
+
+Maybe it’s time for another look with fresh eyes.
+
+-------------------------
+
+skilesare | 2022-06-02 03:03:31 UTC | #10
+
+>> I’m a bit confused about the types involved in your example. What is the type of `x` ? I imagine the problem isn’t to do with evaluation but rather with type checking.
+
+For this one I want an early return to the user telling them that something isn't found or configured
+
+let found_user : User = Option.get(sate.users.get(user_id), return #err("user not found")); //dont do this or you will be up until three am convinced you are going crazy and your significant other will be mad at you in the morning when you fall asleep at the breakfast table
+
+> Are you trying to early return from some function scope here? Otherwise it looks like you’re trying to unify `Text` and `{ #error : Text }`
+
+Exactly! I want to return here and tell the user to get their stuff together before calling the is function again.  You wouldn't have to return #err there, you could provide a default...so it would be like Option.get but with an in context executable block that only gets executed if the bang hits.
+
+-------------------------
+
+paulyoung | 2022-06-02 03:08:21 UTC | #11
+
+[quote="skilesare, post:10, topic:13427"]
+I want to return here and tell the user to get their stuff together before calling the is function again.
+[/quote]
+
+I suspect `Result` Is the way to do this, but there isn’t built in syntax for that. If you have a more complete example of what you want to do with `found_user` I could demonstrate how to do that.
+
+-------------------------
+
+paulyoung | 2022-06-02 03:09:31 UTC | #12
+
+[quote="skilesare, post:10, topic:13427"]
+You wouldn’t have to return #err there, you could provide a default…so it would be like Option.get but with an in context executable block that only gets executed if the bang hits.
+[/quote]
+
+There are ways to do that lazily but I still think the types are the problem.
+
+-------------------------
+
+chenyan | 2022-06-02 03:59:02 UTC | #13
+
+[quote="skilesare, post:6, topic:13427"]
+```
+let x :Nat = switch(x){
+     case(null){ return #error("x was null, try again")};
+     case(?x){x};
+}
+```
+[/quote]
+
+You could use `do ?` for this. Assume `x : ?Nat`
+```
+let res : ?Nat = do ? {
+  let y = x!;
+  let z = Foo.nat(foo_variant)!;
+  y + z
+}
+```
+If `res` is `null`, it means one of the `!` is `null`, but don't know which one.
+
+-------------------------
+
+skilesare | 2022-06-02 06:05:35 UTC | #14
+
+Right...but my frustration with this is that if I'm solving for x it is likely because I want to add it something or subtract it or do something.  When I get there in my code I have to do another switch to get it out of the ?Nat.
+
+-------------------------
+
+rossberg | 2022-06-02 10:19:07 UTC | #15
+
+@skilesare, or use another `do`. That is natural and intentional: hitting null is a kind of failure, and if there is the possibility of failure somewhere earlier in a code path, it has to propagate outwards. The type system does not allow you to "forget" that possibility. Null has to either be handled or propagated; `do` is the convenient way to propagate it, `switch` a way to handle it.
+
+-------------------------
+
+skilesare | 2022-06-02 17:16:08 UTC | #16
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=2732881938
+
+```
+import Buffer "mo:base/Buffer";
+import RB "mo:base/RBTree";
+import Nat "mo:base/Nat";
+import Iter "mo:base/Iter";
+import Time "mo:base/Time";
+import Result "mo:base/Result";
+
+actor Echo {
+
+  type Gender = {
+          #M;
+          #F;
+          #O: Text;
+      };
+
+  type User = {
+      id : Nat;
+      var fname: Text;
+      var mi: ?Text;
+      var lname: Text;
+      var email: ?Text;
+      var access_count: Nat;
+      var gender: Gender;
+      access_log: Buffer.Buffer<(Nat, Int)>;
+  };  
+
+  let users = RB.RBTree<Nat, User>(Nat.compare);
+  var nonce = 1;
+
+  let aUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat, Int)>(1);
+  };
+
+  let bUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat, Int)>(1);
+  };
+
+  let cUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat,Int)>(1);
+  };
+
+    
+
+  //50 lines
+  public shared(msg) func query_gender(user_id : Nat, access_id : Nat) : async Result.Result<Text, Text> {
+    let foundAccessUser = switch(users.get(access_id)){
+        case(null){return #err("access user not found")};
+        case(?val){val};
+    };
+
+    //let foundAccessUser = take(user.get(access_id)){return "access user not found"}
+
+    let foundUser = switch(users.get(user_id)){
+        case(null){return #err("user not found")};
+        case(?val){val};
+    };
+
+    foundUser.access_log.add((foundAccessUser.id, Time.now()));
+
+    
+    return #ok(switch(foundUser.gender){
+        case(#M){"male"};
+        case(#F){"female"};
+        case(#O(val)){val};
+    });
+  };
+
+  // Say the given phase.
+  public shared(msg) func is_female(user_id : Nat, access_id : Nat) : async Result.Result<Bool, Text> {
+    let foundAccessUser = switch(users.get(access_id)){
+        case(null){return #err("access user not found")};
+        case(?val){val};
+    };
+
+    //let foundAccessUser = take(user.get(access_id)){return "access user not found"}
+
+    let foundUser = switch(users.get(user_id)){
+        case(null){return #err("user not found")};
+        case(?val){val};
+    };
+
+    foundUser.access_log.add((foundAccessUser.id, Time.now()));
+
+    switch(foundUser.gender){
+        case(#O(val)){return #err("nyi for custom gender")};
+        case(_){}
+    };
+
+    return #ok(switch(foundUser.gender){
+        case(#M){false};
+        case(#F){true};
+        case(#O(val)){true//unreachable
+        };
+    });
+  };
+
+/* 27 lines
+  public shared(msg) func query_gender(user_id : Nat, access_id : Nat) : async Result.Result<Text, Text> {
+    let foundAccessUser = take(users.get(access_id)!){return #err("access user not found")};};
+    let foundUser = take(users.get(user_id)!{return #err("user not found")};
+
+    foundUser.access_log.add((foundAccessUser.id, Time.now()));
+
+    return #ok(switch(foundUser.gender){
+        case(#M){"male"};
+        case(#F){"female"};
+        case(#O(val)){val};
+    });
+  };
+
+  public shared(msg) func is_female(user_id : Nat, access_id : Nat) : async Result.Result<Bool, Text> {
+    let foundAccessUser = take(users.get(access_id)!){return #err("access user not found")};};
+    let foundUser = take(users.get(user_id)!{return #err("user not found")};
+
+    foundUser.access_log.add((foundAccessUser.id, Time.now()));
+
+    match(foundUser.gender, #O(val)){return #err("nyi for custom gender")};
+
+    return #ok(switch(foundUser.gender){
+        case(#M){false};
+        case(#F){true};
+        case(#O(val)){true//unreachable
+        };
+    });
+  };
+*/
+  
+
+
+}; 
+
+```
+
+-------------------------
+
+paulyoung | 2022-06-02 18:24:15 UTC | #17
+
+Will respond soon with some suggestions.
+
+-------------------------
+
+paulyoung | 2022-06-02 19:57:52 UTC | #18
+
+I would start by doing something like this:
+
+```
+import Buffer "mo:base/Buffer";
+import RB "mo:base/RBTree";
+import Nat "mo:base/Nat";
+import Iter "mo:base/Iter";
+import Time "mo:base/Time";
+import Result "mo:base/Result";
+
+actor Echo {
+
+  type Gender = {
+      #M;
+      #F;
+      #O: Text;
+  };
+
+  type User = {
+      id : Nat;
+      var fname: Text;
+      var mi: ?Text;
+      var lname: Text;
+      var email: ?Text;
+      var access_count: Nat;
+      var gender: Gender;
+      access_log: Buffer.Buffer<(Nat, Int)>;
+  };
+
+  let users = RB.RBTree<Nat, User>(Nat.compare);
+  var nonce = 1;
+
+  let aUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat, Int)>(1);
+  };
+
+  let bUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat, Int)>(1);
+  };
+
+  let cUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat,Int)>(1);
+  };
+
+  func isFemale(gender : Gender) : Bool {
+    switch(gender) {
+      case(#M) false;
+      case(#F) true;
+      case(#O(_)) false;
+    };
+  };
+
+  func isOther(gender : Gender) : Bool {
+    switch(gender) {
+      case(#M) false;
+      case(#F) false;
+      case(#O(_)) true;
+    };
+  };
+
+  func printGender(gender : Gender) : Text {
+    switch(gender) {
+      case(#M) "male";
+      case(#F) "female";
+      case(#O(val)) val;
+    };
+  };
+
+  public shared(msg) func query_gender(user_id : Nat, access_id : Nat) : async Result.Result<Text, Text> {
+    let accessUser = Result.fromOption(users.get(access_id), "access user not found");
+
+    Result.chain<User, Text, Text>(accessUser, func (foundAccessUser) {
+      let user = Result.fromOption(users.get(user_id), "user not found");
+
+      Result.chain<User, Text, Text>(user, func (foundUser) {
+        foundUser.access_log.add(foundAccessUser.id, Time.now());
+        #ok(printGender(foundUser.gender));
+      });
+    });
+  };
+
+  public shared(msg) func is_female(user_id : Nat, access_id : Nat) : async Result.Result<Bool, Text> {
+    let accessUser = Result.fromOption(users.get(access_id), "access user not found");
+
+    Result.chain<User, Bool, Text>(accessUser, func (foundAccessUser) {
+      let user = Result.fromOption(users.get(user_id), "user not found");
+
+      Result.chain<User, Bool, Text>(user, func (foundUser) {
+        foundUser.access_log.add(foundAccessUser.id, Time.now());
+
+        if (isOther(foundUser.gender)) {
+          #err("nyi for custom gender");
+        } else {
+          #ok(isFemale(foundUser.gender));
+        }
+      });
+    });
+  };
+};
+```
+
+-------------------------
+
+paulyoung | 2022-06-02 19:57:44 UTC | #19
+
+I would then extract the common parts to separate functions, like this:
+
+```
+import Buffer "mo:base/Buffer";
+import RB "mo:base/RBTree";
+import Nat "mo:base/Nat";
+import Iter "mo:base/Iter";
+import Time "mo:base/Time";
+import Result "mo:base/Result";
+
+actor Echo {
+
+  type Gender = {
+      #M;
+      #F;
+      #O: Text;
+  };
+
+  type User = {
+      id : Nat;
+      var fname: Text;
+      var mi: ?Text;
+      var lname: Text;
+      var email: ?Text;
+      var access_count: Nat;
+      var gender: Gender;
+      access_log: Buffer.Buffer<(Nat, Int)>;
+  };
+
+  let users = RB.RBTree<Nat, User>(Nat.compare);
+  var nonce = 1;
+
+  let aUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat, Int)>(1);
+  };
+
+  let bUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat, Int)>(1);
+  };
+
+  let cUser = {
+      id = nonce += 1;
+      var fname = "jane";
+      var mi = ?"d";
+      var lname = "doe";
+      var email = ?"z@s.com";
+      var access_count = 0;
+      var gender = #F;
+      access_log = Buffer.Buffer<(Nat,Int)>(1);
+  };
+
+  func isFemale(gender : Gender) : Bool {
+    switch(gender) {
+      case(#M) false;
+      case(#F) true;
+      case(#O(_)) false;
+    };
+  };
+
+  func isOther(gender : Gender) : Bool {
+    switch(gender) {
+      case(#M) false;
+      case(#F) false;
+      case(#O(_)) true;
+    };
+  };
+
+  func printGender(gender : Gender) : Text {
+    switch(gender) {
+      case(#M) "male";
+      case(#F) "female";
+      case(#O(val)) val;
+    };
+  };
+
+  func getUser(userId : Nat) : Result.Result<User, Text> {
+    Result.fromOption(users.get(userId), "user not found");
+  };
+
+  func getAccessUser(accessId : Nat) : Result.Result<User, Text> {
+    Result.fromOption(users.get(accessId), "access user not found");
+  };
+
+  func access<Ok>(userId : Nat, accessId : Nat, action : User -> Result.Result<Ok, Text>) : Result.Result<Ok, Text> {
+    let accessUser = getAccessUser(accessId);
+
+    Result.chain<User, Ok, Text>(accessUser, func (foundAccessUser) {
+      let user = getUser(userId);
+
+      Result.chain<User, Ok, Text>(user, func (foundUser) {
+        foundUser.access_log.add(foundAccessUser.id, Time.now());
+        action(foundUser);
+      });
+    });
+  };
+
+  public shared(msg) func query_gender(user_id : Nat, access_id : Nat) : async Result.Result<Text, Text> {
+    access<Text>(user_id, access_id, func (user) {
+      #ok(printGender(user.gender));
+    });
+  };
+
+  public shared(msg) func is_female(user_id : Nat, access_id : Nat) : async Result.Result<Bool, Text> {
+    access<Bool>(user_id, access_id, func (user) {
+      if (isOther(user.gender)) {
+        #err("nyi for custom gender");
+      } else {
+        #ok(isFemale(user.gender));
+      }
+    });
+  };
+};
+```
+
+-------------------------
+
+skilesare | 2022-06-03 00:51:07 UTC | #20
+
+Ahh...interesting, so since you have the wrapped type(in a result) you use the wrapped time functions to unwrap it.  These are great suggestions and I'll incorporate them, but....well it is still ...and maybe even more..hard to read and follow what is going on.
+
+One question.  access takes a type param so you can use this for a generic.  In the second line of access you call chain with Ok(the generic type), but Result.Chain uses <R1, R2, Error> and It thought R1 and R2 had to be result types themselves.  What is going on here that marshals your Bool into a R2?
+
+-------------------------
+
+paulyoung | 2022-06-03 03:15:37 UTC | #21
+
+[quote="skilesare, post:20, topic:13427"]
+It thought R1 and R2 had to be result types themselves
+[/quote]
+
+It would probably be clearer if `R1` and `R2` were named `Ok1` and `Ok2`.
+
+
+[quote="skilesare, post:20, topic:13427"]
+What is going on here that marshals your Bool into a R2?
+[/quote]
+
+There’s no “marshaling”. `R2` _is_ the `Ok` type parameter of whatever `action` Is provided. That’s how in one function it’s `Text` and another it’s `Bool`.
+
+-------------------------
+
+icme | 2022-06-03 05:45:42 UTC | #22
+
+TIL `Result.chain` in Motoko - thanks Paul!
+
+-------------------------
+
+paulyoung | 2022-06-03 05:57:16 UTC | #23
+
+Monads are a great abstraction for sequential computation with “short-circuiting” 🙂
+
+-------------------------
+
+claudio | 2022-06-03 23:34:00 UTC | #24
+
+You are probably aware of this, and explicitly avoiding it, but the code can be shortened, at the cost of increased nesting, by push the happy path continuations into the case branches, instead of returning to the outermost level:
+
+```
+let v = switch (exp) {
+      ... 
+     case (?x) { x }
+};
+decs
+```
+can be written as:
+
+```
+switch (exp) {
+   ... 
+   case (?v) { decs }
+}
+```
+
+which avoids introducing and returning temporary `x`.
+
+In your example, a lot of the `return`s can now also be elided since the function is about to exit anyway (after each case) so there is no need to `return` early.
+
+```
+  public shared(msg) func query_gender(user_id : Nat, access_id : Nat) : async Result.Result<Text, Text> {
+    switch(users.get(access_id)){
+        case(null) { #err("access user not found")};
+        case(?foundAccessUser) {
+            switch(users.get(user_id)){
+                case(null){ #err("user not found")};
+                case(?foundUser){
+                  foundUser.access_log.add((foundAccessUser.id, Time.now()));
+                  return #ok(
+                     switch(foundUser.gender){
+                        case(#M){"male"};
+                        case(#F){"female"};
+                        case(#O(val)){val};
+                   })
+               }
+            }
+        }
+    }
+  };
+```
+
+Another trick is to exploit compound patterns, switching once on the result of several computations rather than switching separately on each, though that does involve doing the computations up front rather than on demand.
+
+```
+ // Say the given phase.
+  public shared(msg) func is_female(user_id : Nat, access_id : Nat) : async Result.Result<Bool, Text> {
+    switch(users.get(access_id), users.get(user_id)){
+        case(null, _){ #err("access user not found") };
+        case(_, null){ #err("user not found") };
+        case(?foundAccessUser, ?foundUser) {
+          foundUser.access_log.add((foundAccessUser.id, Time.now()));
+          switch(foundUser.gender){
+            case(#O(val)){ #err("nyi for custom gender")};
+            case(#M){ #ok(false)};
+            case(#F){ #ok(true)};
+           };
+        }
+    };
+  };
+```
+
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3799158674
+
+-------------------------
+
+claudio | 2022-06-03 23:46:17 UTC | #25
+
+Interestingly, to reduce the pain of `match` (`switch`),
+Rust has `if let pat = e {} <else {}>` conditional let _statements_:
+
+https://doc.rust-lang.org/rust-by-example/flow_control/if_let.html
+
+(does it have conditional let _expressions_ too?)
+
+Similarly for while loops:  `while let pat = e {}`.
+
+https://doc.rust-lang.org/rust-by-example/flow_control/while_let.html
+
+-------------------------
+
+skilesare | 2023-03-07 21:57:36 UTC | #27
+
+In case you previously participated and contributed:
+
+https://forum.dfinity.org/t/new-let-binding-and-serialization-improvements-motoko-updates/18850
+
+![](upload://5oFhhMSttBvaUZ6Q6AROvHUdrTl.gif)
+```
+let ?x = getMyNat() else {return #err("I just could not do it")};
+
+let y = x + x;
+
+```
+
+-------------------------
+

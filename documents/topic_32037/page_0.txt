@@ -1,0 +1,169 @@
+f0i | 2024-06-16 17:57:02 UTC | #1
+
+I've been trying to setup a local ledger canister for testing following the [docs "ICP ledger local setup"](https://internetcomputer.org/docs/current/developer-docs/defi/icp-tokens/ledger-local-setup/).
+
+However I ran into the problem that candid doesn't have a dedicated type for Blobs and just uses [Nat8] instead. There is a thread about this here: [Imported Motoko canister has wrong type, [Nat8] instead of Blob](https://forum.dfinity.org/t/imported-motoko-canister-has-wrong-type-nat8-instead-of-blob/21312).
+
+By converting between Blob and [Nat8], I could make the backend compile (`dfx build backend`), but it still fails when I try to build the frontend which depends on the backend.
+
+I created a repository to show the error and added the full error messages to the README there.
+https://github.com/f0i/motoko-blob-nat8
+
+Is there a way to fix this without using the ["gross", "hacky workaround" of casting to another actor type](https://forum.dfinity.org/t/imported-motoko-canister-has-wrong-type-nat8-instead-of-blob/21312/4?u=f0i)?
+
+-------------------------
+
+skilesare | 2024-06-16 22:49:00 UTC | #2
+
+Typically blob and [Nat8] kind of "just work" in motoko public shared endpoints. I noticed in your week that it is saying that ?subaccount isn't [Nat8] which means you are missing an opt somewhere. If this is in typescript, perhaps you need an array around your UInt8array? Arrays of one element are used to simulate opt such that subaccount: [] is null and [[1,1,...2,2]] is an opt blob/ opt [nat8]
+
+-------------------------
+
+chenyan | 2024-06-16 22:58:19 UTC | #3
+
+What error do you get when building the frontend? As you mentioned, the backend can be fixed by replacing `[Nat8]` to `Blob` type. 
+```
+@@ -8,7 +8,7 @@
+-  type Subaccount = [Nat8];
++  type Subaccount = Blob;
+@@ -74,8 +74,8 @@
+-    //return Blob.fromArray(Buffer.toArray(buffer));
+-    return Buffer.toArray(buffer);
++    return Blob.fromArray(Buffer.toArray(buffer));
++    //return Buffer.toArray(buffer);
+@@ -100,12 +100,12 @@
+-      memo : ?[Nat8];
++      memo : ?Blob;
+-      //from_subaccount = sender.subaccount;
+-      from_subaccount = Blob.fromArray(sender.subaccount);
++      from_subaccount = sender.subaccount;
++      //from_subaccount = Blob.fromArray(sender.subaccount);
+```
+
+After this patch, I see this error while building the frontend, which doesn't seem to be related to the backend code?
+```
+src/App.tsx:15:36 - error TS2304: Cannot find name 'loadAuctions'.
+
+15                   <button onClick={loadAuctions} className="">
+                                      ~~~~~~~~~~~~
+
+
+Found 1 error in src/App.tsx:15
+```
+
+-------------------------
+
+f0i | 2024-06-17 10:32:54 UTC | #4
+
+There have been some errors from trying to simplify the issue from the original project. I fixed the frontend code, and the missing opt.
+
+However, I still get the same error. Calling `dfx build backend` succeeds, but `dfx build frontend`, which depends on the backend,shows an error inside the Motoko file `wallet.mo`
+```
+/workspaces/motoko-blob-nat8/src/backend/wallet.mo:83.35-83.42: type error [M0096], expression of type
+  {owner : Principal; subaccount : ?[Nat8]}
+cannot produce expected type
+  {owner : Principal; subaccount : ?Subaccount}
+```
+
+How can this file be ok when building the backend, but not when building the frontend?
+
+#### Here are some more things I tried
+
+If I change to Blob, I get the same error for both `dfx build backend` and `dfx build frontend`.
+```
+/workspaces/motoko-blob-nat8/src/backend/wallet.mo:83.35-83.42: type error [M0096], expression of type
+  {owner : Principal; subaccount : ?Blob}
+cannot produce expected type
+  {owner : Principal; subaccount : ?Subaccount}
+```
+---
+When I removed the subaccount and just pass null, both backend and frontend can be build.
+But when I add a subaccount I get the above error. Here is the [diff between the version wihtout and with subaccounts](https://github.com/f0i/motoko-blob-nat8/commit/1d0039a64fb8d41dd9b83732d286fed8c871a7b0).
+
+---
+
+I also tried to building inside code spaces to avoid any issues from cached artifacts of previous builds: https://youtu.be/_zFwSqXgGjs?t=140
+
+-------------------------
+
+chenyan | 2024-06-17 15:54:32 UTC | #5
+
+Everything works fine on my side when changing `[Nat8]` to `Blob`:
+```
+diff --git a/src/backend/wallet.mo b/src/backend/wallet.mo
+index b49b8c4..92ce91b 100644
+--- a/src/backend/wallet.mo
++++ b/src/backend/wallet.mo
+@@ -8,15 +8,15 @@ import Ledger "canister:ckusdc_ledger";
+
+ module {
+
+-  type Subaccount = [Nat8];
+-  public type Account = { owner : Principal; subaccount : ?[Nat8] };
++  type Subaccount = Blob;
++  public type Account = { owner : Principal; subaccount : ?Blob };
+   public type TokenInfo = { name : Text; decimals : Nat8; fee : Nat };
+   public type AccountBlob = { owner : Principal; subaccount : ?Blob };
+
+   public func accountForUser(self : actor {}, user : Principal) : Account {
+     let account = {
+       owner = Principal.fromActor(self);
+-      subaccount : ?[Nat8] = ?principalToSubaccount(user);
++      subaccount = ?principalToSubaccount(user);
+     };
+     return account;
+   };
+@@ -74,7 +74,7 @@ module {
+       buffer.add(0);
+     };
+     assert (buffer.size() == 32);
+-    return Buffer.toArray(buffer);
++    return Blob.fromArray(Buffer.toArray(buffer));
+     //return Buffer.toArray(buffer);
+   };
+```
+
+-------------------------
+
+f0i | 2024-06-18 10:54:13 UTC | #6
+
+Thank you for spending the time to look into this. I wonder if there is some difference in the environment or commands you used to build the project.
+I tried again with the patch in [Github Codespaces](https://github.com/codespaces) which provides a clean Debian installation. Still get the same error.
+
+$ dfx --version
+dfx 0.20.1
+$ moc-wrapper --version
+Motoko compiler 0.11.1 (source xqq6zkb5-mhafjk7m-n1samsmj-l4gq1143)
+$ mops --version
+CLI 0.44.1
+API 1.2
+
+Here is another video with the patch applied, from creating the codespace until getting the error (Link is to 3:15 where the actual build command starts): https://youtu.be/-2ZvrNMOPyA?t=195
+
+I will use the workaround by casting to another actor in my project for now to not be stuck.
+
+-------------------------
+
+chenyan | 2024-06-18 17:41:50 UTC | #7
+
+I see. I get the same error by using dfx 0.20.1. But if you upgrade to dfx 0.20.2, everything works fine. Not sure what changed between the dfx versions. You may also need to run `npm install` to get the typescript.
+
+-------------------------
+
+f0i | 2024-06-19 07:35:07 UTC | #8
+
+I can confirm that it works as expected with dfx 0.20.2. :+1:
+Didn't know there was a newer version as https://internetcomputer.org/install.sh still downloads 0.20.1 by default.
+
+Just for reference if someone else runs into this, here is the current version numbers:
+
+$ dfx --version
+dfx 0.20.2
+$ moc-wrapper --version
+Motoko compiler 0.11.0 (source mhbjd2y7-6x090wpf-ilgy86qg-50gxdf1b)
+
+The motoko compiler seems to be downgraded from 0.11.1 to 0.11.0.
+moc 0.11.1 still seems to works in combination of dfx 0.20.2.
+
+-------------------------
+

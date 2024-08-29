@@ -1,0 +1,129 @@
+AnonymousCoder | 2022-06-16 11:41:27 UTC | #1
+
+Hi all!
+
+I want to know what is the easiest way of checking current canister size in the code itself of that canister so that I can know when is the time to either:
+1. Stop receiving further calls that add more data to it (to prevent issues with canister size getting too large, which would cause issues in upgrades etc)
+2. Branch off from that canister to a fresh new canister with the same codebase but empty data
+
+Is there an easy way of just setting a "MAX_CANISTER_SIZE" Nat and then checking against that in any method that would try and add more data to it?
+
+-------------------------
+
+domwoe | 2022-06-16 12:05:29 UTC | #2
+
+In Motoko you can use `Prim.rts_memory_size()` and in Rust it seems to be https://doc.rust-lang.org/core/arch/wasm32/fn.memory_size.html .
+
+Have a look at this thread for more details: https://forum.dfinity.org/t/motoko-array-memory/5324
+
+This repo does this in Rust:
+https://github.com/GLicDEV/quickstart_scaling 
+
+and there might be other examples in the following thread: https://forum.dfinity.org/t/icdevs-org-bounty-20-quickstart-dapp-scaling-with-canisters-200-icp-100-icp-50-icp-multiple-winners/11756
+
+-------------------------
+
+AnonymousCoder | 2022-06-16 12:19:30 UTC | #3
+
+Thank you very much :) I've seen this in another thread around the forum as well, but it was said that it's a "risk" using it since it may change in the future. How viable would this be to use for a platform that would probably get in trouble if this stops working at a certain point and there were already hundreds of deployed smart contracts from the "factory" contract deploying them using now obsolete code for checking the storage? Would it be a terrible (or impossible task) of upgrading code later on in these "auto-deployed" contracts if this happens?
+
+-------------------------
+
+alexeychirkov | 2022-06-16 12:20:34 UTC | #4
+
+Please take a look at how we are getting memory size at Canistergeek (motoko and rust):
+
+https://github.com/usergeek/canistergeek-ic-motoko/blob/master/src/typesModule.mo#L276
+
+https://github.com/usergeek/canistergeek_ic_rust/blob/main/src/ic_util/mod.rs#L31
+
+-------------------------
+
+domwoe | 2022-06-16 12:33:48 UTC | #5
+
+Thanks Alexey! I wanted to mention Canistergeek but forgot.
+
+[quote="AnonymousCoder, post:3, topic:13838, full:true"]
+Thank you very much :slight_smile: I’ve seen this in another thread around the forum as well, but it was said that it’s a “risk” using it since it may change in the future. How viable would this be to use for a platform that would probably get in trouble if this stops working at a certain point and there were already hundreds of deployed smart contracts from the “factory” contract deploying them using now obsolete code for checking the storage? Would it be a terrible (or impossible task) of upgrading code later on in these “auto-deployed” contracts if this happens?
+[/quote]
+
+Good question. I'll forward this internally.
+
+-------------------------
+
+AnonymousCoder | 2022-06-16 13:45:12 UTC | #6
+
+Thank you for this, I didn't know such service exists :) To me, it seems like this tool provides measurements for how much data a specific canister implementing this library is using at specific time during the day? So, since I just need to know this info at any method that might store more data into the canister, I would just need to use `Prim.rts_memory_size()` that your library also uses in the above `collectMemory()` method and check against the MAX_CANISTER_SIZE variable that I can set initially in the canister as the largest size of the canister I want to allow? Something like:
+
+
+```
+let MAX_CANISTER_SIZE: Nat = 2_000_000_000; // this would be approx 2GB of storage?
+  public query func someMethodThatWouldWantToStoreMoreData(data: Blob): async Text {
+    if(Prim.rts_memory_size() < MAX_CANISTER_SIZE) {
+      // we can do further checks for the passed in data to see if it's size + Prim.rts_memory_size is still smaller than MAX_CANISTER_SIZE and error out if not
+
+      // if all is good, we can add new data to the contract here
+    } else {
+      // we return the error
+    }
+  }
+```
+Or am I completely missing something here? :)
+
+-------------------------
+
+domwoe | 2022-06-16 14:45:33 UTC | #7
+
+[quote="AnonymousCoder, post:3, topic:13838, full:true"]
+Thank you very much :slight_smile: I’ve seen this in another thread around the forum as well, but it was said that it’s a “risk” using it since it may change in the future. How viable would this be to use for a platform that would probably get in trouble if this stops working at a certain point and there were already hundreds of deployed smart contracts from the “factory” contract deploying them using now obsolete code for checking the storage? Would it be a terrible (or impossible task) of upgrading code later on in these “auto-deployed” contracts if this happens?
+[/quote]
+
+I chatted with @dsarlis  about this. There is a risk, but the risk is essentially that there are non-backwards compatible changes to WASM, since we are not building our own WASM runtime but use the one developed by the Byte Code Alliance. The risk for this seems to be rather low. 
+
+[quote="AnonymousCoder, post:6, topic:13838"]
+I would just need to use `Prim.rts_memory_size()` that your library also uses in the above `collectMemory()` method and check against the MAX_CANISTER_SIZE variable that I can set initially in the canister as the largest size of the canister I want to allow?
+[/quote]
+
+Yep, with two comments:
+1) Your example is a query, so would not allow to store data anyway ;) . If you're mostly concerned with data from outside the IC you could (additionally) use the `inspect_message` hook to check for this without having to spend cycles.
+
+2) You might want to make `MAX_CANISTER_SIZE` changeable via some form of administrative action, since upgrades to the system could allow to safely increase the limit.
+
+-------------------------
+
+AnonymousCoder | 2022-06-16 14:50:09 UTC | #8
+
+[quote="domwoe, post:7, topic:13838"]
+If you’re mostly concerned with data from outside the IC you could (additionally) use the `inspect_message` hook to check for this without having to spend cycles.
+[/quote]
+
+Thank you very much for the confirmation :) Sorry, I just used some sample method that I doodled real quick to make it into a pseudo code, did not even see it's a query method :D Could you just explain a bit more on the quote ? What's the `inspect_message`, never seen it before, is it a part of one of the core ICP libraries or something else?
+
+-------------------------
+
+domwoe | 2022-06-16 15:08:58 UTC | #9
+
+Sure, your canister can use [this hook](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-inspect-message) to decide if it wants accept an ingress message or deny it without going through consensus. 
+
+Here's how you do it in Rust: https://docs.rs/ic-cdk-macros/latest/ic_cdk_macros/attr.inspect_message.html
+
+In Motoko the feature was only recently exposed: https://github.com/dfinity/motoko/releases/tag/0.6.28
+
+-------------------------
+
+AnonymousCoder | 2022-06-16 15:13:02 UTC | #10
+
+Very nice, ty good ser! All of this will be very useful :) Thank you both
+
+-------------------------
+
+panch8 | 2024-07-09 09:37:17 UTC | #11
+
+[quote="domwoe, post:7, topic:13838"]
+`inspect_message` hoo
+[/quote]
+
+Nice @domwoe  thx!!!  always learning here!
+
+-------------------------
+

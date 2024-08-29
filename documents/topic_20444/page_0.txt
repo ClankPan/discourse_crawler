@@ -1,0 +1,196 @@
+peterparker | 2023-06-04 18:36:41 UTC | #1
+
+For those who have implemented file storage using chunked uploads in a canister, what chunk size have you defined for your uploads?
+
+Currently, I have set my chunk size to 700kb, but, while I know there is a limit, I have a feeling that increasing the value could potentially improve performance. I'm curious if anyone has conducted experiments to determine the optimal chunk size and would appreciate any insights or recommendations on this matter.
+
+```
+const chunkSize = 700000; // <-----I'm looking to find the best upper size
+
+  for (let start = 0; start < data.size; start += chunkSize) {
+    const chunk: Blob = data.slice(start, start + chunkSize);
+
+    await uploadChunk({
+        batchId,
+        chunk,
+        actor
+      });
+  }
+```
+
+-------------------------
+
+Zane | 2023-06-04 19:05:03 UTC | #2
+
+The limit for ingress messages is 2Mb iirc so that is what I use for chunking.
+
+-------------------------
+
+peterparker | 2023-06-04 19:18:08 UTC | #3
+
+You set exactly 2mb or slightly below the threshold?
+
+-------------------------
+
+Zane | 2023-06-04 19:23:52 UTC | #4
+
+Exactly 2Mb. wordcount
+
+-------------------------
+
+peterparker | 2023-06-04 19:25:58 UTC | #5
+
+Coolio. I'll give it a try, thanks for the feedback!
+
+-------------------------
+
+alejandrade | 2023-06-05 01:24:44 UTC | #6
+
+Some one should just make an NPM package for this and this question never needs to be asked again
+
+-------------------------
+
+peterparker | 2023-06-05 06:05:37 UTC | #7
+
+I would not use an npm package for this I have to say. Generally speaking, I avoid third-party JavaScript dependencies as much as possible when they are not necessary.
+
+On the contrary, I have developed a JS library for Juno ([https://github.com/buildwithjuno/juno-js](https://github.com/buildwithjuno/juno-js)) where I should improve this chunk size 😉.
+
+-------------------------
+
+Severin | 2023-06-05 06:32:47 UTC | #8
+
+In the asset canister sync code we use 1900000 bytes per chunk. Seems to be working all right
+
+-------------------------
+
+peterparker | 2023-06-05 06:40:08 UTC | #9
+
+Thanks Severin. In the asset canister, do you parallelize the upload or you proceed these one after the other?
+
+-------------------------
+
+Severin | 2023-06-05 06:41:34 UTC | #10
+
+On a quick glance I don't see any parallelisation code, but it should be fine to split add some
+
+-------------------------
+
+peterparker | 2023-06-05 06:45:00 UTC | #11
+
+Thanks for the feedback. I also don't but, since I plan to have a look to improve the performance, was thinking about parallelizing too. Will have a look.
+
+-------------------------
+
+famouscat8 | 2023-06-05 07:03:13 UTC | #13
+
+with 2MiB limit, it took my 1+hours upload about 2GiB data into local replica!!
+
+-------------------------
+
+Severin | 2023-06-05 07:05:21 UTC | #14
+
+That sounds very slow, even with 2 seconds per call it should not take that long...
+If you want faster local operations you can run `dfx start` with `--artificial-delay 10` which should speed this up massively. By default it emulates the consensus time of a subnet, which is around 1s. With that flag it should be ~100x faster
+
+-------------------------
+
+domwoe | 2023-06-05 08:46:17 UTC | #15
+
+@yrgg Maybe you've done some experiments related to this?
+
+-------------------------
+
+mnl | 2023-06-05 12:03:59 UTC | #16
+
+`ic-asset` does parallelize the upload to the asset canister, see https://github.com/dfinity/sdk/blob/master/src/canisters/frontend/ic-asset/src/batch_upload/semaphores.rs
+
+-------------------------
+
+famouscat8 | 2023-06-05 12:21:44 UTC | #17
+
+Extremely low efficience uploading large file to canister. can we make a proposition: let `sha256(data)` going through consensus and then directly upload and store the large size `data` into canister?
+
+-------------------------
+
+Severin | 2023-06-05 12:29:30 UTC | #18
+
+As @mnl already said there is some parallelisation happening already. `sha256(data)` won't work for files larger than some size because the hashing will take too many instructions for a single call
+
+-------------------------
+
+yrgg | 2023-06-05 18:40:49 UTC | #19
+
+Yeah we've messed around with this a little bit.
+
+We uploaded this 3:36:46 video [https://app.portal.one/watch/DFINITY/d337d189-64f6-40cd-9c30-735709aa06db](https://app.portal.one/watch/DFINITY/d337d189-64f6-40cd-9c30-735709aa06db) the other week and iirc it was about 10GB total. That's four separate resolutions (1080, 720, 480, and 360) with each resolution split into 6,504 individual 2 second long chunks. The entire upload for all of that was around 3:30:00 (about T1) meaning the upload time was about the same as the length of the video.
+
+We upload to asset canisters using a node.js server per resolution, with each resolution being sharded across 5 different canisters, and we throttle the number of concurrent calls per canister to 10 so as not to fill up the subnet/canisters ingest queue. In addition we set our max chunk size to 1.8MB (1_887_436 bytes).
+
+We also spawn the asset canisters on the lowest capacity subnets currently available. T1 is a pretty decent upload speed and good enough for livestreaming if you wanted to.
+
+https://p5qyc-gaaaa-aaaai-qa6yq-cai.raw.ic0.app/?playlist=https://kt3ak-tqaaa-aaaap-qbdea-cai.raw.icp0.io/watch/d337d189-64f6-40cd-9c30-735709aa06db
+
+-------------------------
+
+h1teshtr1path1 | 2023-06-05 22:07:23 UTC | #20
+
+Just chiming in, When we upload assets to an asset canister, those calls don't undergo consensus, right? Or do they?
+
+As I have also worked on something similar, where I made a motoko asset canister implementation, but for uploading a 500mb file, it takes more than half hr. And I assume there is no way to optimize it in a motoko asset canister, as all chunks would get uploaded one after others! Am I missing something? Is there any way to optimise that?
+
+-------------------------
+
+Severin | 2023-06-06 06:43:37 UTC | #21
+
+[quote="h1teshtr1path1, post:20, topic:20444"]
+When we upload assets to an asset canister, those calls don’t undergo consensus, right? Or do they?
+[/quote]
+
+Uploading (read: changing the state of the canister) goes through consensus. `http_request` is don as a non-replicated query call and doesn't need consensus.
+
+[quote="h1teshtr1path1, post:20, topic:20444"]
+And I assume there is no way to optimize it in a motoko asset canister, as all chunks would get uploaded one after others! Am I missing something? Is there any way to optimise that?
+[/quote]
+This is not something the asset canister itself controls. It's a matter of what the _uploader_ does. The receiver can't control the speed at which the uploader sends chunks.
+
+The uploader can send multiple calls at once. The messages will be processed serially, but consensus can schedule multiple messages per round, and IIRC a lot of canisters should easily be able to handle O(100) messages per second
+
+-------------------------
+
+free | 2023-06-06 10:02:02 UTC | #22
+
+A couple of aspects you may want to keep in mind when uploading content to a canister in chunks:
+* As already pointed out above, and somewhat obviously, you want to have multiple (a few, not many) requests in flight at a time. If you make a request to upload a chunk and wait for it to complete before making the next request, you are very much limited by roundtrip latency (i.e. 2 MB every few seconds) instead of block size (4 MB/s).
+* Given that the block size limit is 4 MB and there will virtually always be something or other in it (sometimes with higher priority than ingress messages; sometimes simply other ingress messages that get selected before yours) going with a 2 MB payload means that you will virtually always be limited to one payload per block (because you cannot fit 2 * 2 MB plus change into 4 MB). So either go with something just below 2 MB; or some other amount that, when multiplied, adds up to just below 4 MB. How far under 4 MB is hard to say, as it depends on the subnet and load; and more, smaller payloads are likely to make better use of whatever space is left, but will likely cost more than fewer, larger payloads.
+
+-------------------------
+
+peterparker | 2023-06-06 11:44:21 UTC | #23
+
+Thanks, @yrgg and @free, for your valuable inputs! I now have a clear understanding of what I want to focus on improving. To summarize, I'm aiming to optimize my solution by dividing it into approximately 10 parallel chunks uploaded at a time, each with a size slightly below 2MB, around 1.9MB.
+
+-------------------------
+
+alejandrade | 2023-06-07 13:14:42 UTC | #24
+
+You don't have to, hundreds of other devs will <3
+
+-------------------------
+
+decentralised.trade | 2023-06-07 20:45:04 UTC | #25
+
+Would it be feasible to have it integrated in agent.js as a standard?
+
+-------------------------
+
+sea-snake | 2023-06-07 21:30:31 UTC | #26
+
+Also for the official dfx asset canister there's an npm package to upload and manage your assets: https://www.npmjs.com/package/@dfinity/assets
+
+I plan to do some maintenance on the package soon since the dfx asset canister implementation has changed between now and the last time I worked on the package.
+
+If you use a different canister for assets, feel free to checkout the code of the package to e.g. see how data is chunked and sent in parallel.
+
+-------------------------
+

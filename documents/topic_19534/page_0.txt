@@ -1,0 +1,171 @@
+LiveDuo | 2023-04-20 18:32:37 UTC | #1
+
+
+We've been working on a canister that needs to upgrade itself.
+
+So far we've gotten to the point where the canister can sucessfully upgrade but the call throws an error (even if the update succeeds).
+
+Link to minimal example:
+[icp-self-upgrade-demo](https://github.com/LiveDuo/icp-self-upgrade-demo/blob/master/backend/src/lib.rs)
+
+To reproduce:
+
+1. Deploy the canister with:
+`dfx deploy`
+
+2. Add the canister itself as a controller:
+`dfx canister call aaaaa-aa update_settings '(record { canister_id = principal "'$(dfx canister id child)'"; settings = record { controllers = opt vec { principal "'$(dfx canister id child)'"; principal "'$(dfx identity get-principal)'"; }; }; })'`
+
+3. Call the upgrade function
+`dfx canister call child upgrade_canister`
+
+Although the canister upgrades itself succesfully it throws an error:
+
+```
+Failed update call.
+  The Replica returned an error: code 5, message: "Canister rrkah-fqaaa-aaaaa-aaaaq-cai violated contract: table not found
+
+call_on_cleanup also failed:
+
+Canister rrkah-fqaaa-aaaaa-aaaaq-cai violated contract: table not found"
+```
+
+If anyone tried this before or have more knowledge on the inner workings of IC could shed some light?
+
+-------------------------
+
+msumme | 2023-04-20 20:12:16 UTC | #2
+
+This makes sense.  You are making an async call to the management canister to upgrade the canister that is running.  When the upgrade succeeds, the management canister sends a response to a canister that is no longer running the same code, so it cannot process the response as the call context is no longer there.  It can't pick up the same execution thread that the await happened in.  So the work succeeded, but the reply can't be processed.
+
+Currently, the best solution is a very simple proxy canister.  See NNS or SNS root implementation to see how the Governance canisters are upgraded.
+
+-------------------------
+
+levi | 2023-04-21 23:07:41 UTC | #3
+
+Hi @LiveDuo, currently callbacks are registered using 1 function pointer and 1 env pointer per callback. The rust-cdk abstracts over that by pinning the Future/Waker and then registering the callback with the function-pointer as the global-cdk-callback-function, and with the env pointer as the pointer to the Future/Waker pin. When the callback comes in, the global-cdk-callback-function uses the env pointer to find the Future/Waker pin of the original Future and wakes up the future, thus continuing from the await point. 
+In this case, the global-cdk-callback-function in the new module after the upgrade has a different function pointer value than the pointer that is registered for the callback and the new module does not contain the Future/Waker Pin of the original Future because it was not carried over through the upgrade, so the function pointer and env pointer are invalid. 
+
+One coming feature on the roadmap is the **name-callbacks** feature, which lets canisters register callbacks using function names (instead of pointers), so that callbacks can come in across upgrades as long as the new module contains a callback function with the same name as the registered callback. The name-callbacks feature lets canisters upgrade themselves in a safe way and without stopping.
+
+
+https://forum.dfinity.org/t/update-on-the-ic-roadmap-december-2022-summary/17415
+[quote="samuelburri, post:1, topic:17415"]
+**Safe canister upgrades:** Currently, canisters cannot be upgraded safely without stopping them to ensure there are no outstanding calls. By introducing named callbacks, canisters can be upgraded without stopping, ensuring that canisters can always be upgraded.
+[/quote]
+
+-------------------------
+
+LiveDuo | 2023-04-21 07:19:25 UTC | #4
+
+Thanks @msumme for going deeper into the issue.
+
+Something we noticed is that the error happens even if the canister has the same WASM module but to your comment it doesn't matter for now since been unable to handle the error could be a reliability problem.
+
+We will have a look at the NNS implementation and hopefully get some ideas. For now we are exploring other options out as our canister have EOA controllers and will keep an eye on name-callbacks @levi mentioned above.
+
+-------------------------
+
+LiveDuo | 2023-04-21 07:27:23 UTC | #5
+
+We are assessing our options atm to not hold back for long. Are there any updates on the name-callbacks proposal since December?
+
+-------------------------
+
+dsarlis | 2023-04-21 07:49:46 UTC | #6
+
+> For now we are exploring other options out as our canister have EOA controllers and will keep an eye on name-callbacks @levi mentioned above.
+
+There is an option you can use if you don't care about the result of response you will get back (unlikely I suppose as you seem to care to know whether the upgrade has succeeded or not). It's the "one-way" calls that you get if you use CDK's [notify](https://github.com/dfinity/cdk-rs/blob/24bdf5ee37399c4e27ad329880c79733f6454f27/src/ic-cdk/src/api/call.rs#L179) method.
+
+Building on what the others have explained in the thread, notify sets a function pointer which is invalid by construction (technically a value of -1), which means that when the callback is received, the system will just not execute any Wasm because of the invalid pointer. The response is still delivered and the system does its own bookkeeping (so no worries that you're left with dangling callbacks), only your canister doesn't get the opportunity to execute any code in the callback.
+
+I should still warn that this workaround is only working reliably for canisters that only use such notifications and no other messages are sent to other canisters -- if you do, then you need to stop your canister first but of course that doesn't help you when you're trying to do a self-upgrade. Named callbacks aim to tackle this problem and provide a safe upgrade path without even having to stop your canister.
+
+> We are assessing our options atm to not hold back for long. Are there any updates on the name-callbacks proposal since December?
+
+The team is currently wrapping up some other work and hopefully we can get back to named callbacks as we'll have more capacity. I believe that we can have a first version of it in the next couple of months.
+
+-------------------------
+
+LiveDuo | 2023-04-29 11:46:10 UTC | #7
+
+[quote="dsarlis, post:6, topic:19534"]
+There is an option you can use if you don’t care about the result of response you will get back (unlikely I suppose as you seem to care to know whether the upgrade has succeeded or not). It’s the “one-way” calls that you get if you use CDK’s [notify ](https://github.com/dfinity/cdk-rs/blob/24bdf5ee37399c4e27ad329880c79733f6454f27/src/ic-cdk/src/api/call.rs#L179) method.
+[/quote]
+
+@dsarlis So far we used the `call` method inside a `spawn`, are there any advantages using the `notify` method?
+
+Turns out we might achieve a similar result with the `post_upgrade` method. Whatever code would run after the `install_code` method may run in `post_upgrade`. It's not ideal, as the migration logic is couple with the upgrade logic and there seem to be more ways to break the canister, nevertheless it's a way forward.
+
+In the meantime we'll keep an eye on the protocol level roadmap for when name-callbacks are shipped.
+
+-------------------------
+
+dsarlis | 2023-05-02 11:07:52 UTC | #8
+
+> @dsarlis So far we used the `call` method inside a `spawn`, are there any advantages using the `notify` method?
+
+I don't think using this approach actually solves the problem described in this thread. Even if you use `spawn`, you would still have some callback that comes back eventually and it might have the same problems if it's executed and it points to a wrong function index in the function table. The `notify` method approach goes around this potential issue by using the "always invalid" index of -1.
+
+> Whatever code would run after the `install_code` method may run in `post_upgrade`
+
+There's a catch here if you're not aware: you can't run asynchronous code in `post_upgrade` (similar to `init`). So, in practice, if you need to make calls to other canisters, that is not possible in `post_upgrade`.
+
+-------------------------
+
+bitdivine | 2024-05-29 13:10:58 UTC | #9
+
+Sorry for necroposting but:
+
+- I believe that the NNS upgrades by having two canisters that control each other, and one essentially asks the other:  Hey, please update me.  The other stops the first, upgrades it and starts it again.
+
+- But this involves having a second canister that is trusted to do the right thing.
+
+- Can the first canister be a controller of itself, then sign API  calls to stop itself, upgrade itself and start itself, then give those messages to a proxy for execution?
+
+- The signatures would presumably be time-bounded, like normal ingress message signatures.  Ideally with a window such as 15 minutes of validity so that even in a congested environment, it is most unlikely that calls need to be made after the signature has expired.
+
+- The goal is to limit the power that a proxy has.  This is interesting in cases where one has one canister per user, so a large number of canisters, and you don't necessarily want two canisters per user just in order to support upgrades.  If you have to trust the upgrade proxy less, you can have say a shared upgrader.
+
+- Maybe I worry too much.  Maybe self-upgrading in a single call, without stopping self, is fine.  I worry about open call contexts.
+
+-------------------------
+
+bitdivine | 2024-05-29 15:46:15 UTC | #10
+
+I guess the ideal self-update would be:
+
+- Stop accepting requests (stop canister)
+- Take a state snapshot
+- Upgrade Wasm
+- Start
+On error, rollback to the canister snapshot.
+
+The post_upgrade hook could include a health check, so that if the health check fails, we roll back.
+
+-------------------------
+
+dsarlis | 2024-06-06 11:00:53 UTC | #11
+
+I would generally advise against self-controlled canisters because if your canister gets broken, the very thing that can fix it is broken (itself) so you might be painting yourself into a corner in such a disastrous scenario.
+
+> Can the first canister be a controller of itself, then sign API calls to stop itself, upgrade itself and start itself, then give those messages to a proxy for execution?
+
+Sure, it's possible in theory but why would we go through the trouble of implementing something like this? What's the use case you're trying to solve?
+
+> This is interesting in cases where one has one canister per user, so a large number of canisters, and you don’t necessarily want two canisters per user just in order to support upgrades. If you have to trust the upgrade proxy less, you can have say a shared upgrader.
+
+I think both OpenChat and Vyral (the two biggest examples I'm aware of the canister-per-user architecture) use some form of proxy/upgrader canister to upgrade all the user canisters. It's of course still a controller of the canisters which perhaps you don't want if you have fully realized the vision of canister-per-user architecture.
+
+> Maybe I worry too much. Maybe self-upgrading in a single call, without stopping self, is fine. I worry about open call contexts.
+
+If your canister is making outbound calls, then you cannot safely upgrade without stopping.
+
+> I guess the ideal self-update would be [...]
+
+I think the first step in your ideal list is not possible. Stopping yourself is creating a cycle -- the canister makes a request to the management canister and then cannot be stopped because the very thing that we're waiting for is the stop request itself. If you imply that we should add some exception in the protocol that in this very case, we still allow you to stop the canister, then you'd need to provide very strong arguments why you really want a self-controlled canister that needs to be stopped before upgrading.
+
+-------------------------
+

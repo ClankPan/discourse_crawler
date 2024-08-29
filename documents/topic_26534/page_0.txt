@@ -1,0 +1,121 @@
+peterparker | 2024-01-12 08:15:45 UTC | #1
+
+Hi, I'm trying to build a crate in Rust that offers features which can be easily integrated by developers. While implementing the Rust part only took about 5 minutes to validate, I've been struggling for a day with the Candid generation part because I obviously want developer to be able to generate their did files automatically. Does anyone have any suggestions on how I can accomplish this?
+
+For example, let's consider a crate ("lib") like the following:
+
+```
+use ic_cdk::{query};
+use candid::{CandidType};
+use serde::Deserialize;
+
+#[derive(CandidType, Deserialize)]
+pub struct Demo {
+    pub text: String,
+}
+
+#[query]
+pub fn hello() -> Demo {
+    Demo {
+        text: "world".to_string()
+    }
+}
+
+#[macro_export]
+macro_rules! include_lib {
+    () => {
+        use lib::{hello};
+    };
+}
+```
+
+I want developers to easily integrate these features and extend them with their own code. This is achieved as follows:
+
+```
+use ic_cdk::{export_candid, query};
+use lib::{Demo, include_lib};
+
+#[query]
+fn greet(name: String) -> Demo {
+    Demo {
+        text: format!("Hello, {}!", name)
+    }
+}
+
+include_lib!();
+
+export_candid!();
+```
+
+However, the issue arises with the generated DID file. While the WASM is completely fine, the DID file only contains the additional functions defined in the consumer:
+
+```
+type Demo = record { "text" : text };
+service : { greet : (text) -> (Demo) query }
+```
+
+This is not what I want. Ideally, I would like to automatically generate a DID service that includes both, for example:
+
+```
+service : { 
+   greet : (text) -> (Demo) query;
+   hello : () -> (Demo) query;
+}
+```
+
+Yesterday, I opened a question asking if there's a way to make `export_candid` support this, but I understand it's not possible (see [thread](https://forum.dfinity.org/t/export-candid-from-crate-used-by-consumer/26455)).
+
+Then, I considered importing DID files, which is indeed possible (see [thread](https://forum.dfinity.org/t/candid-file-s-structure-can-i-have-multiple-services-or-import-other-did-files/10268/10?u=peterparker)). However, the issue here is that both DID files contain similar types, leading `didc` to fail due to duplication (see [thread](https://forum.dfinity.org/t/didc-skip-duplicate-binding-instead-of-error/26532)).
+
+In short, it feels like I've hit a series of dead ends. Does anyone have any innovative ideas?
+
+-------------------------
+
+peterparker | 2024-01-12 16:43:16 UTC | #2
+
+@frederikrothenberger Frederik has found a hacky, not recommended, workaround that does the trick for now, which involves moving the functions into the macro.
+
+```
+use candid::CandidType;
+use ic_cdk::{post_upgrade, print, query};
+use serde::Deserialize;
+
+#[derive(CandidType, Deserialize)]
+pub struct Demo {
+    pub text: String,
+}
+
+#[macro_export]
+macro_rules! include_lib {
+    () => {
+        #[query]
+        pub fn hello() -> Demo {
+            Demo {
+                text: "world".to_string(),
+            }
+        }
+    };
+}
+```
+
+That way generating the did files on the consumer side generates all declarations.
+
+```
+type Demo = record { "text" : text };
+service : { greet : (text) -> (Demo) query; hello : () -> (Demo) query }
+```
+
+Thanks a lot Frederik. Not all heroes wear capes!
+
+-------------------------
+
+peterparker | 2024-01-19 18:19:55 UTC | #3
+
+Actually above solution does not work because I would have to leak types to the consumers which I don't want to leak.
+
+It means that one remaining option would be to write my own macro but that would basically mean forking and adapting candid `export_service` which I don't want to do neither.
+
+So back to no idea how to solve this cleanly or with an acceptable workaround.
+
+-------------------------
+

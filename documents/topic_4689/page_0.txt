@@ -1,0 +1,223 @@
+skilesare | 2021-06-03 19:25:18 UTC | #1
+
+I’m struggling through a set of concepts and I’d like to get my suspicions confirmed or rejected(hopefully by someone on the team).  
+
+This started after reading https://forum.dfinity.org/t/can-canisters-hold-icp/4578/10 and seeing that there was some confusion.  I’ve spent a number of hours in the code and I’m not sure my confusion is any less, but I learned a lot!
+
+**Theory:** The current version of the IC has crippled ICP’s ability to be used in de-fi contracts. This may have been done deliberately during beta to reduce risk, or may have been a permanent design decision(but why?).
+
+**Evidence:**
+
+Both the ledger canister and the governance canister have limitations on principals that don’t pass an ‘is_self_authenticating’.  
+
+Self Authenticating means that these canisters have a private key that can be used to sign them. If you don’t have a private key you cannot a) send ICP unless they are on a whitelist that can only be updated by issuing an upgrade to the ledger canister(https://github.com/dfinity/ic/blob/779549eccfcf61ac702dfc2ee6d76ffdc2db1f7f/rs/rosetta-api/ledger_canister/src/lib.rs#L958) and b) cannot be the controller of a neuron(https://github.com/dfinity/ic/blob/779549eccfcf61ac702dfc2ee6d76ffdc2db1f7f/rs/nns/governance/src/governance.rs#L1556).  My understanding is that **a canister’s principle is system generated and thus is not self-authenticating**. If the previous statement is wrong, please inform me and stop reading because there rest of this is rubbish.
+
+If this is true then smart contracts on the IC can be sent ICP but cannot send it anywhere.  The only way to reclaim it is (maybe) to stop and destroy the canister.  It may only be cycles that are sent back to the controller. This means **you can not build a uniswap that took ICP as collateral** because you would not be able to refund it to liquidity providers.  This also limits things like ICO where you send ICP to a contract and get distributed a token.  Maybe we want to dissuade that, but actually keeping it from happening seems to limit many other applications.
+
+In addition, **smart contracts can’t stake their own neurons on the nns**.  This means you can’t create innovative systems of governance over shared-staked neurons.  An example of this would be an on-chain governance canister that controls a neuron that has 3 of 5 multi-sig shared among a charity board.(there are other mechanisms for this but they rely on the quantity of stake, following neurons on the Manage Neuron topic, and require a lot of hoop-jumping that could be automated in a canister.)
+
+
+This seems odd to me because there is specific text in the docs that say “As far as most uses of the system are concerned they are opaque binary blobs with a length between 0 and 29 bytes, and **there is intentionally no mechanism to tell canister id and users ids apart**.” I’m confused as to which it is because the ledger and nns canister highly discriminate on what kind of principal you are.
+
+**What the problem is(I think):**
+
+I think the problem stems from the fact that if a canister could sign a transaction with a private key, that private key would be exposed to node providers.  This will be the case until there is an sgx type private enclave solution.
+
+What I don’t understand is that cycles can be sent from one canister to another. Cycles don’t run in a canister, they are handled by each canister and follow the rules of the system.  I get that the ICP ledger is a bit of a different beast and that it runs in its own canister, but why wouldn’t you use the same system as cycles?  Because the ledger would be too big? Maybe? But maybe there should be system calls to push and pull canister transactions in and out of the ledger?
+
+**How to fix it:**
+
+Solution 1 - Trust the system:  I don’t understand why, if the messages going into canisters are cryptographically secured and if the message ordering is cryptographically secure, and if we are going to trust the trustless IC then why can’t canisters own and send IC?  Ethereum allows its smart contracts to own ETH and it is the thing that makes the whole thing go.  If it requires the ability to discriminate between canister principals and user principals, then so be it. It looks like 2 of the first useful canisters are doing it anyway.
+
+Solution 2 - Employ an interface: Create a ‘Transferable’ interface that the ledger canister  understands.  Create a claim or transferFrom like function on the canister that calls the canister asking for a transfer receipt. Other canisters and users can call an allowance function to see if they are currently allocated any icp from a canister. The receipt can only be used once (use the same mechanism that notify uses) and allows the ledger to move the funds.  If a canister creator wants to be silly enough to deliver infinite receipts then their account will get drained and they won’t have any icp left to transfer.  This would require a two jump async call which may be a bit slow, but if it is for claiming ICP, people may be willing to wait.  I guess I see a security flaw where a malicious canister could withdraw its allowance as soon as it is reported as valid, but that is why the Ethereum ecosystem publishes its contracts in a verifiable way.
+
+**Any other suggestions?**  Or have I completely misunderstood this functionality?  Once we can deploy our own canisters and start playing with the production nns and ledger from those canisters a lot of this speculation will go away.  There is also a section of the docs that says "Canisters can also have accounts in the ledger canister, but the related details are beyond the scope of this document."  Maybe it is time to have that documentation?
+
+-------------------------
+
+levi | 2021-06-02 22:42:46 UTC | #2
+
+Well I guess with that last part from the docs it says there is more to it. But besides that, do I comprehend your question?, a canister can create its own public-private key pair and store the key pair in its memory and then just call the ledger canister with the parameters with the created private-public-key ? That way a canister can be in the charge of many icp counts? Is there more to your question? And you can always set up your own cryption by separating and storing different parts of the private keys on many separate canisters cross different subnets, if you are worried about node providers seeing the private keys before the svg or whatever hides the canister-data from them.
+
+-------------------------
+
+skilesare | 2021-06-03 01:46:28 UTC | #3
+
+**edit** to add solution 3 (But I got a 403 and couldn't edit)
+
+Solution 3 - BLS threshold - I guess we could use the BLS method that Dom mentioned in his medium post on 5/27 about eth integration(https://medium.com/dfinity/internet-computer-ethereum-integration-explained-6967456e35f9) this would require giving each canister the ability to sign via bls.  Maybe this means they have to wait for a block? Not sure how this works in practice or when it will be available:
+
+> **We will now surface this functionality to smart contracts on the Internet Computer blockchain. While the Internet Computer relies heavily upon BLS threshold cryptography (named after Dan Boneh, Ben Lynn, who works at the DFINITY Foundation, and Hovav Shacham) we will introduce support for a threshold variant of ECDSA — the very cryptography scheme that secures Bitcoin and Ethereum balances and smart contracts. In essence, this will enable smart contracts on the Internet Computer to create Bitcoin and Ethereum transactions pertaining to public keys on those chains, without holding corresponding private keys (which will not even exist, and instead take the form of private key shares securely distributed across independent nodes).**
+
+-------------------------
+
+skilesare | 2021-06-03 01:49:31 UTC | #4
+
+You could do both of these things.
+
+The first I would worry about malicious nodes being able to sniff the key out of memory which I know is a know attack vector in the Beta.
+
+The second would have the same attack vector but be harder to pull off. I guess you could cycle the keys somehow to reduce the possibility that a data center would have access to all of your canisters at the same time?  I don't know any of the mechanics of how nodes request(or are assigned) subnets to run.
+
+Either way, it is odd that canisters owning ICP or controlling neurons would not be a primary object of the system.
+
+-------------------------
+
+hackape | 2021-06-03 02:48:00 UTC | #5
+
+**Not official, but just my understanding.** If mapped to ethereum, Cycle is the ETH to dfinity. While as ICP is a special kind of ERC20 token. 
+
+Cycle is the native currency built into the system. While as ICP is more like a privileged application built on top of the system. 
+
+With this perspective, things are easier to understand.
+
+-------------------------
+
+hackape | 2021-06-03 02:52:24 UTC | #6
+
+And I don’t really think this claim in the doc is right. 
+
+[quote="skilesare, post:1, topic:4689"]
+**there is intentionally no mechanism to tell canister id and users ids apart** .
+[/quote]
+
+Also in the doc, https://sdk.dfinity.org/docs/interface-spec/index.html#id-classes
+
+> *Opaque ids* .
+> These are always generated by the system and have no structure of interest outside the system.
+> Typically, these end with the byte `0x01` , but users of the IC should not need to care about that.
+
+Apparently, there is a way to tell canisterId apart from userId.
+
+-------------------------
+
+skilesare | 2021-06-03 03:32:34 UTC | #7
+
+I understand your rationale, but I'll still contend that without the ability for canister to hold ICP or stake neurons that the IC loses a significant portion of benefit of being a cryptographically secure blockchain system.  It will have limited ability to be self aware in the way that ETH is self aware.
+
+To put it another way, there is no way to create a dao without an external party holding private keys.  You can't create unstoppable organizations. All the stuff that Dom's been talking about for a long, long time just isn't possible unless the canisters/smart contracts can reason about the system they are a part of.
+
+I understand that we can create all kinds of external crypto schemes to secure these things and move them about, but I was really hoping for a system that allows me to work with ICP, cycles, neurons, and all the primary objects automagically.
+
+Maybe this is as easy as putting a private key in our canisters and having it generate a principal and that will be 'secure enough'. But it would be nice to see the DFINITY team confirm that.  Or even better for the dfinity foundation to create a canister with this schema, open code and put a few tens of millions of ICP sitting in it to provide a proving ground for how secure it is.  Maybe you can generate the private key from the random beacon so that you never have to send it as a message on the network?
+
+-------------------------
+
+Jessica | 2021-06-03 07:51:57 UTC | #8
+
+I like that a private key is needed in the way it is because it is the safest and cleanest way to protect the project currently .  It’s the most efficient way during this early development .  
+Not being able to send back icp after it’s in a canister makes sense too because that way there is no other way to go but up - for the cycles to do their work and not get rerouted .  
+Making developers work for cycles makes sense too - nothing will get done if people just get it for free .  
+It’s easy , just use the keys and protect the project
+
+-------------------------
+
+skilesare | 2021-06-03 16:16:34 UTC | #9
+
+I thought about this more and simply having a private key in the canister isn't enough! Maybe for rust, but a motoko canister has no access to the raw call function so you have no way to marshal the caller of a function into another principal(the one that you create with the private key).
+
+If the language has this functionality, please let me know I'd like to mock this up.
+
+-------------------------
+
+levi | 2021-06-03 18:56:17 UTC | #10
+
+Ok, i see, I haven't had a chance to test this myself but so you are saying that the ledger canister as of now can send icp to a canister but not let a canister send icp out? if this is the case then first, i would like to know how you know this? have you had a chance to test this on the mainnet or locally? (is the ledger canister even open-source yet?), and are you sure you are using the account-identifier? second If this is true, then Is it on the purpose? and how does the ledger canister know if the caller is a canister or a principal if it says in the spec that there is "intentionally" no way to tell a user-caller and a canister-caller apart?
+
+-------------------------
+
+dmd | 2021-06-03 19:10:32 UTC | #11
+
+This is only a temporary restriction, we're hoping to lift it in the next couple of months.
+
+We added a bunch of restrictions for the launch of the IC, (restricted subnets, cycles conversions ect.) to limit some of the attacks people could do and we're lifting them as quickly as we can.
+
+More of a bad sprain than being crippled :slight_smile:
+
+-------------------------
+
+skilesare | 2021-06-03 19:13:02 UTC | #12
+
+Looks like it is a short-term thing. See @dmd response.
+
+As far as your other questions. Yes! The IC is opensourced: https://github.com/dfinity/ic
+
+How I know that canisters can't send ICP is on the lines mentioned in the first post.
+
+I can't test on main net because I can't create a canister yet. Need to get my principal approved. Waiting on DFINITY.
+
+I can't test locally because....well...I haven't put in the time to set up a test environment that has all the system canisters. Someone needs to build a ganache that has all of this pre-loaded!
+
+Looks like the other questions are irrelevant thanks to @dmd 's response.
+
+-------------------------
+
+levi | 2021-08-13 19:26:12 UTC | #13
+
+more of a training wheels situation.
+
+@dmd So do the canister-principals always finish with the byte: 0x01 and the user-caller-principals always finish with the byte: 0x02 ? cause this means that their is a way for a canister to tell if the caller is a user or a canister.
+
+-------------------------
+
+nomeata | 2021-06-03 20:28:23 UTC | #14
+
+No. That happens to be the case now, but that’s, IMHO, incidental.
+
+Imagine we’d start to use “self-authenticating ids” for canisters to allow canister developers know their canister id before deploying (and using a cryptographic signature on canister creation to prove that they are in possession of that self-authenticating id). 
+
+Or conversely, imagine that maybe some users (or “users” – maybe important institutional players) get to use special opaque ids to authenticate, where the actual keys are managed by the NNS.
+
+Or many other possible futures where the current correspondence “opaque id ⇔ canister” breaks down.
+
+The type of principal encodes special information related to authentication (self-authenticating) or namespacing (derived ids, currently unused). It does _not_ inherently restrict what kind of entity this principal denotes.
+
+The code in the ledger that disallows opaque ids from holding ICPs is thus, well, a bit of a hack, relying on an implementation detail of the system. And as @dmd says, will hopefully go away.
+
+-------------------------
+
+Hazel | 2021-08-13 19:24:23 UTC | #15
+
+[quote="nomeata, post:14, topic:4689"]
+The type of principal encodes special information related to authentication (self-authenticating) or namespacing (derived ids, currently unused). It does *not* inherently restrict what kind of entity this principal denotes.
+[/quote]
+
+@nomeata - apologies for replying on an old post, but quick question: Does this mean I would be able to build a mechanism such that given a calling principalId, I would be able to determine if this princpal was created by some keypair or canister?
+
+For instance, say I have some hub which spawns two buckets. I'm trying to figure out how I can securely enable the two buckets to determine they're a part of the "swarm" without hitting a registry, using secrets, or storing a list of "authd" ids inside them.
+
+-------------------------
+
+skilesare | 2021-08-13 20:08:27 UTC | #16
+
+Same as here maybe?: https://forum.dfinity.org/t/tackling-certifieddata-in-motoko/6272/18?u=skilesare
+
+
+`Bucket.doAThing(witnessContainingLeafsWithAllSwarmNodesAndParentAndTimeStamp, certificate, myParams)`
+
+Swarm Node:
+
+```
+public func doAThing(witness: Witness, cert : CandidVersionOfCertificate, myParams: MyParams){
+   assert(verifySiblingsAndTimeStamp(cert, witness)); //does this need to get the shared BLS key via a system function?
+   //trust below code
+}
+```
+
+-------------------------
+
+levi | 2021-08-13 20:16:51 UTC | #17
+
+see "3. Derived ids" 
+https://sdk.dfinity.org/docs/interface-spec/index.html#id-classes
+
+-------------------------
+
+saikatdas0790 | 2023-05-28 16:46:50 UTC | #18
+
+Hi @Hazel,
+
+Were you able to figure out a solution to this question of yours?
+
+-------------------------
+

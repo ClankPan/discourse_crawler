@@ -1,0 +1,65 @@
+ilbert | 2023-10-17 14:05:49 UTC | #1
+
+# Current state
+I'm working on the [IC WebSocket](https://forum.dfinity.org/t/ic-websocket-roadmap/21503) **Rust CDK**. Like in a traditional WebSocket server, the developer can pass to the IC WebSocket CDK the events' function callbacks (`on_open`, `on_message`, `on_close`). These functions are stored in the [WsHandlers](https://github.com/omnia-network/ic-websocket-cdk-rs/blob/ec6d2fcb1bfdf3fc887007d14350e282bdbc9abb/src/ic-websocket-cdk/src/lib.rs#L758-L828).
+
+ At the current state, when a message is received by the canister, it is passed to the [OnMessageCallback](https://github.com/omnia-network/ic-websocket-cdk-rs/blob/ec6d2fcb1bfdf3fc887007d14350e282bdbc9abb/src/ic-websocket-cdk/src/lib.rs#L766-L773) as raw encoded **Candid** bytes and the developer needs to decode it manually as done in the example:
+https://github.com/omnia-network/ic_websocket_example/blob/b2eb97d46d17c88d472b4ecb0ef5b3c6a738ba86/src/ic_websocket_example_backend/src/canister.rs#L30
+
+# Goal
+We want to make it possible for developers to receive the message already decoded based on a type that they provide. For this reason, the OnMessageCallback [arguments](https://github.com/omnia-network/ic-websocket-cdk-rs/blob/ec6d2fcb1bfdf3fc887007d14350e282bdbc9abb/src/ic-websocket-cdk/src/lib.rs#L766-L770) should have a dynamic `message` field type like:
+```rust
+/// Arguments passed to the `on_message` handler.
+pub struct OnMessageCallbackArgs {
+    pub client_principal: ClientPrincipal,
+    pub message: Box<dyn CandidType>,
+}
+```
+
+This way, when a new message is received by the canister in the **ws_message** function, the message can be decoded from Candid and the callback called with the correct type (how it's done now: https://github.com/omnia-network/ic-websocket-cdk-rs/blob/ec6d2fcb1bfdf3fc887007d14350e282bdbc9abb/src/ic-websocket-cdk/src/lib.rs#L988-L991).
+
+# Question
+However, the compiler is giving this error:
+```bash
+error[E0038]: the trait `CandidType` cannot be made into an object
+   --> src/ic-websocket-cdk/src/lib.rs:794:22
+    |
+794 |     pub message: Box<dyn CandidType>,
+    |                      ^^^^^^^^^^^^^^ `CandidType` cannot be made into an object
+    |
+note: for a trait to be "object safe" it needs to allow building a vtable to allow the call to be resolvable dynamically; for more information visit <https://doc.rust-lang.org/reference/items/traits.html#object-safety>
+```
+
+Does anyone has any suggestions on how to make it work? Should we change the way the developer provides the events callbacks to the CDK?
+
+-------------------------
+
+chenyan | 2023-10-17 16:54:22 UTC | #2
+
+As the compiler suggested, you cannot have `dyn CandidType`. This is true for other serde based serialization libraries, e.g., you cannot define `dyn Serialize` or `dyn Deserialize` either. 
+
+The easiest is to keep message as raw bytes. If you want to cache the parsing, you can use something like this:
+```
+enum Message<T1:CandidType, T2:CandidType> {
+    Zero,
+    One(T1),
+    Two(T1,T2),
+    ...
+}
+```
+The drawback is that you only support a limited number of tuples, but in practice, functions don't tend to take large number of arguments.
+
+-------------------------
+
+ilbert | 2023-10-18 11:27:12 UTC | #3
+
+So, if I understand correctly, there's no way to pass the deserialized message to the callback?
+
+-------------------------
+
+chenyan | 2023-10-18 17:08:53 UTC | #4
+
+That `Message` enum is the deserialized message. Not super convenient, but it's doable.
+
+-------------------------
+

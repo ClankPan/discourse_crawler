@@ -1,0 +1,132 @@
+0kenx | 2023-07-04 14:38:14 UTC | #1
+
+Hello, I added the dfnity/ic repo as a submodule in my own project.
+
+In the CI pipeline I set up a github action to update the IC and build wasms periodically using `cd ic && ./gitlab-ci/container/build-ic.sh -c`. But I run into the error `fatal: not a git repository: /ic/../.git/modules/ic`.
+
+Weirdly it all works on my local machine from the same repo. Any ideas on how to solve it?
+
+```
+Repository rule new_git_repository defined at:
+
+  /ic/.cache/bazel/_bazel_1001/6d065581cce7ad9076e3b8db2b3afaf0/external/bazel_tools/tools/build_defs/repo/git.bzl:186:37: in <toplevel>
+
+INFO: Analyzed target //publish/canisters:canisters (592 packages loaded, 16235 targets configured).
+
+INFO: Found 1 target...
+
+[0 / 100] [Prepa] BazelWorkspaceStatusAction stable-status.txt
+
+ERROR: <builtin>: BazelWorkspaceStatusAction stable-status.txt failed: Failed to determine workspace status: Process exited with status 128
+
+fatal: not a git repository: /ic/../.git/modules/ic
+
+Target //publish/canisters:canisters failed to build
+
+Use --verbose_failures to see the command lines of failed build steps.
+
+INFO: Elapsed time: 167.605s, Critical Path: 0.11s
+
+INFO: 1 process: 1 internal.
+
+FAILED: Build did NOT complete successfully
+
+FAILED: Build did NOT complete successfully
+
+Gathering metadata for bazel cquery...
+cp: cannot stat 'bazel-out/k8-opt/bin/publish/canisters/candid-test-canister.wasm.gz': No such file or directory
+cp: cannot stat 'bazel-out/k8-opt/bin/publish/canisters/canister-creator-canister.wasm.gz': No such file or directory
+cp: cannot stat 'bazel-out/k8-opt/bin/publish/canisters/cycles-minting-canister.wasm.gz': No such file or directory
+```
+
+-------------------------
+
+basvandijk | 2023-07-05 07:41:08 UTC | #2
+
+Do you use https://github.com/actions/checkout to checkout your repo by any chance? 
+
+If so, you probably want to set the `submodules` field to `true`.
+
+-------------------------
+
+0kenx | 2023-07-05 07:50:37 UTC | #3
+
+Yes, the `submodules` flag is set.
+
+```
+name: Update IC repo
+run-name: Update IC repo
+on: 
+  workflow_dispatch:
+  schedule:
+    - cron: '30 2 * * 2,4,6'
+jobs:
+  update_ic_repo:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Event ${{ github.event_name }}. OS ${{ runner.os }}. Branch ${{ github.ref }}."
+      - name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          submodules: 'true'
+      - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
+      - name: List files in the repository
+        run: |
+          ls ${{ github.workspace }}
+          flag='a'
+          echo $flag
+      - name: Update IC folder
+        run: |
+          cd ic
+          git checkout master
+          git pull --rebase
+      - name: Install SDK
+        run: |
+          sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall --no-confirm ic-wasm
+          rustup target add wasm32-unknown-unknown
+      - name: Bazel cache restore
+        uses: actions/cache/restore@v3
+        with:
+          path: |
+            ~/.cache/bazel
+            bazel-bin/
+            bazel-ic/
+            bazel-out/
+            bazel-testlogs/
+            target/
+            artifacts/
+          key: ${{ runner.os }}-bazel-
+      - name: Build IC canisters
+        run: |
+          cd ic
+          ./gitlab-ci/container/build-ic.sh -c
+          cp artifacts/canisters/ic-icrc* ../rs/ic-wasms/
+          cp rs/rosetta-api/icrc1/ledger/ledger.did ../rs/ic-wasms/
+          cp rs/rosetta-api/icrc1/index-ng/index-ng.did ../rs/ic-wasms/
+          cp rs/rosetta-api/icic1/archive/archive.did ../rs/ic-wasms/
+      - name: Bazel cache save
+        uses: actions/cache/save@v3
+        with:
+          path: |
+            ~/.cache/bazel
+            bazel-bin/
+            bazel-ic/
+            bazel-out/
+            bazel-testlogs/
+            target/
+            artifacts/
+          key: ${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE.bazel', 'bazel-timestamp.txt') }}
+      - name: Commit Compiled WASMs
+        uses: EndBug/add-and-commit@v9
+        if: env.TESTS_PASSED
+        with:
+          add: ../rs/ic-wasms/*
+          default_author: github_actions
+          commit: --signoff
+          message: "🤖 IC WASM auto-update"
+```
+
+-------------------------
+

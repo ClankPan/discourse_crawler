@@ -1,0 +1,245 @@
+Manu | 2024-06-20 11:09:41 UTC | #1
+
+Hi everybody! 
+
+DFINITY is working on a full post mortem, but in the interest of transparency and giving more clarity quickly, here is already a summary of the current understanding of the NNS subnet incident of June 14th. 
+
+What happened
+
+* The NNS subnet progressed very slowly, processing roughly 1 block per minute, instead of being close to 1 block per second. This subnet contains the NNS governance canister and the ICP ledger.
+* Every subnet regularly certifies their state, allowing users to securely read information from the blockchain. To make sure that no old stale data is given to users, the user agent logic checks the timestamp of certificates, and rejects if they are more than 5 minutes old. Because the NNS subnet processed things so slowly, the latest certified state was often > 5 minutes old, leading to all user agents rejecting this certificate. This means users could not query their ICP balance or see whether their ICP transaction was processed (even though ICP transactions were still slowly being processed).
+* Communication from DFINITY was very limited by only posting on [statuspage](https://status.internetcomputer.org), and initially incorrectly stated that the problem was limited to the NNS FE dapp. This left many people in the dark on what’s happening.
+* The NNS subnet was always making progress, albeit slow, and the integrity of the system was never compromised.
+* All other subnets were unaffected and working at their normal speed.
+
+What was the root cause
+
+* A new storage layer has recently been implemented, which should allow for subnets to hold more state. The new storage layer led to clear performance and scalability improvements on all other subnets, but the particular workload on the NNS subnet did not work well with the new storage layer and resulted in slower computation.
+* The NNS is a system subnet which is configured differently than other subnets. Most importantly, it does not have deterministic time slicing (DTS) which splits long-running computation into chunks that are processed across multiple rounds. Instead, it allows a lot of computation to be scheduled in one round, which means processing one block may take a lot longer than 1 second, resulting in a slow block rate.
+* The combination of these two lead to very long execution rounds.
+
+How was it addressed
+
+* DFINITY used the boundary nodes it controls to temporarily block traffic to the NNS subnet and reduce the load
+* A proposal was submitted to upgrade the NNS subnet to a replica version without the new storage layer
+
+What are future steps
+
+* Enable deterministic time slicing on the NNS subnet, and minimize configuration differences between the NNS subnet and other subnets
+* Further improve the storage layer to avoid performance regressions on the NNS subnet before enabling it again
+* Set up better communication during highly visible incidents like this one
+
+-------------------------
+
+raymondk | 2024-07-10 12:14:27 UTC | #3
+
+Hello everyone, as promised, here is a more detailed post mortem for the incident.
+
+# ICSUP-3832: NNS subnet finalization rate severely reduced
+
+External comms: [https://manage.statuspage.io/pages/kc2llmsd16bk/incidents/pwzsbrbz5npj](https://manage.statuspage.io/pages/kc2llmsd16bk/incidents/pwzsbrbz5npj)
+Time and duration of incident: 2024-06-14 10:50 / 12 hours
+Detected by automated monitoring: yes
+Caused by change: IC-1306 - storage layer that avoid fragmentation
+
+# Executive summary
+
+The new LSMT storage layer led to a performance regression on the NNS subnet. In combination with the high round limits on the NNS subnet (as DTS was not enabled there at the time of the incident), this led to very long execution rounds and consequently a slow NNS subnet. Long execution rounds cause a backlog of finalized blocks and the subnet working with an old timestamp, causing state certifications with an old timestamp. Clients reject certificates that are more than 5 minutes old, leading to users being unable to read the chain via queries, and unable to check the status of their transactions, making it seem like the NNS subnet was completely unavailable.
+
+**High Priority Action Items:**
+
+* [***Done***] Enable DTS on the NNS subnet and revise the instruction limit.
+* [***In progress***] Establish better communication strategy during incidents.
+* [***In progress***] Add features to ic-boundary and ic-gateway to better control rate limiting.
+* Inventory of the differences between the NNS subnet and other subnets to work towards a single configuration.
+
+# Scope and severity of impact
+
+From an end user perspective, the incident affected only the NNS subnet and dapps depending on canisters on the NNS subnet, such as DEXs and dashboards. For canisters on other subnets that depend on canisters on the NNS, the slowdown manifested in very slow responses to requests or even timeouts. In addition to this, during the incident, the execution backlog was large enough such that the timestamp of the most recent certified state was over 5 minutes after the wall-clock time. ic-agents as well as the boundary nodes, discard query responses based on stale certificates, particularly certificates with a timestamp that is older than 5 minutes.
+
+Once certificates were stale, interacting with the NNS subnet was functionally impossible for users. Any queries or `read_state` calls would not get an answer and eventually time out. In principle, update calls would still execute, but their status could not be queried. The error that users would see when querying the state of an update call would be “certificate is stale”.
+
+Any reasonably complex interaction with the NNS subnet would likely include some queries, e.g. querying the ICP balance before triggering a transfer, so these interactions would time out as a whole.
+
+This implies that submitting and voting on proposals was practically impossible and rolling back was not possible without blocking update calls to the NNS.
+
+# Timeline of events (UTC)
+
+2024-06-03: Finalization rate alerts trigger, but the subnet recovered on its own.
+2024-06-04: Finalization rate alerts trigger, but the subnet recovered on its own.
+2024-06-07: Finalization rate alerts trigger, but the subnet recovered on its own.
+2024-06-11:
+* Identified the storage layer as the cause for the performance degradation since June 3rd and an MR had been merged to address it. The plan was to roll it out with the next regular release cycle.
+
+2024-06-14 (Friday):
+* 10:50am:
+  * Finalization rate alerts fire for the NNS subnet
+  * Similar alerts were emitted earlier already but the system had been able to recover.
+* 14:50: Finalization rate recovers
+* 16:00: Finalization rate drops again
+* 17:03: User [posts on the forum](https://forum.dfinity.org/t/nns-dapp-not-loading-internal-server-error-nns-issue/31946) that the NNS is not working
+* 17:06: User reports on [twitter](https://x.com/ASmagicpoint/status/1801666250356969778)
+* 17:26: Decide to update the status page
+* 18:44:
+  * Boundary node team starts working on limiting traffic to NNS subnet
+  * Message routing team working on a fix to disable the new LSMT storage layer on the NNS subnet
+* 18:51: Replica hotfix is ready
+* 20:13: [Proposal to elect hotfix is created](https://dashboard.internetcomputer.org/proposal/130400)
+* 20:50: Started rolling out boundary node patch
+* 21:15: Execution speeds up partially due to reaching a checkpoint
+* 21:30: Last boundary node has been patched
+* 22:04: [Proposal to elect hotfix passed](https://dashboard.internetcomputer.org/proposal/130400)
+* 22:14: [Proposal to upgrade NNS subnet passed](https://dashboard.internetcomputer.org/proposal/130401)
+* 22:20: NNS subnet goes down for the upgrade
+* 22:22: NNS subnet finished the upgrade and is healthy again
+* 22:40: Started to roll back the boundary node patch
+* 23:21: Completed boundary node roll back
+
+# What went well
+
+* Disabling the LSMT storage layer worked as designed
+* The team found out about the problem via automated alerts, not user reports.
+* Internal monitoring helped the team to quickly zero in on what turned out to be the culprit.
+* Relevant experts quickly arrived on scene and began investigating.
+* Having control over the boundary nodes allowed us to pause traffic. However, this will not be possible when the API boundary nodes are moved under NNS control.
+
+# What went wrong
+
+* **LSMT performance regression on the NNS subnet**: The LSMT storage layer led to a performance regression on the NNS subnet
+  * The LSMT storage layer was tested against the NNS workload, but the scale of the regression was missed. Particularly, the NNS workload was sampled from a time period that did not reflect the worst case regression. Furthermore, the methodology based on replaying old blocks did not capture the negative feedback loop due to the slowing finalization rate.
+* **Lack of DTS**: The NNS subnet was running in a configuration that allowed for slow execution rounds due to DTS not being enabled and the NNS canisters needing very high limits. The work was eventually picked up and it was unfortunate that the incident happened weeks before DTS would have been enabled on the NNS subnet.
+* **Not enough action was taken when early signals showed**: As can be seen from the timeline, there were problematic signals before the main incident on Friday.
+  * A rollback was discussed, but at the time people thought that the worst that could happen was degraded performance and higher latency for the NNS subnet. The risk that long execution rounds could cause stale certificates had not been anticipated and the worst-case scenario seemed like “only” degraded performance. With that in mind, it was decided to not immediately elect a new replica version without LSMT, but rather stick to the normal schedule and improve the LSMT performance based on the learnings ([commit](https://github.com/dfinity/ic/commit/e9a0c5533)).
+  * Reacting more forcefully to the initial observed change in performance starting June 3rd, would have prevented the incident.
+* **Whenever execution is very slow, it’s impossible to read the chain**:
+  * Consider making the stale certificate timeout configurable in the agent so that dfx calls can still succeed if the subnet is backed up.
+* **Understanding the full impact of the incident was slow:** Initially, concerns were more about the NNS FE dapp, not about the whole NNS subnet. This meant the scope of the problem was underestimated for a while, leading to a slower reaction time.
+* **Lacking communication:** There were complaints about the public communication strategy, e.g. in the [forum](https://forum.dfinity.org/t/todays-outage-and-the-lack-of-communication-was-bad-title-changed/31965). Statuspage initially said that the problem was with the NNS FE dapp, which was not accurate as people realized the ICP ledger was also affected. This was a highly visible incident and people were likely worried about their ICP / neurons, so it would have helped the community to spend more effort in communicating what’s happening along the way.
+* Rolling out patched versions of the boundary nodes could have been faster:
+  * The configurability of ic-gateway and ic-boundary could be improved to include options to tune certain features so that startup parameters can be tuned instead of requiring a new build which is risky.
+  * Boundary node rollout in singapore is very slow
+* dfx voting with a non-standard network argument does not work on all OSs, even when changing /etc/hosts
+  * Voting instructions were to use dfx with `--network=ic` and to set the /etc/hosts file with entries for ` nns.ic0.app identity.ic0.app icp-api.io` but it looks like dfx uses https://icp0.io see [github](https://github.com/dfinity/sdk/blob/master/src/dfx-core/src/config/model/dfinity.rs#L229).
+
+# Lessons learned
+
+* Act more quickly whenever there are risks with the NNS subnet, erring on the side of caution. In this case, it would have been beneficial to more carefully estimate how slow execution rounds could become and to roll back the LSMT feature earlier.
+* Eliminate the differences between how the NNS subnet is configured and how other subnets are configured, avoiding future exceptions or special cases in the form of higher limits for NNS canisters.
+* Ensure that during an incident, there is a step back to understand the full user impact. The incident coordinator should regularly reevaluate the user impact.
+* Emphasize the importance of communication during highly visible incidents, dedicating time to it even when the focus is on fixing the incident as soon as possible.
+
+# Action items by priority
+
+## P0 - most important
+* Enable DTS on the NNS subnet and revise instruction limits for execution rounds
+* Communicate & document how everybody can update the status page. Establish guidelines & examples for the wording of the status page
+* Re-usable testing of storage layer performance with recent perf improvements against blocks during the incident & re-enable on all subnets after improvements and after DTS is enabled.
+* Establish a better comms strategy during incidents. Consider adding internal or external comms resources to the response team so devs can focus on the technical issues instead of posting updates
+* Additional features for ic-gateway and ic-boundary
+  * option to disable response verification
+  * option disable replica-signed queries
+  * option to block any call for a specific subnet
+  * option to rate-limit any call for specific subnet
+* Inventory of the differences between the NNS subnet and other subnets to work towards a single configuration.
+
+## P1 - Follow ups
+* Revisit subnet recovery with decentralized boundary nodes:
+  * What to do if the API boundary nodes are down?
+  * What to do if the NNS subnet needs to be protected?
+  * Should anyone be able to send requests to replicas?
+* Explore ways to submit & vote on proposals while NNS is overloaded. Answer/solution to this is a precondition to fully switching to NNS-managed API BNs.
+* Explore better ways to deal with stale certifications. Everything stopping when the latest state has a time > 5 min ago is probably not the best approach.
+* Consider adding a "conservative" GuestOS version when rolling out new features, such that switching over to the safe fallback becomes quick and easy
+
+
+# Technical details
+
+## New storage layer
+
+The new storage layer (IC-1306) is a feature that changes how canister states are stored on disk as part of the checkpoints. It was rolled out to all subnets in stages starting from April 29, 2024 and eventually rolled out to the NNS on June 3rd, 2024.
+
+The basic idea of the feature is that when writing checkpoints, data is written in an intermediate format containing multiple files per canister state, and a merge step is introduced, which converts multiple files down to a single file, a representation similar to the old storage layer. This merge step is asynchronous, and does not block execution, and is generally scheduled within a couple of checkpoints (i.e. a couple hundred blocks) of the initial writing of new data.
+
+The advantage of this scheme is that the actual checkpointing step is more efficient. A drawback is that one needs to handle the intermediate format while executing messages, which can be slower (this is something that is inherent to this design and was known prior to the incident).
+
+Both testing and the rollout of this feature to non-NNS subnets suggested that while the advantages to checkpointing are large and immediate, any slowdown to execution due to the intermediate representation were small to non-existent.
+
+After releasing the new storage layer to the NNS, some drops in finalization rate were observed, but they cleared quickly after 15 - 30 minutes. The fact that they were temporary was consistent with the intermediate file format, and the fact that merges would eventually be triggered.
+
+Here is an example of such a series of such drops previously observed on June 6:
+![image|690x136](upload://mmkImDCKf0LcwExVnai5w8DHhm4.jpeg)
+
+
+Due to the observation of these slowdowns, the NNS workload was investigated further. This eventually led to [an improvement](https://github.com/dfinity/ic/commit/e9a0c5533) to how execution using the temporary file representation is handled. Based on experiments, this improvement closes most of the gap to a clean, merged state, at least for the NNS workload. This change was merged to master on June 11, 2024.
+
+As the slowdowns were temporary, the decision was made to simply wait until the performance improvements would reach the NNS as part of the usual release process, which would have happened on June 24, 2024, assuming all related proposals would have been accepted.
+
+However on June 14, 2024, 2 weeks after the initial rollout, the drop was larger than usual. It is still unclear why it was more severe on that day. As the finalization rate dropped to an extremely low level (see below), it also didn’t matter that the slowdown is in principle temporary. As the scheduling of the merges is based on height, rather than time, the very low finalization rate meant that the merge would be hours into the future.
+
+## Different round limits and no DTS on system subnets
+
+The execution message and round limits are quite higher on system subnets. They are currently tuned to be 10 times higher than app subnets. DTS is also not enabled on system subnets. The reasons are mostly historical and there was in fact an effort to enable DTS on system subnets ongoing independently of the incident. This means a message limit of 50B and a round limit of 70B. Due to the scheduling of messages, it is expected that rounds can reach up to 20 billion instructions if many 'small' messages are executed, and up to 70B instructions in the worst-case if a 'large' message just below 20B is executed.
+
+To get some concrete numbers, 2B instructions should ideally take 1 second to compute, so on all non-system subnets, rounds are limited to what should take 1 second of computation. On the NNS, with many small messages, round times of 10 seconds (20B instructions) are expected, and if there are big messages as well, it could even take up to 35 seconds (70B instructions). Canister installations / upgrades are allowed to take even longer. These numbers are when everything works as expected. On all non-system subnets, the limits are always set to 2B, meaning 1 second of computation.
+
+Having a lower round limit would already be helpful in the sense that it would limit the round duration to something more reasonable. E.g. with a round limit of 52B the average expected round would be 2B instructions. This would help in the case where there are many “small” messages because not as many of them would be packed per round. However, there would still be a vulnerability to large messages. This can only be improved with DTS enabled that would allow us to reduce the slice limit enough (and consequently the round limit) while still being able to execute “large” messages over multiple rounds.
+
+## Vicious cycle increasing round duration and execution backlog further and further
+
+Since execution was not fast enough to keep up with the incoming replicated messages, the execution queue grew to its maximum capacity. This in turn triggered the consensus layer to reduce the finalization rate. However, as the amount of incoming messages kept constant, this simply resulted in blocks containing more messages, leading to rounds that all take the max instructions per round.
+
+This cycle can be seen in both the round execution times as well as the number of instructions per round.
+![image|690x136](upload://kq7uXA5tQCX7QAIJW3blzKqM2al.jpeg)
+
+
+On the execution side, these larger blocks caused the round execution times to increase even further, which in turn caused the finalization rate to drop even further. As the round instruction limit on the NNS is very high, at no point were any message timed out before getting executed.
+![image|690x124](upload://tYUWCBSMxuNgiEK7CjJZR102lh5.jpeg)
+
+
+The finalization rate during this period was very low and kept dropping further over time.
+![image|690x152](upload://2526qKqFwDxS9Ecmp1lIDFxjts2.jpeg)
+
+
+
+It would have helped break the cycle if the round instruction limit was set lower, as this would cap the number of instructions executed per block, and as a result maintain a maximum block execution time, and in turn a minimum finalization rate.
+
+## Stale certificate errors
+
+An IC subnet produces a certificate for the most recent state. This most recent certified state is used during queries as well as `read_state` calls. The timestamp of the certificate is based on the timestamp of the most recent block applied to it, which in turn is based on the wall-clock time at the time when the block was proposed.
+
+During the incident, the execution backlog was large enough such that the timestamp of the most recent certified state was over 5 minutes after the wall-clock time. ic-agents, as well as the boundary nodes, discard query responses based on stale certificates, particularly certificates with a timestamp that is older than 5 minutes.
+
+Once certificates became stale, interacting with the NNS subnet was functionally impossible. Any queries or `read_state` calls would not get an answer and eventually time out. In principle, update calls would still execute, but their status could not be queried.
+
+Any reasonably complex interaction with the NNS subnet would likely include some queries, e.g. querying the ICP balance before triggering a transfer, so these interactions would time out as a whole.
+
+## Blocking update calls to the NNS subnet via boundary nodes
+
+The boundary nodes maintain a map of canister to subnet to replica. They route API calls to the correct replica based on the intended canister.
+
+The boundary nodes are currently managed by DFINITY. A change was made to the boundary nodes to block update calls to the NNS subnet. After the NNS recovered, one boundary node was made available to trusted neurons to vote a new proposal and roll back the replica to a known working version.
+
+After that NNS subnet was rolled back, the changes to the boundary nodes were rolled back.
+
+## Hotfix version
+
+A hotfix version based on the then current version of the NNS subnet was created with the new storage layer disabled.
+
+The hotfix version was immediately voted in by the trusted neurons, without waiting for community consideration.
+
+After the rollout of the hotfix version, the performance returned to something comparable to the performance before the rollout of the new storage layer to the NNS.
+
+-------------------------
+
+Lorimer | 2024-07-10 17:43:01 UTC | #4
+
+Thanks for this detailed post-mortem @raymondk. I'm curious that there's no mention of the ongoing XNET issue and the `max_simultaneous_connections_per_ip_address` having been set to 1000 (instead of 100) around the time of this incident. Is this not a contributing factor?
+
+-------------------------
+
+Manu | 2024-07-11 14:59:05 UTC | #5
+
+Correct, I don't think `max_simultaneous_connections_per_ip_address` played a role in the incident
+
+-------------------------
+

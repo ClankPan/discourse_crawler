@@ -1,0 +1,130 @@
+Mathias | 2023-06-21 14:17:28 UTC | #1
+
+![game|690x327](upload://4rZg2jv7TISiYLTqPThKnb9Qon0.png)
+
+I'm building an app where people can assign bounties (in ICP) to questions and then reward the best answers. The core logic of a question is shown above. So far I've implemented this in a naive way. I would like it to be more type safe so that the type system shows me all the possible cases I need to handle when working on the frontend. 
+
+The logic: 
+A question can be open for a certain duration during which people can add answers. Thereafter the user either gets refunded or they are asked to select a winner. If they don't select anyone an arbitration process begins. If they select a winner, other users that gave an answer can dispute that choice. If no dispute occurs, the selected winner is paid. If a dispute happens the arbitration process gets triggered. 
+
+The chart above is only a rough drawing. As you might guess the following has to be stored:
+- answers
+- potential winner (selected by the user)
+- final winner
+
+I've been reading about state machines and DAGs but don't completely understand how I should implement this in Motoko. I want the type system to understand what all the possible states of this system can be. In typescript I think I could use discriminated unions to implement this but I don't really understand how to implement this with variants. 
+
+Thanks in advance for any thoughts.
+
+-------------------------
+
+Severin | 2023-06-21 15:43:10 UTC | #2
+
+I think you can use variants just fine. You can pack arbitrary information into the different variants (see [ledger types](https://github.com/dfinity/ic/blob/master/rs/rosetta-api/icrc1/ledger/ledger.did#L24-L33) as an example for different combinations) and then match on the variant to decide how to proceed
+
+-------------------------
+
+infu | 2023-06-21 18:32:55 UTC | #3
+
+Here is an example <https://github.com/infu/swapper>
+Using variants and switch is pretty much enough.
+
+You will probably be better off with a diagram like this. It shows you what variant types need to be 
+![image|690x451](upload://bMYClSACX2jGokamaofvrmXa8Vi.png)
+
+-------------------------
+
+Mathias | 2023-06-22 16:57:44 UTC | #4
+
+
+Thanks for the help @infu and @Severin. I needed some time to think about the problem. I'm generally not only confused by the variants but by how I best structure the logic. 
+
+
+**DAG vs. state machines**
+
+A core problem is that there seems to be a crucial difference between DAGs and state machines. I think a state machine can be described as mutually excluding decisions pointing to each other. A traffic light is the classic example with the states "green, yellow, red”. 
+
+However, we could have a data variable that gets changed each time we are in the green state. Because the machine is circular there are infinite ways how that data could look like eventually. If I understand correctly we would therefore only enforce the actual machine through the type system, (green yellow red) but not how often we change the data variable. The history of the state transitions is not really captured by the type system. In my case it means that the payout state would be treated as 1 state even though there are 4 ways to get there. Which means the frontend does not understand that a question with 0 answers cannot have a potential winner:
+(no data inside of the variants yet)
+
+
+
+
+```
+type StateMachine = {
+    #OPEN;
+    #WINNER_SELECTION;
+    #DISPUTABLE;
+    #ARBITRATION;
+    #PAYOUT;
+  };
+```
+  
+
+
+I think because the structure of this particular system is not circular that I can have that logic however. I could treat each sub-graph as a node itself. This would mean that the frontend would understand all the possible scenarios of the game and I could handle them all while the type system would ensure nothing else can go wrong. I guess each unique point in the game would be reflected by a variant like this:
+(no data inside of the variants yet)
+
+```
+ type DAG = {
+    #OPEN;
+    #PAYOUT_NO_ANSWER;
+    #WINNER_SELECTION;
+    #ARBITRATION_NO_SELECTION;
+    #PAYOUT_ARBITRATION_NO_SELECTION;
+    #DISPUTABLE;
+    #PAYOUT_NO_DISPUTE;
+    #ARBITRATION_DISPUTE;
+    #PAYOUT_ARBITRATION_DISPUTE;
+  }
+```
+ 
+
+
+To summarise:
+1) I treat the game as a state machine in the classic sense. Where a node represents a decision.
+2) Treat it as a DAG in which each set of decisions is a node.
+
+
+Does that make any sense? 
+
+
+**Variants**
+Variants confuse me because the data within it is only related to a specific state. In the payout state it could be important to know who triggered a dispute to reward them if they rightfully did so. How would that work? it feels much more intuitive with the unions in typescript. I don't follow how exactly I can add data that relate to several variant cases. 
+
+
+**More expressive type systems**
+My intuition about state machines was initially that the actual data represents a state and not just some variant/name for that state. For example there could be a state describing the presence of answers which would be purely defined by a condition like this: “answers.length > 0". 
+Would we need a more expressive type system for something like that?
+
+-------------------------
+
+infu | 2023-06-22 20:01:44 UTC | #5
+
+[quote="Mathias, post:4, topic:20879"]
+history of the state transitions is not really captured by the type system
+[/quote]
+The type system is not supposed to do that.
+IC handles the transactions and sends them to your canister where your state machine is. Whenever a transaction comes you change the state. You can also record these transactions in a DAG.
+Then you end up with a DAG and the state can be reproduced any point in time. 
+Not sure what the DAG in your case is for other than keeping history and replaying it all.
+
+[quote="Mathias, post:4, topic:20879"]
+I don’t follow how exactly I can add data that relate to several variant cases
+[/quote]
+
+```
+{
+#some(Nat)
+#another({name:Text, location:Text})
+}
+```
+
+[quote="Mathias, post:4, topic:20879"]
+In the payout state it could be important to know who triggered a dispute to reward them if they rightfully did so. How would that work?
+[/quote]
+
+Whenever a dispute comes in, you have a transaction and the current state. Reward them with something based on that (send a ledger call or something like that).
+
+-------------------------
+

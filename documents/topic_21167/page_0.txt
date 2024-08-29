@@ -1,0 +1,777 @@
+ielashi | 2023-07-04 08:38:03 UTC | #1
+
+Hey everyone,
+
+[Stable structures](https://github.com/dfinity/stable-structures) is a Rust library built by DFINITY that allows canister developers to store tens of GiBs of data without the need for upgrade hooks.
+
+We've received [feedback](https://github.com/dfinity/stable-structures/issues/69) from users that having to put an upper bound on the size of whatever can be stored in a `StableBTreeMap` makes the library difficult to use, and in many cases is a blocker for adoption altogether. This limitation is also shared by other stable structures, like `StableVec`.
+
+Currently, to store a type in a `StableBTreeMap`, the developer needs to implement both the [Storable](https://docs.rs/ic-stable-structures/0.5.4/ic_stable_structures/storable/trait.Storable.html) and [BoundedStorable](https://docs.rs/ic-stable-structures/0.5.4/ic_stable_structures/storable/trait.BoundedStorable.html) traits:
+
+```
+pub trait Storable {
+    fn to_bytes(&self) -> Cow<[u8]>;
+    fn from_bytes(bytes: Cow<[u8]>) -> Self;
+}
+
+pub trait BoundedStorable: Storable {
+    const MAX_SIZE: u32;
+    const IS_FIXED_SIZE: bool;
+}
+```
+
+Implementing the `BoundedStorable` trait requires specifying a `MAX_SIZE` - an upper bound on the number of bytes this type can use when serialized. This was initially introduced because it simplifies memory management.
+
+To improve the usability of this library, we're now working on removing the requirement of having types be bounded. We'll still allow developers to specify bounds, as that can be useful in making memory optimizations internally, but it would be optional.
+
+There are two solutions we have in mind:
+
+**Solution #1: Introduce "Unbounded" types**
+
+* The `BoundedStorable` and `Storable` traits are kept as-is.
+* Rust doesn't support specializations based on generics, so to support unbounded types, we'd need to introduce new stable structures: `UnboundedStableBTreeMap`, `UnboundedStableVec`, etc.
+* These unbounded types, because of how Rust generics work, will not have access to the bounds of the types if they exist, and can therefore not make optimizations based on that information. For example, if the structure can know that the type is a `u8` (a small, fixed-size type), it can store it in a way that's more efficient than an unbounded type, but it won't be able to make that optimization with this approach as it can't have access to this information.
+
+**Solution #2: Merge the `BoundedStorable` trait into the `Storable` trait**
+
+* This solution works around Rust's limitations with generic specializations and is implemented in  [this PR](https://github.com/dfinity/stable-structures/pull/94).
+* The `BoundedStorable` trait is removed, and the `Storable` trait is extended to include a `BOUND` field.
+
+```rust
+// ----------- Before -------------
+pub trait Storable {
+    fn to_bytes(&self) -> Cow<[u8]>;
+    fn from_bytes(bytes: Cow<[u8]>) -> Self;
+}
+
+pub trait BoundedStorable: Storable {
+    const MAX_SIZE: u32;
+    const IS_FIXED_SIZE: bool;
+}
+
+// ----------- After -------------
+pub trait Storable {
+    fn to_bytes(&self) -> Cow<[u8]>;
+    fn from_bytes(bytes: Cow<[u8]>) -> Self;
+
+    /// The size bounds the type.
+    const BOUND: Bound;
+}
+
+/// States whether the type's size is bounded or unbounded.
+pub enum Bound {
+    /// The type has no size bounds.
+    Unbounded,
+
+    /// The type has size bounds.
+    Bounded {
+        /// The maximum size, in bytes, of the type when serialized.
+        max_size: u32,
+
+        /// True if all the values of this type have fixed-width encoding.
+        /// Some data structures, such as stable vector, can take
+        /// advantage of fixed size to avoid storing an explicit entry
+        /// size.
+        ///
+        /// Examples: little-/big-endian encoding of u16/u32/u64, tuples
+        /// and arrays of fixed-size types.
+        is_fixed_size: bool,
+    },
+}
+```
+
+* Stable structures such as `StableBTreeMap` can then be modified to support both bounded and unbounded types, and performance optimizations can be made in case types are bounded.
+* The downside of this approach is that checking whether or not a bound exists now happens at run-time. Example:
+  * If we have a stable structure that only supports bounded types, and you try to store an unbounded type, the code will compile, and only at run-time would you get an error that the type you're trying to store is unbounded.
+  * With solution #1, such errors would be detected at compile-time, since you'd need to implement `BoundedStorable` for that type.
+
+I'd like to get your feedback on which approach you'd prefer and/or if you have other solutions in mind.
+
+-------------------------
+
+senior.joinu | 2023-07-04 10:05:10 UTC | #2
+
+Hey, Islam!
+
+In `ic-stable-memory` we have a `SBox` smart-pointer. This pointer is fixed in size and it points to a location on stable memory where some data lies.
+
+You can pass any data, that can be serialized, into an `SBox` like this:
+```rust
+let s = String::from("Hello, World!");
+
+// boxed_s is now allocated on stable memory
+let mut boxed_s = SBox::new(s).unwrap(); 
+
+// when a value of SBox is mutated, it may reallocate the data, so it still fits
+boxed_s
+  .with(|it| {
+    it.push("a long string to force it to reallocate");
+  })
+  .unwrap();
+
+```
+
+This smart-pointer makes it possible to store unbound data inside any stable collection (all of which are fixed size by default), by introducing an extra layer of indirection.
+
+```rust
+// stores a mapping of stable mem allocated strings to other stable mem allocated strings
+let example = SHashMap::<SBox<String>, SBox<String>>::new();
+```
+
+I believe, you could also do something like this in `stable-structures`. Seems like this solution won't require a lot of change. And it seems like the most rusty way of doing things like that.
+
+Hope you'll find it useful!
+
+-------------------------
+
+borovan | 2023-07-04 15:45:36 UTC | #3
+
+This is how Dragginz currently implements the trait :
+
+![image|603x362](upload://qsFKbt2fYR3GgwQL7OE8yElzvpo.png)
+![image|614x500](upload://wOGPXYiQWYuldWHhynu8sfCtxfN.png)
+
+We don't really care about the compiler time checks as it's all validated within our schema anyway.
+
+#2 would make life easier for us, but only marginally.
+
+Thanks for all your work on this, it has been a little frustrating trying to code around the max size.
+
+-------------------------
+
+peterparker | 2023-07-04 16:45:59 UTC | #4
+
+I plan to introduce the stable structures in Juno (PR [here](https://github.com/buildwithjuno/juno/pull/130)). So, I am part of the users who's having to put an upper bound on the size is an issue because I cannot know what will the developers effectivelly store in it.
+
+I'm far away of being a Rust expert, so whatever the solution, I will be super happy. However, based on what I understand, I also like the second solution.
+
+-------------------------
+
+lastmjs | 2023-07-05 13:57:10 UTC | #5
+
+With just these two choices I lean towards the second solution as well.
+
+-------------------------
+
+pramitgaha | 2023-07-05 20:17:10 UTC | #6
+
+@senior.joinu 
+does these 2 library serves same feature (allowing access to stable memory)?
+if yes: what's the difference between this and `ic-stable-memory`?
+
+-------------------------
+
+ielashi | 2023-07-07 10:55:51 UTC | #7
+
+Thank you all for your feedback. It seems that there's a slight (but not very strong) preference towards the second solution.
+
+@senior.joinu Thanks for sharing! I remember looking at the `Box` idea a while back. I can't remember exactly why I didn't pursue the idea further, but I'll take a second look. One difference in our architectures is that `ic-stable-structures` does not have a global memory allocator - each structure manages its memory separately to reduce the blast radius of any bugs, so we'll need to take that into account.
+
+@borovan IIUC, in your code you're setting a max size of 2KiB, correct? A large bound like that does give you a lot of wiggle room for you to not worry about bounds, but it also comes at the expense of high memory usage. Has that not been an issue for you?
+
+@pramitgaha These two libraries do share the same goals of allowing you to store data directly to stable memory and scale your canister to 10s of GiBs. There are different trade-offs between the two in terms of speed, safety, architecture, etc, so I suggest you read up on both of the libraries and choose the one that serves you best.
+
+-------------------------
+
+borovan | 2023-07-07 14:24:16 UTC | #8
+
+[quote="ielashi, post:7, topic:21167"]
+@borovan IIUC, in your code you’re setting a max size of 2KiB, correct? A large bound like that does give you a lot of wiggle room for you to not worry about bounds, but it also comes at the expense of high memory usage. Has that not been an issue for you?
+[/quote]
+
+No we're just using a small subset of test data right now.  We'll just switch over to the new dynamic size when it's ready.
+
+-------------------------
+
+levi | 2023-07-07 18:32:26 UTC | #9
+
+Looks like solution #1 is a pure benefit with the compile-time checks that unbounded types are being stored in unbounded stable structures. If the type is a `u8` it can be used within a bounded stable structure type.
+
+Is there any benefit to #2?
+
+-------------------------
+
+witter | 2023-07-24 14:42:37 UTC | #10
+
+#2 will be better. 
+Developers can decide whether to specify the size according to their needs. Especially in some scenarios, the data grows dynamically, and the size cannot be specified at all. #2 is well adapted to the needs of this scenario
+
+-------------------------
+
+Maxfinity | 2023-07-24 18:04:13 UTC | #11
+
+[quote="ielashi, post:7, topic:21167"]
+@borovan IIUC, in your code you’re setting a max size of 2KiB, correct? A large bound like that does give you a lot of wiggle room for you to not worry about bounds, but it also comes at the expense of high memory usage. Has that not been an issue for you?
+[/quote]
+
+At Bitfinity, we've had unbounded size key value stable structures for a while now. Please do check it out and let us know your thoughts. 
+
+https://github.com/bitfinity-network/canister-sdk/blob/main/ic-stable-structures/src/storage/structures/unbounded.rs
+
+-------------------------
+
+tcpim | 2023-07-31 04:11:28 UTC | #12
+
+1. Any update on this? Will this be merged https://github.com/dfinity/stable-structures/pull/94? 
+2. With the new change above, if I change my code to use unbounded from bounded, will the structure that was stored as bounded be serialized correctly?
+
+-------------------------
+
+ielashi | 2023-08-03 07:36:36 UTC | #13
+
+[quote="Maxfinity, post:11, topic:21167"]
+At Bitfinity, we’ve had unbounded size key value stable structures for a while now. Please do check it out and let us know your thoughts.
+[/quote]
+
+@Maxfinity I think that's a very reasonable approach, and we would've likely considered the same approach within `stable-structures` if the only requirement was to support unbounded values. We'd like to also support unbounded keys, and hence the additional complexity.
+
+[quote="tcpim, post:12, topic:21167"]
+* Any update on this? Will this be merged [chore: merge `BoundedStorable` into `Storable` by ielashi · Pull Request #94 · dfinity/stable-structures · GitHub ](https://github.com/dfinity/stable-structures/pull/94)?
+[/quote]
+
+@tcpim Yes, the community feedback has heavily favored this solution, so that will be merged. There are also additional changes that are being worked in in the `BTreeMap` itself to support unbounded values. We plan to release a beta version of this work this month.
+
+[quote="tcpim, post:12, topic:21167"]
+With the new change above, if I change my code to use unbounded from bounded, will the structure that was stored as bounded be serialized correctly?
+[/quote]
+
+Yes, the structure will continue to be serialized correctly.
+
+-------------------------
+
+tcpim | 2023-08-21 20:36:03 UTC | #14
+
+Hi @ielashi , when will this feature be released in prod? It seems the current latest version doesn't have this https://crates.io/crates/ic-stable-structures
+
+-------------------------
+
+ielashi | 2023-08-22 16:46:48 UTC | #15
+
+Timely question :) I just submitted [a PR](https://github.com/dfinity/stable-structures/pull/115) that adds support for the new BTreeMap with unbounded types. There are still performance optimizations to be made, but once this is merged we have enough to do a beta release and get feedback from the community.
+
+-------------------------
+
+saikatdas0790 | 2023-08-22 17:54:53 UTC | #16
+
+Any thoughts on how soon you think the Bitcoin canister or II starts using this upcoming version?
+
+I would definitely feel much more confident adopting this knowing it's being validated by other large use cases built by Dfinity engineers
+
+-------------------------
+
+borovan | 2023-08-22 17:55:55 UTC | #17
+
+chill dude, islam's got this
+
+-------------------------
+
+peterparker | 2023-08-22 18:46:04 UTC | #18
+
+For what it's worth, I'll be using the upcoming version in Juno.
+
+-------------------------
+
+ielashi | 2023-08-23 07:43:57 UTC | #19
+
+That's a very good question. Before this version is released I do plan to test this out on the Bitcoin state, at least by computing the Bitcoin canister's state offline. I think we'd want to upgrade the Bitcoin canister to use this version in production as well, but I don't think we can communicate a timeline for that at the moment.
+
+-------------------------
+
+ielashi | 2023-09-11 13:17:29 UTC | #20
+
+Hey everyone, we just released a beta version of `stable-structures`, version `0.6.0-beta.0`, that contains the new V2 BTreeMap along with the API changes proposed in the initial post of this thread.
+
+You can see an example of using the V2 BTreeMap [here](https://github.com/dfinity/stable-structures/tree/main/examples/src/assets_example). Note that in this release the developer needs to explicitly request using the V2 BTreeMap by using `BTreeMap::init_v2`. We currently do not support migrating a V1 BTreeMap to V2, but in the real release this will be supported, so the migration then can be done seamlessly.
+
+As this is still a beta release, we recommend against using this in production and we may make breaking changes as needed. Your feedback would be very much appreciated :slight_smile: 
+
+cc @peterparker @hpeebles @lastmjs who expressed interest in this.
+
+-------------------------
+
+hpeebles | 2023-09-11 13:38:39 UTC | #21
+
+Nice! I'll have a play around with it shortly.
+
+If we have maps where the keys and values are fixed size would they also benefit from using v2 or should they remain on v1?
+
+-------------------------
+
+ielashi | 2023-09-11 13:59:53 UTC | #22
+
+As far as beta testing is concerned, you won't observe much of a difference. When V2 is ready and we make a production release, developers will not actually choose between V2 and V1 - that'll be abstracted away. BTreeMaps would all automatically get upgraded to V2 under the hood.
+
+-------------------------
+
+lastmjs | 2023-09-11 23:36:58 UTC | #23
+
+Which of the main options discussed in the OP were selected for the beta? I don't see that the example is showing how to define any of the traits
+
+-------------------------
+
+ielashi | 2023-09-12 08:11:30 UTC | #24
+
+We opted for solution #2, which was the favored solution in this thread. All the examples have been updated with the new API already. Here's an example on how to implement `Storable` for a type: https://github.com/dfinity/stable-structures/blob/main/examples/src/custom_types_example/src/lib.rs
+
+-------------------------
+
+lastmjs | 2023-09-12 12:56:19 UTC | #25
+
+I see it's all on main. This is extremely exciting! I'm hoping to get a chance to dive in soon, actually I was just in the middle of reimplementing stable structures in Azle.
+
+-------------------------
+
+lastmjs | 2023-09-12 22:01:05 UTC | #26
+
+So far so good, got our first set of tests passing with the unbounded types
+
+-------------------------
+
+josephgranata | 2023-09-13 18:17:43 UTC | #27
+
+Islam any news on support for this feature from the Motoko team at DFINITY? @claudio is this on the Motoko team radar? Any estimates when it would make it to the code base?
+
+It is great news, great job fellows, I am just wishing it works in Motoko too.
+
+-------------------------
+
+ielashi | 2023-09-14 12:05:46 UTC | #28
+
+Hey Joseph, I'm unaware of this specific change being ported to Motoko. AFAIK there is a Motoko port of StableBTreeMap that's been done by the community and is not owned by the Motoko team. I do know that the Motoko team are working on a memory manager to allow giving separate virtual memories to a type, which is a necessary building block for supporting something like stable structures there.
+
+-------------------------
+
+claudio | 2023-09-14 23:36:38 UTC | #29
+
+We've just release Motoko 0.10.0 which contains a new library Region.mo for declaring isolated subregions of IC Stable Memory, similar to the isolated Memories of stable structures but with a little more integration into the type system of Motoko.
+
+We don't have anything equivalent StableBTree yet, but @matthewhammer is investigating adapting the work of @sardariuss (a Motoko port of the original Rust StableBTree, AFAIU) to use Region.mo for better encapsulation.
+
+-------------------------
+
+josephgranata | 2023-09-18 05:07:53 UTC | #30
+
+Good news @ielashi and @claudio so we don't have the Rust equivalent functionality yet, but there is work happening, and I am glad for StableBTreeMap it has been a lifesaver, and it makes the whole upgrade process far easier.
+
+@claudio I will be looking forward for Motoko 0.10 and I am hopeful Regions enable a close equivalent to Rust's Stable Memory features, including one day the Bounded Size updates.
+
+-------------------------
+
+borovan | 2023-09-18 15:49:31 UTC | #31
+
+Dragginz is now using this, was an easy integration.  Will let you know if we have any problems, thanks again!
+
+-------------------------
+
+RMCS | 2023-09-20 14:29:18 UTC | #32
+
+When trying to implement this with version `0.6.0-beta.0` i ran into the issue where;
+-  the `WHITELIST` data **isn't** persistent between canister upgrades
+- the `WHITELIST_ID` **is** persistent between canister upgrades
+
+Anything known what could cause this / what I am doing wrong?
+
+```
+type Memory = VirtualMemory<DefaultMemoryImpl>;
+type RMemory = RestrictedMemory<DefaultMemoryImpl>;
+
+thread_local! {
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+
+    pub static WHITELIST_ID: RefCell<StableCell<u64, RMemory>> = RefCell::new(
+        StableCell::init(
+            RMemory::new(DefaultMemoryImpl::default(), 0..MAX_PAGES),
+            0,
+        ).expect("failed")
+    );
+    pub static WHITELISTS: RefCell<StableBTreeMap<u64, Whitelist, Memory>> = RefCell::new(
+        StableBTreeMap::init_v2(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))),
+        )
+    );
+}
+```
+
+Whitelist struct
+```
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct Whitelist {
+    pub id: u64,
+    pub name: String,
+    pub color: String,
+    pub owner: Principal,
+    pub whitelist: Vec<Principal>,
+}
+
+impl Storable for Whitelist {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        Cow::Owned(Encode!(self).unwrap())
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        Decode!(bytes.as_ref(), Self).unwrap()
+    }
+
+    const BOUND: Bound = Bound::Unbounded;
+}
+```
+
+-------------------------
+
+ielashi | 2023-09-21 07:07:37 UTC | #33
+
+[quote="RMCS, post:32, topic:21167"]
+```
+thread_local! {
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+
+    pub static WHITELIST_ID: RefCell<StableCell<u64, RMemory>> = RefCell::new(
+        StableCell::init(
+            RMemory::new(DefaultMemoryImpl::default(), 0..MAX_PAGES),
+            0,
+        ).expect("failed")
+    );
+    pub static WHITELISTS: RefCell<StableBTreeMap<u64, Whitelist, Memory>> = RefCell::new(
+        StableBTreeMap::init_v2(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))),
+        )
+    );
+}
+```
+[/quote]
+
+The problem lies in how you're structuring stable memory.
+
+* You're first initializing `MEMORY_MANAGER`, giving it the entire stable memory.
+* You're initializing ` WHITELIST_ID`, also giving it the entire stable memory (a restricted memory from `0..MAX_PAGES` is practically all the stable memory that there is).
+
+This clash is why you're seeing only WHITELIST_ID being persisted, while other structures are not persisted. I recommend that you keep it simple and use the memory manager for everything.
+
+Another approach would be to give `WHITELIST_ID` a `RMemory` with the range `0..1` and the `MEMORY_MANAGER` a `RMemory` with the range `1..MAX_PAGES`.
+
+ And, do you need to store the `WHITELIST_ID` separately? Isn't that information already stored in `WHITELISTS`?
+
+-------------------------
+
+RMCS | 2023-09-21 07:35:01 UTC | #34
+
+Thanks, That makes sense, i assumed it was a memory allocation for that specific storage.
+
+The reason why i keep a seperate `WHITELIST_ID` is because i assume it is cheaper to increment this id compared to searching for the highest value of the `whitelist.id`
+
+-------------------------
+
+ielashi | 2023-09-21 08:41:00 UTC | #35
+
+You can use the [last_key_value](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/btreemap/struct.BTreeMap.html#method.last_key_value) method on the BTreeMap. That's an efficient call.
+
+-------------------------
+
+peterparker | 2023-09-30 17:06:16 UTC | #36
+
+Hello @ielashi 👋,
+
+I tried out today the latest release, `v0.6.0-beta.1`, and encountered the exact same issue as the one I discovered when testing an earlier branch of the v2 version.
+
+When attempting to upload a 10mb file (an image) to my canister, the upload process appears to work correctly. However, I'm unable to deserialize the data through `http_request`, and I receive the following error:
+
+> Replica Error (5): "IC0522: Canister ajuq4-ruaaa-aaaaa-qaaga-cai exceeded the instruction limit for single message execution."
+
+It's possible that the issue is on my end, or there may be no issue at all, and this could be a limitation of the IC. Or it might just be simply dumb of me to think that I can serialize and deserialize 10mb in one go.
+
+To help diagnose, I've prepared a sample repository along with detailed instructions. I've made an effort to streamline the code, eliminating any unrelated components. However, please be aware that due to the presence of upload and HTTP endpoints, there is still some code in the repository. Tried my best.
+
+Please let me know if you have any questions or require further information.
+
+👉 [https://github.com/peterpeterparker/stable_structure_execution_limit](https://github.com/peterpeterparker/stable_structure_execution_limit)
+
+Once again, I apologize in advance if the issue turns out to be on my side.
+
+P.S.: In the real life solution I'll have to limit to 2 mb given the ingress max size, still thought this example was interesting.
+
+-------------------------
+
+peterparker | 2023-10-01 14:19:24 UTC | #37
+
+[quote="peterparker, post:36, topic:21167"]
+P.S.: In the real life solution I’ll have to limit to 2 mb given the ingress max size, still thought this example was interesting.
+[/quote]
+
+Today I incorporated an additional stable tree map into my actual implementation and conducted refactoring to restrict the chunk size to two megabytes (PR [here](https://github.com/buildwithjuno/juno/pull/251)). The result was successful. I performed a quick test involving the upload of four 10-megabyte images, followed by a 200-kilobyte image, and everything worked perfectly. ✅
+
+Therefore when it comes to my project, the issue I shared yesterday isn't a blocker. I would still be interested to know if my feedback / question was totally stupid or interesting a bit though. 😉
+
+![Capture d’écran 2023-10-01 à 16.16.43|690x463](upload://uhlvabDXkyd4zbhze9hDReuO8dz.jpeg)
+![Capture d’écran 2023-10-01 à 16.16.54|690x463](upload://ezyZSx8f82uBtLblP92uN9Rnl7g.jpeg)
+
+-------------------------
+
+ielashi | 2023-10-02 09:27:14 UTC | #38
+
+Hey @peterparker,
+
+Thanks for taking the time to put together the example. I wrote a quick benchmark to see if the `BTreeMap` was indeed the issue. In this benchmark, I measure how many instructions it takes to read 4 10MiB assets.
+
+```rust
+#[query]
+pub fn btreemap_get_10mib() -> BenchResult {
+    let mut btree: BTreeMap<String, Vec<u8>, _> = BTreeMap::new(DefaultMemoryImpl::default());
+
+    // 4 assets, each is 10MiB.
+    let entries = vec![
+        ("some/path/asset1".to_string(), vec![1; 10 * 1024 * 1024]),
+        ("some/path/asset2".to_string(), vec![2; 10 * 1024 * 1024]),
+        ("some/path/asset3".to_string(), vec![3; 10 * 1024 * 1024]),
+        ("some/path/asset4".to_string(), vec![4; 10 * 1024 * 1024]),
+    ];
+
+    // Insert the assets into the map.
+    for (key, value) in entries.iter() {
+        btree.insert(key.clone(), value.clone());
+    }
+
+    // Benchmark retrieving all assets from the map.
+    benchmark(|| {
+        for (key, value) in entries.into_iter() {
+            assert_eq!(btree.get(&key), Some(value));
+        }
+    })
+}
+```
+
+Our internal benchmarks showed that reading all four 10MiB assets took ~1.5 billion instructions, which is well below the instruction limit. In the example you shared, reading a single asset exceeded the instruction limit. The example code is quite complex, so it seems that the reason the instruction limit is hit is due to other code in the example, not the BTreeMap itself.
+
+-------------------------
+
+peterparker | 2023-10-02 09:34:37 UTC | #39
+
+Thanks for double checking and for the benchmark!
+
+-------------------------
+
+saikatdas0790 | 2023-10-02 09:45:29 UTC | #40
+
+Cool trick to generate large mock objects. Definitely going into my toolbelt. Noob me would probably have read 10MB files from disk 🙈
+
+-------------------------
+
+ielashi | 2023-10-05 10:00:56 UTC | #41
+
+Update: we've released [0.6.0-beta.2](https://crates.io/crates/ic-stable-structures/0.6.0-beta.2). This release now makes BTreeMap V2 the default implementation, and has the API that you'd expect in the upcoming production release.
+
+We have been running fuzz tests for over a week and haven't discovered any issues, so we do expect to do a production release soon. In the meantime, please provide us with any feedback.
+
+And a special thanks to @witter and @b3hr4d for their code contributions.
+
+-------------------------
+
+peterparker | 2023-10-05 11:21:02 UTC | #42
+
+@ielashi I've got this error when I try to upgrade a canister containing data from beta.1 to beta.2
+
+```
+An unexpected error happened 😫. Error: Call was rejected:
+  Request ID: ef4ab0dbb3da59e43fc008e5e506391bf45a1484d5d90dfb46f9b3ca4da4ec46
+  Reject code: 5
+  Reject text: Canister cbopz-duaaa-aaaaa-qaaka-cai trapped explicitly: Panicked at 'Failed to deserialize from bytes: Semantic(None, "invalid type: integer `0`, expected str or bytes")', /Users/daviddalbusco/projects/juno/juno/src/shared/src/serializers.rs:12:26
+````
+
+this is my deserialyzer
+
+```
+pub fn deserialize_from_bytes<T: for<'a> Deserialize<'a>>(bytes: Cow<'_, [u8]>) -> T {
+    from_reader(&*bytes).expect("Failed to deserialize from bytes")
+}
+```
+
+Is that error expected? Anything that should be done to migrate from beta1 to 2?
+
+Side note: I've got no issue if I upgrade the same canister code built with beta 1
+
+-------------------------
+
+ielashi | 2023-10-05 12:55:15 UTC | #43
+
+@peterparker `0.6.0-beta.2` isn't backward-compatible with `0.6.0-beta.1` (I didn't mention that because I didn't announce `0.6.0-beta.1` on this thread), so a migration is not possible unfortunately.
+
+-------------------------
+
+peterparker | 2023-10-05 13:00:18 UTC | #44
+
+Gotcha, thanks Islam. So I tried `0.6.0-beta.2` in a brand new canister, everything went fine including my above test of uploading a 10mb file in an unbounded treemap. :+1:
+
+-------------------------
+
+ielashi | 2023-10-13 10:17:47 UTC | #45
+
+We have just released `0.6.0` with the updated BTreeMap! Thanks everyone for all your suggestions, contributions, and test reports.
+
+-------------------------
+
+gravity_vi | 2024-02-15 04:49:47 UTC | #46
+
+@ielashi I am facing an issue migrating to the latest version of ic_stable_structures. Could you please provide guidance or suggestions around this:
+https://forum.dfinity.org/t/migrating-to-latest-version-of-ic-stable-structures-0-6-2/27593
+
+-------------------------
+
+zohaib29 | 2024-04-29 05:21:40 UTC | #47
+
+@ielashi  Is it possible to increase the `max_size` of a type later? If I append new properties to the struct?
+
+-------------------------
+
+ielashi | 2024-04-29 08:22:43 UTC | #48
+
+It is unfortunately not possible to do so as there are assumptions in the way memory is managed in stable structures that assumes that this number doesn't grow. An alternative would be to store these extra fields in an additional structure. If you're using `BTreeMap`, then consider also making that type `Unbounded` to give yourself flexibility.
+
+-------------------------
+
+ielashi | 2024-04-29 09:19:25 UTC | #49
+
+@zohaib29 Actually, an even easier solution would be to change the type of the value in your current map to be `Unbounded`, and then you can add an additional field without any problems. I totally forgot that we support moving from `Bounded` types to `Unbounded` types - thanks for reminding me @dragoljub_duric.
+
+-------------------------
+
+zohaib29 | 2024-04-29 09:59:30 UTC | #50
+
+Thanks!
+So we don't need to worry about memory management when using `Unbounded` types?
+What happens when we remove the property from the struct with max size?
+
+-------------------------
+
+ielashi | 2024-04-29 10:46:56 UTC | #51
+
+We've updated `BTreeMap` in such a way that you can remove the bound of a struct entirely to be `Unbounded`, so it should work out of the box (and you should be able to write a simple unit test to verify that).
+
+-------------------------
+
+Samer | 2024-04-30 20:29:06 UTC | #52
+
+Is this also possible when upgrading from older version?
+
+See https://forum.dfinity.org/t/stable-structures-can-i-just-migrate-bounded-to-unbounded/30174?u=samer
+
+-------------------------
+
+ielashi | 2024-05-02 07:19:38 UTC | #53
+
+Yes, it is possible to upgrade from older versions of BTreeMap to 0.6.x and change the implementation of `Storable` to be `Unbounded` for the keys and/or values.
+
+-------------------------
+
+LiveDuo | 2024-05-09 09:38:19 UTC | #54
+
+@ielashi
+
+I'm curious about the implication of this in the [`stable_read` and `stable_write`](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-stable-memory) linked functions. I'd expect that data should be stored in a similar format to [SQL pages](https://www.sqlite.org/fileformat.html) for efficiently querying multiple data (pages) at the same time.
+
+But, if there's no bounded size for stable structures then data won't be able to be grouped into pages and hence not have the ability to be queried in parallel.
+
+I'm I missing something?
+
+PS: Loosely related to [this question](https://forum.dfinity.org/t/schema-migration-options-with-stable-memory-heap/20225/6) from a year ago.
+
+-------------------------
+
+ielashi | 2024-05-15 07:23:49 UTC | #55
+
+In order to support unbounded sizes in the stable `BTreeMap`, we still use fixed-size pages, but pages can “overflow”. As in, if an entry were to be inserted with a size greater than the capacity available in the page, a new page is allocated and its address is stored in the previous page.
+
+In other words, BTreeMap nodes now become a linked list of pages, as opposed to a single page. Databases like Sqlite conceptually do something similar, though its implementation differs substantially.
+
+-------------------------
+
+LiveDuo | 2024-05-15 10:12:37 UTC | #56
+
+[quote="ielashi, post:55, topic:21167"]
+In order to support unbounded sizes in the stable `BTreeMap`, we still use fixed-size pages, but pages can “overflow”.
+[/quote]
+
+I'd guess If there's an overflow, that should manifest in the cycles cost of the request. Any benchmarks about the costs?
+
+[quote="ielashi, post:55, topic:21167"]
+As in, if an entry were to be inserted with a size greater than the capacity available in the page, a new page is allocated and its address is stored in the previous page.
+[/quote]
+
+That sounds like an allocator that manages where each entry is stored. If so, where the source code for it?
+
+[quote="ielashi, post:55, topic:21167"]
+In other words, BTreeMap nodes now become a linked list of pages, as opposed to a single page. Databases like Sqlite conceptually do something similar, though its implementation differs substantially.
+[/quote]
+
+It would be great to know how these system compare and differ as SQL-like databases are well-understood at some point and can be a point of reference.
+
+-------------------------
+
+evanmcfarland | 2024-05-15 11:51:49 UTC | #57
+
+[quote="ielashi, post:55, topic:21167"]
+stable `BTreeMap`, we still use fixed-size pages,
+[/quote]
+
+What's this page size? I'd assume it'd be advisable to always set the bound if values are below this size.
+
+-------------------------
+
+ielashi | 2024-05-15 15:08:07 UTC | #58
+
+[quote="evanmcfarland, post:57, topic:21167"]
+What’s this page size? I’d assume it’d be advisable to always set the bound if values are below this size.
+[/quote]
+
+The page size depends on the data being stored. If the data being stored is bounded, then we use a heuristic based on the bounds. Otherwise, a default of 1024 bytes is used. See [here](https://github.com/dfinity/stable-structures/blob/main/src/btreemap.rs#L182-L204).
+
+[quote="LiveDuo, post:56, topic:21167"]
+I’d guess If there’s an overflow, that should manifest in the cycles cost of the request. Any benchmarks about the costs?
+[/quote]
+
+The closest thing we have would the [benchmarks in our CI](https://github.com/dfinity/stable-structures/pull/214#issuecomment-2067933979). There you can see stats on the number of instructions used by entries of various sizes.
+
+[quote="LiveDuo, post:56, topic:21167"]
+That sounds like an allocator that manages where each entry is stored. If so, where the source code for it?
+[/quote]
+
+[Here it is](https://github.com/dfinity/stable-structures/blob/main/src/btreemap/allocator.rs).
+
+[quote="LiveDuo, post:56, topic:21167"]
+It would be great to know how these system compare and differ as SQL-like databases are well-understood at some point and can be a point of reference.
+[/quote]
+
+Comparison-like documentation can be quite a time sink and can often be wrong and/or out of date. If there are specific questions that you think our documentation is lacking, please share it and we can address it.
+
+-------------------------
+
+evanmcfarland | 2024-05-15 19:00:37 UTC | #59
+
+I can't find a straightforward/updated answer to this. Do we know how builders should think about storage capacity when deciding to use stable structures in production?
+
+[quote="ielashi, post:1, topic:14210"]
+This data structure has been tested with tens of millions of keys, but as I mentioned in an [earlier post ](https://forum.dfinity.org/t/direct-integration-with-bitcoin/6147/349), we didn’t test this data structure within a canister, so please experiment with it cautiously.
+[/quote]
+
+For example, what if an app (e.g. taggr/hotornot) reaches the canister limit on the Stable bTreeMap that stores user posts (4GiB?). Can it be migrated/copied to a multi-canister architecture while preserving the origingal bTree? What's the upper limit on storage like this?
+
+And thank you. If it wasn't for this library I couldn't build anything here.
+
+-------------------------
+
+ielashi | 2024-05-16 07:52:16 UTC | #60
+
+[quote="evanmcfarland, post:59, topic:21167"]
+For example, what if an app (e.g. taggr/hotornot) reaches the canister limit on the Stable bTreeMap that stores user posts (4GiB?).
+[/quote]
+
+I'm not sure I understand the question. A stable structure can reach hundreds of GiBs in size - they aren't constrained by the 4GiB limit that is currently associated with storing data on the heap. Moving to a multiple canister architecture is in principal possible with a data migration, but the specifics of that migration would largely depend on the dapp's internals.
+
+-------------------------
+
+evanmcfarland | 2024-05-16 10:20:37 UTC | #61
+
+That answers my question and is fine for my use case. Thanks.
+
+-------------------------
+

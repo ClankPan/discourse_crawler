@@ -1,0 +1,396 @@
+ArjaanBuijk | 2022-02-11 20:50:58 UTC | #1
+
+When deploying my wasm, I am getting this error:
+
+```
+The invocation to the wallet call forward method failed with the error: 
+An error happened during the call: 5: 
+Wasm module of canister xxxxx-xxxxx-xxxxx-xxxxx-xxx is not valid: 
+Wasm module defined 220 globals which exceeds the maximum number allowed 200.
+```
+
+What do these *globals* refer to ?
+
+I am trying to figure out where they come from, so I can fix my code. 
+
+I am using C++, and I linked in a 3rd party json library that triggered this error.
+
+-------------------------
+
+ArjaanBuijk | 2022-02-11 23:19:12 UTC | #2
+
+Are they these things?
+
+https://developer.mozilla.org/en-US/docs/WebAssembly/Understanding_the_text_format#declaring_globals_in_webassembly
+
+-------------------------
+
+3cL1p5e7 | 2022-02-12 17:10:16 UTC | #3
+
+Try to use `ic-cdk-optimizer` for wasm optimization (this is Rust utility from Dfinity)
+
+Example of usage
+```bash
+# Install
+curl https://sh.rustup.rs -sSf | sh # rust install
+cargo install ic-cdk-optimizer
+
+# Build your wasm from C++
+
+ic-cdk-optimizer ./your-compiled-module.wasm -o ./your-awesome-compiled-module.wasm
+```
+
+-------------------------
+
+ArjaanBuijk | 2022-02-12 21:29:56 UTC | #4
+
+It made the wasm 37% smaller, but all the 220 globals remain.
+
+Good tip though! I am going to include that optimizer in my build pipeline. Thank you.
+
+-------------------------
+
+3cL1p5e7 | 2022-02-12 21:35:21 UTC | #5
+
+Cool! :slight_smile: 
+In that case, I can only advice to find a smaller library or move necessary code to your repo.
+
+-------------------------
+
+nomeata | 2022-02-12 21:51:41 UTC | #6
+
+These arbitrary limits on the system on what should be internals of the canister can and probably should be adjusted. Different CDKs likely produce quite differently looking modules, and I assume the limit was chosen based on canisters in the wild, so mostly Rust and Motoko. If it turns out that C++ tends to use globals more heavily, then hopefully we can get the limit increased quickly.
+
+(Or simply be lifted, as long as the cost of globals is adequately represented in the storage cost for a canister.)
+
+Pinging @diegop , because this should probably trickle into the internal discussions.
+
+-------------------------
+
+ArjaanBuijk | 2022-02-12 21:58:06 UTC | #7
+
+Yeah, I was feeling the same way. The C++ code is working perfectly fine, but I cannot deploy it to IC due to this limit.
+
+I am trying to find out where these globals come from, so I might be able reduce them, but I have not figured that out yet.
+
+-------------------------
+
+nomeata | 2022-02-12 23:04:45 UTC | #8
+
+One guess may be function pointers across units of compilation. LLVM represents entries in something called Global Offset Table using globals. But my memory is vague and it's late, so it might be something else. 
+
+There is some information in the note at 
+
+https://github.com/dfinity/motoko/blob/20dc75612beb33721bbee8fe6048cc89230b7239/src/linking/linkModule.ml#L22
+
+If you have some form of link-time-optimization that you can enable that might help?
+
+Are these globals mutable or immutable? Ideally the system doesn't store and thus charge for immutable globals, but I didn't check.
+
+-------------------------
+
+ArjaanBuijk | 2022-02-13 15:21:29 UTC | #9
+
+What I am trying to do is link in a json library. I found a way to use C++ with std::string, so my thinking was that I now can use JSON data by using Candid text -> std::string -> JSON -> do stuff -> JSON -> std::string -> Candid text.
+
+I tried 3 different versions, which all are pretty small & standalone:
+- https://github.com/DaveGamble/cJSON 
+  This one is OK. It is pure C.
+- https://github.com/nlohmann/json
+  This one creates 220 globals
+- https://github.com/open-source-parsers/jsoncpp
+  Creates 665 globals
+
+I think that I need to stick to lower level C libraries for now, and wrap them myself into Classes that somehow do not generate globals. I am still studying what is generating these globals, but it does seem to be caused by function pointers, traits, virtual things & such...
+
+-------------------------
+
+rckprtr | 2022-02-14 00:05:33 UTC | #10
+
+Im sure you are using WABT already, but if not there a lot of powerful tools for debugging these issues. Here is a wasm2wat online which can be useful: https://webassembly.github.io/wabt/demo/wasm2wat/
+
+-------------------------
+
+ArjaanBuijk | 2022-02-14 18:47:21 UTC | #11
+
+Yeah, I had already discovered WABT. Great tools indeed!
+
+I am having good luck with `cJSON`, and can send json text back & forth. For now, this will work, but I will probably hit the globals limit again soon.
+
+-------------------------
+
+ArjaanBuijk | 2022-02-19 13:24:01 UTC | #12
+
+@3cL1p5e7 ,
+I have a follow-up question on `ic-cdk-optimizer`.
+
+I added it to my github actions workflow, but the `cargo install ic-cdk-optimizer` step takes 7 minutes (!).  I am using the ubuntu-latest runner.
+
+I did some searching, but could not find a way to speed this up. Do you happen to know a trick?
+
+-------------------------
+
+3cL1p5e7 | 2022-02-19 14:20:39 UTC | #13
+
+Someone who knows rust well, correct me please
+
+As I know, cargo can not download precompiled packages and compile crates directly on machine.
+Nevertheless, you can try using [github actions cache](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows) between jobs and put [cargo caches](https://doc.rust-lang.org/cargo/guide/build-cache.html) there. More info about [installed crates location](http://web.mit.edu/rust-lang_v1.25/arch/amd64_ubuntu1404/share/doc/rust/html/book/second-edition/ch14-04-installing-binaries.html#:~:text=All%20binaries%20installed%20with%20cargo,the%20installation%20root's%20bin%20folder.)
+Here is another [useful link](https://github.com/rust-lang/cargo/issues/4725) with a similar problem
+
+-------------------------
+
+AdamS | 2022-06-13 15:06:42 UTC | #14
+
+(Reposting here from something I vaguely remember saying at the dev tools WG, at @Fulco's request:)
+
+The issue here is that the things other programs think of as translators from code to binary, like the linker, C++ thinks of as a direct build tool, as integral as rustc. Exported symbols are how other programs perform FFI; they're how C++ works across files at all. This can result in some surprising behavior in environments that have requirements on things like the number of exported symbols. There is a [SO post on the subject of controlling exports](https://stackoverflow.com/a/9648970) which you may find helpful to read - one of those strategies is likely to work in solving your problem.
+
+-------------------------
+
+icpp | 2023-09-25 01:24:25 UTC | #15
+
+I'd like to raise this issue again, because another user of C++ CDK recently ran into this limit.
+
+See [here](https://oc.app/community/cklkv-3aaaa-aaaar-ar7uq-cai/channel/117897814462211637184451071958267825777/6), it is related to the ostream operator. They had to strip out a library. 
+
+My experience from integrating several libraries is that the ostream is used very, very often to make the library work on a variety of systems. I had to hack just that piece of code, and then it worked.
+
+I haven't yet seen the limit go above 750, and I wonder if raising it to 1,000 would be a possibility, so many more C++ libraries would just work for the IC
+
+-------------------------
+
+lastmjs | 2023-09-27 02:43:39 UTC | #16
+
+Down with the limits! Out with them!
+
+I've hit similar issues in the past with Azle/Kybra, let's get rid of them.
+
+-------------------------
+
+icpp | 2023-10-11 01:58:32 UTC | #17
+
+@diegop , @domwoe ,
+
+Today I learned about yet another C++ library that compiled fine to Webassembly running in a  canister, except that the user had to work around the globals limit.
+
+Would it be possible to start a discussion how this limit can be removed?
+
+This is the project with the library in question. 
+https://github.com/ktimam/JoltSample
+
+-------------------------
+
+diegop | 2023-10-11 03:08:48 UTC | #18
+
+[quote="icpp, post:17, topic:10834"]
+Would it be possible to start a discussion how this limit can be removed?
+[/quote]
+
+I dont see why not. You can start a thread and I think @dsarlis would know much more about the WebAssembly side.
+
+-------------------------
+
+ktimam | 2023-10-11 12:06:19 UTC | #19
+
+I hope this limit gets removed as well, it would make 3rd party libraries build process very smooth.
+
+-------------------------
+
+berestovskyy | 2023-10-11 12:27:33 UTC | #20
+
+Hey folks,
+We're lifting the limit to `1000`. The change should be merged ~today and rolled out by the next week.
+
+Andriy
+
+-------------------------
+
+icpp | 2023-10-11 15:41:23 UTC | #21
+
+That is awesome news!!
+
+-------------------------
+
+icpp | 2023-10-12 00:07:48 UTC | #22
+
+@dsarlis ,
+I think we can just use this thread to discuss the possibility to completely remove this limit on the number of globals. 
+
+The coming increase to 1,000 will be sufficient for all cases I have seen so far, but we're only getting started, so you never know if this is sufficiently high. 
+
+Would it be possible to get rid of it altogether?
+
+-------------------------
+
+dsarlis | 2023-10-12 07:08:54 UTC | #23
+
+@icpp I think Diego tagged me out of reflex, this is more in the purview of the runtime team nowadays (I'm in the execution team myself which is very closely related and sometimes leading to these confusions). I'll let the folks of the runtime team answer on the possibility of getting rid of limits. (Andriy who replied that the limit is being increased to 1000 is part of the runtime team).
+
+-------------------------
+
+berestovskyy | 2023-10-12 12:24:17 UTC | #24
+
+The limits are in place because ATM, on the IC, WASM compilation should happen within a round, i.e., within approximately 1 second.
+
+There are other compilation limits in place as well. So, removing this particular limit for the globals won't break the IC, but it also won't help to accommodate much larger programs on the IC, unfortunately.
+
+The fundamental solution is a multi-round compilation, which will be technically possible after the [query stats feature](https://nns.ic0.app/proposal/?u=qoctq-giaaa-aaaaa-aaaea-cai&proposal=123481) is fully implemented.
+
+-------------------------
+
+lastmjs | 2023-10-20 04:13:09 UTC | #25
+
+Multi-round compilation ftw!
+
+-------------------------
+
+ktimam | 2023-10-25 11:34:20 UTC | #26
+
+Hello,
+
+Is the change rolled out yet?
+
+-------------------------
+
+berestovskyy | 2023-10-26 10:28:12 UTC | #27
+
+It should be rolled out to all the app subnets and the latest DFX beta should include the change:
+```
+DFX_VERSION=0.15.2-beta.0 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+```
+
+-------------------------
+
+ktimam | 2024-06-16 15:54:22 UTC | #28
+
+Sorry to bring this up again. Been building Deep Learning using Flashlight, and its using 1388 globals which exceeds the maximum number allowed 1000. Could we bring this up again to 2500 (in case i need to bring in yet another library)?
+
+-------------------------
+
+ulan | 2024-06-19 09:00:51 UTC | #29
+
+@ktimam would you mind sharing the build steps on how to reproduce the Wasm binary? I would like to look into why the library uses so many variables and if that is a regular pattern or something exceptional.
+
+-------------------------
+
+ktimam | 2024-06-19 13:16:40 UTC | #30
+
+Thanks @ulan . Can you send me your github id so i can send you an invite to the repo?
+
+-------------------------
+
+ulan | 2024-06-19 13:23:20 UTC | #31
+
+My github id is `ulan`
+
+-------------------------
+
+ktimam | 2024-06-19 14:12:56 UTC | #32
+
+Sent you access. Please make sure you're on latest icpp-pro 3.17.0, then run "icpp build-wasm" from project root, then "dfx deploy"
+
+-------------------------
+
+ulan | 2024-06-20 07:13:36 UTC | #33
+
+Thanks @ktimam! I completed the investigation.
+
+The Wasm binary declares 1387 globals, however only 138 of them are used.
+
+The unused globals are marked as exported as shown below. That is the reason why they are not eliminated by Wasm optimizers.
+
+I think the fix could be implemented on the `icpp-pro` side:
+
+- Remove all `(export global)` declarations by modifying the Wasm binary and run a Wasm optimizer (`wasm-opt` or `ic-wasm`). Note that globals don't need to be exported on the IC. This should remove the unused globals.
+- If that doesn't help, then it should be possible to implement a script that looks for `(global.get X)` and `(global.set X)` statements in the Wasm binary and removes all globals that are not accessed.
+- There might be also a way on the C++ toolchain side to optimize such that globals are not exported in the first place (e.g. using link time optimization (LTO) flags)
+
+```
+  (global (;1386;) i32 (i32.const 1486192))
+  (global (;1387;) i32 (i32.const 1486248))
+  (export "memory" (memory 0))
+  (export "_ZTVN10__cxxabiv120__si_class_type_infoE" (global 139))
+  (export "_ZTINSt3__219__shared_weak_countE" (global 140))
+```
+
+-------------------------
+
+ulan | 2024-06-20 09:44:02 UTC | #34
+
+@berestovskyy suggested an idea of implementing removal of unused globals in `ic-wasm` when it does the `shrink` pass.
+
+@chenyan: I guess you're the owner of `ic-wasm`? Wdyt about this suggestion?
+
+-------------------------
+
+chenyan | 2024-06-20 17:07:42 UTC | #35
+
+Sure. I think the shrink pass already removes the unused globals. It didn't get removed because they are exported. If we do a pass to remove all exported globals, I think the shrink pass will remove the unused globals for us?
+
+-------------------------
+
+ktimam | 2024-06-21 01:16:26 UTC | #36
+
+Thanks a lot @ulan for all the info. I tried some manual tinkering, converting wasm to wat, then removing all export lines (except the one with the canister function), then turned back to wasm, ran wasm-opt with -Oz flag, then deployed. It deployed successfully, though not sure if i'm doing this right or how to automate this process!
+The code is also broken so i'm not sure if it's something related to the code with ICP or if it's related to those changes. Is there a way to produce a debugging stack when calling "dfx canister --network local call" to determine where the code broke exactly?
+
+-------------------------
+
+ulan | 2024-06-21 07:06:26 UTC | #37
+
+[quote="chenyan, post:35, topic:10834"]
+If we do a pass to remove all exported globals, I think the shrink pass will remove the unused globals for us?
+[/quote]
+
+Yes, that's my understanding as well.
+
+> Is there a way to produce a debugging stack when calling “dfx canister --network local call” to determine where the code broke exactly?
+
+@abk is implementing backtrace support. It will take several weeks until the feature is release. If you share the Wasm binary and `call` parameters, `abk` might be able to run it locally in a patched replica and give you the backtrace.
+
+-------------------------
+
+ktimam | 2024-06-21 13:04:01 UTC | #38
+
+Thanks a lot, that would be of great help. 
+
+Kindly find attached the wasm file with removed exports (the debug info was removed after optimizing though, is there a way to get around with keeping the debug info while removing unneeded globals?):
+https://drive.google.com/file/d/1-6sz1VTuhciDNlMk6Cg1gVvaZesx6-Bf/view?usp=sharing
+
+Command to run after deploying:
+dfx canister --network local call ICMLPSample train
+
+-------------------------
+
+icpp | 2024-06-21 21:21:04 UTC | #39
+
+Thank you @ulan , I will have a look at the options to optimize the wasm as part of the build process in icpp-pro.
+
+-------------------------
+
+ktimam | 2024-06-22 11:38:51 UTC | #40
+
+After some investigation, i found out that the problem results after using Oz flag during compilation process. I tried removing all optimizations during compilation and used Oz flag to optimize the wasm using wasm-opt after removing exports, and all ran well.
+
+Thanks a lot for your valuable input. Here's a Multilayer perceptron Flashlight sample running fully on chain:
+dfx canister --network ic call 52uwu-yyaaa-aaaag-aldoa-cai train
+
+-------------------------
+
+abk | 2024-06-24 07:25:46 UTC | #41
+
+Hi @ktimam, so you don't need me to try and get a backtrace anymore?
+
+-------------------------
+
+ktimam | 2024-06-26 22:21:58 UTC | #42
+
+[quote="ktimam, post:40, topic:10834"]
+Multilayer perceptron
+[/quote]
+
+Thanks a lot @abk . All is good now.
+
+-------------------------
+

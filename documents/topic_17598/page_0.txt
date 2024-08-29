@@ -1,0 +1,174 @@
+saikatdas0790 | 2022-12-21 18:59:41 UTC | #1
+
+Can we use the stable BTreeMap from the [stable-structures](https://github.com/dfinity/stable-structures) repo along with the [regular ic_cdk stable memory](https://docs.rs/ic-cdk/latest/ic_cdk/storage/index.html) API?
+
+I believe the regular API overwrites the entire stable store as documented [here](https://docs.rs/ic-cdk/latest/ic_cdk/storage/fn.stable_save.html).
+
+Are there suggested approaches that I can adopt where I can store large collections of data to the stable BTreeMap and store other data selectively on the heap? I don't want to choose between the two but would rather like to use them both in the same canister depending on the use case
+
+Tagging @ielashi since he's the author of the stable structures library
+
+-------------------------
+
+ielashi | 2022-12-21 19:32:42 UTC | #2
+
+Hey @saikatdas0790,
+
+It is possible to use stable structures alongside storing other data from the heap. However, you cannot use the `ic_cdk` API since it writes to stable memory with disregard to what's already there.
+
+The solution here is to rely on the [MemoryManager](https://docs.rs/ic-stable-structures/0.3.0/ic_stable_structures/memory_manager/index.html). The MemoryManager takes stable memory and provides an API that simulates having multiple memories, so you can give one memory to `StableBTreeMap`, and use another memory for storing data from the heap.
+
+You can see an example of this in the [Bitcoin canister](https://github.com/dfinity/bitcoin-canister/blob/b1166d77fcfca061c904e81fdeae0a702dccdb67/canister/src/lib.rs#L120), where we serialize data on the heap in memory 0, and use memory 1+ for stable structures.
+
+This has been a common source of confusion for `ic-stable-structures` users. I'll create an example of how this can be done and share it in this thread.
+
+-------------------------
+
+ielashi | 2022-12-21 20:58:19 UTC | #3
+
+OK, [here](https://github.com/dfinity/stable-structures/pull/20) is a working end-to-end example that I'm adding to the `examples` directory of the `stable-structures` repo. Hope this helps!
+
+-------------------------
+
+saikatdas0790 | 2022-12-22 13:32:40 UTC | #4
+
+@ielashi 
+Quick question, for serialization/deserialization, why do we use cbor in some places and candid(serde) in others?
+
+What's the general guidance for choosing one over the other depending on use case? Can I get away with using serde OR cbor everywhere?
+
+Reason I'm reluctant to use both is it will quite possibly bloat my canister sizes given we are pushing close to the size limit of 2MB canister sizes
+
+-------------------------
+
+ielashi | 2022-12-22 13:56:45 UTC | #5
+
+To clarify, `candid` != `serde`. serde is a general framework for serialization/deserialization. Libraries like `candid`, `ciborium`, or `serde_json` all rely on `serde` to support various data formats.
+
+The candid in the example is used for the endpoints of the canister, which is the standard that you'd expect. In theory you can also use candid as the data format in pre/post upgrade, but candid doesn't support the `serde(skip)` directive that we need to skip stable structures, so to use it you'll need to implement the `CandidType` manually for now.
+
+For simplicity, and to avoid having to implement `CandidType` manually in my example, I used CBOR as the data format in pre/post upgrade, but that choice was to some extent arbitrary.
+
+@chenyan How difficult would be it to support `serde(skip)` in candid?
+
+-------------------------
+
+paulyoung | 2022-12-22 16:39:20 UTC | #6
+
+Some people were/are using CBOR because of limitations with how much data they could process in the upgrade hooks.
+
+At least a couple of people I know have moved from CBOR to MessagePack and said that was a further improvement.
+
+There are some utilities here that make it a bit easier:
+
+https://github.com/open-ic/ic-utils/blob/main/stable_memory/src/lib.rs
+
+-------------------------
+
+chenyan | 2022-12-22 17:25:20 UTC | #7
+
+> How difficult would be it to support `serde(skip)` in candid?
+
+Not difficult. We just need to implement that attribute in the proc macro.
+
+OTOH, it makes sense to use a non-Candid encoding scheme for upgrade, although it means yet another dependency. Candid is designed for canister communication, and may not suit perfectly for upgrade: 1) it's not optimized for message size; 2) it doesn't support value sharing; 3) The opt subtyping rule can be a footgun in upgrade to silently drop values of incompatible type (we have a static check in motoko, but not in Rust).
+
+-------------------------
+
+saikatdas0790 | 2022-12-26 07:14:05 UTC | #8
+
+Hi @ielashi 
+
+Another quick question.
+
+Can you help me understand why `state_len_bytes` has this value assigned?
+
+https://github.com/dfinity/stable-structures/blob/3d22d483b9c55b79f7b869e3cf930883687d9fda/examples/src/quick_start/src/lib.rs#L83
+
+Is this some sort of magic number?
+
+-------------------------
+
+paulyoung | 2022-12-26 20:58:00 UTC | #9
+
+Doesn’t that initialize a slice of length `4` with all zeros and then reads the length from memory?
+
+-------------------------
+
+saikatdas0790 | 2022-12-27 10:05:10 UTC | #10
+
+Yes, but what I'm trying to confirm is if this same value is to be used regardless of the heap size?
+
+Should I be using this if my heap usage is in MB or GB or is there any other consideration to be made when initializing this value?
+
+@paulyoung
+
+-------------------------
+
+ielashi | 2022-12-27 19:27:01 UTC | #11
+
+The heap is capped to 4GiB, and so is a `u32`, so using a `u32` here should work in all circumstances.
+
+-------------------------
+
+AliSci | 2024-01-18 09:53:46 UTC | #12
+
+I am  also trying to use ic stable setrecture  and I have somthing like this
+```rs
+static PROFILE_STORE: RefCell<BTreeMap<Principal, User>> = RefCell::default();
+````
+
+migrating to 
+```rs
+static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+    
+    
+    static PROFILE_STORE: RefCell<ProfileStore> = RefCell::new(
+        StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))),
+        )
+    );
+```
+
+requiers me to impl stable for `User` and for `Princiapl` how to achive that. I don't want to try somthing like 
+```rs
+pub struct MyPrincipalWrapper(Principal);
+
+impl Storable for MyPrincipalWrapper {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        Cow::Owned(Encode!(self.0).unwrap())
+    }
+
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        let value = Decode!(bytes.as_ref(), Principal).unwrap();
+        Self(value)
+    }
+
+    const BOUND: Bound = Bound::Bounded {
+        max_size: MAX_VALUE_SIZE,  // Replace with the actual max size
+        is_fixed_size: false,
+    };
+}
+
+```
+cuz it reuireqes my to painful huge changes in my code i just want to use princiapl like it is.
+
+-------------------------
+
+Severin | 2024-01-18 10:02:58 UTC | #13
+
+In the latest version of `ic-stable-structures` `Principal` is `Storable`
+
+-------------------------
+
+AliSci | 2024-01-21 13:16:42 UTC | #14
+
+I am still facing the same error
+ |                                   ^^^^^^^^^^^^ the trait `Storable` is not implemented for `candid::Principal`
+```toml
+ic-stable-structures = "0.6.1"
+```
+
+-------------------------
+

@@ -1,0 +1,241 @@
+bdemann | 2023-06-21 19:53:25 UTC | #1
+
+I have a the following canister:
+```rust
+ic_cdk::export::candid::define_service!(
+    UnsortedService : {
+        "b" : ic_cdk::export::candid::func!(() -> (bool) query);
+        "a" : ic_cdk::export::candid::func!(() -> (bool) query)
+    }
+);
+
+ic_cdk::export::candid::define_service!(
+    SortedService : {
+        "a" : ic_cdk::export::candid::func!(() -> (bool) query);
+        "b" : ic_cdk::export::candid::func!(() -> (bool) query)
+    }
+);
+
+#[ic_cdk_macros::query]
+fn check_sorted_service(service: SortedService) -> SortedService {
+    service
+}
+
+#[ic_cdk_macros::query]
+fn check_unsorted_service(service: UnsortedService) -> UnsortedService {
+    service
+}
+```
+There are two services defined. One that has the functions in alphabetical order and one out of order.
+I have one function for each of these services that simple takes the corresponding service as a parameter and returns it.
+Everything is compiling fine, but when I try to call check_unsorted_service
+```bash
+dcc service_canister check_unsorted_service '(service "r7inp-6aaaa-aaaaa-aaabq-cai")'
+```
+I get the following error:
+```bash
+Error deserializing blob 0x4449444c0269020162010161016a00017e01010100010a00000000000000030101
+Error: Failed to deserialize idl blob: Invalid data.
+Caused by: Failed to deserialize idl blob: Invalid data.
+  Cannot parse header 4449444c0269020162010161016a00017e01010100010a00000000000000030101
+    Invalid table entry 0: Service(ServType { len: 2, meths: [Meths { len: 1, name: "b", ty: IndexType { index: 1 } }, Meths { len: 1, name: "a", ty: IndexType { index: 1 } }] })
+      method name a duplicate or not sorted
+```
+If I call the other method it works just fine
+```bash
+$ dcc service_canister check_sorted_service '(service "r7inp-6aaaa-aaaaa-aaabq-cai")'
+
+(service "r7inp-6aaaa-aaaaa-aaabq-cai")
+```
+The other canister looks like this
+``` rust
+#[ic_cdk_macros::query]
+fn a() -> bool {
+    return true;
+}
+
+#[ic_cdk_macros::query]
+fn b() -> bool {
+    return false
+}
+```
+
+Any thoughts on why this is happening?
+
+-------------------------
+
+bdemann | 2023-06-21 20:03:18 UTC | #2
+
+I am seeing this on both DFX 0.13.1 and 0.14.1
+Here are my dependencies
+```toml
+[dependencies]
+candid = "=0.9.0-beta.3"
+ic-cdk = "=0.8.0-beta.0"
+ic-cdk-macros = "0.6.10"
+serde = "1.0.137"
+```
+
+-------------------------
+
+chenyan | 2023-06-22 17:19:20 UTC | #3
+
+Thanks for reporting this. This is a bug, I will fix it. The macro expansion should sort the methods.
+
+-------------------------
+
+bdemann | 2023-06-22 17:38:23 UTC | #4
+
+Thank you for looking into it!
+
+-------------------------
+
+lastmjs | 2023-06-22 17:39:30 UTC | #5
+
+Awesome thanks! Good luck
+
+-------------------------
+
+lastmjs | 2023-07-28 17:39:29 UTC | #6
+
+Is there an issue or PR for this?
+
+-------------------------
+
+lwshang | 2023-07-28 17:52:51 UTC | #7
+
+I found this merged PR: https://github.com/dfinity/candid/pull/441.
+
+Recent released `candid` should include the fix.
+
+-------------------------
+
+lastmjs | 2023-09-13 19:55:24 UTC | #8
+
+Do you know if dfx has this fix integrated yet?
+
+-------------------------
+
+lastmjs | 2023-09-13 20:04:41 UTC | #9
+
+We are running into this issue again, we're still debugging, but it seems like the problem is arising from dfx itself when trying to deserialize a Candid service that we return from an Azle canister.
+
+Is it possible the dfx dependencies haven't been updated to include this fix?
+
+Here's the error:
+
+```
+$ dfx canister call service serviceParam '(service "aaaaa-aa")'Error deserializing blob 0x4449444c036a000171006a00017e01016902077570646174653100067175657279310101020100Error: Failed to deserialize idl blob: Invalid data.Caused by: Failed to deserialize idl blob: Invalid data.  Cannot parse header 4449444c036a000171006a00017e01016902077570646174653100067175657279310101020100    Invalid table entry 2: Service(ServType { len: 2, meths: [Meths { len: 7, name: "update1", ty: IndexType { index: 0 } }, Meths { len: 6, name: "query1", ty: IndexType { index: 1 } }] })      method name query1 duplicate or not sorted
+```
+
+Here's a slightly simplified version of the Azle method that was called:
+
+```typescript
+class extends Service {
+    @query([], bool)
+    query1(): bool {
+        return true;
+    }
+
+    @update([], text)
+    update1(): text {
+        return 'SomeService update1';
+    }
+}
+
+@query([SomeService], SomeService)
+serviceParam(someService: SomeService): SomeService {
+    return someService;
+}
+```
+
+-------------------------
+
+lastmjs | 2023-09-13 20:11:38 UTC | #10
+
+I'm thinking this is a problem with `@dfinity/candid`, I think the same fix for `candid` in Rust needs to be done for `@dfinity/candid`. @kpeacock
+
+-------------------------
+
+lastmjs | 2023-09-13 20:42:09 UTC | #11
+
+It is indeed a problem in `@dfinity/candid`. Debugging we found a quick fix. Notice we changed the sort function in the constructor:
+
+```typescript
+export class ServiceClass extends ConstructType {
+    constructor(fields) {
+        super();
+        // this._fields = Object.entries(fields).sort((a, b) => idlLabelToId(a[0]) - idlLabelToId(b[0]));
+        this._fields = Object.entries(fields).sort((a, b) => {
+            if (a[0] < b[0]) {
+                return -1;
+            }
+
+            if (a[0] > b[0]) {
+                return 1;
+            }
+
+            return 0;
+        });
+    }
+    accept(v, d) {
+        return v.visitService(this, d);
+    }
+    covariant(x) {
+        if (x && x._isPrincipal)
+            return true;
+        throw new Error(`Invalid ${this.display()} argument: ${toReadableString(x)}`);
+    }
+    encodeValue(x) {
+        const buf = x.toUint8Array();
+        const len = lebEncode(buf.length);
+        return concat(new Uint8Array([1]), len, buf);
+    }
+    _buildTypeTableImpl(T) {
+        this._fields.forEach(([_, func]) => func.buildTypeTable(T));
+        const opCode = slebEncode(-23 /* IDLTypeIds.Service */);
+        const len = lebEncode(this._fields.length);
+        const meths = this._fields.map(([label, func]) => {
+            const labelBuf = new TextEncoder().encode(label);
+            const labelLen = lebEncode(labelBuf.length);
+            return concat(labelLen, labelBuf, func.encodeType(T));
+        });
+        T.add(this, concat(opCode, len, ...meths));
+    }
+    decodeValue(b) {
+        return decodePrincipalId(b);
+    }
+    get name() {
+        const fields = this._fields.map(([key, value]) => key + ':' + value.name);
+        return `service {${fields.join('; ')}}`;
+    }
+    valueToString(x) {
+        return `service "${x.toText()}"`;
+    }
+}
+```
+
+-------------------------
+
+chenyan | 2023-09-13 20:49:11 UTC | #12
+
+You are right. That's a bug on the agent-js side. The sorting function should be alphabet, not based on the IDL hash.
+
+-------------------------
+
+lastmjs | 2023-09-13 20:57:09 UTC | #13
+
+Do you have an ETA on when this bug could be fixed? We're trying to decide if we should maintain a fork or not.
+
+-------------------------
+
+dansteren | 2023-11-08 15:56:55 UTC | #14
+
+There's a similar issue in `@dfinity/agent` v0.19.3.
+
+Update: Looks like a fix was recently merged so the JS agent part should be resolved in the next release
+
+See https://github.com/dfinity/agent-js/pull/781
+
+-------------------------
+

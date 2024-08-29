@@ -1,0 +1,752 @@
+dsarlis | 2022-12-15 10:28:36 UTC | #1
+
+## Background
+
+The Internet Computer has a limit of 2MiB on the size of ingress messages on most subnets. This limit also applies to install_code messages when they are sent as ingress messages to install or upgrade canisters. In many cases, this is enough but we are slowly seeing more and more cases where this limit is too low and bigger Wasm modules cannot be installed. There is also the ability to install compressed modules but it only helps up to some extent since in some cases canisters might not compress well enough (or are simply too big even after compression). This poses a big limitation to canister developers and is considered a high priority item to fix from our side.
+
+## Sketch of a high level approach
+
+The high level idea is relatively straightforward. We can allow canister installation to happen in chunks where the Wasm module is uploaded over multiple ingress messages (of up to 2MiB) and the installation proceeds once all chunks have been received. This will likely require changes across the stack, from replica to dfx tooling, to allow for a smooth user experience.
+
+## Action for the community
+
+We would like the community to provide their feedback on how useful they find this feature and additionally, if they have specific requirements in terms of:
+
+* Use cases for large Wasm modules
+* Wasm module sizes to be supported
+* Desired interface to allow chunked installation
+
+The feedback will be of great help as we begin scoping the feature in the following weeks.
+
+Tagging some people for visibility (feel free to tag more that you think they might be interested):
+@lastmjs (who originally asked for this)
+@dfx-json @mikhail-turilin from the SDK/product side
+
+-------------------------
+
+paulyoung | 2022-12-13 09:45:28 UTC | #2
+
+The certified assets crate does something along these lines for static assets, and I think @peterparker may have also written something for dynamic assets.
+
+I’ve seen a few solutions specifically for Wasm modules. I know @skilesare came up with one.
+
+If possible, I’d love it if this could address the more general problem and not result in a solution that is specific to Wasm modules.
+
+I think having this be backed by general purpose abstractions provided in `agent_rs` and `cdk_rs` would be great.
+
+-------------------------
+
+paulyoung | 2022-12-13 09:48:20 UTC | #3
+
+[quote="paulyoung, post:2, topic:17372"]
+I’ve seen a few solutions specifically for Wasm modules. I know @skilesare came up with one.
+[/quote]
+
+This is the other one I saw by @simdi.jinkins.
+
+[quote="simdi.jinkins, post:30, topic:11756"]
+**Issues and Solutions**
+
+1. **Large binary from in-lining wasm via include_bytes!**:
+Wasm code for creating new canisters is added in heap memory at runtime via an init_wasm operation. I’ve created [wasm_uploader ](https://github.com/scroobius-pip/scaled_storage/tree/master/src/wasm_uploader) for this.
+2. **Payload size too large for init_wasm operation:**
+The wasm binary is chunked and sent one at a time.
+[/quote]
+
+-------------------------
+
+dsarlis | 2022-12-13 10:09:37 UTC | #4
+
+Thanks for sharing this info @paulyoung!
+
+To make sure it's clear to everyone: our intent here is to provide a protocol level solution for chunked Wasm uploads. I'm aware there are some cases where people have done some form of chunking on the application level for other use cases (e.g. to upload videos to the IC) but that was not in the scope we had in mind.
+
+> If possible, I’d love it if this could address the more general problem and not result in a solution that is specific to Wasm modules.
+
+That's a fair point. My hope is that starting with a solution for Wasm modules can inform us on the viability of the approach and we can then extend to any ingress message, not just wasm installations. It sounds like most people are currently trying to find their own solutions for large wasm installations and this is what we want to address in a more general way on the protocol side as a first step.
+
+That said, if there is a lot of demand for a solution that covers any ingress message in this thread, we can consider expanding the scope of the work, but given that expanding scope can add delays, we probably want to be careful before doing so and maybe iterating in smaller steps to get faster incremental wins is a better strategy.
+
+-------------------------
+
+saikatdas0790 | 2022-12-13 11:20:19 UTC | #5
+
+I echo this sentiment. If we add support for chunking any ingress message at the protocol level, it is well worth the wait.
+
+Almost any serious application that deals with blob data or large transactions in general has to write boilerplate logic to partition data for transmission for this in their application. This is unnecessary and error prone.
+
+Even the [exchange rate example](https://github.com/dfinity/examples/tree/master/rust/exchange_rate#canister-behaviors) that could just have been a SIMPLE example of polling an API with the [https outcall API](https://docs.rs/ic-cdk/latest/ic_cdk/api/management_canister/http_request/fn.http_request.html) had to implement this additional chunking logic to not exceed the ingress message limit.
+
+Finally, the IC is supposed to be a full stack alternative to traditional cloud and hosting, so having a restrictive limit on networking and having to come up with application level partitioning logic and management is quite frustrating once you start hitting these limits for your use case
+
+-------------------------
+
+peterparker | 2022-12-13 13:43:38 UTC | #6
+
+[quote="paulyoung, post:2, topic:17372"]
+I know @skilesare came up with one.
+[/quote]
+
+Not sure it is what you meant @paulyoung but yes, I use @skilesare approach to upload the code of canister that are spawned at runtime within the canister that will create these. Regardless if Motoko or Rust, I just chunk the wasm (in NodeJs 😅) an upload these to an update endpoint that append everything to an array of bytes in stable memory (e.g. [Motoko](https://github.com/papyrs/ic/blob/4298bc2f0e430548b1d4d80f4a3b4474c177d514/canisters/src/manager/manager.mo#L312)).
+
+-------------------------
+
+lastmjs | 2022-12-13 18:41:03 UTC | #7
+
+I want to list some of the issues that having a small Wasm binary limit has lead to for us:
+
+1. Can't deploy most of the Python stdlib with Kybra
+2. The main source of compilation time in our Kybra/Azle build process seems to be from ic-cdk-optimizer, which is only necessary to use because of the Wasm binary limit (our compilation times are very long, but could be ~5-10 secs without ic-cdk-optimizer)
+3. gzip is required to deploy Kybra/Azle canisters, adding extra plumbing to our build processes and requiring the user to change their dfx.json
+4. ic-cdk-optimizer has installation problems on various people's machines when using Kybra/Azle
+5. ic-cdk-optimizer removes the Wasm metadata section, requiring us to also use ic-wasm to re-insert the metadata section after running ic-cdk-optimizer. We are thus required to force the user to install ic-cdk-optimizer and ic-wasm
+6. We can't get rid of ic-cdk-optimizer because ic-wasm doesn't compress the Wasm binary enough (at least for Kybra)
+
+-------------------------
+
+bob11 | 2022-12-13 19:50:03 UTC | #8
+
+As an early Kybra user I also want chunked Wasm uploads. There are many Python dependencies that Python devs will want to include in their canisters that will easily go over the 2Mb limit right now. And I don't see dependencies being able to be supported (standard lib or external dependencies) without this.
+
+I also agree that implementing a general ingress message chunking solution at the protocol level would be helpful, as it is annoying to implement right now and would simplify large asset transfer.
+
+I'm biased toward focusing on the Wasm solution (as proposed) initially as this is a major blocker for all Kybra projects, and it isn't too crazy to implement a chunking solution for assets using http streaming.
+
+-------------------------
+
+lastmjs | 2022-12-13 21:18:17 UTC | #9
+
+I am also biased towards focusing on removing the Wasm binary limit ASAP for the great detriment it is to most of what Demergent Labs is working on currently.
+
+-------------------------
+
+brady | 2023-02-08 16:40:41 UTC | #10
+
+@dsarlis 
+
+Is this feature currently under development? When could it be expected?
+
+I would like to install certain wasm Blobs using the management canister install_code method but in some cases even the gzipped Blob does not seem to fit within the 2 MiB ingress message limit.
+
+-------------------------
+
+dsarlis | 2023-02-09 13:43:16 UTC | #11
+
+Hi @brady, no the development for this hasn't started yet. It's hard for me to give a good estimate at the moment but I think some time in the first half of the year is a doable target.
+
+For transparency, the team that can work on this is wrapping up some last work items on BTC integration and then we still need to start working on some other high priority projects (like a solution for safe canister upgrades which is a big pain point for canister developers). This all might push this one a bit later in the first half since unfortunately we have limited engineering resources.
+
+-------------------------
+
+lastmjs | 2023-02-09 14:51:58 UTC | #12
+
+In the hopes of giving more motivation to prioritize this: the small Wasm limit is quickly becoming the #1 issue holding back especially the Kybra Python CDK but also Azle.
+
+We can't allow developers to use the Python stdlib and thus almost no PyPI packages, and our build/compilation processes are very long mostly because of dealing with optimizing the binary and the ensuing issues.
+
+This problem is becoming very potent. When discussing Kybra we often have to explain the limitations with the stdlib and PyPI packages.
+
+Oh, and we also can't upgrade Kybra to use async/await instead of generators because we can't use the stdlib, something we'd like to do to get Kybra closer to its final API rather than keep changing it on everyone.
+
+-------------------------
+
+dsarlis | 2023-02-09 15:58:49 UTC | #13
+
+@lastmjs Thank you for sharing this information. I will get back to the team internally and share this feedback and see what we can do and if we can push this up somehow.
+
+-------------------------
+
+justmythoughts | 2023-02-12 14:49:07 UTC | #14
+
+[quote="dsarlis, post:11, topic:17372"]
+For transparency, the team that can work on this is wrapping up some last work items on BTC integration
+[/quote]
+
+Thanks for the transparency.
+
+What work is there still to do on the BTC integration? I thought that work was essentially completed with the launch of ckBTC?
+
+-------------------------
+
+dsarlis | 2023-02-13 09:47:21 UTC | #15
+
+There were some items which are important but we had decided to not block launch for them and tackle them shortly after. For example: more robust testing of upgrading the BTC canister on CI, cleaning up the old replica implementation that was not used anymore, using stability count for counting confirmations instead of longest chain, a couple minor fixes after a security review that was conducted internally and some other minor improvements for the BTC canister in general now that's fully productionised.
+
+>  I thought that work was essentially completed with the launch of ckBTC?
+
+Note that the team working on ckBTC is different than the one working on the core BTC integration which includes the BTC canister which is what I am referring to above and the follow ups we worked on.
+
+-------------------------
+
+skilesare | 2023-02-13 14:33:08 UTC | #16
+
+Are there security concerns for large wasms? I had always assumed the small size was so that an attacker couldn't attack a subnet via this method.  I believe that the current cross-subnet communication limit(~3.x MB) is what restricts the wasm installation since you have to send the wasm from a staging canister to the management canister and then out to the destination subnet.
+
+If the wasms get "big enough" I'd guess they could be used to choke up a subnet or two with data processing.  I have no idea what these costs might be as I'd imagine it would be an expensive attack, but it seems like something that should be addressed in general.
+
+-------------------------
+
+LiveDuo | 2023-02-13 17:39:27 UTC | #17
+
+A few more issues in favour of removing the Wasm limit and its impact.
+
+1. If someone wants to transfer ICP or deploy canisters dynamically or use Internet Identity in their project, developing locally gets quite involved. That's partially due to having to setup the canisters locally (getting the wasm files, understanding the required deploy arguments, switching candid files before and after deployment and having a separate scripts to deploy in different environments). To bypass the wasm limit they have to deploy a deployer canister and managing deploy scripts and add to an already elaborate process.
+
+2. After updating to dfx 12 (from dfx 11) some of the wasm files got around 30% bigger (from 1.6mb to 2.1mb) and went over the Wasm limit. Although the change log states that the actual optimisation hasn't changed in practise it did. About the update [refactor-optimize-from-ic-wasm](https://internetcomputer.org/docs/current/other/updates/release-notes/#refactor-optimize-from-ic-wasm). Probably related to [make-ic-wasm-as-capable-as-ic-cdk-optimizer](https://forum.dfinity.org/t/make-ic-wasm-as-capable-as-ic-cdk-optimizer/17394).
+
+-------------------------
+
+dsarlis | 2023-02-15 09:08:51 UTC | #18
+
+@skilesare Maybe we need to clarify a couple things.
+
+First, the limit that you refer to about cross-subnet communication is related mostly to how much data we can put in a consensus block (eventually all cross-subnet messages get in a block at the destination subnet so they can be delivered to the upper layers of the IC and get processed). And yes, indeed, given that such cross-subnet messages that are trying to install canisters would be adhering to the same limit as other inter-canister messages, they cannot be more than 2MiB.
+
+The proposed solution in this thread would add the ability to upload a large Wasm module by chunking it in smaller pieces that fit within the allowed limit for ingress messages (which are typically the same as for inter-canister calls). We wouldn't increase the limit for individual messages, either ingress or inter-canister. Rather, we'd use multiple (and specifically ingress messages, the solution was not targeting inter-canister calls) to upload a larger Wasm.
+
+Note however that a canister can already send a Wasm over multiple cross-subnet calls (by chunking it up) to another canister which would then install the module on a canister in the target subnet but I don't see any issues there personally.
+
+There are of course some considerations when allowing larger Wasm modules:
+1. If we allow uploading in chunks, this would mean that we would need to keep the intermediate chunks until we receive all of them and can reconstruct the Wasm before installing it. This is some extra overhead but I believe we can incorporate this to the memory used by the target canister which the canister pays for anyway.
+2. We would need to ensure that a large Wasm module does not result in unreasonable compilation times.
+
+Final note: for new features specifically we always consult with the product security team to get a sense of the risk of the change and such security concerns are usually revealed in this process. So, even if I'm missing something now rest assured that there will be a thorough review of any design to ensure we are not introducing new attack vectors.
+
+-------------------------
+
+dsarlis | 2023-02-15 09:11:08 UTC | #19
+
+Thanks for the feedback @LiveDuo! Your second point sounds like a more specific feedback for the SDK team and the regression from dfx 11 to 12. Afaik, the team is aware of the switch from ic-cdk-optimizer to ic-wasm resulting in bigger modules and they are working on getting this fixed.
+
+-------------------------
+
+LiveDuo | 2023-02-15 12:19:20 UTC | #20
+
+Sure thing @dsarlis. A temporary solution at this moment probably is running ic-cdk-optimizer manually if there isn't any issue feeding the optimised wasm from ic-wasm. I hope the team comes up with a solution soon.
+
+About the first point I'll create another topic at some point to get more into details and possible solutions.
+
+-------------------------
+
+lastmjs | 2023-04-18 18:33:55 UTC | #21
+
+We continue to get pummelled by this limit. This latest example from today is just one of a number of issues stemming from this limit that we deal with at Demergent Labs while working on Azle and Kybra.
+
+Our latest issue is updating Kybra's Python interpreter and other important dependencies. We went through the updates over the last couple days and now we are just over the binary limit, again mind you. We've been through this before of course, and each time we have to add some config or hack to overcome it.
+
+Unfortunately we're at almost the end of our rope. We've messed with various optimization parameters in our Cargo.toml, we're using ic-cdk-optimizer, and gzip with the highest compression setting. None of this is good enough anymore. So now we may have to use the hack where we ask our users and ourselves to chunk upload the Kybra binary to deploy to an intermediate canister, and then deploy from there to take advantage of the weird difference in message size limits for cross canister calls.
+
+This will upend the deployment flow for our users, getting rid of the ability to use dfx deploy.
+
+This limit is really killing us.
+
+Does anyone have other ideas for optimization in the mean time? We've try so many things.
+
+-------------------------
+
+dsarlis | 2023-04-20 15:06:35 UTC | #22
+
+@lastmjs Thanks for your input. I can empathise with the problems you mentioned but unfortunately I don't think we can offer something more than what you described as a workaround (maybe someone in the community has thought about a clever alternative).
+
+We will be looking more closely at a proper design on this but a fair warning: as usual, we have realized that things are not as easy as they might seem at first glance. We have discovered a couple of potential problems with larger Wasms that we will need to ensure we have solutions for before we really allow larger Wasm modules, e.g. with potentially longer compilation times or interactions with the sandbox given how data is transferred between the replica and sandbox.
+
+I will update this thread once we have more to share. Again, I understand the pain this limitation is causing but we also want to make sure we don't accidentally add regressions in other places by rushing any solution.
+
+-------------------------
+
+LiveDuo | 2023-04-21 07:08:31 UTC | #23
+
+Been experimenting with various designs lately I came to the following as the more reliable. Some of the concerns are (besides supporting larger wasm modules) are:
+- One command to deploy the canister and one to upgrade
+- Optimise as much as possible to not compile or deploy unnecessarily
+- Stay as close to the default dfx config as possible
+
+This is an example repo:
+https://github.com/LiveDuo/icp-deploy-example
+
+How it works:
+1. There's a deployer canister that handles both deploys and upgrades
+2. Has a script that runs the build command and deploys the canister wasm with the deployer canister
+
+Although there nothing new so far I think there a simple feature that could handle many use cases. A new "deploy" property can be introduced to `dfx.json`. Such property allows to customise the deployment scripts without introducing new commands.
+
+For new projects that need setup this can be included as it will come in `dfx.json` along with the necessary build scripts. For existing projects that need to increase the wasm module they can introduce their custom deploy scripts without breaking their existing config.
+
+@lastmjs Will a custom "deploy" script solve some of the issues with Azle / Kybra?
+
+-------------------------
+
+lastmjs | 2023-04-23 02:06:57 UTC | #24
+
+That could be nice yes, I've long wanted to control the deploy process more with dfx.json, perhaps a pre deploy and post deploy should be considered as well.
+
+But, this will only help to alleviate some of the issues, I think that's well understood.
+
+Since we basically have to use a deployer canister now, a custom deploy command could help us to ease the process for our users, because asking them to use a custom script us going to upend our whole deploy process now, when thus far they've been able to just use dfx essentially as for any other Rust or Motoko canister.
+
+I wonder if the dfx extensions feature that is coming out is of any help here.
+
+-------------------------
+
+lastmjs | 2023-04-24 12:31:44 UTC | #25
+
+Another question is how big are you going to be able to raise the limit? To be safe a minimum of 50MiB is preferable for our use case, based on what I remember from the last time I looked at the numbers necessary for compiling RustPython with the whole stdlib. I could check again if necessary, but will we be able to make Wasm binaries of arbitrary size?
+
+-------------------------
+
+dsarlis | 2023-04-24 07:35:13 UTC | #26
+
+> To be safe a minimum of 50GiB is preferable for our use case
+
+Just to make sure, this is not a typo, right? This is 50**GiB**? If yes, this is orders of magnitude more than we had in mind. I remember numbers in the order of ~100MiB that you had mentioned for Kybra (maybe they are outdated numbers though).
+
+50GiB is *a* *lot*. We certainly cannot go to such numbers in one go, if we can ever go there that is. As I mentioned, we need to ensure that compilation times are in order for such big Wasm modules and that we also don't regress other parts of the system like the communication with the canister sandbox process. Also, a chunked upload of 50GiB would potentially be quite slow if done "naively", i.e. just in chunks of 2MiB, we're bound by how fast the network is.
+
+> I could check again if necessary, but will we be able to make Wasm binaries of arbitrary size?
+
+I think it's useful if you can double check and at least we know what numbers we need to be looking at. Arbitrary size is hard to promise -- usually we do need to impose some limit to make reasonable assumptions about DoS attacks/scenarios and be able to predict how the system will behave under those.
+
+-------------------------
+
+lastmjs | 2023-04-24 12:33:26 UTC | #27
+
+Sorry about that, definitely a typo. Mega not giga :slight_smile: 100MiB would be fantastic and I think well more than we need at the moment, 50MiB could cut it close. I will double-check our numbers, but I'm hoping we can have a safe excess so we're not always towing the line.
+
+-------------------------
+
+dsarlis | 2023-04-24 12:57:15 UTC | #28
+
+Ok, thanks for the confirmation, I was really worried there for a moment :sweat_smile:.
+
+100MiB is the rough target we have in mind and I'm optimistic we can get this (we might still go there in a few steps rather than a big jump from 2MiB to 100MiB but that's mostly to ensure there will be no issues in production).
+
+-------------------------
+
+lastmjs | 2023-04-24 13:03:37 UTC | #29
+
+Sounds amazing! Sorry for the scare, that would be very very concerning to hear.
+
+-------------------------
+
+lastmjs | 2023-04-25 21:08:27 UTC | #30
+
+For our foreseeable use cases, it looks like a minimum increase to 25MiB is needed, but that could be towing the line. Hopefully we can start with an increase to 30-40+MiB?
+
+Here's some of the results of testing I did a while back with RustPython which has given use the most trouble with its larger binary sizes: https://github.com/RustPython/RustPython/issues/4203#issuecomment-1310928944
+
+And I just did another test now with an example project when adding everything into RustPython that I think we would need, and the binary rose from ~9MiB to ~25MiB.
+
+If I had to choose an absolute minimum increase to target for the initial rollout of this feature, I would love for it to be 30MiB.
+
+-------------------------
+
+dsarlis | 2023-04-26 08:39:46 UTC | #31
+
+Thank you for providing this information Jordan! Really useful for us. I suppose these are the numbers for uncompressed Wasm modules, do you have the numbers if you try to compress them?
+
+-------------------------
+
+lastmjs | 2023-04-26 11:48:58 UTC | #32
+
+I know you asked about compression, but one of our main goals is to remove all optimization requirements. Having to install and use tools like ic-cdk-optimizer, ic-wasm, wasm-opt has been the source of many problems and long compilation times for Azle and Kybra.
+
+gzip takes less time and isn't as much of a burden, but it would be ideal to not have to rely on that machinery either. It still introduces extra moving parts in our codebase and requires the user to change the location of the Wasm binary to the gzipped version. Ideally dfx could just gzip automatically when pointing to any Wasm file.
+
+With that in mind, I don't know the numbers for gzipping but I can check. I hope we can shoot for non-gzipped non-optimized binaries.
+
+-------------------------
+
+lastmjs | 2023-07-06 19:01:31 UTC | #33
+
+The recent increase in the Wasm binary limit in dfx 0.14.2 has been awesome, allowing us to reduce compilation times in Kybra.
+
+For those who aren't aware, my understanding is that the dfx 0.14.2 has a new limit of 30MiB total for uncompressed Wasm binaries, with a maximum code section size of 10MiB and a maximum data section size of 30MiB.
+
+But the issue of the 2MiB ingress message limit and the 10MiB cross-canister message limit still exist. The 2MiB limit is the most sinister for us right now. It has required us to do a rather complicated deploy process.
+
+What's the status on dfx automatically chunk uploading Wasm binaries?
+
+-------------------------
+
+bogwar | 2023-07-06 23:51:19 UTC | #34
+
+We're actively working on this feature: we aim to allow uploading Wasm modules to some replica storage and installing modules from there. Uploading will be done in chunks but installing would not suffer from the message limits.
+
+-------------------------
+
+b3hr4d | 2023-07-08 09:10:55 UTC | #35
+
+Hey everyone,
+
+I wanted to take a moment to give a huge shoutout to @peterparker and his incredible work on the [Juno app](https://github.com/buildwithjuno/juno). It's a fantastic tool that showcases the power and flexibility of the Internet Computer Protocol. If you haven't checked it out yet, I highly recommend you do.
+
+In my project, B3Wallet, I've implemented two unique approaches to handle the uploading and installation of Wasm modules, effectively bypassing the message size limit that can often be a bottleneck when dealing with larger Wasm modules.
+
+**Approach 1: Uploading to a System Canister and Creating a New Canister**
+
+1. **Chunking the Wasm Module:** The Wasm module is broken down into smaller pieces, or chunks, using Node.js. Each chunk is small enough to fit within the message size limit.
+2. **Uploading the Chunks:** Each chunk is then uploaded to a system canister. The system canister stores these chunks until all pieces of the Wasm module have been received.
+3. **Reassembling the Wasm Module:** Once all chunks have been uploaded, the system canister reassembles them into the original Wasm module. 
+4. **Creating and Installing a New Canister:** The system canister then creates a new canister and installs the reassembled Wasm module into it.
+
+**Approach 2: Upgrading an Existing Canister**
+
+1. **Chunking the Wasm Module:** The Wasm module is broken down into smaller pieces, or chunks, directly on the frontend. Each chunk is small enough to fit within the message size limit.
+2. **Uploading the Chunks:** Each chunk is then uploaded directly to the canister that is set to be upgraded. The canister stores these chunks until all pieces of the Wasm module have been received.
+3. **Reassembling the Wasm Module:** Once all chunks have been uploaded, the canister reassembles them into the original Wasm module. 
+4. **Requesting Installation:** After the Wasm module has been fully reassembled, a request is sent to the management canister to install the new module. This is done by calling the `install_code` method on the management canister, passing in the reassembled Wasm module as an argument.
+
+These approaches ensure that the process of creating or upgrading a canister with a new Wasm module is smooth and efficient, even for larger modules that exceed the message size limit. It's a testament to the flexibility of the Internet Computer Protocol and the innovative solutions it enables.
+
+You can check out these functionalities live at [b3wallet.live](https://www.b3wallet.live/) and explore the open-source code on the [B3Wallet GitHub repository](https://github.com/B3Pay/b3-wallet). I welcome any feedback or contributions from the community.
+
+Let's continue to build and innovate, pushing the boundaries of what's possible with the Internet Computer Protocol!
+
+Cheers,
+Behrad
+
+-------------------------
+
+peterparker | 2023-07-08 16:49:40 UTC | #36
+
+Thanks @b3hr4d! ☺️🙏
+
+B3Wallet looks really neat and showcases some interesting patterns that I might also consider using. 
+Starred ⭐️✅
+
+-------------------------
+
+sadernalwis | 2023-10-03 15:01:24 UTC | #38
+
+
+Hi @b3hr4d ,
+
+https://github.com/B3Pay/b3-note/issues/2
+
+maybe you can point me in the right direction with this..?
+
+-------------------------
+
+b3hr4d | 2023-10-03 18:42:09 UTC | #39
+
+Hello, @sadernalwis,
+
+If you're trying to deploy it to Mainnet, you should use the load script first. It uploads the wasm into the system canister, and then you can create and install a new wallet using the system canister. If you want to install it locally, you should not encounter this error!
+
+May I ask which version of `dfx` you are using? I'd like to provide more specific assistance based on your setup.
+
+-------------------------
+
+lastmjs | 2023-10-03 18:55:51 UTC | #40
+
+Is there an update on this feature? We would love to allow users to point to Wasm files over 2MiB in gzipped size and have all of this chunking done automatically for them.
+
+-------------------------
+
+sadernalwis | 2023-10-03 19:23:45 UTC | #41
+
+@b3hr4d  Thank you!
+
+I'm still trying to get the local build up.
+using 
+`dfx 0.14.3`
+
+And what further info can I provide?
+
+-------------------------
+
+b3hr4d | 2023-10-03 22:02:09 UTC | #42
+
+Great, thanks for providing your `dfx` version. To ensure we can address this issue effectively, I suggest we track it on GitHub.
+
+-------------------------
+
+bogwar | 2023-10-04 07:53:36 UTC | #43
+
+We have an approved design which we've started implementing. It should be done sometime this quarter: mid Nov at the latest (bar unforeseen developments).
+
+-------------------------
+
+lastmjs | 2023-10-04 10:45:59 UTC | #44
+
+Sounds amazing, good luck!
+
+-------------------------
+
+sadernalwis | 2023-10-04 12:07:34 UTC | #45
+
+such a relief.
+Godspeed crew! 
+god knows we need it..
+
+-------------------------
+
+ktimam | 2023-12-03 19:14:45 UTC | #46
+
+Is this implemented yet (i'm facing same issue with c++ icpp application)?
+
+-------------------------
+
+Severin | 2023-12-04 09:33:30 UTC | #47
+
+AFAIK the replica implementation is done and maybe even released already. The implementation in dfx is scheduled for this month, but I'd rather not make any promises about a release date
+
+-------------------------
+
+bogwar | 2023-12-04 16:23:15 UTC | #48
+
+Quick update on the status on support for installing large Wasms (<tl;dr> we're almost done).  
+
+* the code on the replica side is essentially complete. It is on master but gated by a flag. 
+* work on SDK support is ongoing
+* we're also doing an internal security review 
+
+We plan to enable the feature as soon as possible, but not before the security review.
+
+-------------------------
+
+borovan | 2023-12-04 16:29:23 UTC | #49
+
+Will we have to do anything special to use a wasm > 2MB, or will it just be handled behind the scenes?  
+
+Thanks for all your work on this!
+
+-------------------------
+
+bogwar | 2023-12-04 16:50:45 UTC | #50
+
+For dfx it should be transparent to users/devs; for SNS/NNS more work needs to be done since that requires interaction via proposals and the amount of interaction needs to be minimized. We have a design on how that could be done, but we haven't officially started work in that direction.
+
+-------------------------
+
+lastmjs | 2023-12-04 17:31:39 UTC | #51
+
+I should add some clarification here. It's not that you'll be able to deploy any Wasm binary once this fix is deployed. There are still limits on the code and data sections of the Wasm binary, and the full uncompressed size. I don't remember the exact numbers, can someone explain here what the limits will be?
+
+Full uncompressed size: ?
+Code section: 10 MiB?
+Data section: 30 MiB?
+
+-------------------------
+
+borovan | 2023-12-04 17:43:28 UTC | #52
+
+We're just looking for a better orchestration method to handle deploying all the canisters.  So one canister that can create all the other canisters on the fly and keep track of cycles, addresses etc.
+
+We've got this working with player_hub -> player, which is 1.6 megs.  If I try and have a "root" canister that deploys player_hub and our content database however, then it's 2.3.  We're not going to be a whole lot over the limit.
+
+-------------------------
+
+bogwar | 2023-12-04 17:59:15 UTC | #53
+
+The limits we're currently going for (subject to change following the security review) are 100MB for the Wasm (compressed) with 10MB code section.
+
+-------------------------
+
+lastmjs | 2023-12-04 18:53:24 UTC | #54
+
+So 100MiB fully uncompressed max, 10MiB code section max, 100MiB more or less max data section.
+
+-------------------------
+
+lastmjs | 2023-12-04 18:54:21 UTC | #55
+
+What's the outlook for making the code section bigger? 50MiB, 100MiB a possibility in the future?
+
+-------------------------
+
+berestovskyy | 2023-12-04 19:12:49 UTC | #56
+
+There is a multi-round compilation feature in progress. The first MR is in the code review, but the actual size increase will probably come in Jan-Feb...
+
+-------------------------
+
+lastmjs | 2023-12-04 19:13:36 UTC | #57
+
+Oh awesome, can you give me some kind of intuition on the expected size increase come Jan-Feb and the theoretical practical increase we could expect in the long term?
+
+-------------------------
+
+berestovskyy | 2023-12-04 19:40:07 UTC | #58
+
+The MR in review is to move the compilation into a separate process on IC. There will be still some communication overhead, and some risks... 50MiB sounds very doable, but it's too early to be sure. We need to benchmark it.
+
+Also, I guess it would make sense to increase the limits gradually, starting from 2-round compilation, i.e. increasing the limits ~2x. Ultimately, once everything is done and all the risks are addressed, the hard limits are CUP interval and available memory...
+
+-------------------------
+
+lastmjs | 2023-12-04 20:06:01 UTC | #59
+
+Sounds great, thank you for the info.
+
+-------------------------
+
+ktimam | 2023-12-05 17:23:39 UTC | #60
+
+Is "heap out of bounds, error code Some("IC0502")" related to those limitations (i'm getting this running c++ physics sample, which happens after a few rounds of the simulation (its a very simple simulation with a single object which runs fine on native mode)? If it's a different issue, i can open a new thread for it!
+
+-------------------------
+
+bogwar | 2023-12-05 17:44:12 UTC | #61
+
+Those bounds do not yet apply since the feature is not yet enabled. Also, the bounds are only relevant for installing code, so not for normal operations as I think is the case you’re mentioning.
+It’s worth opening a new thread.
+
+-------------------------
+
+ktimam | 2023-12-05 17:51:20 UTC | #62
+
+Thanks for feedback. Opened new thread at:
+[Heap out of bounds, error code Some("IC0502") on C++ code run - Developers - Internet Computer Developer Forum (dfinity.org)](https://forum.dfinity.org/t/heap-out-of-bounds-error-code-some-ic0502-on-c-code-run/25289)
+
+-------------------------
+
+lastmjs | 2023-12-14 15:50:08 UTC | #63
+
+Is there a branch of the sdk that I could use locally to build dfx? I just started trying to get the Node.js APIs working more deeply in Azle and I was immediately hit by the limit, it would be great to at least work locally while awaiting the feature.
+
+-------------------------
+
+abk | 2023-12-14 16:26:10 UTC | #64
+
+I think @AdamS should be able to give you info on if that's available.
+
+-------------------------
+
+ktimam | 2023-12-19 11:11:03 UTC | #65
+
+It would be great to have a version of dfx without any limits (app size, heap, etc...) that could be used for testing locally (or maybe a flag when running dfx). It would be useful in figuring out whether some of the issues rising is due to limitation!
+
+-------------------------
+
+lastmjs | 2023-12-19 19:04:42 UTC | #66
+
+@AdamS any branch available for this?
+
+-------------------------
+
+AdamS | 2023-12-21 18:23:56 UTC | #67
+
+Not at the moment. The feature is not live on mainnet yet.
+
+-------------------------
+
+lastmjs | 2023-12-21 23:02:06 UTC | #68
+
+Sorry, to clarify, I'm even just looking to deploy locally with a local branch of dfx, even if not live on mainnet
+
+-------------------------
+
+lastmjs | 2024-01-18 20:08:24 UTC | #69
+
+Any update on when this is coming out? We're trying to get node packages working in Azle, was making great progress on sql.js when we were slapped with this limit
+
+-------------------------
+
+Severin | 2024-01-19 07:52:37 UTC | #70
+
+@AdamS's PR to dfx was just merged, it'll be in the next release. I think we target  the end of next week for that
+
+-------------------------
+
+lastmjs | 2024-01-19 16:26:12 UTC | #71
+
+This is amazing news!!! I just tested this locally this morning and was able to deploy a ~14 MiB binary...and get SQL.js to work in Azle!
+
+Great job everybody who worked on this, so awesome!
+
+-------------------------
+
+lastmjs | 2024-01-25 19:57:38 UTC | #72
+
+So what are the next steps and timeline to finally getting this on mainnet? Is it on mainnet yet? dfx 0.16.0 has the feature, but there is this major bug: https://forum.dfinity.org/t/dfx-0-16-0-is-now-promoted/26978/2?u=lastmjs
+
+-------------------------
+
+berestovskyy | 2024-01-25 23:01:16 UTC | #73
+
+No worries, Jordan. The large Wasm support is enabled in this release, so it should be rolled out ~next week.
+
+Thanks for reporting the bug, it was also fixed today. There must be a new `dfx` release soon, we'll keep you informed.
+
+-------------------------
+
+gravity_vi | 2024-02-01 08:35:16 UTC | #74
+
+Hey :wave:, I tried using dfx version 0.16 and still faced an issue. I have an update function that looks like below:
+
+```rs
+ #[ic_cdk::update]
+ #[candid_method(update)]
+pub async fn upload_wasms(wasm_type: WasmType, wasm: Vec<u8>) -> Result<String, String> {
+    CANISTER_DATA.with_borrow_mut(|canister_data| {
+        canister_data.wasms.insert(wasm_type, Blob::from_bytes(Cow::Owned(wasm)));
+    });
+    Ok("Success".into())
+}
+```
+
+These function is used to upload wasm which would be later used to create canisters on the fly. But using these function to upload wasm still results into error:
+
+```
+The replica returned an HTTP Error: Http Error: status 413 Payload Too Large, content type "text/plain", content: Request 0xfb5f0a8564d092d0225c8d30fceb45adf4bccc8a3bb970eab30fe0ee16af7679 is too large. Message byte size 2152499 is larger than the max allowed 2097152.
+```
+
+-------------------------
+
+dsarlis | 2024-02-01 08:48:03 UTC | #75
+
+Hey @gravity_vi this is not the correct way to use this feature. You have defined a regular update method which is still bound by the regular 2MB message limit.
+
+In order to achieve what you want, you'd have to use a combo of the provided [upload_chunk](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-upload_chunk) and [install_chunked_code](https://internetcomputer.org/docs/current/references/ic-interface-spec#ic-install_chunked_code) apis on the management canister that will allow you to upload the Wasm in chunks, store it in the canister that will create the others and then install the code when you need it.
+
+-------------------------
+
+gravity_vi | 2024-02-01 08:54:49 UTC | #76
+
+@dsarlis Thanks for the quick response. I had one more  question. I am planning to add a generic proposal that would take wasm and upgrade other child canisters. Will this mechanism for that use case as well. Also How do we handle sending wasms in inter canister call?
+
+-------------------------
+
+dsarlis | 2024-02-01 08:59:39 UTC | #77
+
+> I am planning to add a generic proposal that would take wasm and upgrade other child canisters.
+
+The underlying mechanism should work. However, using proposals adds another layer on top of the current mechanism which would need some thought to get it right. I believe the NNS team is also planning to use this feature at some point for NNS canisters and also SNS canisters. It might be a good idea to sync with them to align on an approach.
+
+> Also How do we handle sending wasms in inter canister call?
+
+Can you elaborate what exactly you have in mind here?
+
+-------------------------
+
+gravity_vi | 2024-02-01 09:34:15 UTC | #78
+
+> Can you elaborate what exactly you have in mind here?
+
+The wasms received in generic proposal in the top level canister can we send it to other canister using chunking mechanism?
+
+-------------------------
+
+dsarlis | 2024-02-01 09:51:32 UTC | #79
+
+> The wasms received in generic proposal in the top level canister can we send it to other canister using chunking mechanism?
+
+You'd have to build that yourself, sending to another canister would be bound to the 2MB message limit. You don't have to send it around though to install canisters. You can install to another canister on the same subnet through `install_chunked_code` as long as the Wasm is present in the top level canister.
+
+PS: There is a bigger bound (10MB) for same subnet inter-canister requests but we actually plan to remove it since it's main use case was to allow installations of larger Wasm modules before the feature we are discussing in this thread was introduced.
+
+-------------------------
+
+gravity_vi | 2024-02-01 10:52:31 UTC | #80
+
+Alright. I will try it out. Thank you so much @dsarlis :slightly_smiling_face:
+
+-------------------------
+
+jake-beardo | 2024-05-10 12:55:28 UTC | #81
+
+Has anyone got an example of doing this in motoko??? I am not sure what to pass for the `wasm_module_hash` parameter
+
+-------------------------
+

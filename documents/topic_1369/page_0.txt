@@ -1,0 +1,228 @@
+lastmjs | 2020-10-04 00:08:33 UTC | #1
+
+I have a project that I am prototyping on the Internet Computer, but for various reasons I do not plan to host the actual static assets of the project on ICP. I just want to use ICP as the computational and storage backend for the application data.
+
+This doesn't seem easily possible at the moment. I have been trying to import the @dfinity/agent library on my own, hosting and loading it from my own static file server. I keep running into issues, the most fundamental being that window.ic is not defined.
+
+This has led me to believe that the ICP replica is actually adding some extra scripts into the http response for a frontend endpoint, and that I currently am not able to emulate that on my own.
+
+This is a major limitation. I hope we'll be able to host our frontends anywhere we want, including iOS, Android, existing servers, etc.
+
+-------------------------
+
+hansl | 2020-10-04 01:29:13 UTC | #3
+
+You can definitely do that. The Agent package on npm can help you, but it won’t setup a window.ic like you would expect. That’s the bootstrap code which is hosted on ic0.app. 
+
+We don’t have good documentation, but let me see if I can make a simple example for you when I get in front of a computer later.
+
+-------------------------
+
+lastmjs | 2020-10-04 01:40:22 UTC | #4
+
+I would appreciate that!
+
+-------------------------
+
+hansl | 2020-10-05 04:32:25 UTC | #5
+
+Here's code (typescript) that would create the agent and send an update message to a "greet" function. It creates a private key everytime, and will loop through status requests to wait for a reply. To use the Actor factory we use in "normal" DFX you should call didc yourself to create a did.js from a did file.
+
+I didn't test that code, it's mostly from our own bootstrap and agent code base.
+
+I highly suggest that you use the Actor class, which can be found here (interface); https://unpkg.com/@dfinity/agent@0.6.8/src/actor.d.ts (see function `makeActorFactory`).
+
+```typescript
+import {
+  Agent,
+  HttpAgent,
+  generateKeyPair,
+  makeAuthTransform,
+  makeExpiryTransform,
+  makeNonceTransform,
+  Principal,
+  RequestStatusResponseStatus
+} from '@dfinity/agent';
+
+const keyPair = generateKeyPair();
+const principal = Principal.selfAuthenticating(keyPair.publicKey);
+
+const agent = new HttpAgent({
+  host: "http://localhost:8000/",
+  principal,
+});
+
+agent.addTransform(makeNonceTransform());
+agent.addTransform(makeExpiryTransform(5 * 60 * 1000));
+agent.setAuthTransform(makeAuthTransform(keyPair));
+
+async function makeCall(): Promise<Uint8Array> {
+  let { requestId, response } = await agent.call(CANISTER_ID_GOES_HERE, { methodName: "greet", arg: CANDID_ENCODED_ARGUMENT_GOES_HERE });
+  if (!response.ok) throw new Error('could not contact the replica. error: ' + response.statusText);
+
+  while (true) {
+    const status = await agent.requestStatus({ requestId });
+    switch (status) {
+      case RequestStatusResponseStatus.Replied: {
+        return new Uint8Array(status.reply.arg || []);
+      }
+
+      case RequestStatusResponseStatus.Unknown:
+      case RequestStatusResponseStatus.Received:
+      case RequestStatusResponseStatus.Processing:
+        continue;
+      case RequestStatusResponseStatus.Rejected:
+        throw new Error('call was rejected. reason: ' + status.reject_message);
+      case RequestStatusResponseStatus.Done:
+        throw new Error('call was done without a return value. this is an error');
+    }
+  }
+}
+
+}
+```
+
+Cheers!
+
+-------------------------
+
+lastmjs | 2020-10-07 06:20:03 UTC | #6
+
+Thanks a lot for putting the time in!
+
+-------------------------
+
+amr | 2021-01-09 14:37:11 UTC | #7
+
+What does this error mean ?
+
+Unhandled Rejection (Error): call was rejected. reason: IC0503: Canister 7kncf-oidaa-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-q trapped explicitly: IDL error: word read out of buffer
+
+-------------------------
+
+nomeata | 2021-01-11 18:14:00 UTC | #8
+
+This means that the message sent to the canister was not encoded in the Candid data format, or the encoding was wrong. What did you to get that?
+
+-------------------------
+
+amr | 2021-01-12 07:06:22 UTC | #9
+
+i got it when I used this buf as an arg of the call 
+
+> Blockquote
+var buf = Buffer.from(customer_Candid, 'utf8');
+
+then I found this way to call empty value
+
+> Blockquote
+let { requestId, response } = await agent.call(hello_canister_id, {
+methodName: 'greet',
+arg: "DIDL\0\0", //BinaryBlob
+});
+
+I need help to encode sting for examble
+
+-------------------------
+
+palinda | 2022-02-02 12:12:31 UTC | #10
+
+I'm getting the same error. How can I encode wasm buffer into Candid data format in Nodejs?
+
+-------------------------
+
+stopak | 2022-02-02 22:40:31 UTC | #11
+
+Here is the code in js, I'm using to call canisters from node:
+
+```
+import fs from 'fs';
+import fetch from 'node-fetch';
+global.fetch = fetch;
+
+import { Actor, HttpAgent } from '@dfinity/agent';
+import { Ed25519KeyIdentity } from '@dfinity/identity';
+import { idlFactory } from './idl/icpunks.did.js';
+import { Principal } from '@dfinity/principal';
+
+var keyData = fs.readFileSync('key.json', 'utf8');
+var key = Ed25519KeyIdentity.fromJSON(keyData);
+var proxy_principal = key.getPrincipal();
+
+console.log("Using principal: " + proxy_principal.toString());
+
+const host = "https://boundary.ic0.app/"; //ic
+const agent = new HttpAgent({ identity: key, host: host });
+
+const canister_id = "ca4b4-uyaaa-aaaal-aac7a-cai";
+
+const actor = Actor.createActor(idlFactory, {
+        agent: agent,
+        canisterId: canister_id
+ });
+```
+
+You can also just skip identity part, and make read calls :slight_smile: 
+
+```
+const { Actor, HttpAgent } = require('@dfinity/agent');
+const ic_agent = new HttpAgent({ host: "https://boundary.ic0.app/" });
+
+const actor = Actor.createActor(icpunks_idl, {
+    agent: ic_agent,
+    canisterId: cid,
+});
+```
+
+-------------------------
+
+rckprtr | 2022-02-03 05:41:48 UTC | #12
+
+Very similar pattern, I noticed ` "cross-fetch": "^3.1.4",` works if `node-fetch` is giving you issues.
+
+-------------------------
+
+samuelemedici | 2022-09-13 07:04:48 UTC | #13
+
+I've followed these steps but on NextJS 12.3 I have this error:
+
+```
+Uncaught (in promise) Error: Invalid character: "&"
+    at decodeChar (base32.js?cc45:64:1)
+    at decode (base32.js?cc45:83:1)
+    at Principal.fromText (index.js?3619:44:25)
+    at new CanisterActor (actor.js?3acd:111:23)
+    at Actor.createActor (actor.js?3acd:125:1)
+```
+I have the frontend not hosted in a canister ( gonna be hosted in Vercel ), while the BE is in a canister hosted locally. I don't know what I'm doing wrong.
+
+-------------------------
+
+kpeacock | 2022-09-13 19:53:58 UTC | #14
+
+I'll note that the correct `host` is currently https://ic0.app as of September 2022
+
+-------------------------
+
+samuelemedici | 2022-09-14 20:50:22 UTC | #15
+
+I've changed the host as you suggested. But still I get the same error. 
+I really cannot understand what steps to follow in order to deploy the Frontend and use only ICP as Backend.
+
+-------------------------
+
+kpeacock | 2022-09-14 20:56:01 UTC | #16
+
+The error is definitely accurate. You are passing a string as a canister ID, probably in the `createActor` export of your declarations.
+
+`"&"` will not be a part of a valid canister ID. Please check your inputs by debugging with a print statement or Chrome devtools
+
+-------------------------
+
+paulyoung | 2022-09-14 22:12:19 UTC | #18
+
+`const canisterId =
+    "ryjl3-tyaaa-aaaaa-aaaba-cai&id=rrkah-fqaaa-aaaaa-aaaaq-cai";` is definitely the problem.
+
+-------------------------
+

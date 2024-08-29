@@ -1,0 +1,155 @@
+aramakme | 2021-09-15 13:45:48 UTC | #1
+
+Say I have the following function:
+
+```
+public func go() : async bool{
+    if(Time.now() % 2 ==0){
+         let response = await otherCanister.doSomething();
+    };
+    return true;
+};
+```
+
+How does the virtual machine handle this when I call await go()?  Does it call it inline half the time and await half the time?  Does it always get kicked to the back of the queue?  Can other functions be called while I'm waiting for this during the the times that I don't call the other canister?
+
+I'm concerned about race conditions that might queue a bunch of these up.  If I want my canister to be basically locked up while I wait for doSomething, do I need to handle that manually?  What would be a strategy for that?
+
+-------------------------
+
+nomeata | 2021-09-15 13:50:18 UTC | #2
+
+_Every_ `await` causes a yield, so to say, and other things can happen while that happens, even an “internal” call like `await go()`. This `await go()` isn’t much different from `await otherCanister.doSomething()` in that respect.
+
+-------------------------
+
+aramakme | 2021-09-16 11:08:16 UTC | #3
+
+Does the yield always require waiting at least one consensus round? Or is it smart enough to know that there are no other pending calls and that it is the same canister and pick back up right away?  If there are pending calls, would it get knocked back a consensus round at a certain threshold?
+
+-------------------------
+
+nomeata | 2021-09-16 15:29:17 UTC | #4
+
+It's not smart enough, and it can't be (inside the canister) because yields are also commit points, which always correspond to messages on the system.
+
+The _system_ could execute such follow up messages directly, instead of waiting for the next round, which would greatly alleviate this issue. I believe this was worked on at some point, but may not have made it into the release yet. @akhilesh.singhania would know more.
+
+-------------------------
+
+akhilesh.singhania | 2021-09-21 14:54:03 UTC | #5
+
+Right before launch, we implemented the feature where the scheduler will try to execute multiple iterations of rounds as long as the maximum instructions per round limit has not hit yet.  For details see [this](https://github.com/dfinity/ic/blob/master/rs/execution_environment/src/scheduler.rs#L590)
+
+-------------------------
+
+nomeata | 2021-09-21 15:52:07 UTC | #6
+
+So this is live, and applies to self-calls as well? Then indeed using an extra `await` isn't that expensive in the end :-)
+
+-------------------------
+
+akhilesh.singhania | 2021-09-22 08:29:39 UTC | #7
+
+Hmm, looking at [this](https://github.com/dfinity/ic/blob/master/rs/replicated_state/src/replicated_state.rs#L361), it looks like messages sent to self are taking the slow path.  I suppose we should address that.  I don't see any good reason why we don't take the faster path there as well.
+
+-------------------------
+
+nomeata | 2021-09-22 08:33:31 UTC | #8
+
+Maybe that’s from the time when canisters were using busy loop self-calls, rather than heartbeat, to emulate cron functionality.
+
+-------------------------
+
+akhilesh.singhania | 2021-09-22 08:54:13 UTC | #9
+
+Oh yes, that makes sense.  In that case, this optimisation would just result a ton of useless calls to the same canister.  I wonder if it is a good idea to implement this optimisation then if someone were call themselves in a loop for some other reason.  
+
+I vaguely remember that there are some concerns around issuing canister management calls from within a heartbeat context.  @dsarlis , @ielashi : does any of this ring a bell for you guys?
+
+-------------------------
+
+nomeata | 2021-09-22 09:13:02 UTC | #10
+
+From a programming model point of view, having such differences in behavior between calls to yourself and calls to other canisters is very fishy. Usually, uniformity is king. I’m not worried about people doing such self-call-loops, no more than I am worried about people doing self-call-loops-involving-two-canisters.
+
+-------------------------
+
+aramakme | 2021-09-22 10:39:35 UTC | #11
+
+Use case: utility classes that want to encapsulate logic inside a class expose async functions that canister owners can wire up to their actors. The utility functions may call another canister. It seems silly to have to await those and wait for a cycle…especially if the function takes a happy path and doesn’t have to call another canister after all.
+
+Is there room in the language for a function declaration type that says “I might want to call a remote canister in here but I’m not really async myself so wait to queue this until I actually call await, I want the power to call async later."
+
+Maybe this is already in the language?
+
+-------------------------
+
+nomeata | 2021-09-22 10:51:30 UTC | #12
+
+The desire for that has been an endless discussion within the languages team, see maybe https://github.com/dfinity/motoko/issues/680 and https://github.com/dfinity/motoko/issues/1482 although I don't know if I that captures the full discussion.
+
+-------------------------
+
+ielashi | 2021-09-22 11:57:00 UTC | #13
+
+I don't personally recall/see any issues with issuing canister management calls within a heartbeat.
+
+-------------------------
+
+aramakme | 2021-09-22 20:22:15 UTC | #14
+
+These look like they would address the issue.  Are they being worked on? Is there an eta or prioritization?
+
+-------------------------
+
+nomeata | 2021-09-22 20:27:56 UTC | #15
+
+We couldn’t find a design that satisfies all and everyone’s needs so far, and discussion has stalled, so don’t hold your breath.
+
+-------------------------
+
+claudio | 2021-09-23 23:05:39 UTC | #16
+
+I actually had an implementation of this that I liked but relied on interpreting `await e` as may commit and suspend, not must commit and suspend (regardless of whether `e` is already complete or not), but this was deemed too dangerous as the commit points would be determined dynamically, not statically.
+
+I'm open to suggestions though, as I, too, feel that the inability to efficiently abstract asynchronous code is bad and discourages abstraction.
+
+-------------------------
+
+skilesare | 2021-09-23 23:14:02 UTC | #17
+
+I'll just add that after trying to build some libraries for broader consumption this liability just makes it really hard.  I am NOT a programming language designer and I'm sure I could throw out some bad ideas, but it would be really great to have a solution to this!
+
+As a developer, I'm fine assuming that a state transition has occurred and acting accordingly.  Knowing what is going to happen inside of every function you call seems like an very very high bar to try to clear.
+
+-------------------------
+
+akhilesh.singhania | 2021-10-01 14:52:20 UTC | #18
+
+I am happy to announce that I just started the merge train on a merge request to merge a block of code where messages that a canister sends to self will also be inducted via the fast path and do not have to wait till next round to execute.  Hopefully this will get rolled out into production soon.
+
+-------------------------
+
+skilesare | 2022-05-14 00:17:37 UTC | #19
+
+Did this get rolled out?
+
+-------------------------
+
+claudio | 2022-05-14 08:38:26 UTC | #20
+
+Yes, some time ago. Unless it got disabled since then. 
+
+I think you can observe the difference by calling the management canister  (get_random_blob) vs a message on self or an async block. 
+
+I'm still slightly concerned about the fairness implication of this though.
+
+-------------------------
+
+jzxchiang | 2022-05-17 00:40:16 UTC | #21
+
+Could you clarify what this "fast path" entails? Is there still a state commit? What semantic differences does it have with making a synchronous call to a private helper function in the same canister?
+
+-------------------------
+

@@ -1,0 +1,163 @@
+lastmjs | 2024-02-22 13:34:31 UTC | #1
+
+While implementing the under-the-hood work to make Express work in Azle, chunked responses that use the response header `Transfer-Encoding: chunked` simply break. I will poste the actual error once I'm at my computer, but it comes from the Rust hyper library and says essentially that an unexpected `content-length` header has been found.
+
+My theory is that somewhere in the boundary node pipeline the `Content-Length` header is always being put into the response, even if `Transfer-Encoding: chunked` exists. This is incorrect, as if `Transfer-Encoding: chunked` exists then the `Content-Length` header should be omitted.
+
+Basically in Express (and I assume in a regular Node http server as well), using `res.write` will create a chunked response.
+
+We can't support this basic functionality right now because of the described error.
+
+We have a workaround that requires extra machinery and cycles to transform all chunked responses into normal responses before returning them, and stripping our the `Transfer-Encoding` header and the `Content-Length` header.
+
+It would be great if the boundary node pipeline would honor `Transfer-Encoding: chunked` headers and `Content-Length` headers, and generally any headers that the canister sets. The boundary nodes should interfere as little as possible with canister HTTP functionality.
+
+I would love some help here @rbirkner @NathanosDev thanks!
+
+-------------------------
+
+rbirkner | 2024-02-22 14:18:31 UTC | #2
+
+Hey @lastmjs, 
+
+Can you please share a curl command or some other example that helps us reproduce. That will make it much easier for us :)
+
+-------------------------
+
+lastmjs | 2024-02-22 14:44:54 UTC | #3
+
+I can do that, but also you can just add `Transfer-Encoding: chunked` into your response headers and it should break on any response.
+
+-------------------------
+
+lastmjs | 2024-02-22 16:09:49 UTC | #4
+
+Here's a simple Azle app to demonstrate:
+
+```typescript
+import { Server } from 'azle';
+import express from 'express';
+
+export default Server(() => {
+    const app = express();
+
+    app.get('/test', (req, res) => {
+        res.write('Hello world!');
+        res.end();
+    });
+
+    return app.listen();
+});
+```
+
+I would expect output similar to the following with `curl -i http://bkyz2-fmaaa-aaaaa-qaaaq-cai.localhost:8000/test`:
+
+```
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Date: Thu, 22 Feb 2024 16:06:59 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+Hello world!
+```
+
+The `Transfer-Encoding: chunked` header is present and the body displays nicely.
+
+But instead in Azle I get:
+
+```
+curl: (52) Empty reply from server
+```
+
+And then if I look at the replica terminal I see:
+
+```
+2024-02-22T16:08:51.921404Z  WARN hyper::proto::h1::role: unexpected content-length found, canceling
+```
+
+FYI I had to change Azle locally to get the error to display because we are using a workaround that converts chunked response bodies into regular response bodies to overcome the issue.
+
+-------------------------
+
+lastmjs | 2024-02-22 16:17:43 UTC | #5
+
+Here's an Express app written in Node that does the same thing:
+
+```javascript
+const express = require('express');
+
+const app = express();
+
+app.get('/test', (req, res) => {
+    res.write('Hello world!');
+    res.end();
+});
+
+return app.listen(4000);
+```
+
+`curl -i http://localhost:4000/test` returns:
+
+```
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Date: Thu, 22 Feb 2024 16:06:59 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+Hello world!
+```
+
+-------------------------
+
+lastmjs | 2024-02-22 16:28:02 UTC | #6
+
+And here is just a hand-written `http_request` canister that should be easily reproducible in Rust or Motoko if desired:
+
+```typescript
+import { Canister, HttpRequest, HttpResponse, None, query } from 'azle';
+
+export default Canister({
+    http_request: query([HttpRequest], HttpResponse(), (httpRequest) => {
+        return {
+            status_code: 200,
+            headers: [['Transfer-Encoding', 'chunked']],
+            body: Uint8Array.from([]),
+            streaming_strategy: None,
+            upgrade: None
+        };
+    })
+});
+```
+
+`curl -i http://bkyz2-fmaaa-aaaaa-qaaaq-cai.localhost:8000` gives:
+
+In `curl` terminal:
+
+```
+curl: (52) Empty reply from server
+```
+
+In replica terminal:
+
+```
+2024-02-22T16:27:03.352089Z  WARN hyper::proto::h1::role: unexpected content-length found, canceling
+```
+
+-------------------------
+
+lastmjs | 2024-02-29 14:57:16 UTC | #7
+
+@rbirkner Have the last few comments been helpful to reproduce the problem?
+
+-------------------------
+
+rbirkner | 2024-02-29 15:22:44 UTC | #8
+
+Sorry, I haven't had time to look into that yet. However, it is on my todo list.
+
+-------------------------
+

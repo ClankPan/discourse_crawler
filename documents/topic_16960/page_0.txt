@@ -1,0 +1,324 @@
+bitbruce | 2022-12-01 02:39:28 UTC | #1
+
+Using variant variables in Canister public interface return values, such as ICRC1's TransferError, can break composability and compatibility when variant items need to be added when the interface version is upgraded. Other canisters that are using the API may not continue to run, and the front-end js calls require a lot of 'if... . .else'.
+It is recommended that the official examples lead to a better specification, such as return type error = record{ code: nat; message: text} generic type.
+
+
+Let the rules of content be in the documentation, not in the code.
+This way, the content can be upgraded within the specification, keeping the API unchanged.
+
+-------------------------
+
+paulyoung | 2022-12-01 04:57:22 UTC | #2
+
+In general, I think variants are ideal for composability and compatibility because they allow fields to be added without breaking existing code.
+
+Variants are sum types, but we can gain some intuition for them in this context by looking at a familiar example using product types, i.e. records.
+
+When accessing or matching on a subset of fields from a record, if new fields are added to the record then existing code continues to work. The same is true for variants.
+
+In practice, Candid currently has an issue with variant extensibility that requires making fields optional to get the usual benefits:
+
+https://github.com/dfinity/candid/issues/295#issuecomment-1207493610
+
+Is this a comment about that? Or perhaps some other issue you’re facing?
+
+I think a concrete example might illustrate things better.
+
+-------------------------
+
+bitbruce | 2022-12-01 07:04:50 UTC | #3
+
+[quote="paulyoung, post:2, topic:16960"]
+When accessing or matching on a subset of fields from a record, if new fields are added to the record then existing code continues to work. The same is true for variants.
+[/quote]
+
+The situation you describe is only in a canister-centric use case. Upgrading to add a field is forward compatible and can be done successfully without losing data.
+But in another scenario, considering composability and scalability, CanisterA is the previous version and CanisterB is the new version after the field is added and they will no longer interoperate. This is bad in blockchain applications.
+
+The advantage of variant is the internal data upgrade. And should not be exposed to the API.
+
+-------------------------
+
+paulyoung | 2022-12-01 07:16:02 UTC | #4
+
+[quote="bitbruce, post:3, topic:16960"]
+CanisterA is the previous version and CanisterB is the new version after the field is added and they will no longer interoperate.
+[/quote]
+
+[quote="bitbruce, post:3, topic:16960"]
+The advantage of variant is the internal data upgrade.
+[/quote]
+
+I disagree with these statements.
+
+When an API returns a variant, the code of its consumers should continue to work even after a new field is added. Consumers could opt-in to handling the new field but shouldn’t be forced to.
+
+Again, if you have a concrete example I think it would help me understand the problem.
+
+-------------------------
+
+rossberg | 2022-12-01 08:00:19 UTC | #5
+
+Variants and records are exactly dual to each other with respect to backwards-compatible extensibility. Consider two canister functions:
+```
+f : () -> (T)
+g : (T) -> ()
+```
+If `T` contains a record, then adding a _field_ to it is fine for `f`, because an existing caller will just ignore the new field. It is not fine for `g`, because an existing caller will fail to pass the extra field. Candid hence only allows adding a new field there when it is optional, and transforms a missing field to a field whose value is `null`.
+
+If `T` contains a variant, then adding a _case_ to it is fine for `g`, because an existing caller will simply never supply the new case. It is not fine for `f`, because an existing caller that switches on the result will have no handler for the new case. Candid hence only allows adding a case there when the entire variant is optional, and transforms an unknown case into `null`.
+
+In other words, if you want a variant to be extensible, you need to make it an option whenever it is used in a return position:
+```
+f : () -> (opt variant {a; b})
+```
+This way, all clients are forced to implement a fallback for `null`, and that will automatically handle any new case `c` they do not (yet) understand.
+
+-------------------------
+
+bitbruce | 2022-12-01 11:58:41 UTC | #6
+
+[quote="rossberg, post:5, topic:16960"]
+In other words, if you want a variant to be extensible, you need to make it an option whenever it is used in a return position:
+
+```
+f : () -> (opt variant {a; b})
+```
+
+This way, all clients are forced to implement a fallback for `null`, and that will automatically handle any new case `c` they do not (yet) understand.
+[/quote]
+
+Yes. This solves the compatibility problem.
+But in the usage habit, few people use opt variant
+
+-------------------------
+
+paulyoung | 2022-12-01 12:38:57 UTC | #7
+
+[quote="bitbruce, post:1, topic:16960"]
+Using variant variables in Canister public interface return values, such as ICRC1’s TransferError, can break composability and compatibility when variant items need to be added when the interface version is upgraded.
+[/quote]
+
+https://github.com/dfinity/ICRC-1/blob/b5594b92d210dfa26884a7ca2aed058a592092f9/standards/ICRC-1/ICRC-1.did#L50-L50
+
+It does appear that extending `TransferError` would be a breaking change for `icrc1_transfer` because it uses `Err : TransferError` instead of `Err : opt TransferError`
+
+[quote="bitbruce, post:6, topic:16960"]
+few people use opt variant
+[/quote]
+
+I think it’s unfortunate that to support extensibility we need to do something unintuitive. More importantly, I don’t like that this introduces otherwise invalid states.
+
+i.e. `Err : opt TransferError` would allow the error to be omitted.
+
+-------------------------
+
+rossberg | 2022-12-01 13:12:08 UTC | #8
+
+> I think it’s unfortunate that to support extensibility we need to do something unintuitive.
+
+I don't disagree, but unfortunately, there is no obviously better alternative. One could imagine a way to support variant extension by subcasing, i.e., new cases can only be introduced as subcases of previously existing ones (so that a preexisting consumer sees it as the preexisting case). But what if there is no suitable case to refine? In general, you'd need to plan ahead by introducing a fallback default supercase upfront that's initially unused, but then that's no different from wrapping an opt around.
+
+> More importantly, I don’t like that this introduces otherwise invalid states.
+
+Well, the same is true when adding record fields which are forced to be optional. That's the price for backwards-compatible extensibility.
+
+-------------------------
+
+bitbruce | 2022-12-01 16:06:00 UTC | #9
+
+[quote="rossberg, post:8, topic:16960"]
+I don’t disagree, but unfortunately, there is no obviously better alternative. One could imagine a way to support variant extension by subcasing, i.e., new cases can only be introduced as subcases of previously existing ones (so that a preexisting consumer sees it as the preexisting case). But what if there is no suitable case to refine? In general, you’d need to plan ahead by introducing a fallback default supercase upfront that’s initially unused, but then that’s no different from wrapping an opt around.
+
+> More importantly, I don’t like that this introduces otherwise invalid states.
+
+Well, the same is true when adding record fields which are forced to be optional. That’s the price for backwards-compatible extensibility.
+[/quote]
+
+```
+type error = record{ code: nat; message: text} 
+```
+This can be a perfect balance. Why is it not the preferred choice?
+
+-------------------------
+
+rossberg | 2022-12-02 00:05:34 UTC | #10
+
+[quote="bitbruce, post:9, topic:16960"]
+```
+type error = record{ code: nat; message: text} 
+```
+
+This can be a perfect balance. Why is it not the preferred choice?
+[/quote]
+
+Sure, you could do that (I'd call it 60s style ;) ), but that's much worse wrt what @paulyoung is concerned about, because it introduces not just one but an infinite number of invalid states. Moreover, it will enable zero help from languages regarding case coverage.
+
+-------------------------
+
+bitbruce | 2022-12-02 02:57:22 UTC | #11
+
+[quote="rossberg, post:10, topic:16960"]
+Sure, you could do that (I’d call it 60s style :wink: ), but that’s much worse wrt what @paulyoung is concerned about, because it introduces not just one but an infinite number of invalid states. Moreover, it will enable zero help from languages regarding case coverage.
+[/quote]
+
+Technical specifications are first and foremost the pursuit of API invariance. If this is happening in the official base functionality and the topic you are focusing on is happening more in the business layer, please give the business layer back to the developers themselves. The more you do, the more you ostensibly make it easier for developers, but actually hinder many innovative possibilities and deprive developers of choice.
+
+If it is an API for an end product, it is appropriate. But with a specification like ICRC1, it is difficult to extend using variant in the interface.
+```
+icrc1_transfer : shared (_args: TransferArgs) -> async { #Ok: Nat; #Err: TransferError; };
+```
+Developers cannot extend TransferError because it would break compatibility.
+
+```
+icrc1_metadata : shared query () -> async [(Text, Value)];
+```
+This one is scalable. As for use cases, developers will form a consensus and publishers can make " conventionality " to guide them.  "icrc1:symbol", "icrc1:name", "icrc1:decimals", They are good " conventions ".
+
+It would be catastrophic to define it as such.
+```
+icrc1_metadata : shared query () -> async [{ #symbol: Text; #name: Text; #decimals: Nat8;}];
+```
+
+Many of IC and motoko's products seem to ignore the role of "conventions" in protocol layer. 
+
+What can be solved by " convention ", please do not use code. 
+
+Code is a debt, not an asset.
+
+-------------------------
+
+timo | 2022-12-02 06:05:57 UTC | #12
+
+`TransferError` has exactly what you want:
+```
+GenericError : record { error_code : nat; message : text };
+```
+is one of its variants.
+
+-------------------------
+
+bitbruce | 2022-12-02 08:32:54 UTC | #13
+
+Yes, it solves the problem. You know, what I said above is a matter of general applicability, because the demonstration of examples leads developers into a development paradigm.
+The point I'm trying to make is that it's not a good habit to expose variant to the public API.
+
+-------------------------
+
+timo | 2022-12-02 11:38:04 UTC | #14
+
+I think having a typed interface through candid is an innovation and a great advancement. We should not give it up. Personally, I am fine with taking the precautions mentioned above around the proper usage of `opt` to deal with upgradeability. There are so many advantages in terms of safety that compiler checks bring here. dfx even warns you if you upgrade a canister and the new interface is breaking the old interface. That isn't possible if we circumvent the check with a `Nat` error code and a `Text` value.
+
+But I do acknowledge that there sometimes can be differences between canister to canister calls and agent calls from outside. You could provide an additional API specifically for agents who do not care about candid and do not care about compile-time type checking on their end.
+
+-------------------------
+
+rossberg | 2022-12-02 14:26:59 UTC | #15
+
+I think it's important to distinguish different use cases.
+
+For errors, you don't usually care as much about knowing the complete list of possible errors, because in most cases they are just diagnostics that you do not use programmatically but just forward elsewhere, e.g, to the user.
+
+Other variants are used much more programmatically, meaning that client code typically needs to perform an exhaustive switch on the possible values. And they are often fixed. Say, day-of-week, order, or bool (which is nothing but a built-in 2-case variant). In those cases, proper variants are preferable, because the types then tell exactly which cases exist and need to be handled, and a modern language can check that.
+
+If you want, variants essentially are the "typeful" alternative to an unchecked and uncheckable nat/text representation. And like with all choices in the typed-vs-untyped space, that involves (a) a tradeoff, and (b) a learning curve to get most out of the type system.
+
+-------------------------
+
+paulyoung | 2022-12-05 08:09:51 UTC | #16
+
+@chenyan I saw that this PR was merged:
+
+https://github.com/dfinity/candid/pull/311
+
+which closed this issue:
+
+https://github.com/dfinity/candid/issues/295
+
+Does that affect anything we’ve been discussing here?
+
+-------------------------
+
+chenyan | 2022-12-05 20:58:09 UTC | #17
+
+That issue basically enables the `opt variant` type to upgrade with new tags, as we discussed here. But to implement this with `serde`, we have to use `unsafe` features. We are still trying to decide whether that solution is production-ready or not.
+
+-------------------------
+
+Samer | 2023-02-24 23:52:21 UTC | #18
+
+Any feedback on this [documentation of sub-typing](https://olm72-siaaa-aaaal-qbtpa-cai.ic0.app/advanced-types/subtyping.html#backwards-compatibility) would be appreciated!
+
+-------------------------
+
+rossberg | 2023-02-25 10:46:54 UTC | #19
+
+@Samer
+> Any feedback on this [documentation of sub-typing ](https://olm72-siaaa-aaaal-qbtpa-cai.ic0.app/advanced-types/subtyping.html#backwards-compatibility) would be appreciated!
+
+- "Subtyping" should be spelled without a hyphen. :)
+
+- The section on actor subtyping claims that " Actor `V2` is technically NOT a subtype of actor `V1` (like in the case of object subtyping)". That's incorrect. In Motoko, subtyping on actors follows exactly the same rules as on objects.
+
+- In the section on function subtyping there is a note saying: "There is an [exception](https://forum.dfinity.org/t/new-candid-version-and-catching-send-failures-motoko-updates/18410/3) for variant return types in new versions of [Candid](https://olm72-siaaa-aaaal-qbtpa-cai.ic0.app/internet-computer-programming-concepts/async-data/candid.html)". This note (which is repeated twice) is misleading in several ways. Candid has more permissive subtyping rules on variants than Motoko does, but they apply everywhere; there is no exception specific to function types. It also has similarly more relaxed rules for object types. (Also, technically, these more liberal rules always existed in Candid, but for variants they were broken for a while due to other changes.)
+
+  Specifically, in Candid, object supertypes can have _more_ fields as well, as long as those are optional. Dually, variant supertypes can have _fewer_ fields as well, as long as the whole variant is optional. That greatly extends the set of changes that are legal and safe for upgrades. Since Candid is what matters fur upgradability, maybe this section needs to distinguish between Motoko and Candid, and explain the difference. Subtyping in Motoko has a different role (mainly, supporting OO-style patterns), technically, it is neither necessary nor sufficient for upgradability.
+
+-------------------------
+
+Samer | 2023-02-25 11:17:23 UTC | #20
+
+I will edit and respond when I get to it.
+
+In the mean time, I would be equally grateful if [generics](https://olm72-siaaa-aaaal-qbtpa-cai.ic0.app/advanced-types/generics.html) and [stable vars](https://olm72-siaaa-aaaal-qbtpa-cai.ic0.app/internet-computer-programming-concepts/basic-memory-persistence/stable-variables.html) are checked also before merging into main.
+
+-------------------------
+
+Samer | 2023-02-26 14:06:10 UTC | #21
+
+[quote="rossberg, post:19, topic:16960"]
+The section on actor subtyping claims that " Actor `V2` is technically NOT a subtype of actor `V1` (like in the case of object subtyping)". That’s incorrect. In Motoko, subtyping on actors follows exactly the same rules as on objects.
+[/quote]
+
+Thank you, I will correct that.
+(Reason I wrote that is that it isn't mentioned in the [Language Quick Reference - Subtyping](https://internetcomputer.org/docs/current/motoko/main/language-manual#subtyping) section. )
+
+On the second point: I will remove the NOTE and think about making a clear distinction for Motoko and Candid subtyping after experimenting a bit with both.
+
+[quote] Specifically, in Candid, object supertypes can have *more* fields as well, as long as those are optional. Dually, variant supertypes can have *fewer* fields as well, as long as the whole variant is optional. That greatly extends the set of changes that are legal and safe for upgrades...[/quote]
+
+Aah ok! I'm learning as I go! I will have to cover this separately.
+
+Thanks a lot! (and sorry for spamming this thread :sweat_smile:)
+
+-------------------------
+
+rossberg | 2023-02-26 19:44:38 UTC | #22
+
+[quote="Samer, post:21, topic:16960"]
+(Reason I wrote that is that it isn’t mentioned in the [Language Quick Reference - Subtyping ](https://internetcomputer.org/docs/current/motoko/main/language-manual#subtyping) section.)
+[/quote]
+
+It actually is, though easy to miss: `actor` is one of the possible [sorts](https://internetcomputer.org/docs/current/motoko/main/language-manual#type-syntax) that occur in the subtyping rule for object types. Other sorts are `object` and `module`; all of them are different forms of object type.
+
+-------------------------
+
+Samer | 2023-02-26 22:06:46 UTC | #23
+
+Got it! 
+
+I included all your corrections
+
+-------------------------
+
+claudio | 2023-02-27 20:49:02 UTC | #24
+
+There's actually a different error in the description of subtyping between object-like types. 
+
+It should say that every field in  the supertype appears in the subtype, but gets that bit the wrong way round.
+
+https://github.com/dfinity/motoko/issues/3846 tracks both issues.
+
+-------------------------
+

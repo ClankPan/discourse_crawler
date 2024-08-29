@@ -1,0 +1,132 @@
+adobeair | 2024-04-08 06:52:04 UTC | #1
+
+What's the preferred lifespan and garbage collection techniques for using Actors/Agents?
+
+I'm doing this code:
+
+
+const jsagent = new HttpAgent({ host: 'https://nns.ic0.app', identity: identity });
+const jsactor = await Actor.createActor(idlFactory, {
+    agent: jsagent,
+    canisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai"
+});
+var result = await jsactor.icrc2_approve(approveArg2);
+//handle result
+
+
+Now i have 2 choices, should i be saving jsactor and jsagent in global variables so i can re-use them for the next calls to the same canister? or should i immediately delete all that stuff and then creating a brand new jsactor and jsagent next time I need to call the same canister?
+
+-------------------------
+
+peterparker | 2024-04-08 07:42:53 UTC | #2
+
+While, to my knowledge, it's still not explicitly documented, I believe the behavior recommended by the SDK team involves caching the Agent on the frontend side.
+
+cc @kpeacock
+
+-------------------------
+
+b3hr4d | 2024-04-08 09:34:08 UTC | #3
+
+Why not cache them for a season? what's the point of recreating agent and actor?
+I guess we should cache agent for sure, and the actor is just a proxy to use agent using specific interface! 
+
+I made a [library](https://forum.dfinity.org/t/introducing-ic-reactor-core-streamline-your-development-on-the-internet-computer/27907), that will centralize the whole agent and actor management,  for example if you login using agentManager it will update(recreate) all the actor that connected to that agent!
+
+Your code will be look like this:
+```typescript
+const agentManager = createAgentManager({
+    identity,
+})
+
+const { callMethod } = createActorManager({
+    agentManager,
+    idlFactory,
+    canisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
+})
+
+const result = await callMethod("icrc2_approve", approveArg2)
+```
+
+It has strong type system, state management and so much more.
+
+Please take a look at the [Doc](https://b3pay.github.io/ic-reactor/modules/core.html)
+
+-------------------------
+
+peterparker | 2024-04-08 11:01:09 UTC | #4
+
+[quote="b3hr4d, post:3, topic:29449"]
+Why not cache them for a season? what’s the point of recreating agent and actor?
+[/quote]
+
+Matter of taste probably. That was my original approach in all dApps I've participated in. I prefer to follow a declarative and functional approach.
+
+-------------------------
+
+b3hr4d | 2024-04-08 13:42:09 UTC | #5
+
+You are one of best IC developer that I know so far, I should take a look at your frontend code also :slight_smile:
+
+-------------------------
+
+peterparker | 2024-04-08 14:15:31 UTC | #6
+
+You don't know enough developers so far, then. 😉
+
+Note that I've also started caching the agent. For example, in Oisy [here](https://github.com/dfinity/oisy-wallet/blob/7f88c5b053cfe3a1093453c97199f6480c1c8be0/src/frontend/src/lib/actors/agents.ic.ts#L7). I hope I've written more beautiful code in my life, though.
+
+-------------------------
+
+b3hr4d | 2024-04-08 14:22:04 UTC | #7
+
+Interesting, thanks for the sharing and one question? why did you cache agent for each identity and not use `agent.replaceIdentity` instead?
+
+-------------------------
+
+peterparker | 2024-04-08 14:32:48 UTC | #8
+
+It might be convenient to use an anonymous principal for some calls that may accept it. As mentioned above, I prefer a functional and declarative approach, so imperatively replacing a state doesn't align with this philosophy. Additionally, there might be calls happening in parallel, so if both anonymous and authorized identities are used, it could become tricky to manage both.
+
+I also have never used `replaceIdentity`. 🤷‍♂️
+
+But, as already mentionned, might also just be a matter of taste.
+
+-------------------------
+
+kpeacock | 2024-04-08 20:38:31 UTC | #9
+
+I'm not opposed to a functional approach in general, it's just that by the time I joined, the JS Agent was already composed of classes, so I've been rolling with that.
+
+In terms of general code design principals, when working with classes, you can nicely abstract some complex state behavior. With the `read_state` polling for updates and the new query signatures that require checking against the subnet, there are now some pretty compelling reasons to stick with stateful classes, because the agent can abstract some heavy logic that you shouldn't need to worry about. 
+
+Recreating the agent every time means it won't know about the node signatures for your canister's subnet. If you're off mainnet, it won't know the network's root key. It introduces additional async network calls each time, which slows down an application and bogs down the boundary nodes with redundant calls. 
+
+In a functional approach, you could still provide all of this information to a call, but all the context would have to be available in every call in addition to the parameters of the canister method you're calling. Sure, you could keep track of the subnet signatures and root key yourself and pass them along, along with the polling strategy, the host, and all the other configurable options that the HttpAgent accepts, but there are multiple pieces of information you'd become responsible for as the developer. 
+
+I figure if you are going to keep track of some piece of information, you might as well keep a reference to the agent instance.
+
+-------------------------
+
+kpeacock | 2024-04-08 20:42:22 UTC | #10
+
+I'm totally fine with @peterparker 's approach with spawning multiple agents though. One per canister seems very reasonable, and the performance implications on typical websites won't matter all that much.
+
+As for `replaceIdentity`, it's primarily a tool for managing identities that you want to expire. If you have a delegation identity that gets rejected in the middle of a session, you can log back in update your actors with the fresh delegation without having to navigate away from the page or start all your flows back over. No idea how many people have actually implemented flows like that, but that was the design intent
+
+-------------------------
+
+b3hr4d | 2024-04-09 08:28:37 UTC | #11
+
+First of all, let me express my appreciation for the remarkable work you've done with the [agent-js](https://github.com/dfinity/agent-js) repository. The entire repository demonstrates an impressive level of technical sophistication while remaining remarkably readable. I particularly admire the elegance of the agent and candid packages, which I'm actively collaborating on. They offer simplicity and seamlessness, designed to be easily abstracted and utilized in any scenario.
+
+Regarding the [ic-reactor](https://github.com/B3Pay/ic-reactor) packages, I'm currently developing a wrapper around these packages to enhance their usability for developers even further. This wrapper ensures those safety you mentioned and maintains a compact size, making it an excellent choice for simplifying agent and actor management.
+
+-------------------------
+
+kpeacock | 2024-04-09 20:44:18 UTC | #12
+
+I appreciate the praise, although it's my pleasure to shout out that @chenyan is primarily responsible for the Candid implementation, and Hans Larsen did a great job with the design of the agent before I took the repo over in 2021!
+
+-------------------------
+

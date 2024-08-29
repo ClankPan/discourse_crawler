@@ -1,0 +1,153 @@
+dfx-json | 2023-07-11 20:29:12 UTC | #1
+
+Hello devs. I would like to get your take on something we are considering.
+
+## Background
+Debugging an application is an exercise that every developer will have to perform at some point. There are many ways to debug, but the tool that developers reach for first - and this is pretty much universal - is the log. 
+
+How many times have you written `console.log` or `println`? Probably more times than you can count. And you very likely trace a few print statements before you bust out the big guns and start adding in breakpoints.
+
+Suffice it to say, being able to write and read logs is important, and it aids immeasurably in debugging. Why don't we have platform-level logging capabilities on IC then?
+
+## It's complicated
+Providing the ability to write and retrieve logs on the IC is no small feat. Several things need to be considered, and each requires extensive design and planning. For example, collecting a log across many replicated nodes is a challenge. So is ensuring what is being returned is certified and secure. What about cost and performance? Minimizing attack vectors? The list goes on and on.
+
+While it's certainly a tough problem to solve at the platform level, a few fine folks have gone ahead and created logging libraries in user land. This is great, and it is a testament to the gumption of this developer community. But, user land logs can only get us so far..
+
+## The shortcomings
+Currently, there are two main shortcomings when it comes to logging in user space.
+
+### No ability to write logs during query calls
+Since query calls can't update state, any logs that would be written during the execution of that query method would not be persisted. Debugging a query call in this way would not be possible.
+
+#### Possible alternative?
+Using a separate logging service / canister and HTTPS outcalls, send the log elsewhere for processing. This might work, but it is expensive and complicated.
+
+### Inability to retrieve logs when a trap occurs
+If your canister traps, that is likely one scenario where you need logs the most. However, since your canister is in a non-functional state at this point, there would be no way to write or retrieve those logs until the canister was restored to a functioning state. 
+
+## Platform-level Logging
+My question then to you is this: Do you want platform-level logging? Is the ability to log query calls a compelling enough value-add for you to consider using platform-level logging over your current logging solution? What about for logging traps?
+
+We will use this information to decide how we should prioritize bringing platform-level canister logs to you through the Rust and Motoko CDK's and Replica execution environment.
+
+Thank you and looking forward to your responses!
+
+cc @dsarlis
+
+-------------------------
+
+tiago89 | 2023-07-11 21:29:51 UTC | #2
+
+Hell yeah!!! :smile: 
+
+I confirm the context detailed by the OP.
+
+Compared to web2, we always have a way to know when a bad response is being delivered and a good stack trace of the event to debug.
+
+It is much less common on Motoko due to strict type, but it's still possible and we can only know when users get back with the errors. :( If we control the frontend, we can allow React to send the error logs of trapped calles.
+
+In my use case it's NFT canisters, and being sure that the transactions are still working despite a year of operation and successive changes. Especially changes of standards on the caller or wallets.
+
+The main point is: the sooner we know a release broke something, the better. If that feedback can pinpoint stack trace (and params), great!
+
+Discussing design:
+- cost is very important, instead of something "that always writes" it should be something of a "before trap". Maybe we can set a function that gets executed, with the same context as trap has (as it returns the error message to caller). Think that would be very powerful as anyone can customize the behavior to their best use case (like storing locally or making an inter canister call). And very cheap, as it only costs when something goes wrong.
+- as you said that trapped = can't execute code, I have the suggestion of using a similar system as Timers. We set the function, and the subnet/canister only needs to be listening for a "trap" event, so it can automatically call the defined function. Instead of being triggered by time, it's triggered by a "trap" :) In theory it could work (again, very cost efficient).
+
+Hope this helps :)
+
+PS.: I wasn't sure if you meant logging of traps or logging for analytics. If it is analytics, then it would need a different system and apologies for my deviation :smile:
+
+-------------------------
+
+icme | 2023-07-11 21:41:03 UTC | #3
+
+![image|690x443](upload://kPuUGEutQ89LS6qrmGoVTXKA9H0.jpeg)
+
+Even if it’s something we can’t 100% trust due to no replication, it would be nice to allocate a certain amount of memory that individual nodes can write to, even during queries. Devs may abuse this and write data during queries, but that’s their choice (imo it’s a not as much of an issue as a feature).
+
+Maybe the feature can be called un-replicated data storage regions?
+
+-------------------------
+
+levi | 2023-07-21 04:52:11 UTC | #4
+
+@dfx-json Thanks for starting this thread.
+
+I propose the following protocol level canister logs available for canister controllers:
+Each message that the canister processes, the initiator of each message (ingress message, canister-call, timer, callback, etc..), the caller principal information (canister, or off-chain user, or callback-canister if its a callback), the message argument if there is one (if the canister is receiving a callback, this is the reply that the callee sent back to the canister), and the result (trap, reply, reject) with the information of whether the message rolled back or not.
+
+This is crucial information that will let the controller audit and watch the canister for it's correctness and make sure that the canister's current state lines up with the messages processed. This can also help if a canister traps during some message, to know how to fix the canister state. This must come of the protocol since canister messages can trap and roll back the canister's state. 
+
+It can be a rolling minimum 1-GiB space for these logs so the controller can download them either on or off chain. And of course the canister can pay for this space with it's cycles-balance.
+
+-------------------------
+
+saikatdas0790 | 2023-08-17 03:23:20 UTC | #5
+
+@dfx-json 
+
+I'd expect this to be as simple as how [`ic_cdk::println!()`](https://docs.rs/ic-cdk/latest/ic_cdk/macro.println.html) works on the local replica. Same stuff, but for mainnet. Additionally:
+- the ability to tail streaming logs
+- limit the total space allocated to logs on a per-canister basis. A fixed-size buffer. Essentially an array that will only store up to the max size limit set. Any additional values added overwrite the oldest values.
+
+EDIT: Now that I think about it, we should also revert the need for a separate `println()` specific to the IC. We (app developers) should just be able to use good ol' regular [`std::println!()`](https://doc.rust-lang.org/std/macro.println.html) and the tooling should do what is required. The need to conditionally log using a different method is bad DX and unintuitive.
+
+-------------------------
+
+dfx-json | 2023-08-11 22:15:45 UTC | #6
+
+thank you for the feedback. this aligns with what we have discussed internally.
+
+-------------------------
+
+icme | 2023-12-22 02:19:05 UTC | #7
+
+[quote="dfx-json, post:1, topic:21300"]
+### Inability to retrieve logs when a trap occurs
+
+If your canister traps, that is likely one scenario where you need logs the most. However, since your canister is in a non-functional state at this point, there would be no way to write or retrieve those logs until the canister was restored to a functioning state.
+[/quote]
+
+It's not that important that logging is decentralized (in the same way that computation is). What about apportioning a specific chunk of circular "buffer memory" for these types of logs in each node for a canister, and allow the developer to fetch logs from all nodes for that canister via a `canister_log` endpoint (similar to `canister_status`)
+
+Then provide the controller(s) of a canister the ability to pull these logs and review them. In the canister settings, a developer can decide how much space they want to reserve on a per-node basis for that canister.
+
+This then allows developers to debug not just updates, but also queries, and as a side effect developers would burn more cycles while doing so.
+
+-------------------------
+
+dfx-json | 2023-12-28 17:48:05 UTC | #8
+
+this feature is currently in the design phase and it looks very close to what you are suggesting. we will share more details when we have a solid draft ready. cc @ielashi
+
+-------------------------
+
+icme | 2024-01-12 04:14:13 UTC | #9
+
+Regarding query logging, if the intention is to make canister logging work with traps (outside of the normal message execution flow), are there any concerns with this logging being performed at the query level?
+
+I'd imagine that developers wouldn't be opposed to receiving duplicated logs as long as it means they're able to receive logging for query calls. People can then build their own abstractions and de-duplication mechanisms on top.
+
+-------------------------
+
+maksym | 2024-01-19 19:11:25 UTC | #10
+
+[quote="icme, post:9, topic:21300"]
+are there any concerns with this logging being performed at the query level?
+[/quote]
+
+it was decided to approach a broad 'canister logging' goal in smaller steps. 
+the first step design is relatively simple with the goal of exploring the capabilities of the IC and learn from early adopters' experience.
+with this in mind it was decided to keep 'logging at query level' out of the scope for now and so there should be no concerns about duplicated log entries.
+
+-------------------------
+
+maksym | 2024-04-02 13:56:13 UTC | #11
+
+The first canister logging implementation is now available in dfx 0.19.0 release.
+Please try it out and let us know about your experience!
+
+-------------------------
+

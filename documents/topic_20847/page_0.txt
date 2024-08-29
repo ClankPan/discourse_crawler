@@ -1,0 +1,43 @@
+mariop | 2023-06-20 16:27:11 UTC | #1
+
+Dear IC Community,
+
+I would like to give some context around the security patch proposal [123012](https://dashboard.internetcomputer.org/proposal/123012) to upgrade the ICP Ledger.
+
+On Friday 2023-06-16 afternoon DFINITY found a security bug in the ICP Ledger and immediately started a security patch procedure according to the Security Patch Policy and Procedure (see proposal [48792](https://dashboard.internetcomputer.org/proposal/48792)). The security patch was finalized at 9 PM UTC of the same day. The proposal [123012](https://dashboard.internetcomputer.org/proposal/123012) was then created, voted and executed.
+
+The security bug affected the `icrc1_transfer` endpoint of the ICP Ledger. The memo in `icrc1_transfer` is supposed to be 32 bytes in length but, because of the bug, a caller could pass an arbitrarily-sized memo to the ICP Ledger up to a bit less than 3MB. This would not break the ICP Ledger but could be used to consume storage on the NNS system subnet.
+
+### How it Happened
+
+The bug has been introduced with commit [bd3c42961bd2ae8fdabb4291d5d6776b637bf148](https://github.com/dfinity/ic/commit/bd3c42961bd2ae8fdabb4291d5d6776b637bf148). The [ICP Ledger](https://github.com/dfinity/ic/tree/387f39130bc2f2e5b081ad65b16b61eefb1e908b/rs/rosetta-api/icp_ledger/ledger) shares some fundamental code around the ICRC-1 standard with the ckBTC/SNS Ledger (aka [ICRC Ledger](https://github.com/dfinity/ic/tree/387f39130bc2f2e5b081ad65b16b61eefb1e908b/rs/rosetta-api/icrc1/ledger)) via the library [icrc-ledger-types](https://github.com/dfinity/ic/tree/387f39130bc2f2e5b081ad65b16b61eefb1e908b/packages/icrc-ledger-types). icrc-ledger-types defines the types of an ICRC-1 Ledger including the transaction memo. Prior to commit [bd3c42](https://github.com/dfinity/ic/commit/bd3c42961bd2ae8fdabb4291d5d6776b637bf148), the memo was a bytes array with a fixed length of 32. The check of the memo length was done at deserialization time ([here](https://github.com/dfinity/ic/blob/95daa57461342d966fd6287cffb4f91a845923f7/packages/icrc-ledger-types/src/icrc1/transfer.rs#L48)) and as such affected both the ICP and the ICRC Ledgers. Commit [bd3c42](https://github.com/dfinity/ic/commit/bd3c42961bd2ae8fdabb4291d5d6776b637bf148) removed this check to allow Ledgers to dynamically specify the size of the memo. The reason is that for ckBTC, which uses the ICRC Ledger, we realized that we needed a bigger memo where we can store some additional context surrounding the mint and burn of ckBTC tokens. The removal of the memo length check at deserialization time should have been done together with introduction of checks on the memo length in both Ledgers in their respective `icrc1_transfer` methods. However the check was introduced only for the ICRC Ledger [here](https://github.com/dfinity/ic/commit/bd3c42961bd2ae8fdabb4291d5d6776b637bf148#diff-6ebcced1b51310ee059734fc75380656e977a16adc3b4c8e86938a40724ed349R271) and not for the ICP Ledger.
+
+On 2023-06-05, the ICP Ledger upgrade proposal [122740](https://dashboard.internetcomputer.org/proposal/122740) went live. This upgrade included the commit [bd3c42](https://github.com/dfinity/ic/commit/bd3c42961bd2ae8fdabb4291d5d6776b637bf148) and exposed the security bug on mainnet.
+
+### Verify the Patch
+
+The security patch code is available in the branch `release-ledger-2023-06-16`. You can verify the changes between proposal 122740 and 123012 via
+
+```
+$ git diff release-ledger-2023-06-02..release-ledger-2023-06-16
+```
+
+or in [github](https://github.com/dfinity/ic/compare/release-ledger-2023-06-02..release-ledger-2023-06-16).
+
+The hash of the ICP Ledger can be verified with
+
+```
+$ git checkout 692e4064632e6c9e6cf987c75f0690672c646384
+$ ./gitlab-ci/container/build-ic.sh -c
+$ sha256sum artifacts/canisters/ledger-canister_notify-method.wasm.gz
+8af216ba47d03337bfde34447cb04651031d9a2b63be97a9cf53852dddbfbcfa artifacts/canisters/ledger-canister_notify-method.wasm.gz
+```
+
+The hex of the argument can be calculated with
+
+```
+$ didc encode -d ./rs/rosetta-api/icp_ledger/ledger.did -t '(LedgerCanisterPayload)' '(variant { Upgrade = null },)'
+```
+
+-------------------------
+

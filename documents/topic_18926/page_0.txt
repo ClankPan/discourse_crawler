@@ -1,0 +1,56 @@
+icme | 2023-03-14 05:02:41 UTC | #1
+
+In writing some integration tests recently, I've tried spinning up several hundred canisters in parallel.
+
+When I'm spinning up canisters in preparation for the tests, I execute the following function
+
+```
+export async function batchDeployCanisters(
+  numCanisters: number,
+  withIcp: number = 0.1
+): Promise<Principal[]> {
+  const canisters = await Promise.all(
+    [...Array(numCanisters)].map(
+      async (): Promise<Principal> =>
+        new Promise((resolve, reject) => {
+          exec(
+            `dfx ledger create-canister --amount ${withIcp}`,
+            (err, stdout) => {
+              if (err) {
+                reject(err);
+                return;
+              }
+
+              const canister = stdout
+                .toString()
+                .match(/Canister created with id: "([a-z0-9-]+)"/)[1];
+              resolve(Principal.fromText(canister));
+            }
+          );
+        })
+    )
+  );
+
+  return canisters;
+}
+```
+
+
+And while a few canisters are created, for the majority of `create-canister` attempts I receive many of the following error.
+```
+Burning of 0.01000000 Token ICPTs from subaccount 0a00000000000000160101000000000000000000000000000000000000000000 failed with code 5: "IC0503: Canister ryjl3-tyaaa-aaaaa-aaaba-ca> trapped explicitly: transaction is a duplicate of another transaction in block 470"
+```
+(for reference, `ryjl3-tyaaa-aaaaa-aaaba-cai` is the `nns-ledger` canister).
+
+Am I overloading the ledger's capacity per block? Do I need batch these requests to slow down the spin up of canisters in my local testing? Would I receive the same error on main net if I flooded the ledger with `create-canister` requests?
+
+One puzzle to me however is the error message - why is it saying that each of these `create-canister` requests are duplicate transactions?
+
+-------------------------
+
+levi | 2023-03-14 08:34:33 UTC | #2
+
+Hi @icme, This error happens when two transactions are sent to the ledger with the same exact transfer args within 24 hours. It is a feature to help a client if the client lost power or had a system failure before getting a message-response, the client can make sure the transaction goes through without scanning the ledger transaction history by sending the same exact transfer args. See [here for the transaction-de-duplication mechanics](https://internetcomputer.org/docs/current/developer-docs/integrations/icrc-1/#transaction-deduplication-). When calling the ledger, dfx sets the [`created_at_time` field](https://github.com/dfinity/sdk/blob/b508df132800632586ce7f7db443f4f8b44c68c2/src/dfx/src/lib/ledger_types/mod.rs#L32) to the [computer's current time](https://github.com/dfinity/sdk/blob/b508df132800632586ce7f7db443f4f8b44c68c2/src/dfx/src/commands/ledger/mod.rs#L121) so most of the time the transactions have a different `created_at_time` field value but in your case since you are doing these commands at the same time, the computer's time is the same for multiple requests triggering the duplicate transaction error. You can control the transaction de-duplication by setting a different `created_at_time` value on each ledger request. Here is a dfx PR: https://github.com/dfinity/sdk/pull/3018.
+
+-------------------------
+

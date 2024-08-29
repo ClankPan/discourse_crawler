@@ -1,0 +1,71 @@
+skilesare | 2024-07-30 14:33:59 UTC | #1
+
+I just finished refactoring a large function to Array.tabulate to try to save some cycles and heap(see  https://forum.dfinity.org/t/new-vector-data-structure-in-motoko/19872/5?u=skilesare) and received a rude awakening when I realized I had to call a <system> type function to create a timer. 
+
+Generally, it seems we need a way to do `<system> ` in iterable functions like tabulate, map, fold, etc.
+
+Would it be insecure to have dynamic functions inherit the type of their context function?  I added system to the function that calls tabulate but it doesn't flow through:
+
+```
+public func myfunc<system>(caller: Principal, items : [Items]) : async* [?result]{
+
+      //doesn't work 
+      let results = Array.tabulate(items.size(), func<system>(i : Nat): ?Items {
+
+      //doesn't exist and calls into Prim so I can't shim my own
+      let results = Array.tabulateSys<system>(items.size(), func<system>(i : Nat): ?Items {
+
+      //preferred - just flows through to dynamic functions because containing function has the `system` type.
+       let results = Array.tabulate(items.size(), func(i : Nat): ?Items {
+
+
+```
+
+Pingning @claudio @luc-blaeser @ggreif @rvanasa @dfx-json
+
+-------------------------
+
+claudio | 2024-07-31 15:49:49 UTC | #2
+
+
+> Would it be insecure to have dynamic functions inherit the type of their context function? I added system to the function that calls tabulate but it doesn’t flow through:
+
+I think it would because then you could return a function that parades as a safe function but needs system capability.
+
+Here's a way to define a system version of tabulate, though slightly clunky:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=771722088
+
+```motoko
+import Array "mo:base/Array";
+import Debug "mo:base/Debug";
+
+
+actor {
+
+   func tabulate<system, T>(n : Nat, f : <system>Nat -> T) : [T] {
+      let a = Array.init<?T>(n, null);
+      for (i in a.keys()) {
+        a[i] := ?f<system>(i);
+      };
+      Array.tabulate<T>(n, func(i) { 
+        let ?v = a[i] else Debug.trap("impossible");
+        v
+      });
+   };
+
+   func protected<system>(n : Nat) : Nat {n};
+
+   let a = tabulate<system, Nat>(100, func<system>(n : Nat) : Nat { protected<system>(n);} );
+
+}
+```
+
+-------------------------
+
+skilesare | 2024-07-31 16:46:42 UTC | #3
+
+Many thanks for the example! I'll try to run some performance on it...I'm expecting it to lose a good bit of the performance advantages it has in the performance metrics of the 'standard' tabulate as mentioned on https://mops.one/vector/benchmarks, but we'll have to see by how much!
+
+-------------------------
+

@@ -1,0 +1,69 @@
+zshuaibin | 2022-05-22 07:26:37 UTC | #1
+
+I was following the sample code of `rust-profile`，i was confused by using `ManualReply`.
+![image|690x362](upload://fd8eLqoCZJmdOr5FiC1iI5bbmNz.png)
+
+I've checked the  docs here：
+[query in ic_cdk_macros - Rust (docs.rs)](https://docs.rs/ic-cdk-macros/latest/ic_cdk_macros/attr.query.html)
+
+![image|690x188](upload://kfl4GDwtGi6xV8BiH0BteKOOkP6.png)
+
+so，when need to use `ManualReply`?
+
+Thank you ~~
+
+-------------------------
+
+AdamS | 2022-05-24 11:29:43 UTC | #2
+
+In the Rust abstraction over the system interface, functions take parameters and produce return values. In the system interface, functions are `() -> ()`, take input by calling `ic0.msg_arg_data_*`, and produce output by calling `ic0.reply`. Sometimes these two models of the world conflict. 
+
+The function you have posted is one that 'returns' `Profile` in Candid-encoded form. The convenient abstraction would be to return the `Profile` struct from the function - *except* `Profile` contains owned non-`Copy` data. To return it by value would require cloning it, and there is no lifetime that it could be returned under by reference because it is obtained through `thread_local!`. The canister would like to not waste cycles with an allocation (allocations are cheap, but it's an example for when your operation *isn't* cheap).
+
+But ownership and lifetimes are irrelevant to the underlying operation - it's just getting serialized and passed to `ic0.reply`, which does not require ownership. If you could just 'return' your data that way, there are no lifetime problems, and you can pass it to the function by reference just fine. Thus, the `manual_reply = true` flag on the export macros allows you to reply yourself to skip the entire problem. (This is necessary because otherwise the export macro would call `ic0.reply` itself, and calling `ic0.reply` twice traps.)
+
+`ManualReply` is an abstraction over manually calling `ic0.reply`. It is a struct that contains no data - it only exists to provide `CandidType::ty`, so that declaring it as a return type allows you to still auto-generate Candid bindings. When you construct it with parameters, it immediately calls `ic0.reply` regardless of whether it's returned or not. Saying
+```rust
+return ManualReply::one(Some(p));
+```
+is equivalent to saying
+```rust
+call::reply((Some(p),));
+return;
+```
+except that declaring it as your return type ensures you cannot accidentally return a value without actually exiting the function. Use of this type is not required when using `manual_reply = true` - you can use `ic_cdk::api::call::reply` if you want to.
+
+-------------------------
+
+paulyoung | 2022-05-26 22:58:18 UTC | #3
+
+I hadn't seen Adam's reply but came across this motivating example and quickly understood why it's needed:
+
+https://github.com/dfinity/examples/blob/8381ca44a172e5aeed7afdf82261c7f3233aac58/rust/dip721-nft-container/src/http.rs#L33-L40
+
+-------------------------
+
+flyq | 2022-10-27 08:57:49 UTC | #4
+
+Very good example, just that I had a problem after looking closely at the comments:
+1. Why do you say cdk 0.5 makes this unnecessary?
+2. Why are `headers: HashMap<String, String>` not `headers: Vec<(String, String)>`
+
+https://github.com/dfinity/examples/blob/master/rust/dip721-nft-container/src/http.rs#L22
+
+-------------------------
+
+paulyoung | 2022-10-27 15:40:21 UTC | #5
+
+1. I think that’s referring to `ic::cdk_setup`, `call::arg_data`, and `call::reply`.
+
+    I think I only added the macro, changed the type signature to include `ManualReply` and return value to `ManualReply::one`.
+
+2. I think because their Candid representation is the same.
+
+    Related:
+
+    https://github.com/dfinity/cdk-rs/issues/328
+
+-------------------------
+

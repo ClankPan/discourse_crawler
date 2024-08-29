@@ -1,0 +1,173 @@
+chenyan | 2021-12-10 01:16:45 UTC | #1
+
+We are designing a new feature for canister profiling. I've built a prototype on Motoko playground to generate flamegraph for each update call. You can preview this feature by selecting the "Enable profiling (experimental)" checkbox when you deploy the canister. Then in the Candid UI, when you call an update method, the interactive flamegraph will show up in the log section.
+
+There are several restrictions with the current approach, which is outlined in this [PR](https://github.com/dfinity/motoko-playground/pull/89). 
+
+To make this approach generic, I have outlined the needed changes at the system level in this design doc, and would like to gather community comments for different design choices:
+https://docs.google.com/document/d/17jERYBGpLbU4_a2yt90gcc26U94TlUZ2Fawt_Ef2wa4/edit?usp=sharing
+
+cc @akhilesh.singhania @nomeata
+
+-------------------------
+
+nomeata | 2021-12-10 07:15:13 UTC | #2
+
+It seems that this proposal is trying to use debug_print to extract profiling information. This is reasonable, but the use-case "get debug_print output from a canister" is a very valuable one, independent from profiling. I would even say it is more valuable than profiling!
+
+So I suggest, also to build building blocks, to provide the feature "developer can get debug_print" output  on its own (but in a way that the profiling use-case can use it of course).
+
+Here is a strawman propsoal: We add a canister setting "debug_log_size". This allow the controller to configure how much debug_print output should be preserved. Maybe with a default of 1MB?
+
+The system maintains a buffer (no need to call it memory, there is no random writes) of that size per canister. debug_print appends to that buffer. If it gets larger than the configured size, the oldest debug_print entries disappear (i.e. a ringbuffer). The contents of the buffer is available to the controllers of the canister via the state tree. The buffer is preserved across traps and also across query-methods-executed-as-updates.
+
+Maybe the system injects system-generated log messages when a message processing starts, and when it ends, so that the log becomes more helpful.
+
+This would be already a huge improvement for our developers! And then the canister-level profiling use case can build on top of that easily, without additional system support.
+
+-------------------------
+
+chenyan | 2021-12-10 16:40:09 UTC | #3
+
+Yes, developer can get debug_print output on its own is the main subtask of this feature, and profiling is merely a use case of debug_print.
+
+[quote="nomeata, post:2, topic:9537"]
+The system maintains a buffer (no need to call it memory, there is no random writes) of that size per canister.
+[/quote]
+
+Buffer is certainly enough for debug_print. But I wonder if supporting random writes can enable more applications. For example, for profiling large computation, the trace can be very large. We can instead store a map from function id to counter, which requires random access. Another use case is to allow canisters to export dynamic metrics, such as GC metrics and prometheus monitoring data.
+
+[quote="nomeata, post:2, topic:9537"]
+The buffer is preserved across traps and also across query-methods-executed-as-updates.
+[/quote]
+
+Calling query method as update call can work for most cases, but it also changes the semantics of query method: State mutation in query method are persisted. Another option is to append the log data as the last return value in Candid. But this requires changing the type table, which is not easy for an instrumentation tool.
+
+[quote="nomeata, post:2, topic:9537"]
+Maybe the system injects system-generated log messages when a message processing starts, and when it ends, so that the log becomes more helpful.
+[/quote]
+
+When there are concurrent calls, the log will still be mixed. So profiling for now only works when there are no other concurrent calls.
+
+-------------------------
+
+nomeata | 2021-12-10 18:35:49 UTC | #4
+
+[quote="chenyan, post:3, topic:9537"]
+State mutation in query method are persisted
+[/quote]
+
+Thats already the case: it changes the cycle balance. This is another argument for keeping it a simple write only buffer that the canister cannot read from: this way it does not affect canister semantics. (If you make it a memory, cabisters could abuse it as a information channel from query-as-update to the state.) So I see no problem here.
+
+[quote="chenyan, post:3, topic:9537"]
+When there are concurrent calls, the log will still be mixed. So profiling for now only works when there are no other concurrent calls.
+[/quote]
+
+Calls maybe, but not messages. A tool at this level probably can't hide the fact that calls are implemented by messages and the post CPS semantics. So here too I think we are fine.
+
+[quote="chenyan, post:3, topic:9537"]
+We can instead store a map from function id to counter, which requires random access.
+[/quote]
+
+Hmm, I see the point. But still, system level structured data that suits all is a big can of worms; easily gets rather complex, and still won't fit all. The canister could maybe print a summary at the end of each message, and that might be small enough?
+
+Since the ability to see prints is so useful (`dfx canister log --watch`!), and the implementation seems to be of reasonable complexity, maybe thats a good first step at least?
+
+-------------------------
+
+chenyan | 2021-12-13 18:47:32 UTC | #5
+
+[quote="nomeata, post:4, topic:9537"]
+The canister could maybe print a summary at the end of each message
+[/quote]
+
+How to identify the end of a message at the Wasm level?
+
+[quote="nomeata, post:4, topic:9537"]
+system level structured data that suits all is a big can of worms; easily gets rather complex, and still won’t fit all.
+[/quote]
+
+The structure is defined at the application level. The system is only providing a generic API for random I/O, similar to stable memory. Basically, I'm trying to understand if anything is getting simpler by using a buffer vs a memory region?
+
+-------------------------
+
+nomeata | 2021-12-13 20:04:16 UTC | #6
+
+[quote="chenyan, post:5, topic:9537"]
+How to identify the end of a message at the Wasm level?
+[/quote]
+
+Before you return from the exported function? The same point in time when, for example, Motoko runs GC.
+
+[quote="chenyan, post:5, topic:9537"]
+Basically, I’m trying to understand if anything is getting simpler by using a buffer vs a memory region?
+[/quote]
+
+You might be able to do less this way, but some things get easier:
+
+ * Buffer can be read-only, memory with random access is (I assume) meant to be read-write. This makes them _very_ different beasts:
+
+   A read-only buffer doesn’t affect the semantics of the canister otherwise, which for example means it’s ok to preserve it across rollbacks (trap, or query-as-update), which is what you want for logging (and likely also profiling). A memory region that can be read should be rolled back upon a trap.
+
+   How would your memory region differ in system semantics from stable memory, besides the fact that it can be read through the state tree?
+
+ * A log buffer would solve the problem of how to expose `debug_print` and system-generated logs to the canister.
+
+IMHO, access to logs for debugging is more pressing than profiling support. But access to logs as a system feature enables some profiling. Hence my suggestion to add debug logging to the system, and use that for initial profiling.
+
+-------------------------
+
+chenyan | 2021-12-13 20:34:55 UTC | #7
+
+[quote="nomeata, post:6, topic:9537"]
+Before you return from the exported function? The same point in time when, for example, Motoko runs GC.
+[/quote]
+
+That's Motoko specific. There is no GC in Rust. The message entry points includes the exported functions, plus all the callback functions. It's not easy to identify these callback functions.
+
+[quote="nomeata, post:6, topic:9537"]
+How would your memory region differ in system semantics from stable memory, besides the fact that it can be read through the state tree?
+[/quote]
+
+There is no difference. That's why I think it may be easier to implement, because it's just another region in the stable memory. But good point about rollback, that's a strong reason for a read-only buffer.
+
+-------------------------
+
+nomeata | 2021-12-13 21:58:00 UTC | #8
+
+[quote="chenyan, post:7, topic:9537"]
+There is no GC in Rust. The message entry points includes the exported functions, plus all the callback functions. It’s not easy to identify these callback functions.
+[/quote]
+
+Doesn't the rust CDK have control over the post-CPS'ed code? I would assume so, it has to put the callbacks into the system calls and put responses into the calls to `reply`. So I would be surprised if it had a hard time to inject some counter-dumping code in the right spot.
+
+-------------------------
+
+chenyan | 2021-12-13 22:44:06 UTC | #9
+
+Ah, you mean injecting code from the CDK or moc directly. Yes, that would work. But given a Wasm produced by an unknown tool, it is not easy to figure out the callback functions without some static analysis on the code.
+
+-------------------------
+
+nomeata | 2021-12-14 08:23:12 UTC | #10
+
+Ah, you want to instrument arbitrary code. That's a bit more challenging, maybe too much so - your instrumentation for example must not use the main memory because it has not known structure. My code in https://github.com/dfinity/motoko/tree/master/wasm-profiler, which is what we use for the flame graphs in the Motoko CI, has some workarounds for that, not sure how well they scale.
+
+OTOH, assuming the log buffer can be large (and why shouldn't it), this code (because it only uses `print`) would actually work out of the box on the IC already, and produce flame graphs and other profiles!
+
+-------------------------
+
+saikatdas0790 | 2023-06-13 13:47:06 UTC | #11
+
+@nomeata @chenyan Did this discussion lead to anything actionable? A simple canister specific logging mechanism would be SUPER helpful :)
+
+-------------------------
+
+chenyan | 2023-06-20 21:10:01 UTC | #12
+
+The profiling work is mostly done in ic-wasm and we generate reports on various benchmarks at https://github.com/dfinity/canister-profiling.
+
+As for logging, we need a stable memory allocator to store the logs. There are allocators in both Rust and Motoko, but both are experimental and have slightly different API, so we don't have a tool to do the logging yet.
+
+-------------------------
+

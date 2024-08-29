@@ -1,0 +1,371 @@
+skilesare | 2022-08-08 16:07:40 UTC | #1
+
+Today is **∞/∞/2^3** - [Infinity Day](https://billpetro.com/history-of-infinity-day) - Origyn has 3 Gifts for the Motoko Community!
+
+Gift 1: A migration pattern
+
+https://github.com/ZhenyaUsenko/motoko-migrations
+
+One of our developers, @ZhenyaUsenko, came up with this great migration pattern.
+
+This pattern allows users to use stable variables and keep a record of migrations in their code.
+
+Your main actor looks like this:
+
+```
+import Array "mo:base/Array";
+import Types "./types";
+import Migrations "./migrations";
+import MigrationTypes "./migrations/types";
+
+shared deployer actor class MotokoMigrations() {
+  let StateTypes = MigrationTypes.Current;
+
+  // you will have only one stable variable
+  // move all your stable variable declarations to "migrations/001-initial/types.mo -> State"
+  stable var migrationState: MigrationTypes.State = #state000(#data);
+
+  // do not forget to change #state002 when you are adding a new migration
+  // if you use one previous states in place of #state002 it will run downgrade methods instead
+  migrationState := Migrations.migrate(migrationState, #state002(#id), { deployer = deployer.caller });
+
+  // do not forget to change #state002 when you are adding a new migration
+  let #state002(#data(state)) = migrationState;
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  public shared func addTeacher(teacher: StateTypes.Teacher): async () {
+    state.teachers := Array.append(state.teachers, [teacher]);
+  };
+
+  public shared func addStudent(student: StateTypes.Student): async () {
+    state.students := Array.append(state.students, [student]);
+  };
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  public query func fetchTeachers(): async Types.FetchTeachersResponse {
+    return {
+      items = state.teachers;
+      totalCount = state.teachers.size();
+    };
+  };
+
+  public query func fetchStudents(): async Types.FetchStudentsResponse {
+    return {
+      items = state.students;
+      totalCount = state.students.size();
+    };
+  };
+};
+```
+
+Your migrations are held in a migrations directory that looks like:
+
+![image|272x199](upload://93wWH3zXAVNQi2VyazivkSYaJJM.png)
+
+And each migration has a lib.mo:
+
+```
+import Array "mo:base/Array";
+import Types001 "../001-initial/types";
+import Types002 "./types";
+import MigrationTypes "../types";
+
+module {
+  public func upgrade(prevMigrationState: MigrationTypes.State, args: MigrationTypes.Args): MigrationTypes.State {
+    // access previous state
+    let #state001(#data(prevState)) = prevMigrationState;
+
+    // make any manipulations with previous state to convert it to current migration state type
+    let teachers = Array.map(prevState.teachers, func (item: Types001.Teacher): Types002.Teacher {
+      return {
+        firstName = item.firstName;
+        lastName = item.lastName;
+        fullName = item.firstName # " " # item.lastName;
+        subject = item.subject;
+      };
+    });
+
+    let students = Array.map(prevState.students, func (item: Types001.Student): Types002.Student {
+      return {
+        firstName = item.firstName;
+        lastName = item.lastName;
+        fullName = item.firstName # " " # item.lastName;
+        speciality = item.speciality;
+      };
+    });
+
+    // return current state
+    return #state002(#data({
+      var admin = prevState.admin;
+      var teachers;
+      var students;
+    }));
+  };
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  public func downgrade(migrationState: MigrationTypes.State, args: MigrationTypes.Args): MigrationTypes.State {
+    // access current state
+    let #state002(#data(state)) = migrationState;
+
+    // make any manipulations with current state to convert it to previous migration state type
+    let teachers = Array.map(state.teachers, func (item: Types002.Teacher): Types001.Teacher {
+      return {
+        firstName = item.firstName;
+        lastName = item.lastName;
+        subject = item.subject;
+      };
+    });
+
+    let students = Array.map(state.students, func (item: Types002.Student): Types001.Student {
+      return {
+        firstName = item.firstName;
+        lastName = item.lastName;
+        speciality = item.speciality;
+      };
+    });
+
+    // return previous state
+    return #state001(#data({
+      var admin = state.admin;
+      var teachers;
+      var students;
+    }));
+
+    // if you are sure you wont need downgrades in your project, you can just "return #state000(#data);"
+    // note that it will fail to deploy if you then try to downgrade
+  };
+};
+```
+
+and a types.moc:
+
+```
+// please do not import any types from your project outside migrations folder here
+// it can lead to bugs when you change those types later, because migration types should not be changed
+// you should also avoid importing these types anywhere in your project directly from here
+// use MigrationTypes.Current property instead
+
+module {
+  public type Teacher = {
+    firstName: Text;
+    lastName: Text;
+    fullName: Text;
+    subject: Text;
+  };
+
+  public type Student = {
+    firstName: Text;
+    lastName: Text;
+    fullName: Text;
+    speciality: Text;
+  };
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  public type State = {
+    // this is the data you previously had as stable variables inside your actor class
+    var admin: Principal;
+    var teachers: [Teacher];
+    var students: [Student];
+  };
+};
+
+```
+
+Please explore the pattern, ask questions, and test that it works for you.  It should simplify changing data during upgrades.
+
+-------------------------
+
+rossberg | 2022-08-08 16:09:06 UTC | #2
+
+Nice!
+
+FWIW, in this example (and possibly many real ones), the downgrade functions could just do `return item`, because subtyping is enough to adapt the type.
+
+Out of curiosity, where do you use downgrades?
+
+Oh, and what's that fancy `deployer` attribute?
+
+-------------------------
+
+icme | 2022-08-08 17:28:49 UTC | #3
+
+Glad we're starting to think about patterns/best practices around migrations - a few questions/points:
+
+1. What's the purpose of the `#id` variant in `Migration.State` [here](https://github.com/ZhenyaUsenko/motoko-migrations/blob/4094a8d2a232f45897d6202b22ec1cd0233edc10/src/migrations/types.mo#L16)?
+
+
+
+2. Also, I'm assuming the references to [`state` here](https://github.com/ZhenyaUsenko/motoko-migrations/blob/4094a8d2a232f45897d6202b22ec1cd0233edc10/src/main.mo#L23) should be to `migrationState`?
+
+3. Since the migration is not being performed in `preUpgrade`/`postUpgrade` but in the class body, what happens if you have a lot of data and hit a runtime error like a `message instructions limit exceeded` error?
+
+4. In many of the cases where you are upgrading/downgrading, this example is advocating also eliminating the data field, which results in data loss. <br/>
+It might be nice to modify the example to demonstrate what an downgrade from a version with an optional field (and losing that data) might look like - or maybe the downgrade keeps the highest level data type and doesn't lose any of this data. For example, maybe the data types don't get downgraded, but the API does, keeping the v2 data and type, but returning only specific fields from v1 or v0. <br/>
+
+-------------------------
+
+ZhenyaUsenko | 2022-08-08 19:48:01 UTC | #4
+
+[quote="rossberg, post:2, topic:14756"]
+Oh, and what’s that fancy `deployer` attribute?
+[/quote]
+
+it is not an attribute)
+`shared (deployer) actor class MotokoMigrations()` does it make things clearer?)
+
+[quote="rossberg, post:2, topic:14756"]
+Out of curiosity, where do you use downgrades?
+[/quote]
+
+Hmm. Every person who looks at this pattern so far seems to ask that question
+Well, I've worked on some projects in the past which made use of SQL databases, upgrade/downgrade pattern was pretty common... and pretty useful as well
+
+1) No need to go far, you can use it even mid-development when you already applied your migration and made changes after that (downgrade -> reapply)
+
+2) You want do check 2 features developed by 2 people originating from 1 branch: you switch to #1 branch -> apply migration -> check the feature -> downgrade -> switch to #2 branch -> apply migration -> check the feature
+
+3) Well, this one is the most obvious - you've messed up, deployed to prod... and want to fix that
+
+[quote="icme, post:3, topic:14756"]
+What’s the purpose of the `#id` variant in `Migration.State` [here ](https://github.com/ZhenyaUsenko/motoko-migrations/blob/4094a8d2a232f45897d6202b22ec1cd0233edc10/src/migrations/types.mo#L16)?
+[/quote]
+
+It is used to point which state we need to migrate to [here](https://github.com/ZhenyaUsenko/motoko-migrations/blob/4094a8d2a232f45897d6202b22ec1cd0233edc10/src/main.mo#:~:text=.migrate(migrationState%2C-,%23state002(%23id),-%2C%20%7B%20deployer%20%3D%20deployer)
+
+[quote="icme, post:3, topic:14756"]
+Also, I’m assuming the references to [`state` here ](https://github.com/ZhenyaUsenko/motoko-migrations/blob/4094a8d2a232f45897d6202b22ec1cd0233edc10/src/main.mo#L23) should be to `migrationState`?
+[/quote]
+
+Nope, `state` variable is declared [here](https://github.com/ZhenyaUsenko/motoko-migrations/blob/4094a8d2a232f45897d6202b22ec1cd0233edc10/src/main.mo#:~:text=let%20%23state002(%23data(state))%20%3D%20migrationState%3B)
+
+-------------------------
+
+ZhenyaUsenko | 2022-08-08 20:27:58 UTC | #5
+
+[quote="rossberg, post:2, topic:14756"]
+FWIW, in this example (and possibly many real ones), the downgrade functions could just do `return item`, because subtyping is enough to adapt the type.
+[/quote]
+
+Will it be able to properly collect garbage in this case (removing all those "fullName"-s from memory in this example)?
+
+-------------------------
+
+rossberg | 2022-08-08 20:54:08 UTC | #6
+
+[quote="ZhenyaUsenko, post:5, topic:14756"]
+Will it be able to properly collect garbage in this case (removing all those “fullName”-s from memory in this example)?
+[/quote]
+
+Good question. It certainly will the next time you upgrade, which, after a downgrade, is probably soon? But before that, probably not. However, keeping it around for a while may still be cheaper than producing all the extra garbage from copying everything. It all depends on how frequently you upgrade, I suppose.
+
+-------------------------
+
+ZhenyaUsenko | 2022-08-10 11:51:08 UTC | #7
+
+[quote="icme, post:3, topic:14756"]
+Since the migration is not being performed in `preUpgrade`/`postUpgrade` but in the class body, what happens if you have a lot of data and hit a runtime error like a `message instructions limit exceeded` error?
+[/quote]
+
+Are you sure there is a limit for instructions in class body? I just tried creating a Map with 30_000_000 items in class body, it succeeded consuming 30_543_864_797 cycles. Increasing it further resulted in "RTS error: Cannot grow memory"
+
+-------------------------
+
+skilesare | 2022-08-10 13:06:23 UTC | #8
+
+Make sure your dfx has the application subtype and you'll have a more reasonable limit.  You can certainly run out of cycles during the body.  I think that if post upgrade fails the whole thing rolls back so I'd assume that extends to the core body as well...but worth an investigation.  I guess if it is an issue you could move the assignment to the post_upgrade....but you'd be limited on what initialization you could do in the body.
+
+-------------------------
+
+icme | 2022-08-10 17:06:38 UTC | #9
+
+[quote="ZhenyaUsenko, post:7, topic:14756"]
+Are you sure there is a limit for instructions in class body?
+[/quote]
+
+I think you're right that there isn't a message instructions limit for upgrades - otherwise we'd have already seen problems left and right with respect to serialization/de-serialization during upgrades. 
+
+My question might be more of a Motoko/upgrades question, and was asking what happens if some error limit (like heapSize) gets hit during the migration/upgrade. 
+
+For example, let's say that you have some large amount of records (similar to the example you provide in the repo), what happens if you go from migration `#state001` to `#state002`? I'm assuming that would just rollback to the previous wasm and `migrationState` data version?
+
+-------------------------
+
+sardariuss | 2023-06-27 14:08:01 UTC | #10
+
+I like this pattern a lot, one thing missing for me was that the migrations were not having any input argument, so each new data introduce within an upgrade had to be initialized with a default value.
+
+So I gave it a try with arguments: https://github.com/sardariuss/motoko-migrations
+
+The argument type is a bit complex to be able to handle every case, noticeably to be able to upgrade/downgrade more than one version at once:
+
+```
+public type Args = {
+    #init: InitArgs;
+    #upgrade: [UpgradeArgs];
+    #downgrade: [DowngradeArgs];
+  };
+```
+
+But at the end it seems to work well. Any feedback appreciated :slight_smile:
+
+-------------------------
+
+timo | 2023-06-27 18:49:31 UTC | #11
+
+[quote="icme, post:9, topic:14756"]
+I think you’re right that there isn’t a message instructions limit for upgrade
+[/quote]
+
+The instruction limit for upgrades is 10x the one for update calls: [instruction-limits](https://internetcomputer.org/docs/current/developer-docs/production/instruction-limits)
+
+-------------------------
+
+icme | 2023-06-27 19:02:58 UTC | #12
+
+Thanks for the correction!
+
+-------------------------
+
+skilesare | 2023-06-27 23:17:13 UTC | #13
+
+Do parameters actually get passed into the upgrade call like this?
+
+My understanding is that the parameters were really only ever observed the first time through. This may be an artifact of storing most of them in stable variables,  but I always kind of just passed in whatever the initial values were, and they never took any affect, even if they had changed in the meant time.
+
+I've also seen people use message.caller of the initializer as being set permanently. This is not the case if you call from a different controller?
+
+-------------------------
+
+sardariuss | 2023-06-28 02:06:22 UTC | #14
+
+Yeah it seems to work well. I added some getters in the canister just to be sure of it. Updated the repo.
+
+> My understanding is that the parameters were really only ever observed the first time through. This may be an artifact of storing most of them in stable variables, but I always kind of just passed in whatever the initial values were, and they never took any affect, even if they had changed in the meant time.
+
+Hmm that's weird, if you store the argument in stable memory and reassign it every upgrade.... ahh maybe it's because if a var is tagged as stable, the initial assignement operator does only run once, at canister init. For every upgrade this line with be ignored.
+
+Something similar is: I wasn't sure that my stable state would be reinitialized or not if when I change version in the code, I also change the version used in the stable var assign. Eg:
+
+When upgrading from 0.1.0 to 0.2.0, changing:
+` stable var migrationState: MigrationTypes.State = Migrations.init(#v0_1_0, args);`
+to 
+` stable var migrationState: MigrationTypes.State = Migrations.init(#v0_2_0, args);`
+
+does NOT reinitialize my canister, which is cool. Means I can spawn new canister which will directly be initialized with last version (without going through every upgrade), and also upgrade the old ones.
+
+Take all this with a grain of salt, I just tested today.
+
+-------------------------
+
+sardariuss | 2023-06-28 02:05:56 UTC | #15
+
+> I’ve also seen people use message.caller of the initializer as being set permanently. This is not the case if you call from a different controller?
+
+Well I don't see how you could prevent it to be changed through an upgrade if you add code that allow the change in the upgrade.
+
+-------------------------
+

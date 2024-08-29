@@ -1,0 +1,189 @@
+2bonahill | 2023-12-05 20:54:16 UTC | #1
+
+Hi all
+
+I am trying to introduce the new stable structures in order to store a complex struct.
+
+I have read the custom example in the dfinity repo, and it looks like this:
+
+```Rust
+static MAP: RefCell<StableBTreeMap<u64, UserProfile, Memory>> = RefCell::new(
+      StableBTreeMap::init(
+          MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))),
+      )
+  );
+```
+
+My problem is, that the "outer-most" container is not a StableBTreeMap, but a struct like:
+
+```Rust
+pub struct UserRegistry {
+    users: BTreeMap<PrincipalStorable, User>,
+}
+```
+
+The struct PrincipleStorable basically wraps the Principal in order to make it "storable".
+
+How can I use this UserRegistry in my thread local environment?
+
+I have tried to use the Cell API provided by stable structs:
+
+```Rust
+use ic_stable_structures::{[...] cell::Cell as StableCell};
+
+static USER_REGISTRY: RefCell<StableCell<UserRegistry, Memory>> = RefCell::new(StableCell::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0))),
+            <UserRegistry>::new()).unwrap());
+```
+
+and later in the code, when I modify the user registry, i try this:
+
+```Rust
+USER_REGISTRY.with(
+      |ur| -> Result<User, SmartVaultErr> {
+          let mut user_registry_snapshot = ur.borrow().get().clone();
+          // ...
+          user_registry_snapshot.add_user(new_user) {...};
+	  ur.borrow_mut().set(user_registry_snapshot){...}
+      },
+  )
+```
+
+It is quite a workaround... the code compiles, but it does not work as planned.
+
+Any clue what I am doing wrong? Does the user field in the UserRegistry be of type StableBTreeMap as well? Any other thoughts?
+
+Thank you
+
+-------------------------
+
+ielashi | 2023-12-06 12:19:08 UTC | #2
+
+Hi @2bonahill,
+
+Stable structures at the moment cannot be nested, so nesting a `StableBTreeMap` within a `StableCell` doesn't work, as you have already experienced.
+
+You'll find the answer to your question in our [quickstart example](https://github.com/dfinity/stable-structures/blob/main/examples/src/quick_start/src/lib.rs#L25). There, you'll see how you can declare a stable structure within a struct. This is the state defined in the example:
+
+```
+// The state of the canister.
+#[derive(Serialize, Deserialize)]
+struct State {
+    // An example `StableBTreeMap`. Data stored in `StableBTreeMap` doesn't need to
+    // be serialized/deserialized in upgrades, so we tell serde to skip it.
+    #[serde(skip, default = "init_stable_data")]
+    stable_data: StableBTreeMap<u128, u128, Memory>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            stable_data: init_stable_data(),
+        }
+    }
+}
+
+thread_local! {
+    static STATE: RefCell<State> = RefCell::new(State::default());
+}
+
+fn init_stable_data() -> StableBTreeMap<u128, u128, Memory> {
+    StableBTreeMap::init(crate::memory::get_stable_btree_memory())
+}
+```
+
+Applying this to your example, it would look something like this:
+
+```
+struct UserRegistry {
+    #[serde(skip, default = "init_users")]
+    users: StableBTreeMap<PrincipalStorable, User, Memory>,
+}
+
+impl Default for UserRegistry {
+    fn default() -> Self {
+        Self {
+            users: init_users(),
+        }
+    }
+}
+
+thread_local! {
+    static STATE: RefCell<State> = RefCell::new(State::default());
+}
+
+fn init_users() -> StableBTreeMap<PrincipalStorable, User, Memory> {
+    StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0)))
+}
+```
+
+-------------------------
+
+2bonahill | 2023-12-16 14:06:56 UTC | #3
+
+Thank you @ielashi 
+
+This helped! The problem was indeed my nesting of stable structures.
+
+Nevertheless, we realize that moving our whole codebase to use stable structures would mean quite some heave rewriting, like "impl Storable" and wrapping. we would also have to adjust some of our internal APIs, because for example StableBTreeMap::get() returns an Option< T > (whereas default BTreeMap::get() returns Option<&T>, i.e. an Option of a reference.)
+
+We are asking ourselves: is it worth the effort? Is using the stable structures best practice? How do other projects do?
+
+We would very much appreciate a little guidance here.
+
+Many thanks
+
+-------------------------
+
+ielashi | 2023-12-17 12:51:44 UTC | #4
+
+That's a very good question. I agree migrating fully to stable structures can be quite difficult, or at least it's not as ergonomic as declaring data structures on the heap. And I agree we have little guidance on that front.
+
+There has been some minor improvements in `stable-structures` around wrapping. For example, @Severin just implemented `Storable` for the `Principal` type [last week](https://github.com/dfinity/stable-structures/pull/163), so once that's release, you won't need to wrap `Principal` in `PrincipalStorable` anymore.
+
+How much data do you plan to store in the canister, and can you share (roughly) what the state looks like and some of the challenges? That can help guide the discussion on what could be the best approach for your canister.
+
+-------------------------
+
+2bonahill | 2023-12-19 07:28:03 UTC | #6
+
+Hi @ielashi 
+
+We are from the [iolo app](https://twitter.com/iolo_app) (a Dfinity grantee) and we have written a first version of a safe vault which will allow users to safely store their secrets while allowing them to make use of a dead-man's-switch using vetkd encryption.
+
+So our app is heavily focused on storing data like usernames, passwords, notes, etc. and in the future even documents. The app is structured around vaults to securely store user information. So there is plenty of maps and key-value pairs like BTreeMaps.
+
+So far we have taken the approach of using Rust native BTreeMaps with the intention of persisting data using the pre- and post upgrade hooks (we have not yet tested this). But to this day, this is a bit of a question mark to us...
+
+So we would be very happy to get some guidance, both from the community and the Dfinity experts.
+
+BR and thanks
+
+-------------------------
+
+Severin | 2023-12-19 08:46:20 UTC | #7
+
+[quote="2bonahill, post:6, topic:25294"]
+So far we have taken the approach of using Rust native BTreeMaps with the intention of persisting data using the pre- and post upgrade hooks
+[/quote]
+
+I would recommend using stable structures instead. If you have everything in the heap, you'll effectively limit yourself to ~1.8GB of data in a canister (total heap is 4GB, but you'll have the 'real' and the serialized copies in memory at the same time, plus some overhead). And you'll have to fight with the instruction limit.
+
+-------------------------
+
+2bonahill | 2023-12-19 15:11:29 UTC | #8
+
+Thank you @Severin. Okay, looks like we will go for the stable structures.
+
+Quick follow up question: how much effective memory per canister will we finally have using these stable structs? Reason: if we start letting users upload documents, we will need a lot of memory. Would it be better to consider a multi canister setup from the beginning? E.g. 1 canister per user?
+
+Thanks
+
+-------------------------
+
+Severin | 2023-12-19 15:57:18 UTC | #9
+
+Your choice depending on your assumptions. Stable storage is limited to 96GB per canister for now.
+
+-------------------------
+

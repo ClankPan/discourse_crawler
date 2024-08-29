@@ -62,6 +62,8 @@ enum Commands {
 
         // target_canister_id: String,
     },
+
+    SpecificRaw {},
     Update {},
 }
 
@@ -73,7 +75,6 @@ async fn main() -> Result<()> {
         "error_after_{}_before_{}.json",
         search_range.0, search_range.1
     );
-    let id_set_file_name = format!("after_{}_before_{}.json", search_range.0, search_range.1);
 
     let cli = Cli::parse();
 
@@ -209,6 +210,80 @@ async fn main() -> Result<()> {
             let topic_ids: Vec<_> = id_set.into_iter().map(|value| {
                 if let Value::Number(id) = value {id.as_u64().unwrap()} else {panic!()}
             }).collect();
+
+            let topics_len =  topic_ids.len();
+            println!("topics len: {}", topics_len);
+
+
+            for (count, topic_id) in topic_ids.into_iter().enumerate() {
+                
+                // If already the file exsits
+                let topic_dir = format!("documents/topic_{topic_id}");
+                if Path::new(&topic_dir).is_dir() {
+                    continue;
+                }
+
+                let raw_text_url = format!("{origin}/raw/{topic_id}");
+                let mut pages = Vec::new();
+                let mut page_number = 1;
+
+                // Loop until respoinse content is empty
+                loop {
+                    let response_text = reqwest::Client::new()
+                        .get(&raw_text_url)
+                        .query(&[("page", page_number.to_string())])
+                        .send()
+                        .await?
+                        .text()
+                        .await?;
+
+                    if response_text.len() == 0 {
+                        break;
+                    } else {
+                        pages.push(response_text)
+                    }
+
+                    println!("loaded raw page={page_number}");
+
+                    page_number += 1;
+                    sleep(Duration::from_millis(100));
+                }
+
+
+                let tmp_dir = "documents/topic_tmp";
+                if Path::new(&tmp_dir).exists() {
+                    std::fs::remove_dir_all(&tmp_dir)?;
+                }
+                std::fs::create_dir_all(&tmp_dir)?;
+                for (page_number, page_text) in pages.into_iter().enumerate() {
+                    let mut file = File::create(format!("{tmp_dir}/page_{page_number}.txt"))?;
+                    file.write_all(page_text.as_bytes())?;
+                }
+                std::fs::rename(tmp_dir, topic_dir)?;
+
+                println!("{}/{topics_len}: id={topic_id}\n", count+1)
+
+
+                // 
+                // std::fs::create_dir_all(topic_dir)?
+            }
+            
+
+        }
+        Commands::SpecificRaw {} => {
+            let mut contents = String::new();
+            // File::open(error_log_file_name.clone())?.read_to_string(&mut contents)?;
+            // let mut json: HashMap<String, Value> = serde_json::from_str(&contents)?;
+
+            // let Some(Value::Array(id_set)) = json.remove("id_set") else {
+            //     panic!()
+            // };
+
+            // let topic_ids: Vec<_> = id_set.into_iter().map(|value| {
+            //     if let Value::Number(id) = value {id.as_u64().unwrap()} else {panic!()}
+            // }).collect();
+
+            // 7, 18, 19, 20
 
             let topics_len =  topic_ids.len();
             println!("topics len: {}", topics_len);

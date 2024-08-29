@@ -1,0 +1,190 @@
+daniel-wong | 2024-07-22 09:47:11 UTC | #1
+
+Now that [Public & Private Neurons has been approved by motion proposal](https://dashboard.internetcomputer.org/proposal/130832), I wanted to share more details with developers how the API would change, and request feedback. This will cover not only what the API would eventually look like, but also how we would transition from the current API to the eventual API, paying special attention to breaking changes and migration strategy.
+
+# Breaking Changes
+
+The breaking changes would affect apps that read neurons that do not "belong" to the caller (i.e. the caller is neither a controller, nor hotkey of the neuron).
+
+How the behavior will be different in the eventual API: when a) you call call a method whose response contains NeuronInfo (e.g. get_neuron_info), b) the neuron does not belong to you, and c) the neuron is private, then, a couple of fields will eventually be "redacted". Specifically,
+
+* recent_ballots: This field is of type vec BallotInfo. Here, redacted means that the field will have 0 elements.
+* joined_community_fund_timestmap_seconds: This field is of type opt nat64. Here, redacted means that the field will have null as its value.
+
+To interpret these values, apps will need to make use of a new field: visibility. It will be of type opt int32. Possible values in this field, and what they mean:
+
+* opt 1: Private. In this case, if recent_ballots has 0 elements, it does not (necessarily) mean that the neuron did not vote recently. Rather, the caller cannot tell whether the neuron voted recently. Similarly, if joined_community_fund_timestamp_seconds is null, it does not (necessarily) mean that the neuron is not a member of the Neurons' Fund. Rather, the caller cannot tell whether the neuron is in the NF.
+* opt 2: Public. In this case, the aforementioned fields would not be redacted.
+* null: Visibility enforcement has not been released yet. See the next section "How to Migrate".
+
+Structurally, the interface changes would look like this:
+
+```
+type NeuronInfo {
+  // Existing code elided...
+
+  visibility : opt int32;
+}
+```
+
+Notice that even apps that do not migrate would still be able to deserialize responses, because the only structural change is the addition of visibility (which is of type opt int32). They would simply misinterpret the redacted fields once visibility enforcement has been released.
+
+## How to Migrate
+
+To give apps an ample migration window, the API changes would be released in multiple steps. For breaking changes, two releases would be of particular interest:
+
+1. The visibility field would be added to NeuronInfo. This would have one of the values described above, but at this point, there is no redaction, no "enforcement". At this point, the governance canister would declare this new visibility field, and apps would be able to start reading it, and using it to get ready for the second step.
+2. Fields are redacted. At this point, we say that visibility is "enforced".
+
+Thus, the migration window lies between these two points. During this time, apps would need to add code that looks like this pseudocode:
+
+```
+if recent_ballots.is_empty() {
+  // New: use visibility to deduce why we see recent_ballots is empty:
+  let is_face_value =
+    visibility == null || // No enforcement yet.
+    visibility == opt 2;  // Neuron is public.
+  if is_face_value {
+    print("The neuron has not voted recently.");
+  } else {
+    assert visibility == opt 1; // Neuron is private.
+    print("Not sure if the neuron voted recently, because it is private.");
+  }
+
+} else {
+  // Old behavior.
+  print("Here are the neuron's recent ballots:");
+  for ballot in recent_ballots {
+    print_ballot(ballot);
+  }
+}
+```
+
+Notice that during the migration window, unmigrated apps would still behave the same.
+
+Notice that migrated apps will continue to work correctly after the migration window without further changes.
+
+# Non-Breaking Changes
+
+This section describes new functionality that apps can start taking advantage of (if they want to).
+
+## Reading and Writing Visibility
+
+Earlier, we mentioned that NeuronInfo would gain a new visibility field. The Neuron type would also gain this field. As explained in the previous section, initially, visibility would not be "enforced".
+
+In addition to being able to read a neuron's visibility, users will also need the ability to write the visibility of neurons that belong to them. To do that, there will be an enhanced version of the manage_neuron method. Specifically, the following will be added to the Operation type:
+
+
+```
+type Operation = variant {
+  // Existing code elided...
+
+  // New.
+  SetVisibility : SetVisibility;
+}
+
+// New.
+type SetVisibility = record {
+  visibility : opt int32;
+}
+```
+
+(The visibility field within SetVisibility is analogous to the visibility field in Neuron, except that null will be considered an invalid value, and the manage_neuron call will result in an Error response.)
+
+## Reading Public Neurons
+
+Currently, one has to have special privileges to read a full neuron, but once we have public neurons, special privileges will not be necessary to read a full neuron if it is public. To accommodate this, the list_neurons method will be changed as follows:
+
+* ListNeurons.include_public_neurons_in_full_neurons
+  * This is a new field that controls the behavior of the list_neurons method.
+  * type: opt bool
+* ListNeuronsResponse.full_neurons
+  * Existing field.
+  * Previously, this only included neurons that belong to the caller.
+  * However, going forward, callers can use include_public_neurons_in_full_neurons to specify that they want public neurons to also be included in this field.
+
+Structurally, the changes would look like this:
+
+```
+type ListNeurons = {
+  // Existing code elided...
+
+  // New.
+  include_public_neurons_in_full_neurons : opt bool;
+}
+```
+
+## Known Neurons Are Always Public
+
+This will happen automatically. If a known neuron tries to become private, they will get an Error response.
+
+## References
+
+This feature was discussed in an [earlier thread](https://forum.dfinity.org/t/request-for-comment-public-private-nns-neurons/31597).
+
+-------------------------
+
+pixld8ta | 2024-07-19 11:22:31 UTC | #2
+
+Thanks for sharing this.
+
+Did I understand correctly that once this is released, none of the neurons will become private automatically without any specific action from the user?
+
+-------------------------
+
+pixld8ta | 2024-07-19 11:30:37 UTC | #3
+
+I was wondering if there is an estimated release date for the Neuron Index? Any information would be greatly appreciated!
+
+-------------------------
+
+daniel-wong | 2024-07-19 17:52:51 UTC | #4
+
+[quote="pixld8ta, post:2, topic:33360"]
+Thanks for sharing this.
+[/quote]
+
+:grin:
+
+[quote="pixld8ta, post:2, topic:33360"]
+none of the neurons will become private automatically
+[/quote]
+
+No. Per the motion proposal, they will be private.
+
+We will do our best to encourage neurons to set themselves to public. Our ideas around this mainly involve nudging in the NNS Dapp.
+
+[quote="pixld8ta, post:3, topic:33360"]
+Neuron Index?
+[/quote]
+
+The best answer I can give to this right now is "in the not too distant future". FWIW, the reason we are doing this is to prepare the way for neuron index.
+
+-------------------------
+
+pixld8ta | 2024-07-22 10:14:26 UTC | #5
+
+Ok, found it in motion proposal text:
+
+> Each neuron can choose to be private or public and change this at any point in time. The known neurons are public while all other neurons are **set to private by default**.
+
+-------------------------
+
+daniel-wong | 2024-08-20 14:07:19 UTC | #6
+
+**TL;DR**: API consumers can begin migrating right now.
+
+(Actually, this :point_up: was true earlier, but I didn't update this thread as soon as possible.)
+
+Most of the backend API changes have been released.
+
+# Next Steps
+
+* The main thing left is to enable redaction of fields in NeuronInfo for private neurons.
+
+* Another small thing is left to do is enable SetVisibility (ManageNeuron) proposals.
+
+We do not have very specific plans when these things would happen. Ideally, sooner is better, but since enabling redaction could be disruptive to some API consumers, we want to make sure everyone has a reasonable amount of time to migrate. Please, reply if you have concerns about when these changes are released.
+
+-------------------------
+

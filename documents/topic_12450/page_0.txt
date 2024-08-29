@@ -1,0 +1,499 @@
+gabe | 2022-04-26 15:17:52 UTC | #1
+
+I want to know the operating costs of a canister that I am developing. Initially, I tried to estimate the costs using [this table](https://smartcontracts.org/docs/developers-guide/computation-and-storage-costs.html#_details_cost_of_compute_and_storage_transactions_on_the_internet_computer) but besides the obvious ones like canister creation and storage, it turned out to be very difficult since I do not know the number of Wasm instructions of each function. I am now instead investigating if I can actually measure the cycles consumption of the functions. However, I immediately start questioning if it is even possible to do so.
+
+The idea is to use the [ExperimentalCycles](https://smartcontracts.org/docs/base-libraries/ExperimentalCycles.html) API to check the balance before and after the execution of a function. However, if the storage cost "ticks" every second (raw assumption based on the fee described in "GB Storage Per Second"), that would likely make it unreliable to check the balance before and after a function. Does anyone know how often the storage and compute allocation costs are deducted from the cycles balance?
+
+I guess another way would be to check the balance *in* the function that I want to measure, but that would presumably not include every cost related to that function call such as Ingress Message Reception.
+
+Is it possible to programmatically measure cycles consumption function-wise or am I out of luck?
+
+-------------------------
+
+domwoe | 2022-04-27 08:01:23 UTC | #2
+
+I'll tag @chenyan. He has written a design doc on canister profiling. Maybe he can chime in on commenting your approach and maybe provide some info about the roadmap to include profiling in dfx.
+
+If the latter is far out, we could think of providing a bounty, because I think that would be useful for a lot of developers.
+
+-------------------------
+
+gabe | 2022-04-27 08:40:33 UTC | #3
+
+Thank you. Canister profiling would definitely be helpful and I cannot wait for it.
+
+That being said, I am in need of cost estimation quite soon since I am designing a protocol where costs are crucial for the design in order to make it sustainable. I would appreciate workaround methods to measure and/or calculate close approximations of cycles consumption in the meantime.
+
+-------------------------
+
+gabe | 2022-04-27 12:32:03 UTC | #4
+
+I have a question regarding the dynamic cycles cost for update call execution. In [the cost table](https://smartcontracts.org/docs/developers-guide/computation-and-storage-costs.html#_details_cost_of_compute_and_storage_transactions_on_the_internet_computer) it says:
+
+> **Ten Update Instructions Execution**
+> For every 10 instructions executed when executing update type messages
+
+Do "instructions" refer to the number of *Wasm instructions* for the virtual machine? Or is it *machine instructions* after JIT compilation for some real CPU?
+
+I assume it is the former but I would like to have it confirmed.
+
+-------------------------
+
+chenyan | 2022-04-27 21:08:39 UTC | #5
+
+Cycles are simply a weighted sum of Wasm instruction counts. Some system APIs are more expensive than others, e.g. bulk memory access, stable memory. If the Wasm instruction doesn't access the stored data, there is no charge. So all cost can be computed from the instruction counts, and it's safe to measure cycle consumption before and after the function call.
+
+If you use Motoko Playground, and enable profiling while deploy, we can draw a flamegraph for each update call, so that you can understand which function costs the most.
+
+The design doc is here: https://docs.google.com/document/d/17jERYBGpLbU4_a2yt90gcc26U94TlUZ2Fawt_Ef2wa4/edit#heading=h.1tl9yquiwy02
+
+-------------------------
+
+gabe | 2022-04-28 12:05:24 UTC | #6
+
+I did not know that Motoko Playground had started to support profiling. This is huge for me, great work!
+
+I have a few questions regarding the interpretation of the profiling data after reading the design document and experimenting with it a bit in the playground:
+
+1. Immediately when I deploy a canister I get an output as shown below. Does this represent instructions for installing the canister code? If so, is that a cycles cost on top of the *Canister Created* cost [here](https://smartcontracts.org/docs/developers-guide/computation-and-storage-costs.html#_details_cost_of_compute_and_storage_transactions_on_the_internet_computer)?
+
+> Wasm instructions executed 4246 instrs.
+
+2. When looking at the flame graph below of the `insert()` function from the Phone Book example, does the number of instructions (3891) represent the number of "pure" Wasm instructions *or* the weighted number of instructions where some system API calls are counted as multiple instructions (as discussed [here](https://forum.dfinity.org/t/heads-up-fixing-prod-issue-by-adjusting-the-complexity-of-some-system-api-calls/9516?u=gabe))?
+The reason I'm asking is because I want to know if it is correct to divide the number of instructions by 10 and multiply by 4 to get the cycles cost of the execution, or if there is more to it.
+
+![image|406x238](upload://8AP1gqpBKVWLtp7jGwqWrz3wR59.png)
+
+3. Again using the Phone Book example in the playground, I measure three operations where I insert three records one after the other in the same canister. See results below. What causes the same function to vary in instructions count based on different inputs?
+
+> insert("aaa", record {desc="aaa"; phone="111"})
+**insert: 5970 instrs**
+
+> insert("bbb", record {desc="bbb"; phone="222"})
+**insert: 7345 instrs**
+
+> insert("ccc", record {desc="ccc"; phone="333"})
+**insert: 5807 instrs**
+
+4. When I run the `lookup()` function, which is a query call, a number of instructions is shown from the profiling. Can these be ignored when calculating cycles costs of a canister, since (if I'm not mistaken) query calls are currently free?
+
+![image|386x299](upload://8hOjXr2qF6YMlIKq8Fu8NBtCLhJ.png)
+
+5. Does the profiling support inter-canister calls, as in that you may see the combined number of instructions?
+
+-------------------------
+
+berestovskyy | 2022-04-28 15:03:17 UTC | #7
+
+hey @gabe,
+Thanks for bringing it up. The [document you are referencing](https://smartcontracts.org/docs/developers-guide/computation-and-storage-costs.html#_details_cost_of_compute_and_storage_transactions_on_the_internet_computer) will be updated to clarify this point.
+
+Each System API call is a function call from the WebAssembly standpoint. The number of instructions each call takes depends on the work done.
+
+Answering your questions:
+
+1. Yes, it's the number of "update instructions", which will be charged on top of the Canister Created cost, i.e. 4246 / 10 * 4 = 1696 Cycles
+
+2. As the system API calls are normal functions, just implemented on the IC, the number of instructions is always "pure" if I get your question correctly.
+
+3. The instructions count varies based on the work done, for example if we need to allocate more Wasm memory, it will take more instructions. Or if the key we're looking for is deeper in the tree structure, it will take more instructions, etc...
+
+4. Yes, query calls are free for now.
+
+5. Yes, the instruction counter normally takes into account any work the Canister performs, including the inter-canister calls.
+
+-------------------------
+
+gabe | 2022-04-28 15:16:56 UTC | #8
+
+This is so great. Huge thank you for answering my questions!
+
+-------------------------
+
+chenyan | 2022-04-28 16:35:49 UTC | #9
+
+Besides @berestovskyy's answer, some clarification to your questions:
+1: It's the cost of Wasm `start` and `canister_init`. For Motoko, it's mostly loading the RTS and initialize the init args if it's provided.
+2: It's the pure Wasm instruction counts.
+4: We cannot profile query calls at the moment. You can ignore the graph output from query calls.
+5: We didn't count the cycle transfer amount here, so inter-canister call is just 1 Wasm instruction. Once the replica exposes the real instruction counter, we can track the number more precisely.
+
+-------------------------
+
+berestovskyy | 2022-04-28 17:11:47 UTC | #10
+
+ah, sorry, I thought we're using the instructions counter already... we need to prioritize the real counter then, otherwise it might be really confusing...
+
+-------------------------
+
+chenyan | 2022-04-28 17:15:31 UTC | #11
+
+Is `ic0.performance_counter` implemented already?
+
+-------------------------
+
+berestovskyy | 2022-04-28 18:04:21 UTC | #12
+
+I don't think so, yet I think it's quite easy to implement it as it's available internally...
+
+-------------------------
+
+gabe | 2022-04-29 08:33:25 UTC | #13
+
+[quote="chenyan, post:9, topic:12450"]
+5: We didn’t count the cycle transfer amount here, so inter-canister call is just 1 Wasm instruction. Once the replica exposes the real instruction counter, we can track the number more precisely.
+[/quote]
+
+Could you elaborate on this? Does the entire operation of the function invoked by an inter-canister call appear as one 1 Wasm instruction to the function that invoked it, or is it the call instruction itself that is counted inaccurately? (Sorry if my question is unclear. This is a bit too low-level compared to what I usually work with.)
+
+-------------------------
+
+chenyan | 2022-04-29 18:43:29 UTC | #14
+
+To be precise, we only count Wasm instructions on the caller side. It takes a few system API calls to make an inter-canister call. We are not tracking cycles consumed by the callee, which is paid by the caller.
+
+-------------------------
+
+Iceypee | 2022-05-04 10:33:03 UTC | #15
+
+>We are not tracking cycles consumed by the callee, which is paid by the caller.
+    
+Wait so are you saying that during intercanister calls, the caller pays for the full execution of the called method on the called canisters behalf? 
+
+Or are you saying the caller pays cycles just to "hit play" and transfer whatever data is needed on the called canisters function while the called canister pays to execute that function itself.
+
+-------------------------
+
+gabe | 2022-05-19 10:02:09 UTC | #16
+
+Hi chenyan, are you aware if it is currently possible to locally enable canister profiling in Candid UI with [the new (0.10.x) dfx release](https://forum.dfinity.org/t/exciting-changes-coming-to-your-local-development-experience/12527?u=gabe)?
+
+-------------------------
+
+berestovskyy | 2022-05-23 12:34:39 UTC | #17
+
+hey all,
+Two small updates:
+1. The [documentation](https://smartcontracts.org/docs/current/developer-docs/updates/computation-and-storage-costs/#details-cost-of-compute-and-storage-transactions-on-the-internet-computer) now has a note saying:
+`Note: System API calls are just like normal function calls from the WebAssembly stand point. The number of instructions each call takes depends on the work done.`
+2. The first iteration of the [performance counter specification](https://smartcontracts.org/docs/current/references/ic-interface-spec/#system-api-performance-counter) was just merged, so it should be available on the main net once the new release is rolled out (~1-2 weeks).
+
+Note, it does not mean the flame graph will be using the new perf counter right away. Probably it will take a bit of time to start using it, test it etc. Probably, @chenyan would be a better person to comment on this.
+
+-------------------------
+
+chenyan | 2022-05-19 16:49:38 UTC | #18
+
+Not yet. We will wait for the replica change to land on dfx. I also need to adjust the Candid UI code to interpret the new format.
+
+-------------------------
+
+gabe | 2022-05-23 12:10:08 UTC | #19
+
+[quote="berestovskyy, post:17, topic:12450"]
+The first iteration of the [performance counter specification ](https://docs.dfinity.systems/public#system-api-performance-counter) was just merged, so it should be available on the main net once the new release is rolled out (~1-2 weeks).
+[/quote]
+
+Interesting! Is that a link to internal docs? I don't seem to be able to access it but would love to read up on it.
+
+-------------------------
+
+gabe | 2022-05-23 12:10:54 UTC | #20
+
+Got it, thanks for letting me know.
+
+-------------------------
+
+berestovskyy | 2022-05-23 12:34:16 UTC | #21
+
+[quote="gabe, post:19, topic:12450"]
+Interesting! Is that a link to internal docs? I don’t seem to be able to access it but would love to read up on it.
+[/quote]
+
+Ah sorry, here is the [link to the spec on smartcontracts.org](https://smartcontracts.org/docs/current/references/ic-interface-spec/#system-api-performance-counter)
+
+-------------------------
+
+gabe | 2022-05-23 14:39:36 UTC | #22
+
+Thank you, I am very excited for this.
+
+If I interpret the specification right, `ic0.performance_counter` counts all in-canister Wasm instructions from the entry point invocation, including chained functions. Does it also count instructions executed in other canisters from inter-canister calls?
+
+-------------------------
+
+inviscidpixels | 2022-05-23 15:10:34 UTC | #23
+
+Very useful distinction to understand how actor messaging on the IC works.
+
+-------------------------
+
+jzxchiang | 2022-05-24 00:37:33 UTC | #24
+
+@chenyan @berestovskyy Would you happen to know? I'm curious about this as well.
+
+-------------------------
+
+jzxchiang | 2022-05-24 00:58:12 UTC | #25
+
+Actually, this might be the answer: https://forum.dfinity.org/t/calculate-an-estimate-of-cycles-consumption-a-universal-example/12526/6?u=jzxchiang
+
+-------------------------
+
+berestovskyy | 2022-05-24 16:09:07 UTC | #26
+
+[quote="gabe, post:22, topic:12450"]
+If I interpret the specification right, `ic0.performance_counter` counts all in-canister Wasm instructions from the entry point invocation, including chained functions. Does it also count instructions executed in other canisters from inter-canister calls?
+[/quote]
+
+hey @gabe,
+The perf counter is in WASM instructions, and it starts from zero at the beginning of each execution. It's a bit tricky with the actor model, as every `await` is a new execution.
+
+I just created an example of the Cycles balance and Perf Counter during the inter-canister calls on Wiki, please have a look: https://wiki.internetcomputer.org/wiki/Comparing_Canister_Cycles_vs_Performance_Counter
+
+@jzxchiang At the moment the perf counter starts from zero for each new execution. We could preserve the counter and continue it after the `await`, but it gets tricky when we have a few calls in flight...
+
+So for now please use the perf counter only for the "normal" WASM code, not across inter-canister calls.
+
+-------------------------
+
+jzxchiang | 2022-05-24 23:26:52 UTC | #27
+
+This wiki is a really great resource, thanks.
+
+-------------------------
+
+gabe | 2022-05-25 09:47:58 UTC | #28
+
+This is great! Thank you for sharing.
+
+For others reading this thread, I can recommend [this thread](https://forum.dfinity.org/t/calculate-an-estimate-of-cycles-consumption-a-universal-example/12526?u=gabe) as well.
+
+-------------------------
+
+berestovskyy | 2022-05-25 10:23:58 UTC | #29
+
+it's very cool @gabe, very detailed page 👍 Looking forward to see a blog post!
+
+And sure, if you have more questions, we are here to help!
+
+-------------------------
+
+gabe | 2022-05-26 15:19:20 UTC | #30
+
+Thank you! I'm glad people appreciate it. :slight_smile: 
+
+I have a question regarding the number of instructions I am getting from measurements of a particular entry point. I am using the profiling mode in Playground for the measurements and measured the instruction count 30 times. 
+
+Here is a plot of the data:
+![image|599x358, 100%](upload://tMENRAdiy8YHKsBJfQR0ngmTSud.png)
+
+Here are some statistics:
+![image|690x96](upload://e42mbJ19cGD4h92vU7MZE77Gb7b.png)
+
+And here is the raw data:
+```
+{
+"x":[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+"y":[4909516, 446697, 446697, 446697, 4913081, 446697, 446697, 446697, 4916251, 446697, 446697, 446697, 4919456, 446697, 446697, 446697, 4922661, 446697, 446697, 446697, 4925866, 446697, 446697, 446697, 4925866, 446697, 446697, 446697, 4925866, 446697]
+}
+```
+
+Each bottom of the pattern is exactly 446,697 instructions.
+
+Below is some simplified pseudo-ish code of what the entry point does:
+```
+let messages: TrieMap<MessageId, Message>;
+
+let userToReceivedIds: TrieMap<Principal, List<MessageId>>;
+let userToSentIds: TrieMap<Principal, List<MessageId>>;
+
+  // Stores the message and adds the ID to the sender's sent IDs and each recipient's received IDs.
+  func addMessage(message: Message) {
+    messages.put(message.header.id, message);
+
+    // Add message ID to sender' sent messages.
+    let currentIdList = userToSentIds.get(message.header.from);
+    let newIdList = List.push(message.header.id, currentIdList);
+    userToSentIdsMap.put(message.header.from, newIdList);
+
+    // Add message ID to each recipients received messages.
+    let currentIdList = userToReceivedIds.get(message.header.to);
+    let newIdList = List.push(message.header.id, currentIdList);
+    userToReceivedIdsMap.put(message.header.to, newIdList);
+  };
+```
+
+So basically there are two `get` from two `TrieMap`s, two `push` to two `List`s, and three `put` to three `TrieMap`s.
+
+Do you know what could be causing this repeating triangle/sawtooth pattern? I am very curious to know since the difference between the bottoms (446,697) and the peaks (max 4,925,866) is huge.
+
+-------------------------
+
+chenyan | 2022-05-26 16:10:57 UTC | #31
+
+Do you force GC when compiling the canister? I suspect the difference is due to whether GC is triggered.
+
+-------------------------
+
+gabe | 2022-05-26 18:54:56 UTC | #32
+
+Sounds like a very valid guess. To be honest, I am not really sure. I use the default canister settings.
+
+-------------------------
+
+chenyan | 2022-05-26 19:36:02 UTC | #33
+
+Yep, the default flag only triggers GC when there are enough changes from last GC. In the playground, there is a checkbox "Force garbage collection (only if you want to test GC)" to enable GC for every message.
+
+-------------------------
+
+gabe | 2022-05-27 08:00:23 UTC | #34
+
+That must be it then, thank you!
+
+[quote="chenyan, post:33, topic:12450"]
+triggers GC when there are enough changes from last GC
+[/quote]
+What is considered enough changes?
+
+Also, as a bonus question: is the stable memory in canisters deployed in the Playground capped to a size of less than 4 GB? If so, can I bypass it e.g by sending more cycles to it?
+
+-------------------------
+
+chenyan | 2022-05-28 04:57:46 UTC | #35
+
+Here is the current parameter: https://github.com/dfinity/motoko/blob/master/Changelog.md#066-2021-07-30
+
+The playground caps stable memory at 1G. If you want to experiment with stable memory, is it easier to deploy locally?
+
+-------------------------
+
+gabe | 2022-05-28 05:56:20 UTC | #36
+
+Perfect, thank you!
+
+[quote="chenyan, post:35, topic:12450"]
+The playground caps stable memory at 1G. If you want to experiment with stable memory, is it easier to deploy locally?
+[/quote]
+Definitely much easier. The thing is that I am using the profiler in Playground to count instructions, and have not had time to fiddle with that in a local environment yet.
+
+-------------------------
+
+gabe | 2022-06-27 15:43:25 UTC | #37
+
+I am measuring wasm instruction count with forced GC (copying) and get the following linear pattern:
+![image|560x455](upload://87PKXVYvhWKeRyyIDknbzujyekf.png)
+
+In each measurement, I push an element to a list and put it in a TrieMap. Each element is of the same size and the canister's state is not reset between measurements.
+
+Do you know what could be causing the linear pattern in instruction count?
+
+-------------------------
+
+chenyan | 2022-06-27 23:43:15 UTC | #38
+
+Could be related to forcing GC. The container size is increasing each time, causing the GC to copy more data after each insertion.
+
+-------------------------
+
+gabe | 2022-06-28 08:44:28 UTC | #39
+
+Good point. The amount of useful data that the GC has to copy grows linearly.
+
+I was speculating around the fact that I am using a Trie structure. AFAIK, the Motoko Trie implementation produces a new copy of the trie for each put. I assume that the memory of the obsolete Trie is freed by the GC, but I am not sure if this would result in a higher number of instructions. Do you have any thoughts on this?
+
+-------------------------
+
+roman-kashitsyn | 2022-06-28 09:15:07 UTC | #40
+
+[quote="gabe, post:37, topic:12450"]
+Do you know what could be causing the linear pattern in instruction count?
+[/quote]
+
+That's a common pattern with all copying garbage collectors: GC time grows linearly with the size of the working set. Pusher engineers wrote a nice article about problems they experienced with the GHC GC: https://making.pusher.com/latency-working-set-ghc-gc-pick-two/
+
+[quote="gabe, post:39, topic:12450"]
+AFAIK, the Motoko Trie implementation produces a new copy of the trie for each put. I assume that the memory of the obsolete Trie is freed by the GC, but I am not sure if this would result in a higher number of instructions.
+[/quote]
+
+Insertions into a Trie don't require copying the entire data structure, only a few nodes that changed. In addition, with a copying GC, it's not important how much garbage you have on the heap, only how much live memory you have.
+
+-------------------------
+
+gabe | 2022-06-28 12:53:29 UTC | #41
+
+Thank you for the good explanation and the article.
+
+Are we confident that the increase in instruction count depends primarily on the GC? Or will the instruction count to, e.g., put an object in a TrieMap increase as the Trie grows?
+
+-------------------------
+
+roman-kashitsyn | 2022-06-28 21:26:08 UTC | #42
+
+[quote="gabe, post:41, topic:12450"]
+Are we confident that the increase in instruction count depends primarily on the GC? Or will the instruction count to, e.g., put an object in a TrieMap increase as the Trie grows?
+[/quote]
+
+We can't be confident until we measure :slight_smile:
+
+That's what the theory predicts: if we ignore the GC costs, with the current implementation of TrieMap, the cost of inserting an object into a TrieMap should be almost independent of the map size: it's proportional to the number of bits in the Hash, and the number of hash collisions in the bucket.
+
+-------------------------
+
+gabe | 2022-06-29 08:23:48 UTC | #43
+
+[quote="roman-kashitsyn, post:42, topic:12450"]
+We can’t be confident until we measure :slight_smile:
+[/quote]
+Ditto :slight_smile: That will be for a future effort.
+
+[quote="roman-kashitsyn, post:42, topic:12450"]
+the cost of inserting an object into a TrieMap should be almost independent of the map size: it’s proportional to the number of bits in the Hash, and the number of hash collisions in the bucket
+[/quote]
+And the instruction count for the addition of an object to a List should be completely independent of the List size, correct?
+
+Then it should, indeed, be the GC that dominates the increase in instruction count.
+
+-------------------------
+
+chenyan | 2022-07-01 02:38:36 UTC | #44
+
+[quote="gabe, post:43, topic:12450"]
+Ditto :slight_smile: That will be for a future effort.
+[/quote]
+
+It's easy to verify. You can simply disable "force GC" and re-measure.
+
+-------------------------
+
+lastmjs | 2022-07-25 13:59:16 UTC | #45
+
+Can you force GC from dfx? I'd like to measure that in our Rust/Motoko/Azle benchmarks that don't use the playground.
+
+-------------------------
+
+lastmjs | 2022-07-28 22:44:53 UTC | #46
+
+@gabe what are you using to get these nice plots and graphs?
+
+-------------------------
+
+gabe | 2022-08-24 12:51:42 UTC | #47
+
+Sorry, must have missed your reply. The flame graphs are from Motoko Playground and the rest are made in LaTeX since I have been writing a paper about a messaging protocol on the IC.
+
+-------------------------
+
+GLdev | 2022-08-24 13:21:53 UTC | #48
+
+There's an interesting question on discord, and wanted to get the team's input on this:
+
+> Is it possible to track / log errors like “exceeding call limit” or “out of cycles”. I guess that not on a canister level so not able to catch or am I wrong?
+
+One scenario that I see here would be that the canister has to perform some large task. Let's assume we want to perform a large task that can be split into sub-tasks based on a multiplier. It would be interesting if the canister itself can self-adjust that multiplier based on previous success. (e.g. batch convert *100* frames / request). 
+
+There's a clear alternative where the multiplier gets sent by the requesting service, but it would be nice to know if this can somehow be detected by the canister itself.
+
+-------------------------
+

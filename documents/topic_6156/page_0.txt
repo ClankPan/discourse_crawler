@@ -1,0 +1,506 @@
+diegop | 2021-08-19 21:46:27 UTC | #1
+
+**Summary**
+
+Enable node images to be run as virtual machines, improving data center adoption while continuing to support privacy-protecting subnets.
+
+**Status**  
+In Progress
+
+**What you can do to help**
+
+* Ask questions
+* Propose ideas
+
+**Key people involved** 
+ @khushboo-dfn1 ,  @bogdanwarinschi ,  @jplevyak , @hcb , Rudiger  Kapitza
+
+**Relevant Background** 
+
+We need to enable our node images to be run as virtual machines to aid data center adoption and support privacy-protecting subnets. AMD SEV will allow us to do this with minimal R&D effort. It can provide confidentiality against a potentially buggy/malicious hypervisor and other code that may happen to coexist on the physical server. AMD SEV allows transparently encrypting the memory of each VM with a unique key and provides an attestation report that can help VM’s owner verify that the state is untampered and is being run on a genuine ADM SEV platform. This is especially relevant for IC, where IC-OS is deployed on remote servers that are not under our control. It can reduce the amount of trust needed to be placed in the hypervisor and the administrator of the host system.
+
+Right now, there are 3 flavors of SEV:
+
+1. AMD SEV: Encrypt in-use data
+2. AMD SEV-ES (Encrypted State): Encrypt VM register state (Protect data in memory)
+3. AMD SEV-SNP (Secure Nested Paging): Provide strong memory integrity protection
+
+Currently, our machines EPYC2 (Rome) have SEV enabled and SEV-ES can be enabled with a custom kernel. Whether we need a full-fledged SEV-SNP is something to be evaluated. SEV-SNP is available on EPYC2 (Milan) servers.
+
+To have SEV functionality, we need the following requirements to be met:
+
+1. Agent providing secret: For each VM one agent (HW token, separate machine, etc.) knowing a secret whose disclosure is equivalent to SEV break
+2. Storage encryption: Each VM needs to encrypt its persistently stored data.
+3. Verified boot: Chain to verify that VM runs authorized software.
+4. Signed software builds: Authenticate the software towards verified boot.
+
+High-level tasks:
+
+1. Bring up a QEMU image on an existing SEV machine and understand the tooling.
+2. Bring up an IC-OS node with AMD SEV
+3. Encryption of persistent storage
+4. Attestation (Does SEV-SNP help such that we don’t need an external attestation provider?)
+5. Verified Boot
+
+Acceptance criteria:
+
+1. Keys and canister state have confidentiality and cryptographic integrity protection
+2. Ensure that host and guest isolation exists
+3. Only attested software is run as the Guest
+
+-------------------------
+
+lastmjs | 2021-08-16 21:37:14 UTC | #2
+
+There are many issues with the security of secure hardware enclaves. What mitigations for side channel attacks are being considered?
+
+-------------------------
+
+diegop | 2021-08-17 18:21:18 UTC | #4
+
+Updated Summary and relevant people in the intro
+
+-------------------------
+
+lastmjs | 2021-08-18 00:11:17 UTC | #5
+
+Will this provide cryptographic guarantees that the replica software running from within the enclave has not been tampered with? Will we be able to know that node operators have not installed a modified replica? I'm especially thinking about MEV (miner extractable value), and wondering if these kinds of attestations would be able to prevent MEV (which I think would be a very good thing for the IC).
+
+-------------------------
+
+diegop | 2021-08-18 00:23:29 UTC | #6
+
+> Will this provide cryptographic guarantees that the replica software running from within the enclave has not been tampered with?
+
+I believe that is the intent.
+
+> Will we be able to know that node operators have not installed a modified replica?
+
+Good question. I do not know.
+
+@khushboo-dfn1 can you confirm?
+
+-------------------------
+
+khushboo-dfn1 | 2021-08-18 23:47:26 UTC | #7
+
+That's correct @lastmjs. The goal is to provide attestation to identify any tampering of the replica by a malicious actor.
+
+-------------------------
+
+hcb | 2021-08-19 07:27:40 UTC | #8
+
+@lastmjs: Thanks for the questions, some answers given already, let me add a few.
+
+Side channels: it is ultimately impossible to prevent a malicious actor with control over the host system to trace certain aspects of enclave execution through side channels. We can and will apply counter-measures such as "data-independent code and memory access patterns" (e.g. for cryptographic primitives to avoid exposing secret key material as side channel patterns) but we must admit that the applicability of such techniques is narrow and cannot protect the system in its entirety.
+
+Tampering: We will have cryptographic guarantees against tampering with either the software or the data in storage (and of course also encryption at rest). This also includes software upgrades.
+
+-------------------------
+
+lastmjs | 2021-08-19 20:54:13 UTC | #9
+
+I wonder if node shuffling would help to prevent side channel attacks. The fact that node assignments to subnets are essentially static means a malicious node operator has a possibly indefinite amount of time to perform a side channel attack on an identified hosted canister. If nodes were to randomly rotate amongst subnets, could this prevent certain side channel attacks?
+
+I think node shuffling is paramount for security, and side channel attacks on enclaves might be one enhancement they provide.
+
+-------------------------
+
+hcb | 2021-08-20 06:19:50 UTC | #10
+
+Shuffling would only help if moving between machines of different authority, i.e. different data centers. As it stands however, in all likelihood every data center will contribute at least a single machine to each subnet (more or less). That means shuffling would not help.
+
+-------------------------
+
+lastmjs | 2021-08-20 14:10:35 UTC | #11
+
+Won't there be more data centers than replicas in subnets? What are we thinking the end number of data centers will be, 100s or 1000s? And subnet replication is really low right now, 7-34 (I'm hoping it can be pushed up into the 100s or 1000s).
+
+Also, there are independent node operators within data centers I believe. So shuffling among node operators could prove helpful. Also, I am not sure on the nature of side channel attacks, but I imagine they would be rather targeted to one or a few machines at a time, thus even if you moved a canister to another machine in the same data  center, you might save it from an attack in progress (though the canister it was replaced with would then be attacked, but who knows if the attack would need to be specific to the canister).
+
+-------------------------
+
+hcb | 2021-08-20 14:54:44 UTC | #12
+
+There is no reason to believe that a side channel attack would be limited to a single machine, rather than be deployable on an identified target. Randomized moving will only help you if an attacker-in-waiting has no way of knowing when to strike, however canister/subnet/machine membership needs to be public information for routing purposes.
+
+-------------------------
+
+skilesare | 2021-08-20 15:36:57 UTC | #13
+
+This probably goes without saying, but solving this some satisfactory degree is very important to any number of Enterprise use cases. Cloud computing has demonstrated the Enterprise's ability to shift their philosophy about where their data sits and who has access, but it hasn't been an easy or fast transition. 
+
+It is possible for me to break into an azure data center and access Enterprise data, but it is highly unlikely.  Microsoft could access the data but they have significant financial reasons not to do so and to protect it at all costs.
+
+All of this to say that the more roadblocks that can be put up, the better. Perfection doesn't have to be achieved. If node shuffling helps in some scenarios then it is helpful(not to mention the other security advantages that @lastmjs has mentioned elsewhere).
+
+On the financial side, perhaps these enclave operators need another layer of financial incentive to protect against compromise? In an ideal world you wouldn't want them securing more financial value then they have at stake. That seems hard to maintain.
+
+-------------------------
+
+lastmjs | 2021-08-27 22:42:13 UTC | #14
+
+Has anyone looked at multi-party computation in addition to secure enclaves? From what I've learned, that would be a killer combination, perhaps providing BFT guarantees on data privacy, or some kind of threshold guarantee. Some threshold of node operators would have to perform a side channel attack to be able to decrypt the multi-party computation and access the private data. Seems the hardest part is scaling MPC?
+
+-------------------------
+
+tkitchens | 2021-10-17 16:28:15 UTC | #16
+
+Where are things now regarding this topic? Timeframe for moving forward? Seems the combination of E2E encryption would help mitigate loss from attacks but that is helpful for data at rest. We need to get to a place where on-chain analysis of sensitive data is possible with minimal risk. This is absolutely necessary for many enterprises (like mine which is healthcare) to leverage the distributed compute power and other features of the IC.
+
+-------------------------
+
+diegop | 2021-10-20 04:02:35 UTC | #17
+
+Thank you for asking. I have been meaning to post an update.
+
+The current status is that the team is still working and investigating options (including trying existing tools and systems), but it is still too early for anything concrete. There are other projects where the lack of updates signifies that teams working on it may be pulled away to other priorities, but this is actually one of the cases where the team is still hard at work, but do not feel they have made concrete solid enough progress yet.
+
+-------------------------
+
+lastmjs | 2021-10-20 14:05:43 UTC | #18
+
+I would love to get more insight into the history of secure enclave/TEE development within DFINITY. This tweet makes it seem like the feature was nearly ready 1 year ago: https://twitter.com/dominic_w/status/1304576423705767936
+
+This seems to happen often, where these tweets seem to show excellent progress on a feature but then when digging in the feature seems to be barely working or under development.
+
+What's going on?
+
+-------------------------
+
+tkitchens | 2021-10-20 15:08:16 UTC | #19
+
+Totally agree. Again the e2e solution that Timo presented for recent hackathon is the only real advancement that i’ve seen with regard to secure data sharing linked to II. Wonder if the next big advancement here will come from a hackathon as well. 
+
+I hope figuring out this issue is mission critical for dfinity because if they don’t, enterprise will not move from traditional stack/cloud because they would be assuming a higher risk of data exposure then their current state.
+
+Would love to have more detailed insight into where things are currently.
+
+-------------------------
+
+diegop | 2021-10-20 19:33:11 UTC | #20
+
+[quote="lastmjs, post:18, topic:6156"]
+What’s going on?
+[/quote]
+
+I do recall the one demo Dom mentioned in the tweet. Here is my recollection:
+
+1. There was work for this in Fall 2020 (but not production-tested)
+
+2. Engineers were pulled off this project to focus on the one priroity: **launch the network.** Many projects and features rightly halted to focus on launching the network which became the #1 priority within the org. Launching of course also meant "*have sufficient testing and reliability to make sure it never goes down*" which required lots of teams and projects like "disaster recovery" (which came in handy this weekend and was very complex to sufficiently test). The org increasingly hyper-focused from Q2 2020 to Genesis.
+
+3. Since Genesis in May 2021, some projects have begun to pick up steam as the network becomes more stable and performant (and confidence grows).
+
+-------------------------
+
+lastmjs | 2021-10-20 19:44:31 UTC | #21
+
+Love this inside look, thanks!
+
+-------------------------
+
+diegop | 2021-10-20 19:51:15 UTC | #22
+
+You are very much welcome!
+
+-------------------------
+
+lastmjs | 2022-02-23 18:07:03 UTC | #23
+
+It looks like AMD-SEV is completely broken: https://arxiv.org/pdf/2108.04575.pdf, also posted here: https://forum.dfinity.org/t/long-term-r-d-tee-enhanced-ic-proposal/9384/10
+
+-------------------------
+
+khushboo-dfn1 | 2022-11-16 03:25:35 UTC | #24
+
+Hello, sorry for the late reply. We have been focusing on bringing SEV-SNP enabled nodes on the BTC subnet. Here is the current plan and status:
+
+1. Complete SEV-SNP design - ongoing
+2. Move ahead with qualifying more Gen-2 hardware - ongoing
+3. Bring Gen-2 hardware to the IC (and BTC subnet in particular)
+4. Enable SEV-SNP for BTC subnet nodes.
+
+We will keep the forum updated with the progress.
+
+-------------------------
+
+jzxchiang | 2022-11-16 05:26:49 UTC | #25
+
+Will this be the first subnet that has SEV-SNP enabled nodes? Will other subnets soon enable this feature? Exciting stuff!
+
+-------------------------
+
+lastmjs | 2023-03-30 20:11:59 UTC | #26
+
+What is the latest update for SEV-SNP?
+
+-------------------------
+
+andrewbattat | 2023-05-03 19:28:28 UTC | #27
+
+Hello!
+
+We are currently actively working on this! 
+
+We are working on (1) rolling out SEV-SNP hardware and (2) developing software to support a SEV-SNP GuestOS.
+
+SEV-SNP is a hardware-based security feature, which means we must test and onboard SEV-SNP enabled nodes. We have just begun onboarding new node providers with SEV-SNP enabled nodes (what we’re calling [“gen2 node machines”](https://wiki.internetcomputer.org/wiki/Node_Machine_Hardware)). However, these machines are not yet running GuestOS VMs in SEV-SNP mode, as there is much work that must be done first.
+
+Enabling GuestOS to run with SEV-SNP support is not trivial, as:
+
+* This is still a new technology and is being actively developed.
+* The gen2 SEV machines must interoperate with the gen1 non-SEV machines.
+* When a node enters a subnet and begins communicating with peers, we must perform mutual attestation between each node in the subnet to the joining node to establish trust.
+* The GuestOS upgrade process becomes more complicated. Now, in order to upgrade the GuestOS, an additional SEV-SNP enabled VM must be spun up and go through an attestation process before data can be transferred from the old VM to the new VM.
+
+We are likely still a few months away from the first SEV-SNP enabled GuestOS running in production, but we will give more updates as we get closer!
+
+-------------------------
+
+lastmjs | 2023-05-03 21:04:11 UTC | #28
+
+Thanks for the update! Good luck with all of this work
+
+-------------------------
+
+khushboo-dfn1 | 2023-07-06 21:49:25 UTC | #29
+
+Hello,
+
+Would like to give an update on our progress. 
+1. We have SetupOS and HostOS which are enabled with SEV-SNP and are in the testing phase.
+2. We are refining the design for upgrading the GuestOS. This upgrade process will take care of upgrading both traditional as well as SEV-SNP VMs to a newer(blessed) version of SEV-SNP VMs without compromising the privacy or confidentiality of the data.
+3. We are also working on all the tooling required to enable a SEV-SNP enabled GuestOS. 
+
+Stay tuned for more updates :slight_smile:
+
+-------------------------
+
+lastmjs | 2023-08-10 20:43:09 UTC | #30
+
+Any more updates you can share a month later?
+
+-------------------------
+
+khushboo-dfn1 | 2023-08-28 14:59:52 UTC | #31
+
+Update on SEV-SNP Enabled Replicas:
+1. We have GuestOS running as an SEV-SNP VM. Development is going on for mutual attestation between GuestOS VMs.
+2. The GuestOS upgrade design is going through a Security review.
+3. HostOS upgrade work is in the testing phase currently.
+4. We are also working on a more robust end-to-end testing framework for SEV-SNP based SetupOS.
+
+-------------------------
+
+lastmjs | 2023-08-28 18:34:08 UTC | #32
+
+Can you give an update on generally how long the process could be before general mainnet adoption in all subnets?
+
+-------------------------
+
+tokuryoo | 2023-09-11 07:22:29 UTC | #33
+
+When will AMD SEV be launched on the mainnet?
+I'm looking forward to AMD SEV, as relying solely on vetKD isn't sufficient for managing personal information in an enterprise setting. I have a keen interest in the enterprise sector, and knowing its release date would facilitate my work.
+
+-------------------------
+
+raymondk | 2023-09-12 01:17:30 UTC | #34
+
+Hi folks,
+
+This is a small update on the state of SEV-SNP.
+I recently joined the node team and we've been reviewing priorities. SEV enabled replicas are a high priority and we've trimmed the scope of a first release to be:
+
+"We have an SEV enabled subnet on mainnet that canisters can deploy to and we are able to upgrade hostOS and guestOS"
+
+For a while we had been discussing how we would convert non SEV replicas running on gen2 hardware to SEV replicas but we took that out of scope for now. For this milestone we are assuming that will create a subnet from fresh nodes.
+
+**Roadmap / progress:**
+- We're now able to boot a replica with SEV enabled (building a working kernel and all the associated tools turned out to be trickier than expected).
+- We're working on the mutual attestation - this is where the blessed replica version is recorded in the NNS along with the measurements and two replicas trying to join a subnet will check each other before establishing a p2p connection.
+- There is a new mainline kernel with SEV support which we want to try - so far we've been working with an AMD fork which has been relatively unstable.
+- After that we will work on the upgrade process which is rather complex and is just going through our security design review.  The "upgrade process" is the ability for a replica to upgrade to a new version which requires an attestation before encryption keys are exchanged.
+
+We're aiming to have this milestone completed by early Q1 - ie an SEV subnet on mainnet.
+
+-------------------------
+
+skilesare | 2023-09-12 14:08:52 UTC | #35
+
+I understand that there is likely a number of steps and that the focus is currently on SEV on the replica side, but the #1 feature requested when we talk to multimillion-dollar corporations that consider using the IC is "can I compute over data that the node provider can't see?".
+
+Some simple way to send encrypted data that can only be decrypted inside the enclave and the ability to aggregate state across descriptions for a data set would be highly impactful for how much IC we can sell to enterprise.
+
+-------------------------
+
+raymondk | 2023-09-12 15:39:30 UTC | #36
+
+That's why we're pushing forward with SEV-SNP. Do you have ideas for another simpler way to achieve this @skilesare?
+
+-------------------------
+
+skilesare | 2023-09-12 15:45:20 UTC | #37
+
+I wish had any competencies on this so I could help!  I'm sure you guys have it in hand, just raising my voice so you all know you're kicking butt and doing awesome stuff we all want!
+
+-------------------------
+
+tokuryoo | 2023-09-13 04:25:06 UTC | #38
+
+@raymondk 
+Have you already decided to adopt AMD?
+
+-------------------------
+
+khushboo-dfn1 | 2023-09-13 05:08:22 UTC | #39
+
+@tokuryoo we have validated AMD's EPYC Milan servers for Gen2 HW specs. https://wiki.internetcomputer.org/wiki/Node_Provider_Machine_Hardware_Guide
+
+-------------------------
+
+tokuryoo | 2023-09-13 06:57:09 UTC | #40
+
+Thank you for your reply. I understood.
+
+-------------------------
+
+lastmjs | 2023-10-03 02:54:38 UTC | #41
+
+So do you think SEV + vetKD is sufficient? I'm thinking of a use case of publishing packages to npm from IC canisters. I wonder if storing the auth token encrypted with vetKD and decrypting it temporarily inside of the SEV enclaves for pushing to npm is sufficient?
+
+I wonder if the HTTPS encryption would be done inside of the enclave as well.
+
+-------------------------
+
+tokuryoo | 2023-11-02 04:38:04 UTC | #42
+
+I agree that vetKD alone is not sufficient for such use cases.
+I am hopeful that SEV + vetKD will solve this problem, too. However, I am not familiar with SEV.
+
+-------------------------
+
+raymondk | 2024-02-07 22:32:06 UTC | #43
+
+Hi folks, I wanted to give a quick update about [SEV-SNP](https://www.amd.com/content/dam/amd/en/documents/epyc-business-docs/white-papers/SEV-SNP-strengthening-vm-isolation-with-integrity-protection-and-more.pdf). There has been a lot of interest from the community around the its use and its potential to provide integrity protection and confidentiality to the replica nodes.
+
+At DFINITY, we've been working for several months with the goal of rolling out SEV replicas to a subnet, and in the December 6th Global R&D, we demoed some of that work: SEV-SNP enabled replicas spinning up and joining a testnet after mutually attesting each other.
+
+However, there is still some work to do specifically around replica upgrades, network integration and enabling disk and memory encryption.
+
+For the time being, we are going to prioritize leveraging SEV-SNP to enhance the security of the boundary nodes instead of the replicas. As you may be aware, there is a [roadmap to decentralize the boundary nodes](https://forum.dfinity.org/t/boundary-node-roadmap/15562) that is being executed. It includes splitting the boundary nodes into an API boundary node and an HTTP Gateway.
+
+* **API boundary nodes**: Provide an endpoint that handles API canister calls by routing them to the correct subnet and replica node, and provides caching and rate-limiting to protect the IC. These nodes will be run by NNS-approved node providers and managed by the NNS.
+* **HTTP gateways**: Provide endpoints that terminate TLS and translate user HTTP requests to API canister calls. These nodes can be run by anyone.
+
+SEV-SNP can be used to improve the security of these new components:
+
+The first phase will be to use SEV-SNP for the HTTP gateways. Users would be able to independently verify that they are querying a known version of the gateway and be confident that the gateway is not intercepting or tampering with the traffic flowing through it. This is especially beneficial now that the service worker has been removed and we rely on the gateway for certifying HTTP responses.
+
+The second phase will be to use SEV for the API boundary nodes. Today, a lot of the metrics that power the dashboard are emitted by the boundary nodes. API boundary nodes running on SEV-SNP increases the confidence in the accuracy of the scraped metrics. Moreover, it will ensure that the content of the API calls proxied by the API boundary nodes cannot be read by Node Providers.
+
+Because these components are stateless, it removes a level of complexity and gives an opportunity to vet the technology before using it on replicas.
+
+-------------------------
+
+Ajki | 2024-02-08 18:02:20 UTC | #44
+
+[quote="raymondk, post:43, topic:6156"]
+The first phase will be to use SEV-SNP for the HTTP gateways
+[/quote]
+
+What is the expected ETA for ohase 1 and 2?
+
+-------------------------
+
+massimoalbarello | 2024-02-08 18:25:44 UTC | #45
+
+Thanks for the update @raymondk!
+
+Will Dfinity have its own SEV-SNP enabled servers to run the HTTP gateways? What if instead the replicas that are not part of any subnet are used?
+
+I'm also curious about your findings regarding TEEs in general. What can a node provider do when the HTTP Gateway (or API BN or replica) code is run in the TEE?
+
+-------------------------
+
+raymondk | 2024-02-08 18:30:30 UTC | #46
+
+We don't have ETAs yet - The boundary node team is focused on the actual decentralization of the boundary nodes which we expect to have completed by the end of Q2.
+
+In parallel, we are evaluating ways to leverage SEV for the HTTP Gateways that could be easily reused by anyone willing/wanting to host an HTTP Gateway including running on bare metal, in confidential containers or on cloud provider confidential computing offerings.
+
+We'll publish a more detailed roadmap with ETAs when we have a solid plan. As always ideas and input from the community are welcome!
+
+-------------------------
+
+raymondk | 2024-02-08 18:43:36 UTC | #47
+
+Hey @massimoalbarello - the HTTP Gateways will technically not be part of the IC and anyone should be able to run them.
+
+DFINITY is evaluating ways to leverage SEV for the HTTP Gateways that could be easily reused by anyone willing/wanting to host an HTTP Gateway including running on bare metal, in confidential containers or on cloud provider confidential computing offerings. I expect that when the time comes, DFINITY will host its gateway at least partially on its own SEV-SNP enabled servers.
+
+For API Boundary nodes, those will be under node provider control and the idea is that an NPs machine can be used as either a replica or an API boundary node. Gen2 machines are speced with SEV-SNP enabled processors and the expectations is that those will be used.
+
+The promise of SEV-SNP is that the hardware provider is not able to tamper with the VM image or read the memory.
+
+-------------------------
+
+massimoalbarello | 2024-02-08 18:59:07 UTC | #48
+
+[quote="raymondk, post:47, topic:6156"]
+The promise of SEV-SNP is that the hardware provider is not able to tamper with the VM image or read the memory.
+[/quote]
+
+In theory that is amazing but how far away are they in practice?
+
+If it was actually the case that they are tamperproof and can attest the image they are running, why would the consensus algorithm need to tolerate byzantine failures instead of only fail-stop failures?
+
+-------------------------
+
+raymondk | 2024-02-08 20:14:47 UTC | #49
+
+It's a question that comes up regularly and the idea is to layer the different levels of protection and not rely on one single thing.
+
+-------------------------
+
+rbirkner | 2024-02-09 09:33:51 UTC | #50
+
+@massimoalbarello this is an interesting thread on your question: https://www.reddit.com/r/compsci/comments/ui30ta/does_the_advent_of_so_called_confidential/
+
+-------------------------
+
+lastmjs | 2024-07-20 13:12:45 UTC | #51
+
+What's the latest update on SEV-SNP for boundary and replica nodes?
+
+-------------------------
+
+rikonor | 2024-08-08 13:46:33 UTC | #52
+
+Hi!
+
+A few updates from the Boundary Node team regarding SEV-SNP - over the last few months we've done a lot of exploratory work and are now targeting the HTTP Gateways as our first SEV-SNP workload.
+
+The first fleet of HTTP Gateways will be Dfinity owned with that deployment serving as a reference for others to follow.
+
+Once deployed, several prominent IC domains will be moved to these gateways with users being able to reproduce the entire supply-chain, i.e, every node in the following tree is reproducible and can he hashed in a consistent manner, producing a measurement that can be used for verification of the workload.
+
+![Screenshot 2024-08-08 at 09.36.03|473x500, 75%](upload://r2gVqQORttHxAgfBiOTgxBWpN5a.png)
+
+Once you have a measurement, you can perform remote attestation against an HTTP Gateway to get a live measurement, which you can compare with the offline-produced measurement to ensure the workload is the expected one.
+
+Follow-up work for this will include the NNS-managed API Boundary Nodes being transitioned to become SEV-SNP workloads as well, with replicas being targeted at a later time.
+
+Happy to answer any follow-up questions!
+
+-------------------------
+
+lastmjs | 2024-08-20 15:13:11 UTC | #53
+
+Thanks for the info!
+
+Could you give us some rough/estimated timelines for transitioning each of these?
+
+-------------------------
+

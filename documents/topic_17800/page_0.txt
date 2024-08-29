@@ -1,0 +1,113 @@
+skilesare | 2023-01-04 23:19:33 UTC | #1
+
+I'm trying to figure out how to handle tuples in candid.  On https://internetcomputer.org/docs/current/references/candid-ref/#type-record--n--t-- It looks like you can do record { a; b; c}, but elsewhere it is stated that the order for records doesn't matter.
+
+If I have a function
+
+```
+public func test( x : ( Nat, Nat32, Text)) -> Text
+```
+
+Candid UI produces something like this for tuples: (record {text; nat; nat32}) → (text) query
+
+How is this encoded in candid?  For dfx I think I just add some extra parens to separate it off, but I'm guessing that the candid encoder does something to this to make the order imporat. 
+
+Use case:  Messing with https://github.com/edjCase/motoko_candid and trying to convert a Candy Library Array[] where values can be of multiple types. My assumption was if they were all the same to submit a vec and if they were different to treat it as a tuple. Motoko candid doesn't really have the concept of a tuple except at the top level which is an [Arg].
+
+-------------------------
+
+paulyoung | 2023-01-05 05:47:22 UTC | #2
+
+Did you see this part?
+
+> If you omit the label, Candid automatically assigns sequentially-increasing labels. This behavior leads to the following shortened syntax, which is typically used to represent pairs and tuples. The type `record { text; text; opt bool }` is equivalent to `record { 0 : text; 1: text; 2: opt bool }`
+
+-------------------------
+
+skilesare | 2023-01-05 01:06:30 UTC | #3
+
+Thanks! Makes sense. These are nats and equivalent to the hash?
+
+-------------------------
+
+paulyoung | 2023-01-05 05:48:23 UTC | #4
+
+I assume these are nats that represent the index of the element in the tuple.
+
+@chenyan might be able to say more.
+
+-------------------------
+
+chenyan | 2023-01-05 19:02:10 UTC | #5
+
+Yep, nats are equivalent to hash. In fact, the string label is always converted to nat via the hash function. You can omit nat that is +1 of the previous field, e.g. `record { 42 : int; text; opt bool }` is the same as `record { 42 : int; 43 : text; 44 : opt bool }`. Tuple is a shorthand of record, when the field nat is numbered from 0 to n-1.
+
+-------------------------
+
+tomijaga | 2023-01-13 01:13:56 UTC | #6
+
+Hey @chenyan, 
+
+I ran into an error while deserializing a tuple from bytes to a motoko type using the `from_candid` fn.
+
+Decoding works fine for tuple types wrapped within an array or option type, but it doesn't work for tuple types.
+I've reproduced the problem in the motoko playground:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=512591308
+
+Notice that the `tuple()` function traps while the other functions serialize the data and deserialize them without any errors.
+
+-------------------------
+
+chenyan | 2023-01-15 19:36:52 UTC | #7
+
+It's a tricky question. 
+
+There is no tuple type in Candid. Tuple is just a shorthand for record, whose indices happen to be from 0 to n-1. For example, `{ 0 = "motoko"; 1 = true }` in Candid can be abbreviated as `("motoko", true)`. In Motoko, this means both `{_0_ = "motoko"; _1_ = true}` and `("motoko", true)` translate to the tuple shorthand in Candid.
+
+At the top-level in Candid (also the function arguments and return types in Motoko), there is a tuple-like thing, but it's not really a tuple. For example, a Motoko function that returns `async (Text, Bool)` doesn't return a tuple of type `(Text, Bool)`. Instead, it means the function returns TWO values. They are `Text` and `Bool` respectively. 
+
+Now, in your `tuple` function, `to_candid` encodes a single value (tuple in Motoko, which is a record type in Candid). `from_candid` is trying to decode this blob as three values, which causes the runtime error of "not enough values to decode".
+
+There are two ways to fix this function, depending on whether you want to fix from_candid or to_candid:
+
+```
+  public query func tuple() : async ?(Text, Nat, Bool) {
+    let motoko = ("candid", 1, true);
+
+    let blob = to_candid(motoko);
+
+    // Cannot use ?(Text, Nat, Bool) type, because that would mean to decode three values.
+    let ?f : ?{_0_:Text; _1_: Nat; _2_: Bool} = from_candid(blob);
+    ?(f._0_, f._1_, f._2_)
+  };
+
+  public query func tuple2() : async ?(Text, Nat, Bool) {
+    let blob = to_candid("candid", 1, true);
+
+    from_candid(blob)
+  };
+```
+
+Another minor thing is that there is no unary tuple in Motoko. So in your `single_tuple` code, both `("candid")` and `("candid",)` means `"candid"` in Motoko. If you want to return a unary tuple in Candid, use `{_0_="candid"} in Motoko`.
+
+If you want to be more formal, you can read this spec: https://github.com/dfinity/motoko/blob/master/design/IDL-Motoko.md
+
+-------------------------
+
+tomijaga | 2023-01-20 04:10:49 UTC | #8
+
+Thanks for taking the time to explain and for providing alternative solutions.
+
+I had intended to add a `#Tuple` variant to the [Serde](https://github.com/NatLabs/serde) library for serializing and deserializing Candid text into Motoko. However, I might reconsider adding it since the type is not officially supported by the Candid standard.
+
+-------------------------
+
+claudio | 2023-07-20 13:17:54 UTC | #9
+
+We have a GH issue for this (with some discussion on ways around/forward):
+
+https://github.com/dfinity/motoko/issues/4130
+
+-------------------------
+

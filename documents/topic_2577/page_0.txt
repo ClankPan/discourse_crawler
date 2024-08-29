@@ -1,0 +1,176 @@
+theonlyandreas | 2021-04-23 09:38:36 UTC | #1
+
+Hey, I would like to call the IC from a flutter app. 
+So far, I managed to run rust code and import the ic_agent module. I tried to make a query call but didn't receive any answer. This is how I tried to make the call:
+
+    pub async fn query_call(canister_id: &str, method_name: &str) -> String {
+        // create random identity for agent
+        let rng = ring::rand::SystemRandom::new();
+        let key_pair = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+            .expect("Could not generate a key pair.");
+        let identity = BasicIdentity::from_key_pair(
+    ring::signature::Ed25519KeyPair::from_pkcs8(key_pair.as_ref())
+                .expect("Could not read the key pair."),
+        );
+
+        // initialize agent and canister_id
+        let url = format!("/api/v2/canister/{}/query", canister_id);
+        let agent = ic_agent::Agent::builder()
+            .with_identity(identity)
+            .with_url(url)
+            .build()
+            .unwrap();
+        let canister_id_principal = Principal::from_text(canister_id).unwrap();
+    
+        // use QueryBuilder to make query call
+        let query_builder = QueryBuilder::new(&agent, canister_id_principal, String::from(method_name));
+        let response = query_builder.call().await;
+        match response {
+            Ok(reply) => return String::from_utf8_lossy(&reply).to_string(),
+            Err(AgentError::ReplicaError {
+            reject_code,
+            reject_message,
+            }) => return format!("Error {} occured with message: {}", reject_code, reject_message),
+            Err(_) => return "Error occured other than ReplicaError!".to_string(),
+        }
+    }
+
+What did I do wrong? Is QueryBuilder the right object for this?
+
+-------------------------
+
+hansl | 2021-04-24 19:14:09 UTC | #2
+
+The URL just need to be root. Don’t use the fully qualified path. Rest seems okay.
+
+-------------------------
+
+theonlyandreas | 2021-04-25 10:28:48 UTC | #3
+
+Ok cool, thanks! I'll try it when I get back on Tuesday 👍🏻
+
+-------------------------
+
+theonlyandreas | 2021-04-27 22:21:52 UTC | #4
+
+It still doesn't return anything..
+The root url would look something like this right?
+
+    let url = format!("https://{}.ic0", canister_id);
+
+Or should I add the canister id somewhere else?
+
+-------------------------
+
+hansl | 2021-04-27 23:42:21 UTC | #5
+
+Try with `ic0.app` for contacting sodium. But yes essentially.
+
+-------------------------
+
+theonlyandreas | 2021-05-02 21:45:29 UTC | #6
+
+Alright, switching to tokio 1.2.0 instead of 0.2.0 did the trick :+1:t2:
+
+With the `ic0.app` ending I can reach the replica, but it returns a 404 error.
+Any idea why this happens?
+The canister and function work when called by the dfx command line tool.
+
+-------------------------
+
+cryptoschindler | 2021-05-03 06:56:19 UTC | #7
+
+This might be the reason
+
+https://forum.dfinity.org/t/important-update-on-sodium-developer-network/2574?u=cryptoschindler
+
+-------------------------
+
+theonlyandreas | 2021-05-16 19:20:13 UTC | #8
+
+Yeah that's true :+1:t2:
+I tried to deploy a canister on the Beta Mainnet now, but it's not possible just yet as is described here: 
+https://forum.dfinity.org/t/developer-setup-best-practices-testing-deploying-canisters-to-new-beta-mercury-network/3753/2?u=theonlyandreas
+Therefore, I'm deploying locally for now. Calling the query with
+
+`let response = query_builder.with_arg("everyone".to_string()).call().await;`
+
+returned this error: `IDL error: missing magic bytes`.
+
+Changing the string to `.with_arg("DIDLeveryone".to_string())` as you suggested here:
+https://forum.dfinity.org/t/any-specifications-on-the-http-api-cbor-message/259/2?u=theonlyandreas
+got me to the next error: `IDL error: too many types`.
+I'm not sure what it means though. :sweat_smile:
+Is there maybe some other convention from candid that needs to be considered?
+
+-------------------------
+
+chenyan | 2021-05-16 19:24:47 UTC | #9
+
+You need to use the candid crate for encoding values: https://docs.rs/candid/0.6.21/candid/
+
+`.with_arg(candid::Encode!("everyone")?)`
+
+-------------------------
+
+theonlyandreas | 2021-05-17 14:36:31 UTC | #10
+
+Thanks, it works now from a pure rust project! :slightly_smiling_face:
+
+Although calling the exact same code from within a flutter app gives me an empty string.. (This is with calling the localhost as 10.0.2.2 from an android emulator)
+
+Anyway, I'm going to try this again when the public app subnets are unlocked.
+
+-------------------------
+
+levi | 2021-05-17 22:05:44 UTC | #11
+
+Do you know how I can candid en-code a record in the rust? Which rust-object-type should I pass in the candid::Encode!() for the candid-code of a candid-record?
+
+-------------------------
+
+chenyan | 2021-05-17 22:10:38 UTC | #12
+
+Any struct/enum that derives `CandidType` can be used in `Encode` macro. See the docs: https://docs.rs/candid/0.6.21/candid/#operating-on-user-defined-structenum
+
+-------------------------
+
+levi | 2021-05-19 02:50:32 UTC | #14
+
+Thanks, I’m new to the rust, this is working: 
+
+Thanks, it works now in the rust. 
+
+    use candid::{Encode, CandidType, Decode, Deserialize };
+
+
+    #[derive(CandidType)]
+    pub struct CountbalanceMap {
+        account: String
+
+    }
+
+    #[derive(CandidType, Debug, Deserialize)]
+    pub struct ICPTs {
+        e8s: u64
+    }
+
+    fn main() {
+
+        let param: CountbalanceMap = CountbalanceMap {
+            account: "c42e675e8049832dc4ad8ef0c77d6b8e8acf33abc55ad740525357e196ac52af".to_string()
+        };
+
+        let candid_bytes: Vec<u8> = Encode!(&param).unwrap();
+        println!("{:?}", candid_bytes);
+
+        let candid_sponse_bytes: Vec<u8> = [68, 73, 68, 76, 1, 108, 1, 224, 169, 179, 2, 120, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0].to_vec();
+        let icpts: ICPTs = Decode!(&candid_sponse_bytes, ICPTs).unwrap();
+        println!("{:?}", icpts);
+    }
+
+
+---------------
+
+-------------------------
+

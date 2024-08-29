@@ -1,0 +1,156 @@
+Fulco | 2022-04-10 12:00:35 UTC | #1
+
+Hey everyone, 
+
+I am building a DAO application in rust where you vote on proposals and get executed if they get a majority. Sometimes the execution of these proposals involves no outgoing calls like adding or removing a new member. Other times they involve an async call to the management canister. 
+
+Since the management canister is provided by the system I trust it (is that a correct assumption?) and I would like to await the result of calls to it before executing other proposals to simplify things. To implement such a scheme I had the following in mind:
+
+1. Have a queue of proposals to be executed
+2. Have a boolean `is_executing` that you set to true before the await boundary and to false after it.
+3. Have a function executeNextProposal() that if `is_executing` is false takes the next proposal in the queue and executes it.  Otherwise do nothing (base case)
+4. If a proposal has been executed call executeNextProposal() recursively 
+
+Does anybody see any problems here or things I should pay extra attention to? Is it possible to create a "stack overflow" of outstanding calls to the canister itself?
+
+-------------------------
+
+GLdev | 2022-04-10 14:04:27 UTC | #2
+
+This is how I'd do it:
+
+```
+// Take ownership of the task
+let _rand_id = RUNTIME_STATE.with(|state| {
+     let some_rand = state.borrow_mut().env.random_u32();
+     state.borrow_mut().data.bucket_index.index_state = IndexState::InSync(some_rand);
+     some_rand
+ });
+
+```
+
+And after the .await I'd check if index_state is still ::InSync(rand_id), before doing anything. This should confirm that the state didn't roll back, and we're in the same "thread"... At least that's how I understood the idea of .await and state roll-back :slight_smile: 
+
+Even if you're not checking for state consistency, it's better to use enums with descriptive states rather than booleans. Sooner or later you'll want to add some functionality that extends your first case, and you'll have to juggle lots of booleans "is_executing and is_first_task and not is_favourite_task", etc.
+
+Edit with more code:
+
+```
+async fn send_index() {
+    // Take ownership of the task
+    let rand_id = RUNTIME_STATE.with(|state| {
+        let some_rand = state.borrow_mut().env.random_u32();
+        state.borrow_mut().data.bucket_index.index_state = IndexState::InSync(some_rand);
+        some_rand
+    });
+
+    let effective_index =
+        RUNTIME_STATE.with(|state| state.borrow().data.bucket_index.effective_index.clone());
+
+    let index_canister_id = RUNTIME_STATE
+        .with(|state| state.borrow().data.canister_settings.index_canister_id)
+        .unwrap();
+
+    // Actually send the index
+    let call_succeeded: CallResult<(bool,)> =
+        ic_cdk::api::call::call(index_canister_id, "add_bucket_index", (effective_index,)).await;
+
+    if let Err((code, msg)) = call_succeeded {
+        print(format!("Error! Code:{:?} Msg:{:?}", code, msg));
+        // Set the task to new so the next iteration of heartbeat can work on it
+        RUNTIME_STATE
+            .with(|state| state.borrow_mut().data.bucket_index.index_state = IndexState::New);
+    } else {
+        // Set the task to completed
+        // Check if it is still the task we took ownership of before await.
+        if let IndexState::InSync(lock) =
+            RUNTIME_STATE.with(|state| state.borrow().data.bucket_index.index_state)
+        {
+            if lock == rand_id {
+                RUNTIME_STATE.with(|state| {
+                    state.borrow_mut().data.bucket_index.index_state = IndexState::Synced
+                });
+            }
+        }
+    }
+}
+```
+
+I found working with state from async functions pretty frustrating and "ugly", but the above code seems to do the job.
+
+Edit2: After reading [this blog post](https://mmapped.blog/posts/01-effective-rust-canisters.html) from Roman, the way I understand working with async from a "loop" is this: If something happens somewhere and the canister panics, state could be reversed *while* your await is well ... waiting. After your await is done, your code resumes but it's not guaranteed that the state "under" your code is the same as it was at the start of the function when it got called. So you'll have to "check" for state consistency, and having a rand added to the enum that describes the state of my variable seemed the most reasonable way to do so. 
+
+Please correct me if the above is wrong, or unnecessary. @roman-kashitsyn
+
+-------------------------
+
+Fulco | 2022-04-10 19:22:45 UTC | #3
+
+Hey GLDev,
+
+Thanks for the extensive answer! I'm not exactly sure if I understand the solution here, for one thing it seems to assume using heartbeat which I would rather not use. (I know when I want to check the proposal queue, only after votes). Could you explain how this would fix the following situation?   
+
+Let says I have the following situation in my DAO:
+
+- There is a rule that the DAO can only own 5 canisters. 
+- The DAO currently has 4 canisters 
+- Two proposals about creating a new canister are currently open. Both only need one more yes vote
+- The DAO receives an additional yes vote for both proposals at the same time through an update call. 
+
+The following happens:
+ 
+- The update call for the first yes vote is executed
+- The `nr_of_canisters < 5` check passes 
+- Because the voting threshold has now been reached the execute_proposal function calls: `call_with_payment(Principal::management_canister(), "create_canister", (args,),cycles ).await;`
+- Because of the `await` the next message for the canister is now processed which is the second yes vote. 
+- The `nr_of_canisters < 5` check still passes because the reply from `create_canister` in the previous call hasn't returned.
+- `call_with_payment(Principal::management_canister(), "create_canister", (args,),cycles ).await;` is called for a second time.
+- The successful reply from the first `create_canister` call comes back and the newly minted canisterID is added to the canister list. 
+- The successful reply from the second `create_canister` comes back and the newly minted canisterID is added to the canister list.
+- There are now 6 canisters while there are supposed to 5.
+
+This could be prevented in a number of ways like:
+- Don't have more create_canister proposals then there are slots left 
+- Add the canister to the list already before the create_canister call and remove or update it based on the reply of the call
+
+But to makes things simpler I'd rather just have one final check of all the conditions that need to hold before calling the execute_proposal function. I can only make sure those conditions hold if there are no outstanding calls.
+
+-------------------------
+
+GLdev | 2022-04-11 05:53:11 UTC | #4
+
+Right, sorry for the confusion. I was deep into my own thoughts and conflated your problems with mine for a bit there :slight_smile: 
+
+So, I think there are two steps to your scenario here:
+
+1. how to prevent creating two instances of a create_canister async call
+2. what to do after, in the event one fails
+
+The answer to the first question would still be "use an enum with a payload" IMO. You could have it so that you check if there is any proposal in ProposalsStateTracking::InProgress(id), and only call execute_proposal if there are no "in progress" tasks. This would solve your <5 canisters condition, as I believe one of the threads would change the state first, and the second one would "see" this change when it gets its turn. 
+
+As to what happens after this in your hypothetical, I'm not clear on what needs to happen if say first call somehow fails but the second call already got "rejected" because the first one was "in processing". You'd need a way to either re-issue an update call or piggyback on other update calls and re-check your proposal Queue and check the "next" proposal in line. Another advantage of using enums would be that you could have your "second" proposal from the example above be in a state of "Waiting", and process it next if that is what your business logic needs. You can first do everything you can for the first proposal that got executed, and if that proposal reaches a state of "this is 100% rejected" then you move on to the next in queue. 
+
+tl;dr; use enums rather than booleans to track the changes in your "state machine", as it can be more descriptive of your business logic, and it can help you catch unwanted and hard to reason about bugs earlier.
+
+As for the other thing that I mentioned in the long code paste, I *think* that's a problem worth thinking about, but I'll wait for confirmation from someone that understands this better than I do. It might be that I totally misunderstood something and it's not a valid concern.
+
+edit: And I found the original source for the "beware of state changes between await calls": It's [this post](https://www.joachim-breitner.de/blog/788-How_to_audit_an_Internet_Computer_canister) by @nomeata, which I took to mean what I tried explaining in my first reply.
+
+> Canisters process messages atomically (and roll back upon certain error conditions), but not complete calls. This makes programming with inter-canister calls error-prone. Possible common sources for bugs, vulnerabilities or simply unexpected behavior are:
+
+>    Reading global state before issuing an inter-canister call, and assuming it    to still hold when the call comes back.
+
+ >   Changing global state before issuing an inter-canister call, changing it again    in the response handler, but assuming nothing else changes the state in    between (reentrancy).
+
+ >   Changing global state before issuing an inter-canister call, and not    handling failures correctly, e.g. when the code handling the callback rolls    backs.
+
+> If you find such pattern in your code, you should analyze if a malicious party can trigger them, and assess the severity that effect
+
+-------------------------
+
+AdamS | 2022-04-11 13:12:50 UTC | #5
+
+Note that the [0.5.0 release](https://github.com/dfinity/cdk-rs/commit/095be3b43e99404a78c6a300e76cc6838b373298) of the CDK will no longer contain this annoyance. It may still be possible to trigger it with an edge case, but straightforward use of awaiting will, on panic, clean up anything that needs to be cleaned up through its Drop handler, including things like mutex locks. You could create your own such cleanup code not attached to any specific type via the `scope-guard` crate.
+
+-------------------------
+

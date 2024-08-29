@@ -1,0 +1,148 @@
+kobby5angels | 2024-03-13 14:10:19 UTC | #1
+
+## Overview
+
+When building and deploying the `basic_bitcoin` example canister to local bitcoin `regtest` node, calls to the `get_balance` and `get_utxos` functions return 0 in all cases, even though similar calls using the `bitcoin-cli` return correct values.
+
+## System
+
+dfx version: `0.17.0`
+OS: `Apple M1 Pro, Sonoma 14.4`
+
+## Steps to reproduce
+
+1. Kindly clone the `basic_bitcoin` canister in the `example` repo.
+2. Run `dfx start --background` to start the local replica.
+3. Run `make`, which will execute the `Makefile` at the root of the `basic_bitcoin` example. This file contains basic deployment flow in `regtest` mode.
+4. Fund some address with bitcoins(`generatetoaddress RPC`), then call `dfx canister call basic_bitcoin get_utxos '("BITCOIN_ADDRESS")'` to retrieve UTXOs. In my case, it returns 0; however, the `bitcoin-cli` returns correct values.
+
+NOTE: With `dfx` version `0.18.0`, executing any of the endpoints produces:
+```(
+  variant {
+    Err = record {
+      variant { SysTransient };
+      "IC0501: Canister g4xu7-jiaaa-aaaan-aaaaq-cai is out of cycles";
+    }
+  },
+)
+```
+
+-------------------------
+
+lwshang | 2024-03-13 20:47:48 UTC | #2
+
+Hi @kobby5angels .
+
+I can confirm that dfx v0.18.0 will produce the error of `IC0501: Canister g4xu7-jiaaa-aaaan-aaaaq-cai is out of cycles`.
+
+But dfx v0.17.0 worked for me.
+
+### Prepare Bitcoin Regtest network
+```bash
+$ bitcoind -regtest -daemonwait
+$ bitcoin-cli -regtest createwallet "test"
+$ ADDRESS="$(bitcoin-cli -regtest getnewaddress)"
+$ echo $ADDRESS
+bcrt1qwtcc7xmt9gx99pu0q5976uzdnufccawwc4rfxj
+$ bitcoin-cli -regtest generatetoaddress 1 "$ADDRESS"
+[
+  "3526ba1ec3960eebf0249720f87b11b6e9c2cb1b9856a692764b43183f7efb02"
+]
+```
+
+### Start local replica
+```bash
+$ dfx start --clean --background --enable-bitcoin
+# Many logs ...
+```
+
+### Deploy canister and make a call
+```bash
+$ make
+$ dfx canister call basic_bitcoin get_utxos '("bcrt1qwtcc7xmt9gx99pu0q5976uzdnufccawwc4rfxj")'
+(
+  record {
+    next_page = null;
+    tip_height = 1 : nat32;
+    tip_block_hash = blob "\02\fb\7e\3f\18\43\4b\76\92\a6\56\98\1b\cb\c2\e9\b6\11\7b\f8\20\97\24\f0\eb\0e\96\c3\1e\ba\26\35";
+    utxos = vec {};
+  },
+)
+```
+
+The result of `generatetoaddress` and the `tip_block_hash` field are the same (in reverse order).
+
+> to retrieve UTXOs. In my case, it returns 0; however, the `bitcoin-cli` returns correct values.
+
+Could you elaborate a bit what did you mean by "returns 0"? And what `bitcoin-cli` command did you execute to get correct value?
+
+-------------------------
+
+kobby5angels | 2024-03-14 09:08:45 UTC | #3
+
+You're absolutely right! This was mainly a setup issue, and not a bug in the BTC-integration canister. In particular, the local IC replica I started with `dfx start --clean --background` wasn't communicating with the BTC-integration canister properly. I don't know how crucial the `--enable-bitcoin` argument is, but it somehow did the trick for me.
+
+Many thanks for your thorough response. I'm marking this as the solution.
+
+-------------------------
+
+lastmjs | 2024-03-22 19:38:17 UTC | #4
+
+Are you sure you fixed your problem?
+
+@lwshang didn't provide a solution in his comment did he? It looks like he agreed that on dfx 0.18.0 there is a problem.
+
+We are also running into this problem, our bitcoin and ckbtc examples are both failing on the update to dfx 0.18.0.
+
+Adding --enable-bitcoin to the dfx start command doesn't resolve it for us, we already had a local configuration in our dfx.json file.
+
+Is there a fix for this yet?
+
+Also here are some of the replica logs on startup:
+
+```
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Starting heartbeat...
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Running ingest_block_continue...
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Looking for new stable blocks to ingest...
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Sending request: Initial(GetSuccessorsRequestInitial { network: Regtest, anchor: BlockHash(0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206), processed_block_hashes_len: 0, processed_block_hashes: [] })
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Received response: Err((SysTransient, "Couldn't send message"))
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Error fetching blocks: [SysTransient] Couldn't send message
+2024-03-22 19:36:21.929271825 UTC: [Canister g4xu7-jiaaa-aaaan-aaaaq-cai] Done fetching new response.
+```
+
+-------------------------
+
+lastmjs | 2024-03-22 19:41:32 UTC | #5
+
+I tried adding cycles just to see if it would work: `dfx ledger fabricate-cycles --canister g4xu7-jiaaa-aaaan-aaaaq-cai --cycles 1000000000000000` but it did not work
+
+-------------------------
+
+lwshang | 2024-03-22 19:57:13 UTC | #6
+
+The dfx v0.18.0 bundled bitcoin integration canister doesn’t work in local replica with an application subnet. You have to configure the local replica to run a system subnet.
+
+The temporary fix which downgrade the bundled bitcoin canister was merged last week. It will be available in the upcoming dfx release next week.
+
+You can also use dfx 0.17.0 for now. Building the dfx from sdk repo master branch will also work.
+
+-------------------------
+
+lastmjs | 2024-04-10 13:53:25 UTC | #7
+
+Seems like dfx 0.19.0 has resolved this issue at least temporarily?
+
+-------------------------
+
+lwshang | 2024-04-10 15:36:40 UTC | #8
+
+It is resolved in 0.19.0 by downgrading the bundled bitcoin canister.
+
+https://forum.dfinity.org/t/dfx-0-19-0-is-promoted/29268/6
+
+The actual fix on the bitcoin canister side was merged: https://github.com/dfinity/bitcoin-canister/pull/286.
+
+We are waiting for a new release of the bitcoin canister so that we can include it in `dfx`.
+
+-------------------------
+

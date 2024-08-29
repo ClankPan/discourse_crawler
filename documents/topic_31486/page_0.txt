@@ -1,0 +1,197 @@
+AlliDoizCode | 2024-06-02 16:51:37 UTC | #1
+
+When trying to upgrade a canister with a new wasm module programmatically through the admin canister I am getting this error.
+
+```bash
+(
+  "Error from Canister dfztg-4aaaa-aaaak-qijzq-cai: Canister\'s Wasm module is not valid: Failed to decode wasm module: unsupported canister module format",
+)
+```
+Here is the code block that is is attempting to make the upgrade
+```
+try {
+      status := "stopping";
+      await Canister.CanisterUtils().stopCanister(canister);
+      status := "installing";
+      await Canister.CanisterUtils().installCode(canister, arg, wasm);
+      status := "starting";
+      await Canister.CanisterUtils().startCanister(canister);
+      status := "success";
+  } catch (e) {
+      await Canister.CanisterUtils().startCanister(canister);
+      status := Error.message(e);
+  };
+},
+```
+
+```
+public func stopCanister(canisterId: Principal): async () {
+    await ic.stop_canister({ canister_id = canisterId });
+};
+
+public func startCanister(canisterId: Principal): async () {
+    await ic.start_canister({ canister_id = canisterId });
+};
+
+public func installCode(canisterId: Principal, arg: Blob, wasmModule: Blob): async() {
+    await ic.install_code({
+        arg = arg;
+        wasm_module = wasmModule;
+        mode = #upgrade;
+        canister_id = canisterId;
+    });
+};
+```
+DFX Version 0.20.1
+
+The canister that is attempting to make the upgrade is a controller of the canister that it is trying to upgrade. I also tried deleting and creating a new canister but the error persist.
+
+The logic I am using above has worked for multiple other projects so I'm not sure what the issue is
+
+-------------------------
+
+berestovskyy | 2024-06-02 19:20:09 UTC | #2
+
+[quote="AlliDoizCode, post:1, topic:31486"]
+`unsupported canister module format"`
+[/quote]
+
+The error comes from [here](https://github.com/dfinity/ic/blob/4fd4484020819ece99a1ef5b6612c245c7f6b83d/rs/embedders/src/wasm_utils/decoding.rs#L56). Seems, it's not about the install code logic, but just the Wasm file is invalid?
+
+-------------------------
+
+AlliDoizCode | 2024-06-02 22:45:12 UTC | #3
+
+The wasm was created from a motoko project and I don't think I'm using gzip.
+
+dfx.json below
+
+```
+{
+    "canisters": {
+        "treasury": {
+            "main": "src/stacked_dao_backend/treasury/main.mo",
+            "type": "motoko"
+        },
+        "governance": {
+            "main": "src/stacked_dao_backend/governance/main.mo",
+            "type": "motoko"
+        },
+        "upgrader": {
+            "main": "src/stacked_dao_backend/upgrader/main.mo",
+            "type": "motoko"
+        }
+    },
+    "networks": {
+        "development": {
+            "providers": ["https://icp0.io"],
+            "type": "persistent"
+        },
+        "staging": {
+            "providers": ["https://icp0.io"],
+            "type": "persistent"
+        }
+    },
+    "defaults": {
+        "build": {
+            "args": "",
+            "packtool": "mops sources"
+        }
+    },
+    "output_env_file": ".env",
+    "version": 1
+}
+
+```
+
+-------------------------
+
+skilesare | 2024-06-03 02:47:10 UTC | #4
+
+Maybe you should try specifically using gzip? I think it is the default now(although old stuff shouldn't break)
+
+-------------------------
+
+berestovskyy | 2024-06-03 07:59:21 UTC | #5
+
+From the replica code, it's just the beginning of the Wasm file should start with either `\x00asm` or `\x1f\x8b\x08`.
+
+You could probably just manually check if the Wasm you're installing starts with one of those signatures. Something like:
+
+```
+find . -name '*.wasm'
+xxd <Wasm file> | head -1
+```
+
+-------------------------
+
+AlliDoizCode | 2024-06-03 12:15:07 UTC | #6
+
+```bash
+jonathangreen@Jonathans-Mac-mini Uploader % xxd ./governance.wasm | head -1
+00000000: 0061 736d 0100 0000 01cc 011f 6000 0060  .asm........`..`
+jonathangreen@Jonathans-Mac-mini Uploader % gzip ./governance.wasm      
+jonathangreen@Jonathans-Mac-mini Uploader % xxd ./governance.wasm.gz | head -1
+00000000: 1f8b 0808 a100 5d66 0003 676f 7665 726e  ......]f..govern
+```
+
+Here is the output before and after using gzip
+
+Both still give me the same error when I try to install them programmatically. This is the wasm file generated from both the `dfx deploy` and `dfx build` commands and when using the `dfx deploy` command it installs fine. The upload logic and install logic I am using are from pervious projects that worked, namely TheRegistry, CigDao v1 and the original implementation of CanDB
+
+-------------------------
+
+PanIndustrial | 2024-06-03 12:50:02 UTC | #7
+
+Does it work locally?
+
+-------------------------
+
+AlliDoizCode | 2024-06-04 01:02:09 UTC | #8
+
+The issue persist locally
+
+-------------------------
+
+berestovskyy | 2024-06-05 08:43:29 UTC | #9
+
+[quote="AlliDoizCode, post:1, topic:31486"]
+`await Canister.CanisterUtils().installCode(canister, arg, wasm);`
+[/quote]
+
+Then probably we should make sure the `wasm` we pass here still starts with those signatures? If it reproduces locally, we can just dump the first few bytes on the console.
+
+There is an error somewhere, we just need to keep looking...
+
+-------------------------
+
+AlliDoizCode | 2024-06-05 11:04:45 UTC | #10
+
+dfx deploy works and I'm using the same wasm generated from that so seems like it has something to so with how dfx is building the wasm
+
+-------------------------
+
+berestovskyy | 2024-06-05 17:34:16 UTC | #11
+
+I'd really focus on making sure that the Wasm binary stored in the admin canister is valid. The `unsupported canister module format` error is really about Wasm binary signature.
+
+-------------------------
+
+AlliDoizCode | 2024-06-06 18:55:51 UTC | #12
+
+How would I do that and why wouldn't it be invalid when the same wasm deploys successfully when using `dfx deploy`
+
+-------------------------
+
+skilesare | 2024-06-06 19:13:46 UTC | #13
+
+As a start, debug.print the size of the wasm before you send it off and make sure it matches what is on disc.  If they are the same, slice the first few bytes and last few bytes and make sure they match.
+
+let x = Blob.toArray(wasm);
+let xsize = wasm.size();
+Debug.print(debug_show(xsize);
+Debug.print(debug_show((x[0],x[1],x[2],x[3]));
+Debug.print(debug_show((x[xsize-4],x[xsize-3],x[x-2],x[x-1]));
+
+-------------------------
+

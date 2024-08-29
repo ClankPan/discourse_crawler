@@ -1,0 +1,512 @@
+skilesare | 2022-12-29 13:59:45 UTC | #103
+
+
+Question 1: This may be a dumb question, but I can set many timers correct?
+
+```
+let timer1 = setTimer( 365 * 24 * 60* 60 *1000000000, sayHappyAnniversary);
+let timer2 = setTimer( 365 * 24 * 60* 60 *1000000000 * 25 , sayHappySilverAnniversary);
+```
+
+Question 2: Do the timers persist across upgrades?  If yes, what happens if you take the function out of your class?
+
+Question 3: Would there be any benefit to having an async* pathway here?
+
+-------------------------
+
+Iceypee | 2022-12-29 17:59:06 UTC | #104
+
+I think its this sentence but I thought it was in a more clearer wording in the docs. https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/heartbeats
+![image|690x60](upload://qzonVonZjNe749Jz4JBLNfCmgQe.png)
+
+Also, I discussed this in this post https://forum.dfinity.org/t/question-regarding-timing-of-intercanister-update-calls-during-heartbeat/12872/2?u=iceypee
+
+-------------------------
+
+ZhenyaUsenko | 2022-12-29 19:10:18 UTC | #105
+
+[quote="skilesare, post:103, topic:14201"]
+Question 3: Would there be any benefit to having an async* pathway here?
+[/quote]
+
+It was mentioned in the description here
+https://github.com/dfinity/motoko/pull/3542#:~:text=Open-,question,-(s)
+
+-------------------------
+
+ggreif | 2022-12-29 23:48:50 UTC | #106
+
+Q1: yes
+Q2: no persistence, you have to set up your timers in `post_upgrade` (this is explained in PR 3542)
+Q3: yes, there is an issue for that
+
+-------------------------
+
+ggreif | 2022-12-29 23:53:23 UTC | #107
+
+[quote="Iceypee, post:104, topic:14201"]
+I think its this sentence but I thought it was in a more clearer wording in the docs.
+[/quote]
+
+This only means that the heartbeat system function is invoked via `await`, which adds some lag. But there is no blockage. @claudio how to explain this better?
+
+-------------------------
+
+mparikh | 2022-12-30 03:38:51 UTC | #108
+
+What is also interesting is that, apparently,  you cannot clear_timer out of the target function. 
+
+So in my use case of providing streaming **local** backups of memory managed stable stores, i have to launch another timer to cancel the timer (timer interval) of the main function that preps the backup.
+
+-------------------------
+
+berestovskyy | 2022-12-30 23:12:41 UTC | #109
+
+[quote="mparikh, post:108, topic:14201"]
+What is also interesting is that, apparently, you cannot clear_timer out of the target function.
+[/quote]
+You mean the function call has no effect, or it's about passing `timer_id` around?
+
+-------------------------
+
+mparikh | 2022-12-31 08:18:18 UTC | #110
+
+In general, a function that knows when to end it's own timer_interval (and has access to the timer_id that does this time_interval triggering) but needs to execute for more than the cycle execution limit, it should be able to end it's own time interval (at least logically). 
+
+Specifically , assuming thread_local'd BCK_COUNTER and BCK_TIMER
+```
+async fn start_bck_up()  {
+    let bck_counter =  BCK_COUNTER.with(|refcell| *&*refcell.borrow());
+    if bck_counter == 2 {
+        BCK_TIMER.with( |refcell| {
+            let timer_id = &mut *refcell.borrow_mut();
+            ic_cdk::timer::clear_timer(*timer_id); 
+        });
+    }
+    BCK_COUNTER.with(move |refcell| {
+        refcell.replace(bck_counter + 1);
+    });
+    ic_cdk::println!("Called start_bck ONCE !!");
+}
+```
+should ideally work. However this, while it compiles, produces a run-time panic. 
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Panicked at 'called `Option::unwrap()` on a `None` value', /home/user1/.cargo/registry/src/github.com-1ecc6299db9ec823/ic-cdk-0.6.8/src/timer.rs:230:73
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] in canister_global_timer: CanisterError: IC0503: Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped explicitly: Panicked at 'called `Option::unwrap()` on a `None` value', /home/user1/.cargo/registry/src/github.com-1ecc6299db9ec823/ic-cdk-0.6.8/src/timer.rs:230:73
+```
+My workaround is to have another timer chase this timer_interval (because this function executes in finite and roughly constant clock time) and the clear it from that timer function.
+
+```
+async fn stop_bck_up() {
+
+    let bck_counter = BCK_COUNTER.with(|refcell|  *&*refcell.borrow());
+
+    if bck_counter > 2 {
+
+        ic_cdk::println!("Now stopping counter at ... {}", bck_counter);
+        BCK_TIMER.with( |refcell| {
+            let timer_id = &mut *refcell.borrow_mut();
+            ic_cdk::timer::clear_timer(*timer_id); 
+        });
+    }
+
+}
+
+```
+
+-------------------------
+
+berestovskyy | 2022-12-31 21:51:05 UTC | #111
+
+[quote="mparikh, post:110, topic:14201"]
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Panicked at 'called `Option::unwrap()` on a `None` value', /home/user1/.cargo/registry/src/github.com-1ecc6299db9ec823/ic-cdk-0.6.8/src/timer.rs:230:73
+[/quote]
+
+In this line we unconditionally set the swapped out task back, while it might have been removed by the `func()`:
+
+```
+            Task::Repeated { ref mut func, .. } => {
+                func();
+                TASKS.with(|tasks| *tasks.borrow_mut().get_mut(task_id).unwrap() = task);
+            }
+```
+
+Seems, we should check if the `task_id` is still present in the tasks. We will fix it, mparikh, thanks for reporting.
+
+-------------------------
+
+berestovskyy | 2022-12-31 22:07:56 UTC | #112
+
+It's great to enter 2023 with working timers both in Rust and Motoko. Very good job @AdamS, @lwshang, @ggreif, @claudio, @mraszyk and everyone involved!
+
+We've captured already some feedback, we're on it. If you have a suggestion, it's never too late to share it in this thread.
+
+Happy new year everyone! See you all in 2023!
+
+-------------------------
+
+ZhenyaUsenko | 2023-01-01 12:48:47 UTC | #113
+
+Regarding recurring timers. What happens if a job takes more time than a delay? Will the 2nd job start executing before the 1st one finishes? Or... Will the 2nd job start executing right after the 1st one finishes? Or... Will the delay still be awaited after the 1st job finishes?
+
+-------------------------
+
+berestovskyy | 2023-01-02 22:08:50 UTC | #114
+
+In short, "normal" async rules apply. Other executions might start only in the `await` points of the 1st job.
+
+If the 1st job is a long execution (i.e. continuous execution of WASM instructions longer than one round, no `await`s), no 2nd job (or any other execution) might start until the long execution is finished.
+
+If the 1st job `await`s for a call to complete, any other execution might start at this point, including timers, inter-canister calls or ingress messages.
+
+-------------------------
+
+berestovskyy | 2023-01-10 16:21:17 UTC | #115
+
+Hoi everyone,
+It seems we have quite some differences across Motoko and Rust CDKs.
+
+Motoko CDK provides timers feature opt-out flag `-no-timer` and the following API:
+
+* `setTimer : (Duration, () -> async ()) -> TimerId`
+* `recurringTimer : (Duration, () -> async ()) -> TimerId `
+* `cancelTimer : TimerId -> ()`
+
+In Rust CDK the `timers` feature should be explicitly enabled and the following API is implemented:
+
+* `set_timer(delay: Duration, func: FnOnce()) -> TimerId`
+* `set_timer_interval(interval: Duration, func: FnMut()) -> TimerId`
+* `clear_timer(id: TimerId)`
+
+What do you think guys of unifying somehow the flags and the API @ggreif @claudio @AdamS @lwshang
+
+-------------------------
+
+h1teshtr1path1 | 2023-01-12 08:14:18 UTC | #116
+
+I am getting this same error. Please, can anyone help?
+
+-------------------------
+
+ggreif | 2023-01-12 14:57:26 UTC | #117
+
+First thing to make sure is that you have `moc` 0.7.5 installed, and `dfx` does access it.
+
+-------------------------
+
+rabbithole | 2023-01-12 10:59:32 UTC | #120
+
+I used prefix `DFX_MOC_PATH="$(vessel bin)/moc"` before command like:
+
+`DFX_MOC_PATH="$(vessel bin)/moc" dfx build <canister_name>`
+
+-------------------------
+
+Iceypee | 2023-01-16 23:54:24 UTC | #122
+
+is there some tutorial or reading on moc? I kinda found out where it is and how to use it but not really. And how to upgrade it is as well?
+
+-------------------------
+
+h1teshtr1path1 | 2023-01-17 04:15:37 UTC | #123
+
+I think MOC used in dfx gets upgraded with dfx upgrade automatically, and dfx 0.12.1 do not use moc 0.7.5. So to use specific version, you can specify compiler version in vessel bin (vessel.dhall), and then use it for dfx build, using below command :
+```
+DFX_MOC_PATH="$(vessel bin)/moc" dfx build <canister_name>
+```
+
+-------------------------
+
+berestovskyy | 2023-01-17 08:39:12 UTC | #124
+
+Hopefully, the new `dfx` release will be out soon, so we won't need to hassle with the `vessel`...
+
+-------------------------
+
+Iceypee | 2023-01-17 10:04:33 UTC | #125
+
+I get this
+![image|690x248](upload://A2ZQwvYr2UUl5vg7YZZzaYCgXjE.png)
+
+-------------------------
+
+h1teshtr1path1 | 2023-01-17 12:27:51 UTC | #126
+
+I can see you are using 0.6.2 version, change it to 0.7.5 in vessel.dhall file.
+
+-------------------------
+
+Iceypee | 2023-01-17 12:32:23 UTC | #127
+
+@h1teshtr1path1 
+Error: Failed to download Motoko binaries for version 0.7.5, with "403 Forbidden"
+
+Details: <?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>VBR4JNP82AWKXBW6</RequestId><HostId>SGSGkPB1HNWrn68r8vsVaUlKID562wMHUeiIaUF59OhcuJASiTED8j7wqtfGfTCAE7kjGTidt3s=</HostId></Error>
+I get this
+
+
+this is my packageset as well
+![image|690x294](upload://185xLA3Ba3Hmq6ogS7d5wJVcuSY.png)
+
+and the other file 
+![image|564x238](upload://6y8XsTkColTJFZkzC0Yi7bN7WHy.png)
+
+-------------------------
+
+berestovskyy | 2023-01-20 09:37:21 UTC | #128
+
+[quote="mparikh, post:110, topic:14201"]
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Panicked at 'called `Option::unwrap()` on a `None` value', /home/user1/.cargo/registry/src/github.com-1ecc6299db9ec823/ic-cdk-0.6.8/src/timer.rs:230:73
+```
+[/quote]
+
+Should be fixed in the just released ic-cdk v0.6.9, i.e. periodic timers can now cancel themselves.
+
+-------------------------
+
+berestovskyy | 2023-01-20 09:57:21 UTC | #129
+
+[quote="Iceypee, post:127, topic:14201"]
+Error: Failed to download Motoko binaries for version 0.7.5, with “403 Forbidden”
+[/quote]
+
+Sorry, I'm not an expert in Motoko, maybe @ggreif could provide more details here?
+
+But I really suggest you to wait for the official `dfx` release. The release is being a bit delayed due to a critical issue. But hopefully it will be resolved soon and released. I'll keep you updated.
+
+-------------------------
+
+ggreif | 2023-01-21 00:53:12 UTC | #130
+
+@rvanasa you just happened to release for 0.7.5 and 0.7.6, should folks just retry?
+
+-------------------------
+
+rvanasa | 2023-01-21 06:11:05 UTC | #131
+
+Yep! The official `vessel` package-set is now updated to 0.7.6. 
+
+As a quick debugging step for anyone running into issues, try removing everything in your `package-set.dhall` file and then pasting the following link:
+
+```dhall
+https://github.com/dfinity/vessel-package-set/releases/download/mo-0.7.6-20230120/package-set.dhall
+```
+
+This will configure your project to use the latest official package-set without any overrides or modifications.
+
+As the new maintainer for `vessel`, I will do my best to make this process a lot simpler in the near future. Please feel free to [submit an issue on GitHub](https://github.com/dfinity/vessel/issues) if you run into any problems, since we are actively collecting feedback for a possible top-down redesign of the package manager with a focus on improving UX and scalability.
+
+-------------------------
+
+ZhenyaUsenko | 2023-01-22 15:37:33 UTC | #132
+
+Looks like I cannot use **this** inside a timer job function if the timer is set inside an actor class body. Is there a reason for this? The compiler tells me "cannot use this before this has been defined" but it seems like **this** should already be defined at the point when a timer job is run.
+
+-------------------------
+
+ggreif | 2023-01-23 11:16:17 UTC | #133
+
+[quote="ZhenyaUsenko, post:132, topic:14201"]
+cannot use this before this has been defined
+[/quote]
+
+Giving us a glimpse at the code would help. I have seen such an error and the solution was to move a function around. Maybe this helps :-\
+
+-------------------------
+
+ZhenyaUsenko | 2023-01-23 10:57:08 UTC | #134
+
+![image|690x314](upload://vfzBotE3IDIAxoiPyIMWZdl9Mcr.png)
+
+If I place it inside postupgrade hook, it works. But I would need something like postinstall instead.
+
+-------------------------
+
+ggreif | 2023-01-23 12:46:56 UTC | #135
+
+[quote="ZhenyaUsenko, post:134, topic:14201"]
+If I place it inside postupgrade hook, it works. But I would need something like postinstall instead.
+[/quote]
+
+@claudio and I are discussing this. Can you separate out the third argument to the call to `setTimer` to become a private actor method?
+
+(Claudio started https://github.com/dfinity/motoko/issues/3718 for this issue.)
+
+-------------------------
+
+ZhenyaUsenko | 2023-01-23 14:54:49 UTC | #136
+
+[quote="ggreif, post:135, topic:14201"]
+Can you separate out the third argument to the call to `setTimer` to become a private actor method?
+[/quote]
+
+It doesn't work either.
+
+![image|690x321](upload://iNSGNKUAvXq4BYjAYWmDktUs4lX.png)
+
+-------------------------
+
+ggreif | 2023-01-25 17:45:11 UTC | #137
+
+[quote="ZhenyaUsenko, post:136, topic:14201"]
+It doesn’t work either.
+[/quote]
+
+Then (in the meantime) I suggest to have an actor-level `var` to hold a `?Principal` and initialise that at some convenient place. Then use it from your timed action.
+
+-------------------------
+
+ggreif | 2023-02-09 01:08:18 UTC | #138
+
+Quick update. There is a `dfx` version that contains `moc` v0.7.6:
+```
+DFX_VERSION=0.13.0 sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+```
+Have fun!
+
+-------------------------
+
+GLdev | 2023-01-27 17:41:54 UTC | #139
+
+Heads-up on timers: Each timer call takes a slot in your canister's message queue, and they will fail when you reach the limit.
+
+```
+[Canister ryjl3-tyaaa-aaaaa-aaaba-cai] in canister_global_timer: SysTransient: Maximum queue capacity 500 reached
+```
+
+Found this out while trying to max out the output queues with Notify calls. It looks like you'd need to have a "watchdog" timer if you want to dynamically add timers based on received calls. Designing around this seems tricky.
+
+Question for Dfinity folks: is there a way for a canister to check the current size of the queue?
+
+-------------------------
+
+berestovskyy | 2023-01-27 19:14:56 UTC | #140
+
+Timers library tries to call, and the call fails. Not sure how knowing the queue size would help here...
+
+Instead, we can think of improving the call error handling. At the moment we just log the error: https://github.com/dfinity/cdk-rs/blob/main/src/ic-cdk/src/timer.rs#L108
+
+What do you think would be a better approach?
+
+-------------------------
+
+GLdev | 2023-01-28 10:05:11 UTC | #141
+
+Oh, I think I see what you mean. I was calling notify from a closure passed to the timer so this would have been the err caught on the line you linked. Let me try passing a fn that actually checks if the notify succeeds and re-adds it as a timer if it fails. I'll report back.
+
+Thanks for the prompt answer!
+
+-------------------------
+
+GLdev | 2023-01-30 16:02:06 UTC | #142
+
+Something weird is happening with timers when reaching the "Maximum queue capacity 500 reached" error. I've uploaded a minimum repro case here: https://github.com/GLicDEV/test_timers
+
+Calling testTimers(1) produces the expected results:
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 0 - Added a timer with timer_id: TimerId(4v3)
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 0 - Got called from timer!
+```
+
+The same for testTimers(499) - although this might need a ``` dfx canister deposit-cycles 10000000000000 test_timers_backend ``` to cover the cycles needed.
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 0 - Added a timer with timer_id: TimerId(8v5)
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 1 - Added a timer with timer_id: TimerId(2v5)
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 2 - Added a timer with timer_id: TimerId(6v5)
+
+*snip*
+
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 497 - Added a timer with timer_id: TimerId(7v3)
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 498 - Added a timer with timer_id: TimerId(3v3)
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 0 - Got called from timer!
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 2 - Got called from timer!
+
+*snip*
+
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 1 - Got called from timer!
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 3 - Got called from timer!
+```
+
+(ordering not relevant, but all timers get called from 0 to 498)
+
+However calling testTimers(500)+ does this:
+
+(+dfx canister deposit-cycles 10000000000000 test_timers_backend)
+
+```
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 0 - Added a timer with timer_id: TimerId(1v1)
+
+*snip*
+
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Iteration: 499 - Added a timer with timer_id: TimerId(500v1)
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] in canister_global_timer: SysTransient: Maximum queue capacity 500 reached
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] in canister_global_timer: SysTransient: Maximum queue capacity 500 reached
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] in canister_global_timer: SysTransient: Maximum queue capacity 500 reached
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] in canister_global_timer: SysTransient: Maximum queue capacity 500 reached
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] in canister_global_timer: SysTransient: Maximum queue capacity 500 reached
+
+```
+
+None of the 500 timers get to the call_from_timer fn.
+
+Changing the line where I add timers to ```ic_cdk::timer::set_timer(Duration::new(i as u64, 0), move || call_from_timer(i));``` works, as 1-2 timers will be called each round over the next 500 seconds. 
+
+Looking through the code it seems that on [this line](https://github.com/dfinity/cdk-rs/blob/70ecd3486563668a64b417e33b8ffb9ffa2073c4/src/ic-cdk/src/timer.rs#L104) there's a While{}. Do you think it would be prudent to add some bounds to that so that it doesn't attempt to process more tasks than it can? Or break at the first error and re-attempt them in a later round? One would expect that at least *some* timers should be executed, even if not *all* of them can be.
+
+-------------------------
+
+berestovskyy | 2023-01-31 14:58:38 UTC | #143
+
+I think there are bugs, thanks for reporting.
+
+The fix is on its way: https://github.com/dfinity/cdk-rs/pull/366
+
+-------------------------
+
+berestovskyy | 2023-03-06 08:39:35 UTC | #144
+
+hey folks,
+We have a new Rust example comparing timers vs heartbeats: https://github.com/dfinity/examples/tree/master/rust/periodic_tasks
+
+Please let me know If you see any typos/bugs or if something needs to be explained better.
+
+-------------------------
+
+berestovskyy | 2023-03-09 13:29:01 UTC | #145
+
+The timers documentation is complete:
+
+1. Developer Guide: Backend: [Periodic Tasks and Timers](https://internetcomputer.org/docs/current/developer-docs/backend/periodic-tasks)
+   The language agnostic description of timers and heartbeats. Probably, the most important section is [Timers Library Limitations](https://internetcomputer.org/docs/current/developer-docs/backend/periodic-tasks#timers-library-limitations), please check it out.
+
+2. For Motoko: Motoko Developer Guide: [Timers](https://internetcomputer.org/docs/current/motoko/main/timers)
+
+3. For Rust: Developer Guide: Backend: Rust: [Using Timers](https://internetcomputer.org/docs/current/developer-docs/backend/rust/timers) tutorial
+
+Please let me know if we're missing something.
+
+-------------------------
+
+NS01 | 2023-08-21 08:47:50 UTC | #146
+
+Quick question - Does setting or cancelling a timer have a cycles cost? I'm aware that the timer calling it's task does.
+
+-------------------------
+
+berestovskyy | 2023-08-21 13:30:48 UTC | #147
+
+There is no fee associated with timer setting/cancelling. It's rather is a normal Canister execution (there are libraries for Motoko and Rust), so each library call takes some (rather tiny) amount of Instructions.
+
+The precise number of Instructions depend on the language, library version, compilation options etc. There is a performance counter to measure precisely the number of Instructions consumed by a Canister code snippet.
+
+Note, there is an update message execution fee on IC, which is 590K cycles, and timer execution is an update message. But setting/cancelling the timer is just a few Instructions, there is no fee for that...
+
+Here is the list of the IC fees for the reference: https://internetcomputer.org/docs/current/developer-docs/gas-cost
+
+-------------------------
+

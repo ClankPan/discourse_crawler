@@ -1,0 +1,578 @@
+jonit | 2022-06-15 13:50:16 UTC | #1
+
+We have an issue with a canister containing NFT's it is eating through cycles like no tomorrow. 2T an hour. We notice that even though we loaded around 1.2 GB of assets the canister size is hitting 4 BG.
+
+Canister is t2mog-myaaa-aaaal-aas7q-cai. What are we doing wrong?
+
+-------------------------
+
+domwoe | 2022-06-15 14:18:10 UTC | #2
+
+that seems off. Given the storage cost per GB per second from https://internetcomputer.org/docs/current/developer-docs/deploy/computation-and-storage-costs = 127,000 cycles, you should have a burn rate of around 0.002T cycles/hour (if I calculated correctly ;) )
+
+Is your code public?
+
+-------------------------
+
+domwoe | 2022-06-15 14:23:02 UTC | #3
+
+Just looked at your canister on icscan: https://icscan.io/canister/t2mog-myaaa-aaaal-aas7q-cai
+Seems you're using the heartbeat. This is most probably the main source of your cost.
+
+Have a look at this related forum post: https://forum.dfinity.org/t/cycle-burn-rate-heartbeat/12090/45
+
+-------------------------
+
+jonit | 2022-06-15 14:26:41 UTC | #4
+
+yep the dev is looking at that, but even taking that into account the whole of entrepot is burning 65T a day , our burn seem's way off.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 16:43:49 UTC | #5
+
+Hi @domwoe I maintain the canister. The code is not public but I will make it public when I get back to my laptop. 
+
+We are using the same code as @bob11 but are seeing a much higher burn rate.
+
+.5T cycles/day vs. 1T cycles/hour [correction: 2T per hour]
+
+I recently upgraded the canister to include some log/monitor methods and that’s when we noticed it was reporting a memory size of 4GB. It’s my understanding that canisters have a strict 4GB memory limit so I was thinking that might be contributing to the increased burn rate somehow.
+
+As @jonit mentioned, we uploaded our assets (jpegs) directly to the canister. We aren’t using an asset canister at the moment. This collection of images only totaled 1.3GB in size but the canister is about 3x that size.
+
+One last piece of context; after a deployment our canister will eventually enter a state in which it can’t be upgraded. This usually happens right around the time heap memory hits 2GB. Regular method calls still work (transfer, list, settle, etc.) but no upgrade and no ability to stop the canister (it hangs in a “stopping” state). We can only resolve this by raising the freezing threshold to the point the canister stops; then we lower it again and deploy/start the canister. This brings it back to a state where the heap is at 1GB and upgrades are successful
+
+-------------------------
+
+LightningLad91 | 2022-06-15 17:50:10 UTC | #6
+
+I've uploaded our canister code here: https://github.com/lightninglad91/PetBots/blob/main/main.mo
+
+-------------------------
+
+domwoe | 2022-06-15 19:26:46 UTC | #7
+
+Thanks!
+
+There is no non-linear increase in (storage) costs when you get close to the 4 GB limit.
+
+I don't know if there are Garbage Collector related costs that might be relevant here.
+
+One thing I noticed:
+You might have multiple xnet inter-canister calls (ledger, cap) in your heartbeat which could open a lot of call contexts, in particular if the callee needs time to respond because it is busy. I think (and I might be wrong) that these call contexts are also stored on your available heap.
+
+[quote="LightningLad91, post:5, topic:13813"]
+One last piece of context; after a deployment our canister will eventually enter a state in which it can’t be upgraded. This usually happens right around the time heap memory hits 2GB.
+[/quote]
+
+Do you hit the cycle limit in the preupgrade hook or do you get another error?
+
+-------------------------
+
+LightningLad91 | 2022-06-15 19:45:47 UTC | #9
+
+[quote="domwoe, post:7, topic:13813"]
+There is no non-linear increase in (storage) costs when you get close to the 4 GB limit.
+[/quote]
+
+I must have misread this the first time, i thought you were saying there is a non-linear storage cost. That is unfortunate, i was hoping it would be something obvious like that :slight_smile: 
+
+Do you have an idea for why the canister is so large when the assets on disk are a 1/3 of the size?
+
+
+Thank you for pointing out the xnet inter-canister calls. I will keep this in mind as I continue troubleshooting the issue. One of the things I want to test out is reducing the frequency of these calls.
+
+[quote="domwoe, post:7, topic:13813"]
+Do you hit the cycle limit in the preupgrade hook or do you get another error?
+[/quote]
+
+I don't have the exact error on-hand, but I believe it was something along the lines of "the canister_pre_upgrade attempted with outstanding message callbacks (please stop the canister and attempt the upgrade again)"
+
+-------------------------
+
+domwoe | 2022-06-15 19:51:50 UTC | #10
+
+[quote="LightningLad91, post:9, topic:13813"]
+I must have misread this the first time, i thought you were saying there is a non-linear storage cost.
+[/quote]
+
+Sorry, forgot the "no" and edited it back in afterwards :grimacing:
+
+[quote="LightningLad91, post:9, topic:13813"]
+Do you have an idea for why the canister is so large when the assets on disk are a 1/3 of the size?
+[/quote]
+
+I'm not sure:
+* You're storing the assets in an array of a complex type. Don't know the overhead here
+* You maintain other data structures. Don't know how big they are.
+* The open call contexts (although don't think this is soo much. Is the memory usage essentially constant or does it fluctuate/increase ?)
+
+[quote="LightningLad91, post:9, topic:13813"]
+I don’t have the exact error on-hand, but I believe it was something along the lines of “the canister_pre_upgrade attempted with outstanding message callbacks (please stop the canister and attempt the upgrade again)”
+[/quote]
+
+Yep, this is most probably because of the open calls in the heartbeat. You can't upgrade before all calls got a response. That's why you need to stop the canister first.
+
+-------------------------
+
+PaulLiu | 2022-06-15 19:52:14 UTC | #11
+
+Another point to consider is that `HashMap` should be strongly discouraged to manage large set of data. If it has to go through rehashing of keys, it will eat through A LOT OF cycles.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 20:01:28 UTC | #12
+
+@domwoe @PaulLiu thank you both. You've given me a lot to consider. I will work towards a solution that attempts to address these points.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 20:06:31 UTC | #13
+
+[quote="domwoe, post:10, topic:13813"]
+Is the memory usage essentially constant or does it fluctuate/increase ?
+[/quote]
+
+The "memory" as reported by the CanisterGeek interface is constant at 4GB. The "heap memory" starts out at 1GB after an upgrade, fluctuates between 1GB & 2GB for a bit, and then it holds steady at 2GB.
+
+(quotes are intended to convey that I'm not familiar enough with the terms to understand the difference in this context)
+
+-------------------------
+
+domwoe | 2022-06-15 20:19:56 UTC | #14
+
+[quote="LightningLad91, post:13, topic:13813"]
+The “memory” as reported by the CanisterGeek interface is constant at 4GB. The “heap memory” starts out at 1GB after an upgrade, fluctuates between 1GB & 2GB for a bit, and then it holds steady at 2GB.
+
+(quotes are intended to convey that I’m not familiar enough with the terms to understand the difference in this context)
+[/quote]
+
+There's a thread that provides some explanation: https://forum.dfinity.org/t/motoko-array-memory/5324/1
+
+This brings up also the issue with `Array.append()` which you're also using extensively :)
+
+-------------------------
+
+claudio | 2022-06-15 20:23:19 UTC | #15
+
+Are you storing any large binary assets as `[Nat8]` rather than `Blob`? That would take 4x space and stress the GC.
+
+-------------------------
+
+claudio | 2022-06-15 20:28:21 UTC | #16
+
+Also, which version of dfx or motoko are you using. We have optimized the memory requirements of upgrades. These used to take up to 2x space during upgrade (to serialize stable variables into ordinary memory before copying them stable memory). The new releases serialise directly to stable memory in a streaming fashion.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 20:48:54 UTC | #17
+
+I believe I am using 0.10.0. Can't remember if I pulled the latest update yet.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 20:59:26 UTC | #18
+
+This could be it!
+
+I am using the [ic-py](https://github.com/rocklabs-io/ic-py/tree/main/examples)  python agent to call the 'addAsset' method. The 'asset' type defined in the canister expects a 'blob' entry but the ic-py agent doesn't provide a 'blob' type so i had to structure it as 'vec vec nat8'.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 20:55:39 UTC | #19
+
+Thank you for the reference
+
+[quote="domwoe, post:14, topic:13813"]
+This brings up also the issue with `Array.append()` which you’re also using extensively
+[/quote]
+
+This is on my to-do list :smiley:
+
+-------------------------
+
+domwoe | 2022-06-15 20:59:52 UTC | #20
+
+hmm.. given this code:
+
+```
+type File = {
+    ctype : Text;//"image/jpeg"
+    data : [Blob];
+};
+
+type Asset = {
+    name : Text;
+    thumbnail : ?File;
+    payload : File;
+};
+```
+I don't think that's the issue ?!
+
+-------------------------
+
+LightningLad91 | 2022-06-15 21:14:30 UTC | #21
+
+Ok. So it would just be the type that is defined in the code that matters?
+
+-------------------------
+
+claudio | 2022-06-15 21:22:23 UTC | #22
+
+Yeah, I looked at the code for [Nat8] and found just one, probably harmless one.
+
+I strongly suspect the aggressive heartbeat creating lots of call context is a big culprit and also preventing upgrades by always opening up new call contexts and causing callbacks to be stored on the heap, as suggested above.
+
+Can you just do nothing on most heartbeats bar every nth one and provide a method to stop the heartbeat before an upgrade (if there isn't one already).
+
+Some of the array appends could be replace by more efficient Array.map over a source array, avoiding the quadratic behaviour. Others can be made more efficient by using a Buffer.
+
+I believe TrieMaps are an almost drop-in replacement for the HashMaps that scale better and don't have the rehashing cost of HashMaps. Others have reported big improvements after switch from HashMaps to TrieMaps.
+
+dfx 0.10.0 shipped with Motoko 0.6.26, which doesn't have the streaming implementation of stable variable serialization.
+
+dfx 0.10.1 shipped with Motoko 0.6.28, which does have it (and fixes a bug in TrieMap that might affect you if you swap HashMap for TrieMap).
+
+It might be worth upgrading to dfx 0.10.1 if possible.
+
+-------------------------
+
+claudio | 2022-06-15 21:23:48 UTC | #23
+
+> Ok. So it would just be the type that is defined in the code that matters?
+
+Yes, the choice of Blob or [Nat8] in the Motoko code determines how the Candid vec nat8 is imported. But I guess that isn't actually the issue here.
+
+-------------------------
+
+LightningLad91 | 2022-06-15 21:26:21 UTC | #24
+
+[quote="claudio, post:22, topic:13813"]
+Can you just do nothing on most heartbeats bar every nth one and provide a method to stop the heartbeat before an upgrade (if there isn’t one already).
+[/quote]
+ Yes, that's exactly what I had hoped to test out this evening. I will also follow your other suggestions.
+
+Again, thank you @claudio @domwoe and @PaulLiu. You've all been very helpful and i've learned a lot. I will follow-up with the results of my changes soon.
+
+-------------------------
+
+claudio | 2022-06-15 22:06:09 UTC | #25
+
+One more thing:
+
+Your heartbeat issues some awaits:
+
+```
+system func heartbeat() : async () {
+    if (_pushLog == true){
+      canistergeekLogger.logMessage("heartbeat");
+    };
+    if (_runHeartbeat == true){
+      await cronDisbursements();
+      await cronSettlements();
+      await cronCapEvents();
+    };
+  };
+```
+Depending on you semantics, you might be able to just issue the calls and not await the results:
+
+```
+system func heartbeat() : async () {
+    if (_pushLog == true){
+      canistergeekLogger.logMessage("heartbeat");
+    };
+    if (_runHeartbeat == true){
+      ignore cronDisbursements();
+      ignore cronSettlements();
+      ignore cronCapEvents();
+    };
+  };
+```
+(Or even try declaring the `cronXXX` functions as oneway/fire-forget functions that return `()`, not `async ()` so you can drop the `ignore`s)
+
+-------------------------
+
+matthewhammer | 2022-06-16 03:02:14 UTC | #26
+
+[quote="PaulLiu, post:11, topic:13813, full:true"]
+Another point to consider is that `HashMap` should be strongly discouraged to manage large set of data. If it has to go through rehashing of keys, it will eat through A LOT OF cycles.
+[/quote]
+
++1
+
+It may be worth trying `TrieMap` in place of `HashMap`, which does not seem to suffer from the same issues.  It's (essentially) [the underlying data structure used to save projects on Motoko Playground](https://github.com/dfinity/motoko-playground/blob/8c8b1928d4dcdbdddb4bd864d1b03712048e7509/service/saved/Saved.mo#L22).
+
+In the future, `HashMap` will avoid this rehashing (as `Trie` and `TrieMap` already do), but not in the very short term.  Even when that happens, it still will have a worst-case linear insertion time (when the underlying array has to grow).  So, depending on the use case, it may be better to avoid `HashMap` even in the long term, too.
+
+-------------------------
+
+domwoe | 2022-06-20 11:01:32 UTC | #27
+
+Any updates on this?
+
+-------------------------
+
+jonit | 2022-06-20 11:19:49 UTC | #28
+
+we are still running into issues with large cycles consumption, lightning lad is going to post some information and charts later
+
+-------------------------
+
+LightningLad91 | 2022-06-20 11:22:53 UTC | #29
+
+Thanks @jonit i was about to say the same. I’m at work currently and don’t have access to my laptop.
+
+@domwoe thank you for following up. I will provide a detailed response this evening (it’s early morning for me now)
+
+-------------------------
+
+LightningLad91 | 2022-06-21 14:27:57 UTC | #30
+
+@domwoe apologies for the delay. I wanted to try one more thing before posting. Here is a summary of the changes that were made.
+
+Updated code here: https://github.com/lightninglad91/PetBots/blob/main/main.mo
+
+**Changes Made:**:
+Note: Each change (except for #3) was followed by a series of DFX commands to:
+
+**stop the canister (always timed out) > freeze the canister (raising the freezing_threshold) > thaw the canister > deploy changes > start canister**
+
+
+
+Numbered changes correspond to the numbers in the “Heap Memory” chart below.
+
+1. Heartbeat functions now execute on every 8th round
+
+2. Replaced all instances of HashMap with TrieMap
+
+3. No code change / no deployment - just a freeze and restart to see how heap memory reacted.
+
+3. Reduced the size of each JPEG asset by ~50%.
+
+
+**Pending Changes:**:
+
+* Replacing *Array* types with *Buffer*
+
+![image|671x499](upload://e250Id7OUzpMHP8bO7ftz0wvwv7.jpeg)
+
+Here is a chart that shows the number of update calls that were being made before and after each change.
+
+![image|617x500](upload://lfzFAClLOTSmtwjObYbGKXmCJo9.jpeg)
+
+And finally here is a chart that shows the cycle burn rate during the past week. I’ve tried to circle a few spots that align with periods of time that the heap memory was showing steady linear growth rather than modulating between 1.2GB and 1.8GB. During these steady times the burn rate was almost negligible.
+
+Edit: The chart below reflects the total cycles balance of our canister over a week's time. The spikes in the balance are our attempts to keep the canister from running out of cycles.
+
+![image|595x499](upload://40fuNKeTZZ60UQH9EUbmFVxPDaX.jpeg)
+
+
+I did notice that, based on my logged events, the heap memory would start modulating right around the time that a *settle* call was made.
+
+-------------------------
+
+GLdev | 2022-06-21 13:18:21 UTC | #31
+
+Doing a lot of people a lot of favors with sharing this data, thank you! :infinity:
+
+-------------------------
+
+domwoe | 2022-06-21 14:06:20 UTC | #32
+
+Thanks a lot @LightningLad91 !
+
+[quote="LightningLad91, post:30, topic:13813"]
+And finally here is a chart that shows the cycle burn rate during the past week. I’ve tried to circle a few spots that align with periods of time that the heap memory was showing steady linear growth rather than modulating between 1.2GB and 1.8GB. During these steady times the burn rate was almost negligible.
+[/quote]
+
+What's shown in the Cycles graph exactly? 
+There seems to be no strong correlation with neither heap size nor the number of update calls?!
+
+-------------------------
+
+LightningLad91 | 2022-06-21 14:15:49 UTC | #33
+
+The only correlation I’ve found is that after I go through the steps to deploy the canister the heap memory would go back down to 1.2GB and then steadily increase for a period of time. 
+
+During that period of time the canister was burning cycles at the expected rate of .5T per day. That is why the chart shows a flat line at those times. 
+
+Perhaps the chart is not useful. I was just trying to show that the canister is not burning 2T cycles/hour right after being deployed. It takes a period of time before it starts to burn that fast.
+
+-------------------------
+
+matthewhammer | 2022-06-21 14:14:20 UTC | #34
+
+[quote="PaulLiu, post:11, topic:13813, full:true"]
+Another point to consider is that `HashMap` should be strongly discouraged to manage large set of data. If it has to go through rehashing of keys, it will eat through A LOT OF cycles.
+[/quote]
+
+FWIW, opened a PR to fix this issue here, now:
+https://github.com/dfinity/motoko-base/pull/394/files
+
+-------------------------
+
+domwoe | 2022-06-21 14:17:43 UTC | #35
+
+So what is the unit in the cycles graph? cycles/hour? cycles/day?
+
+-------------------------
+
+LightningLad91 | 2022-06-21 14:25:52 UTC | #36
+
+The graph depicts the total cycles balance of the canister over the past week (6/15 - 6/21). Not the rate of burn. Apologies for not making that clear. The spikes you see are our attempts to keep the canister alive by topping it up. I will update my post to clarify this.
+
+The CanisterGeek method appears to collect the data every 5 minutes.
+
+-------------------------
+
+ggreif | 2022-06-21 14:28:41 UTC | #37
+
+The diff is https://patch-diff.githubusercontent.com/raw/dfinity/motoko-base/pull/394.diff
+
+-------------------------
+
+domwoe | 2022-06-21 15:37:49 UTC | #38
+
+[quote="LightningLad91, post:36, topic:13813, full:true"]
+The graph depicts the total cycles balance of the canister over the past week (6/15 - 6/21). Not the rate of burn. Apologies for not making that clear. The spikes you see are our attempts to keep the canister alive by topping it up. I will update my post to clarify this.
+
+The CanisterGeek method appears to collect the data every 5 minutes.
+[/quote]
+
+Ah, got it :slight_smile: 
+
+[quote="LightningLad91, post:30, topic:13813"]
+I did notice that, based on my logged events, the heap memory would start modulating right around the time that a *settle* call was made.
+[/quote]
+
+Do you know how big the transactions array is?
+
+-------------------------
+
+domwoe | 2022-06-21 15:43:25 UTC | #39
+
+[quote="LightningLad91, post:30, topic:13813"]
+**Pending Changes:**:
+
+* Replacing *Array* types with *Buffer*
+[/quote]
+
+Looking forward to the graphs as soon as you do that :)
+
+-------------------------
+
+LightningLad91 | 2022-06-21 15:59:57 UTC | #40
+
+@domwoe i will work on collecting this data and making that change. Will probably have a response around the same time tomorrow. Thanks!
+
+-------------------------
+
+matthewhammer | 2022-06-21 16:26:27 UTC | #41
+
+[quote="domwoe, post:39, topic:13813, full:true"]
+[quote="LightningLad91, post:30, topic:13813"]
+**Pending Changes:**:
+
+* Replacing *Array* types with *Buffer*
+[/quote]
+
+Looking forward to the graphs as soon as you do that :slight_smile:
+[/quote]
+
++1
+
+Related: https://github.com/dfinity/motoko-base/issues/395
+
+I did not link back to this forum conversation.  But I had it in mind when I wrote that issue just now.  Unfortunately, it's not the only example out in the wild. I think the naming proposal will help future devs.  
+
+But what do others think?  Please comment, either here (or ideally) in Github.
+
+-------------------------
+
+LightningLad91 | 2022-06-21 17:09:56 UTC | #42
+
+Thank you for sharing. Being a new motoko dev I agree that it would be helpful to understand when to use an `Array`. I feel like I should avoid them entirely and always use a `Buffer`, but that's probably incorrect.
+
+Edit: Looking at the [Buffer class](https://internetcomputer.org/docs/current/references/motoko-ref/buffer/) it seems like it is always mutable. So maybe the preference is to use a Buffer until you need to do some operation on a subset of its entries that won't change. In which case I would use Buffer.toArray() to create a fixed size array. Does that sound right?
+
+-------------------------
+
+matthewhammer | 2022-06-21 18:51:38 UTC | #43
+
+[quote="LightningLad91, post:42, topic:13813"]
+So maybe the preference is to use a Buffer until you need to do some operation on a subset of its entries that won’t change. In which case I would use Buffer.toArray() to create a fixed size array. Does that sound right?
+[/quote]
+
+First, on behalf of Motoko the language and ecosystem, I apologize that these design choices are not documented more clearly.
+
+There are roughly two ways that a value of some type could arise in your code  (I say "entry point" for any public method of your actor):
+
+- The value is produced entirely during the activation of some entry point.  It serves some role to answer the query or update request there.
+
+- The value is stored in an actor var (stable or otherwise) and mutated there.  Its data persists between entry points' activation, and generally gets larger and larger over time, with successive activations.
+
+To avoid performance issues related to `Array.append`
+
+- For arrays in the first category, `Array.append` is fine to use, assuming one avoids loops.  This category corresponds to the situation [mentioned here](https://github.com/dfinity/motoko-base/issues/395#issuecomment-1162038941), by @roman-kashitsyn 
+
+- For every value in the second category, use a `Buffer` to store large sequences, not an `Array`. Yes, it is very tempting to use a `stable var` of type array because buffers are not stable, and cannot be stored that way.  However, please resist this temptation **unless** there happens to be a natural bound for the array and it will never grow, just mutate in place.  Since that basically never happens in practice, please use a buffer (stored as a non-stable actor var) to store this data.  (To persist, use the pre and post upgrade hooks to write its data and read its data from some arrays used only in that step.).  Alternatively, [I wrote a tree-based (think "ropes") representation for sequences that **can** be stored directly in stable vars](https://github.com/matthewhammer/candid-spaces/blob/802d352ab8c661cadb60b0e63310c4c5473c339d/motoko/service/CandidSpaces.mo#L31).  It should be worst-case O(log n) time for all insertions, making even better than `Buffer` asymptotically.  However, we have not tested this structure much; it remains experimental, and not yet part of `base`.
+
+If any use case you have is hard to classify into those two situations, let me know.  I'd be happy to help give more details and figure it out.
+
+-------------------------
+
+LightningLad91 | 2022-06-21 20:42:16 UTC | #44
+
+Thank you @matthewhammer, this is  really helpful!
+
+I will follow this guidance while updating the canister and let you know if I run into any difficult decisions.
+
+-------------------------
+
+LightningLad91 | 2022-08-04 13:04:12 UTC | #45
+
+I apologize for taking so long to follow-up on this thread. We solved the problem a while back and I neglected to close the issue (even after @domwoe was kind enough to remind me). I understand this is not good etiquette on a forum like this.
+
+In short, the cycles leak was due to my failure to initialize the Certified Assets Provenance (CAP) service before deploying our NFT canister. During operation, whenever a token was sold or transferred the CAP service would attempt to report that event using the `cronCapEvents` method:
+
+```
+  public shared(msg) func cronCapEvents() : async () {
+    canistergeekMonitor.collectMetrics();
+    logEvent(level_3, "cronCapEvents()");
+    var _cont : Bool = true;
+    while(_cont){
+      var last = List.pop(_capEvents);
+      switch(last.0){
+        case(?event) {
+          _capEvents := last.1;
+          try {
+            ignore await CapService.insert(event);
+          } catch (e) {
+            _capEvents := List.push(event, _capEvents);
+            logEvent(level_2, "CapService Error : cronCapEvents()");
+          };
+        };
+        case(_) {
+          _cont := false;
+        };
+      };
+    };
+  };
+  public shared(msg) func initCap() : async () {
+    canistergeekMonitor.collectMetrics();
+    logEvent(level_1, "initCap()");
+    if (Option.isNull(capRootBucketId)){
+      try {
+        capRootBucketId := await CapService.handshake(Principal.toText(Principal.fromActor(this)), 1_000_000_000_000);
+      } catch e {};
+    };
+  };
+```   
+
+After executing `initCap` we no longer experienced any elevated burn rates and have been running smoothly for about a month now. On average we burn ~0.27T cycles/day.
+
+Thank you to everyone who helped with this. It was a great learning experience.
+
+-------------------------
+

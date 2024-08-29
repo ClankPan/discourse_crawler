@@ -1,0 +1,140 @@
+LiveDuo | 2023-05-25 15:47:29 UTC | #1
+
+### Storing data in Rust canisters
+
+In developing canisters with Rust, there are 3 different options to store data:
+1. [ic-stable-memory](https://github.com/seniorjoinu/ic-stable-memory) with stable memory by @senior.joinu
+2. [ic-stable-structures](https://github.com/dfinity/stable-structures) with stable memory by @ielashi
+3. [the standard Rust library](https://doc.rust-lang.org/std/) with heap memory
+
+### Perks of different options
+
+Playing around with these libraries it became apparent that each one has different pros and cons. For example:
+- There are different encoding schemes for the two external libraries that require different levels of investment to a data structure working
+- One library (ic-stable-structures) does not allow for nested variables (composite keys are suggested instead)
+- The standard Rust library can brick a canister by running out of cycles in pre-upgrade hooks. This has possibly [improve with DTS](https://forum.dfinity.org/t/deterministic-time-slicing/10635) but couldn't verify the exact extent of the problem right now
+- There's different performance for each library which is quite slower than the standard library
+- The ic-stable-structures library is used in a few of Dfinity canisters and [OpenChat](https://github.com/open-ic/open-chat/blob/master/backend/canisters/community/impl/src/lifecycle/post_upgrade.rs) while I couldn't find any project on Github that is building on ic-stable-memory. That's not an issue by itself but there could be different support for one of the two libraries over time
+
+### Data migration questions
+
+But there is one thing that is not clear at all at this point - how do migrations work with the two Rust libraries, `ic-stable-memory` & `ic-stable-structures`.
+
+The `ic-stable-memory` [suggest](https://github.com/seniorjoinu/ic-stable-memory/blob/master/docs/upgradeability.md) to have an enum with struct V1 and struct V2. The `ic-stable-structures` does not have a similar question in there docs but there are some hints from @roman-kashitsyn in https://mmapped.blog/posts/11-ii-stable-memory.html#ii-memory-layout that having extra space in a stable structure might allow future extensions.
+
+So, a few questions:
+1. What the standard way to update an `ic-stable-structures` variable?
+2. Is there a working example of `ic-stable-memory`'s upgrade mechanism with enums?
+3. Is it an anti-pattern to copy the data to a new memory slot and copy them back to a new structure? My understanding so far is that this is the way SQL systems currently work
+4. What the current state of DTS with larger amounts of heap memory?
+
+-------------------------
+
+ielashi | 2023-05-25 09:21:33 UTC | #2
+
+[quote="LiveDuo, post:1, topic:20225"]
+* What the standard way to update an `ic-stable structure` variable?
+[/quote]
+
+Stable structures rely on the [Storable](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/storable/trait.Storable.html) trait to load and store data from and into stable memory. The only requirement when updating the schema is for the implementation of `Storable` to be backward compatible.
+
+Maybe it's best to walk through this with an example. Can you share a share a specific example of a data schema and the change you'd like to make?
+
+[quote="LiveDuo, post:1, topic:20225"]
+* Is it an anti-pattern to copy the data to a new slot and copy the back in a new structure? My understanding so far is that this is the way SQL systems currently work
+[/quote]
+
+Generally yes, because there are limits on the number of instructions you can execute within a message. It's currently 20 billion instructions with DTS. Evolving your schema in a backwards-compatible way is the safer and more efficient option in the vast majority of cases.
+
+-------------------------
+
+LiveDuo | 2023-05-25 11:29:19 UTC | #3
+
+[quote="ielashi, post:2, topic:20225"]
+Maybe it’s best to walk through this with an example. Can you share a share a specific example of a data schema and the change you’d like to make?
+[/quote]
+
+The example below describes a SQL-like relation we have in our codebase. Hope is not too long or complex and I'm sharing it in it's entirety since it describes many of the issues we will be facing with migrations and we hope to prepare for accordingly.
+
+```rs
+#[derive(CandidType, Deserialize, PartialEq)]
+struct Post { title: String, description: String, timestamp: u64, }
+
+#[derive(CandidType, Deserialize, PartialEq)]
+struct Reply { text: String, timestamp: u64, }
+
+#[derive(Serialize, Deserialize)]
+struct Relation {
+    #[serde(skip, default = "init_rel_forward")] backward: StableBTreeMap<(u64, u64), (), Memory>,
+    #[serde(skip, default = "init_rel_backward")] forward: StableBTreeMap<(u64, u64), (), Memory>,
+}
+impl Relation {
+    pub fn insert(&mut self, x: u64, y: u64) {
+        self.forward.insert((x.to_owned(), y.to_owned()), ());
+        self.backward.insert((y, x), ());
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct State {
+    #[serde(skip, default = "init_posts")] posts: StableBTreeMap<u64, Post, Memory>,
+    #[serde(skip, default = "init_replies")] replies: StableBTreeMap<u64, Reply, Memory>,
+    post_id_to_reply_id: Relation
+}
+```
+
+There are two main ways we will surely need to extend this:
+1. Add fields to the existing structs eg. add a `tags` field to the `Post` struct.
+2. Create new structs and add relations for them eg. add a `PostLike` struct and a `post_id_to_post_like_id` relation.
+
+-------------------------
+
+senior.joinu | 2023-05-25 11:40:43 UTC | #4
+
+[quote="LiveDuo, post:1, topic:20225"]
+Is there a working example `ic-stable-memory` upgrade mechanism with enums?
+[/quote]
+
+https://github.com/seniorjoinu/ic-stable-memory/tree/develop/examples/schema_evolution
+
+-------------------------
+
+LiveDuo | 2023-05-25 11:57:07 UTC | #5
+
+Thanks @senior.joinu for sharing, somehow missed that example.
+
+> https://www.youtube.com/watch?v=4UfybOlmKgo
+
+-------------------------
+
+ielashi | 2023-05-25 16:38:50 UTC | #6
+
+Can you share also how you're implementing `Storable`? That implementation is really the key to evolving the schema. All you'd need to do is to ensure that your `Storable` implementation works on both the old schema as well as the new schema.
+
+By the way, I don't know how big you expect your dataset to be, but if it's early in the project, I'd consider using the [event log pattern](https://mmapped.blog/posts/19-eventlog.html) as is currently being done with ckBTC. It should give you a lot of flexibility to evolve your schema in the early days, then once it's established and you need to scale, you can switch to using stable BTreeMaps.
+
+-------------------------
+
+LiveDuo | 2023-06-11 16:35:52 UTC | #7
+
+I somehow missed your reply.
+
+We took a look at the "event log" and while being an interesting read and an idea that we didn't have in mind, our Post/Reply system is getting read and updated a lot more frequent than Bitcoin UTXOs so it might not be a good fit.
+
+In the meantime, we are getting convinced that the best design for our system is a hybrid design with both heap and stable storage. The heap storage will be used for tables and relational data and the stable storage for storing assets that shouldn't change a lot. In our use case, It seems impossible to fill up the heap memory just with raw text.
+
+An open question still is if there's any way to prevent bricking the canister and the `pre_upgrade` hook in case of a bug (or any other accident) filling up the heap.
+
+-------------------------
+
+LiveDuo | 2023-06-11 16:39:02 UTC | #8
+
+
+As for the `Storable` trait we had something similar to https://github.com/dfinity/stable-structures/blob/main/examples/src/custom_types_example/src/lib.rs#L26 in mind that is bounded at say 100 bytes. 
+
+1. In the example linked above, there's a `UserProfile` with a u8 `age` and a String `name`. It seems that the `name` field can fill up all 100 bytes by itself. How can someone save 50 bytes for another field later on? Should there be checks so that every string saved to `UserProfile` is less than 50 bytes?
+
+2. Are there any examples changing the stable structures schema to see an actual implementation?
+
+-------------------------
+

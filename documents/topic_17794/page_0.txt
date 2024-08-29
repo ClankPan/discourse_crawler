@@ -1,0 +1,142 @@
+ulan | 2023-02-01 15:23:01 UTC | #1
+
+# Background 
+The Wasm heap of canisters is limited to 4GiB. The limit is fundamental and cannot be increased because of 32-bit memory addresses. If a canister uses all of the available heap space, it will start producing out-of-memory errors and may stop working, which could lead to data loss and bricking of the canister. The developer may not realize this until it is too late to fix the issue.
+
+# Proposal
+
+This proposal aims to introduce an explicit Wasm heap limit that can be configured in the canister settings. The default value for this limit will be a conservative amount, such as 3GiB. If a canister tries to use more memory than the limit, it will receive an out-of-memory error. This will alert the developer to the potential memory issue and allow them to safely upgrade the canister to a version that uses less memory.
+
+# Details
+* Add a new `wasm_heap_limit` field to canister settings with the default value of 3GiB.
+* Change the implementation of `memory.grow()` to check the limit. The operation traps if growing the memory would exceed the limit.
+
+# Alternative naming
+
+We could name the limit `wasm_heap_freezing_threshold` to emphasize its similarity to the existing cycles freezing limit.
+
+-------------------------
+
+dymayday | 2023-01-04 13:22:12 UTC | #2
+
+That's a splendid idea !
+What would be the cost performance wise ?
+
+-------------------------
+
+ulan | 2023-01-04 13:28:10 UTC | #3
+
+Thanks! I expect the overhead the additional check to be negligible compared to the existing cost of the  `memory.grow()` operation.
+
+-------------------------
+
+icme | 2023-01-04 22:27:05 UTC | #4
+
+100% on board with this! Great feature :tada: 
+
+A few questions around the "conservative limit" and how developers should be thinking about this to best protect their canisters.
+
+[quote="ulan, post:1, topic:17794"]
+The default value for this limit will be a conservative amount, such as 3.5GiB.
+[/quote]
+
+What do you see the remaining 0.5GB not being used guarding against? (say instead of setting it at 3.9GB)?
+
+Would the purpose of this be to allow for more runtime heap usage in the context of a function? Space for GC?
+
+For example, there are some functions that are very cheap, and others that may have been enabled by DTS to be quite expensive, i.e. scan through or duplicate/modify an entire data structure (e.g. array) in memory.
+
+What do you feel is a good rule of thumb when thinking about setting safe heap memory limits?
+
+Tagging @claudio and @luc-blaeser to weigh in on this from the Motoko side.
+
+-------------------------
+
+ulan | 2023-01-05 10:21:34 UTC | #5
+
+> What do you see the remaining 0.5GB not being used guarding against?
+
+The 0.5GB would be used for potential allocations in the pre-upgrade hook (e.g. buffers used for serialization of data to stable memory). The idea is to leave enough space in the heap to ensure that upgrading works. @bogwar mentioned to me that 0.5GB might be insufficient for some canisters and a more conservative value would be 2GB in the case when the canister needs to copy all objects before serializing them.
+
+> What do you feel is a good rule of thumb when thinking about setting safe heap memory limits?
+
+I would say: estimate how much additional memory is needed for upgrading in the worst case and reserve that memory using the limit.
+
+-------------------------
+
+claudio | 2023-01-05 12:22:19 UTC | #6
+
+So how would the limit be raised before doing the upgrade? Non-atomically, by updating settings and then attempting upgrade in two steps? That seems mildly dangerous due to races. Or is the limit just not applied during preupgrade at all? 
+
+Also, this seems like it could be implemented entirely in user-space, if desired.
+
+-------------------------
+
+icme | 2023-01-05 19:32:13 UTC | #7
+
+[quote="ulan, post:5, topic:17794"]
+The idea is to leave enough space in the heap to ensure that upgrading works. @bogwar mentioned to me that 0.5GB might be insufficient for some canisters and a more conservative value would be 2GB in the case when the canister needs to copy all objects before serializing them.
+[/quote]
+
+Correct me if I'm wrong here @claudio, but I was under the impression that [streaming serialization](https://github.com/dfinity/motoko/releases/tag/0.6.27), which was introduced in moc 0.6.27, solves this issue.
+
+It does this by significantly reducing the size of the serialization buffer held in the wasm heap (so you can get pretty close to 4GB, but I'm not sure what the actual "safe" cutoff is?).
+
+Are there any metrics from testing out streaming serialization that can give developers some intuition around how much space this could take up during an upgrade?
+
+-------------------------
+
+bogwar | 2023-01-05 20:21:46 UTC | #8
+
+A quick note: although the issue may be solved for motoko canisters it is not solved in general for arbitrary serialisation logic/strategies used by rust canisters.
+
+-------------------------
+
+lastmjs | 2023-01-05 20:28:07 UTC | #9
+
+[quote="ulan, post:1, topic:17794"]
+The limit is fundamental and cannot be increased because of 32-bit memory addresses.
+[/quote]
+
+Can you give some insight into feasibility and timeline for switching to Wasm64 for the heap? Wasmtime [has implemented wasm64](https://github.com/bytecodealliance/wasmtime/issues/572), so this should be possible now, though I understand there are reasons to wait.
+
+Insights would be appreciated.
+
+-------------------------
+
+ulan | 2023-01-06 09:58:01 UTC | #10
+
+[quote="claudio, post:6, topic:17794"]
+So how would the limit be raised before doing the upgrade? Non-atomically, by updating settings and then attempting upgrade in two steps? That seems mildly dangerous due to races. Or is the limit just not applied during preupgrade at all?
+[/quote]
+
+In most cases, the canister is stopped before an upgrade takes place, so there should not be any race conditions. However, if an upgrade is performed without stopping the canister first, the race is indeed possible. 
+
+Ignoring the limit when upgrading might be a good idea regardless of the potential for race conditions. Because it is probably more convenient for developers to not worry about the heap limit when upgrading.
+
+> Also, this seems like it could be implemented entirely in user-space, if desired.
+
+Indeed, but the main problem is that many users are not aware of the out-of-memory problem. It can also be difficult to use the user-land feature without support in canister settings.
+
+> Can you give some insight into feasibility and timeline for switching to Wasm64 for the heap?
+
+@abk is working towards supporting Wasm64 for stable memory in https://forum.dfinity.org/t/proposal-wasm-native-stable-memory/15966
+
+Once that's done, we will follow up with support of Wasm64 for the heap. We expect that the performance will be slower due to the need for heap bounds checks in load/store instructions (Wasm32 avoids bounds check using a trick with guard pages).
+
+I'd like to not to commit to a concrete timeline at this point, as there are still many unknowns. The rough estimate is this year. The timeline will become clearer once https://forum.dfinity.org/t/proposal-wasm-native-stable-memory/15966 is done.
+
+-------------------------
+
+ulan | 2023-02-01 17:08:33 UTC | #11
+
+The motion proposal: https://dashboard.internetcomputer.org/proposal/105322
+
+-------------------------
+
+ulan | 2023-02-22 09:48:44 UTC | #12
+
+The motion proposal has been accepted. The feature is in the [roadmap](https://internetcomputer.org/roadmap) and we are working on it.
+
+-------------------------
+

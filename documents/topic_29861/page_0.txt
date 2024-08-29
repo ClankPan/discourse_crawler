@@ -1,0 +1,149 @@
+skilesare | 2024-04-20 14:36:45 UTC | #1
+
+It would be nice to be able to do this in my actors:
+
+```
+public shared query icrc1_fee : () -> async Nat = icrc1().fee;
+```
+
+It would really help keep actors clean when they are based on the composite of a number of libraries.
+
+It would really reduce the size of files in areas like this:
+
+https://github.com/icdevsorg/ICDevsToken/blob/15aa8bfda889171958b27b3cad658d8a4a3e15d2/src/Token.mo#L350
+
+-------------------------
+
+ZenVoich | 2024-04-21 18:13:47 UTC | #2
+
++1
+
+And maybe a way to not duplicate complex args and return types
+```
+public shared query myFn = myMod.fn;
+// or assign sync lib fn as async
+public shared query myFn2 = async myMod.fn2;
+```
+
+-------------------------
+
+rossberg | 2024-04-21 20:26:58 UTC | #3
+
+It's not so easy. A declaration like
+```
+shared f = a.f
+```
+should mean that `f` literally equals `a.f`. That in turn must imply that `f()` is observably equivalent to `a.f()`. However, `a.f` is a different function than
+```
+shared f2() : async T { a.f() }
+```
+because that does an extra async hop. So the latter would not be a correct implementation of that equality. Indeed, there is no way to implement this equality faithfully on the IC, at least not for public functions. So the suggested syntax would be semantically inappropriate.
+
+(In your example, the time at which `icrc1()` is invoked would also be quite different, but that aspect is at least implementable, I think.)
+
+-------------------------
+
+timo | 2024-04-22 00:13:36 UTC | #4
+
+[quote="skilesare, post:1, topic:29861"]
+`public shared query icrc1_fee : () -> async Nat = icrc1().fee;`
+[/quote]
+
+What's the difference to
+```
+public query func icrc1_fee() : async Nat = async icrc1().fee;
+```
+which you can write right now?
+
+-------------------------
+
+skilesare | 2024-04-22 01:25:25 UTC | #5
+
+Ah!  That is great that that that works.  It seems it works if you don't need the caller?  I tried putting moving:
+
+```
+
+ public shared ({ caller }) func icrc1_transfer(args : TransferArgs) : async TransferResult {
+      switch(await* transfer_tokens(caller, args, false, null)){
+        case(#trappable(val)) val;
+        case(#awaited(val)) val;
+        case(#err(#trappable(err))) D.trap(err);
+        case(#err(#awaited(err))) D.trap(err);
+      };
+  };
+```
+
+Into my module and it complained:  .mops/icrc1-mo@0.0.15/src/ICRC1/lib.mo:528.96-535.4: type error [M0077], a shared function is only allowed as a public field of an actor
+  (This is a limitation of the current version.)
+
+So likely this will work for simple queries...and calls as long as you don't need the caller context?
+
+-------------------------
+
+timo | 2024-04-22 09:55:44 UTC | #6
+
+I didn't understand your post or I don't have enough context.
+This example works for me:
+```
+ func f(p : Principal) : { principal : Principal } = { principal = p };
+ public shared ({caller}) func foo() : async Principal = async f(caller).principal;
+```
+
+-------------------------
+
+skilesare | 2024-04-22 13:37:52 UTC | #7
+
+Ahh....ok...I see what is going on here. It is reduced down to a one-statement context so a lot of the brackets and stuff go away. This probably achieves the aesthetic I was looking for, but by a different method.
+
+What I was going for was the ability to define the shared type function in the library and be able to point to the function in my class to fulfill the definition.
+
+Something like in my actor:
+
+```
+
+public shared({caller}) func icrc1_transfer : (TransferArgs) -> async Nat = MyClassPlusInstance().icrc1.transfer;
+
+```
+
+And in my class
+
+```
+
+public class ICRC1.ICRC1(x :initargs) {
+
+....
+
+   public shared({caller}) icrc1_transfer(req: TransferArgs) : async Result<Nat, Error>{
+      ....
+   };
+...
+}
+```
+
+Looks like I can get most of the way there....but I'm trying to think down the line to a rich set of libraries that are composable at the actor level(like an openzepplin for motoko) and trying to make it as clean and clear for devs(and possibly code auto builders that mix an match standards).  Maybe no improvement is needed...but poking around the edges to what work. This helps a ton and may even be better than what I was thinking because the class gets instantiated in my actor initialization and is ready to use when it gets called by one of these actor public functions.
+
+-------------------------
+
+timo | 2024-04-24 07:48:41 UTC | #8
+
+Maybe what you really want is a way to define an actor across multiple files or combine an actor out of multiple "proto" actors, merging their interfaces into one.
+
+If you could do what you want with the class then that would have some drawbacks for testing:
+- shared functions have more limitations than not shared ones
+- an interface with `shared({caller})` is harder to test than one that looks like `icrc1_transfer(caller : Principal, req : TransferArgs)`
+- an async return type is harder to test than a non-async one
+
+For those reasons I personally don't mind having the shim layer in the actor definition around the class that you are trying to reduce.
+
+But merging multiple actor interfaces into one is definitely something I would use if it was available.
+
+-------------------------
+
+rossberg | 2024-04-24 10:07:55 UTC | #9
+
+@timo, the possibility of extending Motoko actors (and symmetrically, objects) with what is typically called _mixin composition_ was something that we always [envisioned](https://github.com/dfinity/motoko/blob/master/design/WhitePaper.md#mixin-composition). But it is a very complex feature, and it's been less than clear what the underlying representation of an actor mixin would be or how to (separately?) compile it.
+
+Yet, adding this would have obvious benefits for developing larger-scale programs and libraries. It could also subsume the rather ad-hoc and syntactically incoherent notion of record composition that Motoko has right now.
+
+-------------------------
+

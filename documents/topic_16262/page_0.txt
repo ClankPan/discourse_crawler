@@ -1,0 +1,155 @@
+mymikemiller | 2022-10-31 05:22:41 UTC | #1
+
+I'm building a video platform and I have two types of concern: Media and Episode. The Media type stores things like the URL to an actual video file, and each Episode has, among other things, an object of Media type. One Media object can be referenced by multiple Episode objects (when, for example, an Episode is re-released and references the same original video file but might have a different episode title). I want the Media objects to also contain a list of all the Episodes of which they're a part.
+
+```
+public type Media = {
+  uri : Text;
+  episodes : [Episode];
+};
+
+public type Episode = {
+  media : Media;
+  title : Text;
+};
+```
+
+This creates a circular dependency, which is at the root of the problem I'm trying to solve. I don't know how to create an Episode object that contains a Media object which contains the Episode object I'm trying to create in the first place. The Episode object doesn't exist at the time I'm creating the Media object that I need in order to create the Episode object:
+
+```
+let e : Episode = {
+  title = "Episode Title";
+  media = {
+    url = "www.example.com/test.mp4";
+    episodes []; // How do I get "e" into this array while keeping all types stable and shared?
+  }
+};
+```
+
+My attempt involves first creating an Episode object which contains a Media object whose list of Episodes is empty (as above). Once I have that Episode object, I want to add it to its Media object's Episode list, but I can't make the Media's episode list a var because that would mean Episode and Media types are no longer shared (for my needs, they must be able to be transferred over the wire via candid). I could make the Media's Episode list a Buffer instead of an Array, but that would not be stable, which is also a requirement for me.
+
+Is this just not possible? Seems like that might be the case. I'm not sure how you could ever have a circular dependency like I'm trying to accomplish and still be shared since transferring it via candid would cause infinite recursion just trying to print it to string. I imagine the solution will probably be to avoid having the Media type contain a list to the Episodes it's used in, and instead introduce another object of type Map<Media, [Episode]> to keep track of that. But I've run into this problem of how to create objects that contain themselves downstream enough times that I thought it would be worth asking the question here. Thanks in advance!
+
+-------------------------
+
+paulyoung | 2022-10-31 06:01:37 UTC | #2
+
+[quote="mymikemiller, post:1, topic:16262"]
+One Media object can be referenced by multiple Episode objects
+[/quote]
+
+Based on this information, I imagine you’d want to have one instance of each piece of media and refer to them by ID.
+
+Perhaps something like:
+
+```
+public type Episode = {
+  id : EpisodeId;
+  media : MediaId;
+  title : Text;
+};
+```
+
+***
+
+[quote="mymikemiller, post:1, topic:16262"]
+introduce another object of type Map<Media, [Episode]>
+[/quote]
+
+If you have `Map<MediaId, Media>` then each episode can look up its media by ID.
+
+***
+
+If you want to maintain the relationship in the other direction, you could also have something like this:
+
+```
+public type Media = {
+  id : MediaId:
+  uri : Text;
+  episodes : [EpisodeId];
+};
+```
+
+and then have `Map<EpisodeId, Episode>` for looking up episodes.
+
+***
+
+I don’t have any experience in Motoko with assigning unique IDs to new objects but I imagine you could increment a counter or use UUIDs, and probably abstract it away behind a function or class constructor.
+
+I suggest using a variant so that you can’t as easily mix up ID values that represent different things. Something like:
+
+```
+type EpisodeId = { #episodeId : Nat };
+type MediaId = { #mediaId : Nat };
+```
+
+-------------------------
+
+paulyoung | 2022-10-31 06:15:27 UTC | #3
+
+Alternatively you could do something like this:
+
+```
+public type Episode = {
+  id : EpisodeId;
+  title : Text;
+};
+
+public type Media = {
+  id : MediaId:
+  uri : Text;
+};
+```
+
+and then maintain the relationships separately using something like `Map<MediaId, [EpisodeId]>` and `Map<EpisodeId, MediaId>`.
+
+The benefit here is that you don’t need to update the objects themselves.
+
+-------------------------
+
+mymikemiller | 2022-10-31 16:51:29 UTC | #4
+
+@paulyoung I was trying to lean into the whole "we don't need databases anymore" ethos by not giving everything IDs that would need to be joined upon. My idea was to have each object contain an instance of the object it needs, instead of just an ID to be able to look up the object somewhere else. That seemed like a more Internet Computer-y way to do it, where you automatically get the full object without having to do any joins.
+
+One assumption I have is that having that object in multiple places (i.e. a Media object belonging to multiple Episode objects) wouldn't take up any more space than having it only in one place since they're references to the same object somewhere. And updating the object in one place would update it for any other objects that contain it. This is probably false, and doing it with IDs would save on memory and allow for updates to be reflected everywhere, but I'd love some clarification on that from those in the know. 
+
+This might be reason enough to introduce IDs, but one of the draws of the Internet Computer is that I could write code using real, full objects, and persist them that way, rather than thinking in terms of rows in databases that need to perform joins to construct the full object. Is there really no way to have one-to-many or many-to-many relationships on the IC without introducing IDs and joins?
+
+-------------------------
+
+paulyoung | 2022-10-31 17:01:39 UTC | #5
+
+I’m not sure if this is possible but I could be wrong. AFAIK you can have mutually recursive types but not mutually recursive values. Maybe @claudio can weigh in on this.
+
+I think I’ve arrived at the conclusion that I probably do need something like a database.
+
+I’m hoping to replace all the manual work I’ve done that resembles the code I shared above with sudograph.
+
+There’s an example in there that has a similar relationship to the types you’re working with:
+
+https://github.com/sudograph/sudograph/blob/93bad31213d0d91a2305521e5d30d5bcbfb58b8e/examples/basic/canisters/graphql/src/schema.graphql
+
+I can’t seem to find anything about what the generated Rust or a Motoko code looks like for those types though, and how to use them.
+
+@lastmjs can you help?
+
+-------------------------
+
+claudio | 2022-10-31 18:50:02 UTC | #6
+
+Motoko immutable values cannot be cyclic.You need to use either mutable fields, mutable array or function values to encode cycles.
+
+Shared types (Candid types) cannot contain any of those but stable types do support mutable fields and mutable arrays (but not functions) 
+
+I think you are probably stuck with using explicit IDs at the Candid level. 
+
+You might be able to covert those to Motoko values on import by maintaining a table on the side and adding the mutable fields, but the overhead might not be worth it, depending on the application.
+
+-------------------------
+
+mymikemiller | 2022-10-31 19:48:01 UTC | #7
+
+This confirms my suspicions, thanks @claudio! Sounds like immutable fields cannot be cyclic for the reason I identified: how would you insert an object into itself unless you can create the object first and then modify it (i.e. requiring the field to be mutable). And even if you could, how would you ever represent such a cyclic object in candid? Thanks for confirming that it's just impossible. Database-style IDs and joins to the rescue, as much as I was hoping the IC had a different way forward.
+
+-------------------------
+

@@ -1,0 +1,244 @@
+jzxchiang | 2021-09-03 05:49:03 UTC | #1
+
+I'm trying to test my Motoko assets canister using icx-proxy running locally. The Motoko canister code is modeled after the official Rust assets canister, and has a nearly identical .did interface.
+
+However, the icx-proxy stops working as intended at this exact [line](https://github.com/dfinity/agent-rs/blob/f7de7670aa3870023fa45d5b5cee719b6eb7a012/icx-proxy/src/main.rs#L250).
+
+It just doesn't accept the streaming strategy that the Motoko assets canister returns in the response to `http_request`.
+
+Furthermore, the icx-proxy logs this cryptic debug message:
+
+```
+opt table5 <: opt variant {
+  Callback : record {
+    token : record { key : text; index : nat; content_encoding : text };
+    callback : func () -> ();
+  };
+} via special opt rule
+```
+
+I confirmed this is NOT logged when I call the Rust assets canister instead. Has anyone seen this error before?
+
+I define the Motoko streaming strategy as follows:
+
+```
+  public type StreamingStrategy = {
+    #Callback: {
+      callback: StreamingCallback;
+      token: StreamingCallbackToken;
+    };
+  };
+
+  public type StreamingCallback = shared query (StreamingCallbackToken) -> async (?StreamingCallbackResponse);
+
+  public type StreamingCallbackToken =  {
+    content_encoding: Text;
+    index: Nat;
+    key: Text;
+    sha256: ?[Nat8];
+  };
+```
+
+What is going on? The Rust candid parser doesn't like this Motoko-generated candid for some reason, and I can't figure out why.
+
+-------------------------
+
+jzxchiang | 2021-09-03 06:02:40 UTC | #2
+
+@ericswanson Do you have any insight into this? (Sorry for mentioning—I thought you might know something about the icx-proxy streaming code.) :sob:
+
+-------------------------
+
+paulyoung | 2021-09-03 06:48:14 UTC | #3
+
+Possibly related to this: https://github.com/dfinity/candid/issues/242
+
+@chenyan might know something
+
+-------------------------
+
+ericswanson | 2021-09-03 07:04:00 UTC | #4
+
+I have never seen that error before!
+
+[quote="jzxchiang, post:1, topic:6944"]
+`public type StreamingCallback = shared query (StreamingCallbackToken) -> async (?StreamingCallbackResponse);`
+[/quote]
+
+
+
+You might need to change this to
+```
+public type StreamingCallback = shared query (StreamingCallbackToken) -> async StreamingCallbackResponse;
+```
+
+And `sha256` might need to be `?Blob`.
+
+Here are the types I used back when the asset canister was written in Motoko:
+
+```
+  public type StreamingStrategy = {
+    #Callback: {
+      callback: shared query StreamingCallbackToken -> async StreamingCallbackHttpResponse;
+      token: StreamingCallbackToken;
+    };
+  };
+  
+  public type StreamingCallbackToken = {
+      key: Text;
+      content_encoding: Text;
+      index: Nat;
+      sha256: ?Blob;
+  };
+
+  public type StreamingCallbackHttpResponse = {
+    body: Blob;
+    token: ?StreamingCallbackToken;
+  };
+```
+
+-------------------------
+
+jzxchiang | 2021-09-03 07:13:47 UTC | #5
+
+Hm yeah, I just tried what you suggested, and I'm getting the same error.
+
+The `is_streaming` variable in that [line](https://github.com/dfinity/agent-rs/blob/f7de7670aa3870023fa45d5b5cee719b6eb7a012/icx-proxy/src/main.rs#L250) of code still evaluates to false.
+
+Were you ever able to successfully stream a large multi-chunk asset from the Motoko asset canister? If so, did you try it locally with icx-proxy or in prod?
+
+-------------------------
+
+ericswanson | 2021-09-03 16:17:54 UTC | #6
+
+Yes, at Genesis, all asset canisters were the Motoko asset canister, and streaming multi-chunk assets worked locally and in prod.
+
+-------------------------
+
+chenyan | 2021-09-03 17:38:35 UTC | #7
+
+[quote="jzxchiang, post:1, topic:6944"]
+```
+opt table5 <: opt variant {
+  Callback : record {
+    token : record { key : text; index : nat; content_encoding : text };
+    callback : func () -> ();
+  };
+} via special opt rule
+```
+[/quote]
+
+It's a Candid bug. This warning means subtyping doesn't hold for StramingStrategy and thus will be converted to null when decoding. The Rust candid crate doesn't output the correct type for function reference, it's always `func () -> ()`. It's not a problem for Rust canisters, because they fail in the same way...
+
+Thanks for reporting this. I will think about how to fix it. Tracked here: https://github.com/dfinity/candid/issues/273
+
+-------------------------
+
+jzxchiang | 2021-09-03 21:00:31 UTC | #8
+
+Oh my goodness!!!! Thanks for clarifying.
+
+Is there any quick workaround I can take to avoid this while I wait for a more long-term solution?
+
+How did the Motoko assets canister at Genesis get around this? :frowning_face:
+
+-------------------------
+
+chenyan | 2021-09-03 21:26:42 UTC | #9
+
+We didn't roll out the full subtype checking at genesis. 
+
+Here is a hacky workaround, add option type to all callback input arguments and remove query:
+```
+public type StreamingCallback = shared (?StreamingCallbackToken) -> async StreamingCallbackResponse;
+```
+
+-------------------------
+
+jzxchiang | 2021-09-03 21:27:51 UTC | #10
+
+Let me try this later tonight. Thank you!!!
+
+-------------------------
+
+jzxchiang | 2021-09-04 02:11:52 UTC | #11
+
+The candid error goes away!
+
+However, this type is a breaking change, since the icx-proxy expects the callback to be a query method so the replica throws this error:
+
+```
+The Replica returned an error: code 3, message: "IC0302: Canister r7inp-6aaaa-aaaaa-aaabq-cai has no query method 'http_request_streaming_callback'"
+```
+Also, even if I were to resolve this, the new option type added to the callback argument won't be supported by icx-proxy, which will likely cause another runtime error.
+
+-----
+
+Is there a way to define the candid type as you suggested without actually changing how the bytes are sent over the wire? Just so that the Rust candid parser won't throw an error, but the underlying logic is still the same as before. For example, a `//@ts-ignore ...` equivalent for Motoko.
+
+If not, a more principled fix will be needed. Supporting asset streaming for Motoko will be quite important to other developers, I imagine.
+
+-------------------------
+
+chenyan | 2021-09-04 03:04:31 UTC | #12
+
+Do you implement `http_request_streaming_callback` in your canister? If so, you can still define the function as a query method without the option type.
+
+-------------------------
+
+jzxchiang | 2021-09-04 03:43:03 UTC | #13
+
+Yes, both the `http_request` and `http_request_streaming_callback` methods—and their types—are defined in the same canister.
+
+I include a reference to the `http_request_streaming_callback` method in the response of `http_request`, as required.
+
+Can you explain what you mean?
+
+-------------------------
+
+chenyan | 2021-09-04 04:45:33 UTC | #14
+
+You can implement `http_request_streaming_callback` method with the correct type. When you want to send the reference, you can trick the compiler to send a different reference type.
+```
+let s = actor "your_canister_id" : actor { http_request_streaming_callback : shared () -> async () };
+return { callback = s.http_request_streaming_call };
+```
+The receiver gets exactly `your_canister_id.http_request_streaming_call`, so it can make the call properly. The limitation is that you need to hard-code your canister id.
+
+-------------------------
+
+jzxchiang | 2021-09-04 04:46:08 UTC | #15
+
+Incredible, that worked.
+
+Thanks for the help! Please let me know if and when that bug gets resolved so I can remove this hack. :grinning_face_with_smiling_eyes:
+
+-------------------------
+
+peterparker | 2021-10-05 09:52:50 UTC | #16
+
+[quote="chenyan, post:14, topic:6944"]
+The limitation is that you need to hard-code your canister id.
+[/quote]
+
+Thanks for the workaround! Worth to notice is someone is reading this, the canister id does not have to be hardcoded in an actor I think.
+
+```
+let self: Principal = Principal.fromActor(Assets);
+let canisterId: Text = Principal.toText(self);
+let canister = actor (canisterId) : actor { http_request_streaming_callback : shared () -> async () };
+
+?#Callback({
+    token;
+   callback = canister.http_request_streaming_callback;
+});
+```
+
+-------------------------
+
+jzxchiang | 2021-10-05 23:35:47 UTC | #17
+
+Incredible. Didn't know this facility existed.
+
+-------------------------
+

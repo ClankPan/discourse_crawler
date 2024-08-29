@@ -1,0 +1,224 @@
+berestovskyy | 2024-03-07 09:07:42 UTC | #1
+
+Hi everyone,
+We’re working on the IC’s error and reject codes. Briefly, each [reject code](https://internetcomputer.org/docs/current/references/ic-interface-spec#reject-codes) represents a category of errors, allowing applications and libraries to adapt their behavior based on the specific category.
+
+Previously, new error codes were sometimes added without strictly following the established conventions. To address this, we’ll submit these changes for voting with the next release proposal. If adopted, it will then be rolled out to all subnets within 2-3 weeks.
+
+We don't expect any "typical" applications to rely on these specific codes, so most of you can safely disregard this message. Additionally, there's no urgency, so if your dapp needs adjustments and the 2-3 week timeframe doesn't work, please let us know.
+
+**Changes:**
+
+1. **`CanisterOutOfCycles`:**
+   * Renumbered from `IC0501` to `IC0207`.
+   * Reclassified from `CANISTER_ERROR` to `SYS_TRANSIENT`.
+   * **Example:** Attempting to execute a message on a canister with insufficient cycles is now considered a transient error, not a canister error.
+2. **Canister Runtime Errors:**
+   * All hypervisor errors will be mapped to the `CANISTER_ERROR` reject code.
+   * **Example:** The `ic0.call_cycles_add` system API call will return a `CanisterContractViolation` error and the `CANISTER_ERROR` reject code.
+3. **Other Changes:**
+   * `CertifiedStateUnavailable`: renumbered from `IC0515` to `IC0208` (same `SYS_TRANSIENT` code).
+   * `CanisterRejectedMessage`: renumbered from `IC0516` to `IC0406` (same `CANISTER_REJECT` code).
+   * `UnknownManagementMessage`: renumbered from `IC0518` to `IC0407` (same `CANISTER_REJECT` code).
+   * `InvalidManagementPayload`: renumbered from `IC0519` to `IC0408` (same `CANISTER_REJECT` code).
+   * `CanisterInstallCodeRateLimited`: renumbered from `IC0523` to `IC0209` (same `SYS_TRANSIENT` code).
+
+**Context:**
+
+These inconsistencies were discovered while exploring corner cases related to the timers CDK library. We believe these reject codes adjustments will resolve them all.
+
+**Disclaimer:**
+
+While I've tried my best to accurately summarize the changes, there might be slight inaccuracies. I'll be posting links to all relevant MRs in this thread for further details.
+
+-------------------------
+
+timo | 2024-03-07 06:06:04 UTC | #2
+
+Are the error codes when trying to call a stopped canister part of this change? Could you summarize what error code is produced for that error? There was a problem in the past where two different could be produced depending on when the error is caught (by replicated state or by execution). Will this release solve the problem?
+
+-------------------------
+
+berestovskyy | 2024-03-07 07:43:13 UTC | #3
+
+hi Timo,
+Great question. I'm not aware of any issues with the different errors for the stopped canisters. Maybe there are some traces on the forum, so I could have a look?
+
+As far as this change concerned no errors related to the stopped canisters are touched. Also a quick look into the code suggests that both replicated state and hypervisor should return `CanisterStopped` error, which is `IC0508` and `CANISTER_ERROR` reject code.
+
+-------------------------
+
+berestovskyy | 2024-03-07 10:36:29 UTC | #4
+
+Discussed offline. The inconsistency between the state and execution errors was fixed back in November: https://github.com/dfinity/ic/commit/8c9e85f0878498cf841546fb5d59c9d200687aff
+
+-------------------------
+
+diegop | 2024-03-08 17:22:02 UTC | #5
+
+
+
+-------------------------
+
+timo | 2024-03-12 06:38:37 UTC | #6
+
+[quote="berestovskyy, post:1, topic:28171"]
+We don’t expect any “typical” applications to rely on these specific codes
+[/quote]
+
+I think it does make sense for applications to rely on reject codes. Maybe not on the numerical ICxxx error codes but at least on the reject codes:
+
+* `SYS_FATAL` (1): Fatal system error, retry unlikely to be useful.
+* `SYS_TRANSIENT` (2): Transient system error, retry might be possible.
+* `DESTINATION_INVALID` (3): Invalid destination (e.g. canister/account does not exist)
+* `CANISTER_REJECT` (4): Explicit reject by the canister.
+* `CANISTER_ERROR` (5): Canister error (e.g., trap, no response)
+
+What is most important for an application after a failed call is to know whether it should retry or not. And if it should then when to retry (how long to wait) or what event to wait before retrying.
+
+I interpret reject codes 1,3,4 as "don't retry", and 2,5 as retry possible. I used to interpret 2 as something that the IC has to fix. Maybe the subnet is upgrading, overloaded or something like that. So before retrying we are essentially waiting for the IC or the subnet. With reject code 5 on the other hand we are waiting for the canister owner to fix something, for example upgrade the code if it was a trap due to a bug, or get the canister out of frozen, stopping or stopped state.
+
+Now you are proposing to reclassify **`CanisterOutOfCycles`** from 5 to 2. An application that follows my interpretation of the reject codes would then think that it is the subnet it has to wait for instead of the canister owner.
+
+Is that change justified?
+
+Maybe is it justified because **`CanisterOutOfCycles`** is something that the general public can remedy because anyone can top up the canister. Whereas a trap due to a bug or the canister being in stopped state is something that only the controller can remedy. Is that the reasoning behind the reclassification?
+
+-------------------------
+
+berestovskyy | 2024-03-12 11:38:22 UTC | #7
+
+> I interpret reject codes 1,3,4 as “don’t retry”, and 2,5 as retry possible. I used to interpret 2 as something that the IC has to fix. Maybe the subnet is upgrading, overloaded or something like that. So before retrying we are essentially waiting for the IC or the subnet. With reject code 5 on the other hand we are waiting for the canister owner to fix something, for example upgrade the code if it was a trap due to a bug, or get the canister out of frozen, stopping or stopped state.
+
+My mental model is as follows:
+
+1. `SYS_FATAL`. The message didn't reach the canister. The error might be resolved by the IC in a matter of days. Example: the maximum number of canister reached, so the IC might split the subnet or increase the limit.
+
+2. `SYS_TRANSIENT`. The message didn't reach the canister. The error might be resolved by the IC in a few seconds/minutes. Example: the canister queue is full, so the IC might free some slots by just executing the messages.
+
+3. `DESTINATION_INVALID`. The message can't reach the canister. Retrying the call to the same canister ID is unlikely to succeed.
+
+4. `CANISTER_REJECT`. The canister successfully executed the message, but explicitly rejected the call. The details should be provided in the canister reject message. Retrying might make sense, but it's an application-level protocol.
+
+5. `CANISTER_ERROR`. The canister unsuccessfully executed the message. Most likely, the canister needs to be updated or reconfigured to work correctly.
+
+It's just my interpretation of [the IC specification](https://internetcomputer.org/docs/current/references/ic-interface-spec#reject-codes), so please take it with a grain of salt.
+
+> Now you are proposing to reclassify **`CanisterOutOfCycles`** from 5 to 2. An application that follows my interpretation of the reject codes would then think that it is the subnet it has to wait for instead of the canister owner.
+> Is that change justified?
+
+The timers CDK library is designed to retry `SYS_TRANSIENT` errors only. When the canister goes below the freezing threshold, it was treated as a permanent error and the timer execution was skipped. This is not an issue for the periodic timers, but the execution of one-off timer might be completely skipped in this case.
+
+The reject code `SYS_TRANSIENT` might not be the most suitable name for the `CanisterOutOfCycles` situation. But imagine a canister with a few outstanding calls. For each call's callback, the maximum amount of cycles is reserved. With deterministic time slicing (DTS), we reserve ~8B Cycles per callback.
+
+So when the canister balance is low (but still above the freezing threshold), the canister might briefly go under the freezing threshold due to the outstanding calls. Its balance might return to normal once all outstanding callbacks are executed, and the cycles are refunded.
+
+Does it make sense?
+
+-------------------------
+
+timo | 2024-03-12 20:37:29 UTC | #8
+
+Ok, got it.
+
+What about the upgrade sequence then? It is usually fast, in the order of seconds, comparable to your example of outstanding calls whose responses bring the cycle balance back up. During an upgrade the canister cycle through the states stopping, stopped and then running again. If I configure a one-time and happens to hit during stopping or stopped state then it will be reject code 5 and the timer will be skipped, correct? Isn’t that a problem as well?
+
+Or are you saying I should know for when I scheduled my timer and I control my own upgrades so I can avoid this scenario whereas I cannot avoid dropping below the freezing threshold?
+
+-------------------------
+
+berestovskyy | 2024-03-12 21:06:38 UTC | #9
+
+> What about the upgrade sequence then? [...] If I configure a one-time and happens to hit during stopping or stopped state then it will be reject code 5 and the timer will be skipped, correct? Isn’t that a problem as well?
+
+In general, timers are scheduled only for running canisters. The timer will be scheduled as soon as the canister transitions back to the running state.
+
+[According to the spec](https://internetcomputer.org/docs/current/references/ic-interface-spec#global-timer), upgrades or installs deactivate the timer. It should be re-initialized in the post-upgrade.
+
+-------------------------
+
+timo | 2024-03-13 11:46:50 UTC | #10
+
+Ok, got it.
+
+Back to the freezing threshold then. You explained how when we dip below the freezing threshold temporarily then the timer call will be retried (with the new reject code, SYS_TRANSIENT). What happens if we are below the freezing threshold for a different reason than outstanding calls and if we stay below the freezing threshold for an extended period of time (say a week). Is the timer retried indefinitely?
+
+-------------------------
+
+berestovskyy | 2024-03-13 12:24:49 UTC | #11
+
+The timer won't be scheduled for the frozen canister.
+
+We can probably come up with other examples where transient errors might take longer than just a few minutes to resolve. Or vice versa, other errors resolve in a few minutes, but they are not transient.
+
+When a canister is out of cycles, the owner will likely be interested in either removing it completely and reclaiming the remaining cycle balance, or topping it up. Maybe, the topping up process is automated. But I agree, in some corner cases the canister might be in this frozen state for quite some time...
+
+-------------------------
+
+timo | 2024-03-13 13:59:36 UTC | #12
+
+[quote="berestovskyy, post:11, topic:28171"]
+The timer won’t be scheduled for the frozen canister.
+[/quote]
+
+So the timer information will be saved along with the canister and when the canister transitions back to running then the timer will be rescheduled. And it doesn't matter how long the canister stays frozen before the transition back to running.
+
+Ok, I think you wrote that before, I just didn't understand it.
+
+-------------------------
+
+berestovskyy | 2024-03-13 16:30:21 UTC | #13
+
+Exactly. The corner case we're addressing is in the CDK timers library, so it's confusing. Let me try again:
+
+1. The canister is above the freezing threshold.
+2. The global timer is scheduled by the IC.
+3. The timers CDK library successfully executes and schedules user handler execution.
+4. But user handler execution is not happening, as the canister goes below the freezing threshold.
+
+After this reclassification, the timers CDK library will be retrying the user handler execution, as the `CanisterOutOfCycles` error is `SYS_TRANSIENT` now.
+
+-------------------------
+
+berestovskyy | 2024-03-13 18:48:23 UTC | #14
+
+Here is the full list of error-related changes:
+
+1. Review `HypervisorError`s: [merge commit](https://github.com/dfinity/ic/commit/9b3c72d55c6397b55d16b43c9db44fa8f533880c)
+2. Change some error codes to keep the convention: [merge commit](https://github.com/dfinity/ic/commit/7eace38b7580dc35af53b9180ea40480af4977dc)
+3. Re-classify hypervisor `ic0.call_cycles_add` trap as `ContractViolation`: [merge commit](https://github.com/dfinity/ic/commit/354177cf0ff50939e81b4fe90ca3d64d40fe6f76)
+4. Remove error on bad validation config: [merge commit](https://github.com/dfinity/ic/commit/d28e8dc1f5e9c16e6fe3839b6f70c443cf22f8c0)
+5. Remove unused deserialize error: [merge commit](https://github.com/dfinity/ic/commit/b2edb575cd4e7191db630cfb8028c04caa4df6d4)
+6. Remove unused `HypervisorError`s: [merge commit](https://github.com/dfinity/ic/commit/d1a578416a12e3fd7fe559eb7b78060f7e77f5f1)
+7. Remove unused `InstallCodeContextError::InvalidCanisterId`: [merge commit](https://github.com/dfinity/ic/commit/e7ef69d8c09183043c742546818021de8fafac99)
+8. Remove `WasmInstrumentationError::InvalidExport`: [merge commit](https://github.com/dfinity/ic/commit/bcb49149dbc2e3e7760358029a26b9705521ded1)
+9. Re-classify `canister-out-of-cycles` errors as `transient`: [merge commit](https://github.com/dfinity/ic/commit/a659d6c24c6233b15c6838bfaa2a5eee6eddc815)
+
+Please see more details in the corresponding merge commit descriptions.
+
+Apologies for the inconvenience, @timo and others affected. Let's hope that after this comprehensive cleanup, we won't need to touch the errors for quite some time.
+
+-------------------------
+
+timo | 2024-03-18 15:48:36 UTC | #15
+
+[quote="berestovskyy, post:1, topic:28171"]
+All hypervisor errors will be mapped to the `CANISTER_ERROR` reject code.
+[/quote]
+
+Just double-checking, "hypervisor" is what is called "IC methods" or "IC Management canister" in the spec?
+
+Is there a more detailed spec for the behaviour of those methods? You say "All hypervisor errors will be mapped". But how do I know what is an error and what isn't? For example, say I call `delete_canister`. If the canister had already been deleted prior, then is that an error or not? Will the methods just return or will it throw CANISTER_ERROR? The spec on https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-delete_canister isn't detailed enough in that regard.
+
+-------------------------
+
+berestovskyy | 2024-03-18 16:37:23 UTC | #16
+
+Hypervisor is a virtual WebAssembly machine executing the canister code.
+
+The management canister should behave just like any other canister. If we call the `delete_canister()`, but the specified canister doesn't exist, the management canister should reject the call with a `CANISTER_REJECT` code.
+
+IMO the IC source code is the most detailed and up-to-date spec. For the management canister calls see the [execute_subnet_message()](https://github.com/dfinity/ic/blob/09f0b1ff9915b9b8926a39d2b3dbb8da5ac1efc5/rs/execution_environment/src/execution_environment.rs#L538) function. But I'll check with the team for additional documentation.
+
+-------------------------
+

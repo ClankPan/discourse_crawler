@@ -1,0 +1,392 @@
+Gabriel | 2022-11-24 13:39:01 UTC | #1
+
+Hi, 
+
+I'm trying to use a custom build in our project. Due to massive wasm size we are required to gzip the  wasm or use factories eg: https://github.com/crusso/alt-actor-classes/tree/claudio/alt in order to avoid the 2mb limit. 
+
+We have the main canister which imports 3 actor classes: 
+
+```
+import Content "../service/content/Actor";
+import Global "../service/global/Actor";
+import Player "../service/player/Actor";
+```
+
+Gzip works but building normally vs custom doesn't give the expected output: 
+
+So the first method is the usual one: 
+In dfx.json
+```
+  "main": {
+      "type": "motoko",
+      "main": "src/backend/main/Actor.mo"
+    }
+``` 
+
+dfx build time: real    2m14.632s
+wasm size: 6,503kb
+
+Second method: 
+dfx.json:
+``` 
+ "main": {
+      "type": "custom",
+      "build": "sh -c './scripts/compress-main.sh main'",
+      "candid": "src/declarations/main/main.did",
+      "wasm": "src/declarations/content/main.wasm.gz"
+    }
+```
+And the bash script only generates the IDL and the wasm file and creates a gzip file as well. 
+
+```
+mkdir -p src/declarations/$1
+$(dfx cache show)/moc --idl src/backend/main/Actor.mo  --package base ".vessel/base/master/src" -o src/declarations/$1/$1.did $(echo ${packages})
+$(dfx cache show)/moc src/backend/main/Actor.mo  -o src/declarations/$1/$1.did  --package base ".vessel/base/master/src"  -o src/declarations/$1/$1.wasm $(echo ${packages})
+gzip -c src/declarations/$1/$1.wasm > src/declarations/$1/$1.wasm.gz
+
+```
+
+I was expecting roughly the same build time and size but I get something different:
+
+dfx build time: real   3m33.676s
+wasm size: 10,262kb
+
+Also like 1/5 builds I get an error on the custom one like `Error: Failed while trying to build all canisters.
+Caused by: Failed while trying to build all canisters.
+  The post-build step failed for canister 'r7inp-6aaaa-aaaaa-aaabq-cai' (main) with an embedded error: No such file or directory (os error 2)`
+
+I was under the impression that dfx build runs the moc and it should be slower than running the moc compiler manually, but it seems to be the other way around. 
+
+Also I wonder how difficult will be to add a post-build key in dfx like
+
+``` 
+"post-build" : "sh -c 'compress.sh'"
+``` 
+This would be super helpful to generate stuff like declarations, gzip the wasm module etc. 
+
+Any suggestions are welcome.
+
+-------------------------
+
+Severin | 2022-11-24 13:55:46 UTC | #2
+
+[quote="Gabriel, post:1, topic:16838"]
+I was expecting roughly the same build time and size but I get something different:
+[/quote]
+
+Assuming you're running 0.12.1 then the size difference can be explained by these two changelog entries:
+- https://internetcomputer.org/docs/current/developer-docs/updates/release-notes/#feat-default-to-run-ic-wasm-shrink-when-build-canisters
+- https://internetcomputer.org/docs/current/developer-docs/updates/release-notes/#fix-no-longer-shrinks-custom-canisters-by-default
+
+For the difference in duration I can't help much. Have you tried running the build with `-vv` to get very verbose output? That would show you the exact `moc` invocations dfx itself performs. Maybe if you compare these two you can find the difference.
+
+[quote="Gabriel, post:1, topic:16838"]
+Also like 1/5 builds I get an error on the custom one like `Error: Failed while trying to build all canisters. Caused by: Failed while trying to build all canisters.   The post-build step failed for canister 'r7inp-6aaaa-aaaaa-aaabq-cai' (main) with an embedded error: No such file or directory (os error 2)`
+[/quote]
+My bad, I broke that recently. This bug should be fixed in the next version of dfx. `master` already contains the fix if you're adventurous enough to try that :grin: 
+
+[quote="Gabriel, post:1, topic:16838"]
+Also I wonder how difficult will be to add a post-build key in dfx like
+[/quote]
+PR welcome :wink: We actually plan to gzip wasm by default when installing the code. There's no real reason not to do that. We're just waiting for a discussion around the replica to resolve before we implement that
+
+-------------------------
+
+Gabriel | 2022-11-24 21:25:41 UTC | #3
+
+Ok so I used the -vv flag and the output was this: 
+
+```
+"/home/gabriel/.cache/dfinity/versions/0.12.1/moc" 
+"/home/gabriel/projects/dragginz/src/backend/main/Actor.mo"
+ "-o" "/home/gabriel/projects/dragginz/.dfx/local/canisters/main/main.wasm"
+ "-c"
+ "--debug"
+ "--idl"
+ "--stable-types"
+ "--public-metadata" "candid:service"
+ "--actor-idl" "/home/gabriel/projects/dragginz/.dfx/local/canisters/idl/"
+ "--actor-alias" "main" "r7inp-6aaaa-aaaaa-aaabq-cai"
+ "--package" "array" ".vessel/array/v0.2.0/src"
+ "--package" "base" ".vessel/base/master/src"
+ "--package" "encoding" ".vessel/encoding/v0.4.0/src"
+ "--package" "hashmap" ".vessel/hashmap/v8.0.0-rc.2/src"
+ "--package" "io" ".vessel/io/v0.3.1/src" 
+ "--package" "matchers" ".vessel/matchers/master/src"
+ "--package" "rand" ".vessel/rand/v0.2.2/src"
+ "--package" "stable-rbtree" ".vessel/stable-rbtree/main/src"
+ "--package" "ulid" ".vessel/ulid/v0.1.2/src"
+```
+Time: real    1m25.386s
+Size: 6658679 Nov 24 21:14 main.wasm
+I copied, and tried to run this manually: 
+
+```
+$(dfx cache show)/moc src/backend/main/Actor.mo 
+-o /home/gabriel/projects/dragginz/.dfx/local/canisters/main/main1.wasm 
+-c 
+--debug
+--idl
+--stable-types
+--public-metadata candid:service 
+--actor-idl /home/gabriel/projects/dragginz/.dfx/local/canisters/idl/  
+-actor-alias main r7inp-6aaaa-aaaaa-aaabq-cai 
+--package base .vessel/base/master/src   
+--package io .vessel/io/v0.3.1/src 
+--package rand .vessel/rand/v0.2.2/src
+--package ulid .vessel/ulid/v0.1.2/src 
+--package encoding .vessel/encoding/v0.4.0/src 
+--package array .vessel/array/v0.2.0/src 
+--package hashmap .vessel/hashmap/v8.0.0-rc.2/src 
+--package stable-rbtree .vessel/stable-rbtree/main/src
+--package matchers .vessel/matchers/master/src
+```
+
+Time: real    1m22.871s
+Size: 10507380 Nov 24 21:16 main1.wasm
+
+So time has improved a lot but size not, which is what I needed in the first place hah. 
+
+Not sure why is that, I double checked and I'm running exactly the same thing. 
+
+If it helps I can open an issue on github @Severin
+
+-------------------------
+
+Severin | 2022-11-25 08:08:13 UTC | #4
+
+Have you tried the `"shrink": true` thing?
+
+-------------------------
+
+Gabriel | 2022-11-25 08:40:55 UTC | #5
+
+Ok so we're getting somewhere
+
+If I update my dfx.json with
+
+```  "main": {
+      "type": "motoko",
+      "main": "src/backend/main/Actor.mo",
+      "shrink" : false
+    } 
+``` 
+
+I get the same size now.
+
+The issue is shrink is true by default and I can't the moc option to turn it on when I manually run the moc compiler, I can't see it in help as well, I'm guessing --shrink true is missing? or not exposed. 
+
+Even if I run dfx build with or without the shrink option in dfx I can't see it in the verbose output.
+
+-------------------------
+
+Severin | 2022-11-25 08:45:54 UTC | #6
+
+Shrink is not part of the Motoko compiler. It's a separate operation on the compiled wasm, done with [ic-wasm](https://docs.rs/ic-wasm/latest/ic_wasm/). If I do `dfx deploy -vv` on a simple `dfx new hello` project, I get:
+```
+Building canister 'hello_backend'.
+Running "/Users/ssiff/.cache/dfinity/versions/0.12.1/moc" "/Users/ssiff/Desktop/hello/src/hello_backend/main.mo" "-o" "/Users/ssiff/Desktop/hello/.dfx/local/canisters/hello_backend/hello_backend.wasm" "-c" "--debug" "--idl" "--stable-types" "--public-metadata" "candid:service" "--actor-idl" "/Users/ssiff/Desktop/hello/.dfx/local/canisters/idl/" "--actor-alias" "hello_backend" "rno2w-sqaaa-aaaaa-aaacq-cai" "--actor-alias" "hello_frontend" "renrk-eyaaa-aaaaa-aaada-cai" "--package" "base" "/Users/ssiff/.cache/dfinity/versions/0.12.1/base"...
+Shrink WASM module size.
+```
+
+The third line shows the separate shrink step.
+
+To do the whole thing manually, you'd have to run `moc` and then `ic-wasm <file> shrink` (can't remember the exact syntax of ic-wasm) so you get the same output
+
+-------------------------
+
+Gabriel | 2022-11-25 09:07:03 UTC | #7
+
+Ah yes, 
+
+it's the last tine and because of the vessel warning I missed it. 
+```
+gabriel@DESKTOP-8G906R5:~/projects/dragginz$ dfx build main -vv
+Trace mode enabled. Lots of logs coming up.
+Building canisters...
+No canister of type 'rust' found. Not trying to run 'cargo audit'.
+Building canister 'main'.
+Running "/home/gabriel/.cache/dfinity/versions/0.12.1/moc" "/home/gabriel/projects/dragginz/src/backend/main/Actor.mo" "-o" "/home/gabriel/projects/dragginz/.dfx/local/canisters/main/main.wasm" "-c" "--debug" "--idl" "--stable-types" "--public-metadata" "candid:service" "--actor-idl" "/home/gabriel/projects/dragginz/.dfx/local/canisters/idl/" "--actor-alias" "main" "r7inp-6aaaa-aaaaa-aaabq-cai" "--package" "array" ".vessel/array/v0.2.0/src" "--package" "base" ".vessel/base/master/src" "--package" "encoding" ".vessel/encoding/v0.4.0/src" "--package" "hashmap" ".vessel/hashmap/v8.0.0-rc.2/src" "--package" "io" ".vessel/io/v0.3.1/src" "--package" "matchers" ".vessel/matchers/master/src" "--package" "rand" ".vessel/rand/v0.2.2/src" "--package" "stable-rbtree" ".vessel/stable-rbtree/main/src" "--package" "ulid" ".vessel/ulid/v0.1.2/src"...
+WARN: .vessel/io/v0.3.1/src/IO.mo:50.52-50.62: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/io/v0.3.1/src/IO.mo:51.33-51.43: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/io/v0.3.1/src/IO.mo:55.13-55.23: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/io/v0.3.1/src/IO.mo:73.32-73.42: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/io/v0.3.1/src/IO.mo:105.37-105.47: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/io/v0.3.1/src/IO.mo:113.36-113.46: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/io/v0.3.1/src/IO.mo:114.17-114.27: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/rand/v0.2.2/src/XorShift.mo:53.45-53.55: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/rand/v0.2.2/src/XorShift.mo:56.17-56.27: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/stable-rbtree/main/src/StableRBTree.mo:330.19-330.39: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+.vessel/stable-rbtree/main/src/StableRBTree.mo:355.13-355.33: warning [M0154], field toArray is deprecated:
+Use static library function instead.
+
+Shrink WASM module size.
+```
+
+So I installed ic-wasm and now I get the same size when I run
+ `ic-wasm /home/gabriel/projects/dragginz/.dfx/local/canisters/main/main1.wasm -o /home/gabriel/projects/dragginz/.dfx/local/canisters/main/main1-s.wasm shrink`
+
+Wasn't aware of the extra command but thank you for that, I was finally able to crack the issue. 
+
+Last question, when should we expect gzip to be part of dfx?
+
+-------------------------
+
+Severin | 2022-11-25 09:11:32 UTC | #8
+
+[quote="Gabriel, post:7, topic:16838"]
+when should we expect gzip to be part of dfx?
+[/quote]
+
+Just one internal problem resolution away - but it's been lingering around for a while and I honestly don't see it resolved very soon. It's about something how the replica transforms the uploaded code (don't know what, I should probably go investigate some more). Can't give an ETA because of that :frowning_face:
+
+-------------------------
+
+Gabriel | 2022-11-25 17:51:05 UTC | #9
+
+Gotcha, thank you @Severin , quick question
+
+On custom builds on install I get this
+
+``` 
+Installing code for canister main, with canister ID r7inp-6aaaa-aaaaa-aaabq-cai
+Error: Failed to install wasm module to canister 'main'.
+Caused by: Failed to install wasm module to canister 'main'.
+  Failed to install wasm in canister 'r7inp-6aaaa-aaaaa-aaabq-cai'.
+    Failed to install wasm.
+      The replica returned an HTTP Error: Http Error: status 500 Internal Server Error, content type "", content: Internal Server Error
+```
+or 
+```
+Installing code for canister main, with canister ID r7inp-6aaaa-aaaaa-aaabq-cai
+Error: Failed to install wasm module to canister 'main'.
+Caused by: Failed to install wasm module to canister 'main'.
+  Failed to install wasm in canister 'r7inp-6aaaa-aaaaa-aaabq-cai'.
+    Failed to install wasm.
+      An error happened during communication with the replica: error sending request for url (http://127.0.0.1:4943/api/v2/canister/r7inp-6aaaa-aaaaa-aaabq-cai/call): error writing a body to connection: Broken pipe (os error 32)
+
+```
+
+also 
+
+``` 
+hyper::Error(
+    BodyWrite,
+    Os {
+        code: 32,
+        kind: BrokenPipe,
+        message: "Broken pipe",
+    },
+)
+```
+
+After shrink and gzip the size is 1.4mb and all other wasms are smaller than 1mb. 
+
+I tried with a few other smaller test projects and this works really well except the main big project, any ideas how to debug this or why is this happening?
+
+-------------------------
+
+Gabriel | 2022-11-26 10:11:09 UTC | #10
+
+Ok I found out why I'm getting that errror. Created an issue here: https://github.com/dfinity/sdk/issues/2785
+
+-------------------------
+
+Gabriel | 2022-12-21 09:09:41 UTC | #11
+
+Hey @Severin I've just upgraded to 0.12.2-beta-0 and I still get this on build
+
+Error: Failed while trying to build all canisters.
+Caused by: Failed while trying to build all canisters.
+  The post-build step failed for canister 'rdmx6-jaaaa-aaaaa-aaadq-cai' (main) with an embedded error: No such file or directory (os error 2)
+
+Is dfx 0.12.2 using your fix or do I need to wait for another version?
+
+-------------------------
+
+Severin | 2022-12-21 09:16:24 UTC | #12
+
+I see no activity on the ticket - the GH issue is up to date. The bug is still there.
+
+[quote="Gabriel, post:11, topic:16838"]
+Is dfx 0.12.2 using your fix or do I need to wait for another version?
+[/quote]
+WDYM with 'your fix'?
+
+-------------------------
+
+Gabriel | 2022-12-21 09:22:41 UTC | #13
+
+Up above you said 
+`My bad, I broke that recently. This bug should be fixed in the next version of dfx. master already contains the fix if you’re adventurous enough to try that `
+
+I thought that fix is in this dfx version :)
+
+-------------------------
+
+Severin | 2022-12-21 09:27:24 UTC | #14
+
+Oh, right, yes, that has to be in the release. I thought you were asking about https://github.com/dfinity/sdk/issues/2785
+
+-------------------------
+
+Gabriel | 2022-12-21 09:30:28 UTC | #15
+
+[quote="Gabriel, post:11, topic:16838"]
+The post-build step failed for canister ‘rdmx6-jaaaa-aaaaa-aaadq-cai’ (main) with an embedded error: No such file or directory (os error 2)
+[/quote]
+
+ah ok, weird. Thanks 
+
+Any ideas why I still get this? or at least how to fix it? 
+
+`The post-build step failed for canister ‘rdmx6-jaaaa-aaaaa-aaadq-cai’ (main) with an embedded error: No such file or directory (os error 2)`
+
+-------------------------
+
+Severin | 2022-12-21 09:53:16 UTC | #16
+
+The only lines with such a terrible error message seem to be these: https://github.com/dfinity/sdk/blob/master/src/dfx/src/lib/models/canister.rs#L573-L575. And Motoko canisters don't have a postbuild step, so it can't be a line later in that function.
+
+If I interpret this correctly (I'm context switching way too much today) then the build did not put a .did file in the expected place. IDK if this is because you don't specify where you place it or because of a dfx bug, but I don't have time to investigate right now.
+
+-------------------------
+
+Gabriel | 2022-12-21 11:01:25 UTC | #17
+
+move this line `"candid": "src/declarations/main/main.did"` above did the trick. 
+
+``` 
+    "main": {
+      "type": "custom",
+      "candid": "src/declarations/main/main.did",
+      "build": "bash -c './scripts/compress.sh main'",
+      "wasm": "src/declarations/main/main.wasm.gz"
+    },
+``` 
+This works for me now. Thanks
+
+-------------------------
+
+lastmjs | 2023-04-26 12:39:54 UTC | #18
+
+Any progress on dfx automatically gzipping? This is causing us some trouble, we're trying to use the new "optimize" feature in dfx 014.0 but we also need to gzip after the optimization is done, but by the time the optimization is complete dfx has long completed our custom build script, thus I don't know how to gzip the optimized binary without requiring our developers to break out of using dfx deploy/build etc and using custom commands, which is not desirable.
+
+-------------------------
+
+Severin | 2023-04-27 11:27:43 UTC | #19
+
+I'm looking into it again. I've seen some messages that hint that the blocker could be resolved, but I'll have to double-check
+
+-------------------------
+

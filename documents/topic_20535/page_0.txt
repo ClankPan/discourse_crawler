@@ -1,0 +1,100 @@
+ic_axb | 2023-06-08 11:28:53 UTC | #1
+
+I checked the did file and found two transfer methods, icrc1_transfer and transfer
+The parameters required to find the two methods are
+```
+#[derive(Serialize, CandidType, Deserialize, Clone, Debug, Copy)]
+pub struct Account {
+    pub owner: Principal,
+    pub subaccount: Option<Subaccount>,
+}
+
+// icrc1_transfer function
+#[derive(CandidType, Deserialize)]
+pub struct TransferArg {
+    pub to: Account,
+    pub fee: Option<candid::Nat>,
+    pub memo: Option<Vec<u8>>,
+    pub from_subaccount: Option<Vec<u8>>,
+    pub created_at_time: Option<u64>,
+    pub amount: candid::Nat,
+}
+
+// transfer function
+#[derive(CandidType, Deserialize)]
+pub struct TransferArgs {
+    pub to: Vec<u8>,
+    pub fee: Tokens,
+    pub memo: u64,
+    pub from_subaccount: Option<Vec<u8>>,
+    pub created_at_time: Option<TimeStamp>,
+    pub amount: Tokens,
+}
+```
+Is there any difference between the to of these two functions?
+Is to in TransferArgs a sub-account or a value that needs to be processed by the fnnew method?
+```
+fn fnnew(owner: &Principal, subaccount: &Subaccount) -> Vec<u8> {
+    let mut hasher = sha2::Sha224::new();
+    hasher.update(b"\x0Aaccount-id");
+    hasher.update(owner.as_slice());
+    hasher.update(&subaccount[..]);
+    let hash: [u8; 28] = hasher.finalize().into();
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&hash);
+    let crc32_bytes = hasher.finalize().to_be_bytes();
+
+    let mut result = [0u8; 32];
+    result[0..4].copy_from_slice(&crc32_bytes[..]);
+    result[4..32].copy_from_slice(hash.as_ref());
+    result.to_vec()
+}
+```
+
+-------------------------
+
+peterparker | 2023-06-08 13:29:04 UTC | #2
+
+My understanding is that the outcome is the same: sending ICP is executed.
+
+The `transfer` function is the original feature while `icrc1_transfer` was added recently as the [ICRC-1](https://github.com/dfinity/ICRC-1/) standard was adopted.
+
+ckBTC and Snses project use the ICRC-1 ledger that "only" supports `icrc1_transfer`.
+Adding that function to the ICP ledger as well aligns it. 
+
+cc @mariop in case my answer would not be accurate.
+
+-------------------------
+
+bogwar | 2023-06-08 14:20:35 UTC | #3
+
+Each account on the ICP ledger uniquely corresponds to a pair (owner, subaccount). 
+
+The `to` for the `transfer` method is an account identifier which, roughly speaking is the hash of the pair;  this is what the `fnnew` function computes. 
+
+The `to` for the `icrc_transfer` method is a struct which keeps the two components separately.
+
+-------------------------
+
+peterparker | 2023-06-08 14:57:52 UTC | #4
+
+Don't know why I jumped to that explanation 🤷‍♂️. Thanks for properly answering @bogwar .
+
+-------------------------
+
+mariop | 2023-06-08 17:44:03 UTC | #5
+
+The two methods are equivalent from the point of view of the user except for the `memo` which offers more space in `icrc1_transfer`. The differences are mostly in usability as `icrc1_transfer` is easier to use in my option.
+If we want to be precise, there are the following differences:
+
+1. **to**: `transfer` takes in input an `AccountIdentifier` as the `to` account while `icrc1_transfer` takes in input an `Account`, which is a pair of the `Principal` owning the account and an optional 32 bytes as subaccount. You can see `AccountIdentifier` as the hash of an `Account`. For a user there is really no difference between the two except that `Account` is easier to build because it requires one less step.
+2. **fee**: the fee is required in `transfer` and optional in `icrc1_transfer`. This is an QoL improvement as  the fee is not changing that much. If you set it, the Ledger will execute the transaction iff the value is equivalent to the fee expected by the Ledger.
+3. **memo**: the `memo` is a number in `transfer` while it is a 32 bytes array in `icrc1_transfer`. I think this is a great improvement because a memo now can contain an identifier of e.g. a transaction on another chain. Moreover, the `memo` is optional in `icrc1_transfer` which is another QoL improvement similar to the the one for `fee`. You don't always need a `memo` after all.
+4. **created_at_time**: it's optional in both but in `transfer` the inner `TimeStamp` is a record with a field `timestamp_nanos` while in `created_at_time` the inner type is just `u64`  (as nanoseconds since the UNIX epoch in the UTC timezone). Again, I see this as a QoL improvement.
+4. **amount of tokens**: the format of the amount of tokens in the two methods is different. In `transfer`, an amount of tokens is a record that contains a single field called `e8s` which is a `u64`. In `icrc1_transfer`, an amount is a `Nat` (keep in mind that this is capped at `u64::MAX`). This is again a QoL change as it is more natural to represent an amount of tokens as number in my opinion.
+
+`icrc1_transfer` is a standard method specified in the [`ICRC-1` Fungible Token Standard](https://github.com/dfinity/ICRC-1) while `transfer` is a method specific to the ICP Ledger. For this reason, we strongly suggest clients to switch to `icrc1_transfer` and use that one only.
+
+-------------------------
+

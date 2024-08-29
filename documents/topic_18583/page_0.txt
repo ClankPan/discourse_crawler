@@ -1,0 +1,830 @@
+sgaflv | 2023-02-19 11:46:49 UTC | #1
+
+Hi all,
+
+My name is Stan. I wanted to announce that I have started working on the WASI support for the IC under the Developer Grant Program.
+
+# Background
+
+WebAssembly System Interface (WASI) is emerging as the standard target for compiling WebAssembly (Wasm) programs. WASI provides a set of functions to access system resources such as the file system, network, and environment variables regardless of the underlying operating system. This allows Wasm programs to be run in a variety of environments, including the web, cloud, and embedded devices.
+
+Many popular programming languages, including [JavaScript](https://wapm.io/mozilla/spidermonkey) (SpiderMonkey engine), [Python](https://wapm.io/python/python) (CPython), [C++](https://medium.com/wasmer/wasienv-wasi-development-workflow-for-humans-1811d9a50345), [Go](https://wasmbyexample.dev/examples/wasi-hello-world/wasi-hello-world.go.en-us.html) (TinyGo), [Haskell](https://www.tweag.io/blog/2022-11-22-wasm-backend-merged-in-ghc/) (GHC), [Swift](https://github.com/swiftwasm/swift), and [Ruby](https://wapm.io/katei/irb), support WASI as a compilation target. A popular database [Sqlite](https://wapm.io/sqlite/sqlite) can also be compiled to WASI.
+
+
+# Project Description
+
+The goal of the project is to use the IC's System API to implement the core WASI functions, effectively [polyfilling](https://developer.mozilla.org/en-US/docs/Glossary/Polyfill) WASI for the IC. This would allow developers to take advantage of the WASI ecosystem and run WASI-compatible programs on the Internet Computer.
+
+[The set of WASI functions](https://github.com/WebAssembly/WASI/blob/main/phases/snapshot/docs.md) consists of the following groups:
+
+1. Accessing the program arguments and environment variables:
+   * args_get(), args_sizes_get(), environ_get(), environ_sizes_get().
+2. Getting the current time:
+   * clock_res_get(), clock_time_get().
+3. Working with files and paths:
+   * fd_advise(), fd_allocate(), fd_close(), fd_datasync(), fd_fdstat_get(), fd_fdstat_set_flags(), fd_fdstat_set_rights(), fd_filestat_get(), fd_filestat_set_size(), fd_filestat_set_times(), fd_pread(), fd_prestat_get(), fd_prestat_dir_name(), fd_pwrite(), fd_read(), fd_readdir(), fd_renumber(), fd_seek(), fd_sync(), fd_tell(), fd_write(), path_create_directory(), path_filestat_get(), path_filestat_set_times(), path_link(), path_open(), path_readlink(), path_remove_directory(), path_rename(), path_symlink(), path_unlink_file()
+4. Working with sockets:
+   * sock_accept(), sock_recv(), sock_send(), sock_shutdown().
+5. Polling on time and file events:
+   * poll_oneoff()
+6. Getting randomness:
+   * random_get()
+7. Other:
+   * proc_exit(), proc_raise(), sched_yield().
+
+Polyfilling groups 1, 2, 5, 6, 7 should be straightforward with a caveat that currently randomness is not available at canister installation time, which will make random_get() pseudorandom in the initial version. True randomness would require protocol changes to provide randomness during canister installation time. The plan for group 3 is to implement the simplest possible file system on top of IC's stable memory and [stable-structures](https://github.com/dfinity/stable-structures). This is where most of the work is expected to happen. Group 4 will not be supported because sockets are not required to run most of the WASI programs mentioned in the Background section.
+
+Additionally, I am planning to write a command line tool to parse Wasm binaries and substitute the WASI imports with their implementations from the polyfill library.
+
+The workflow for an IC developer utilizing WASI will look as follows:
+    1. Write a WASI program in any language that supports wasm32-wasi.
+    2. Incorporate a build step to my command line tool to replace WASI dependencies.
+    3. Run the Wasm binary on the IC.
+
+I'll post more updates in this thread once I have the initial prototype implementation.
+
+-------------------------
+
+rossberg | 2023-02-19 12:03:44 UTC | #2
+
+That would be great! Will it be a problem for the implementation that some services can only be accessed asynchronously on the IC?
+
+-------------------------
+
+Gekctek | 2023-02-19 15:45:41 UTC | #3
+
+This is great. I've been so excited for wasm in general to take over. 
+This would be a great opportunity for Motoko to expand it's wasi support.
+
+-------------------------
+
+sgaflv | 2023-02-19 16:37:22 UTC | #4
+
+[quote="rossberg, post:2, topic:18583, full:true"]
+That would be great! Will it be a problem for the implementation that some services can only be accessed asynchronously on the IC?
+[/quote]
+
+In order to use the asynchronous features of the IC, the program would need to use the System API in addition to WASI. The primary benefit of the project is to allow the usage of WASI-based libraries in the IC canisters.
+
+-------------------------
+
+chenyan | 2023-02-19 17:32:54 UTC | #5
+
+Interesting idea! I think group 1 is also tricky to implement. If the goal is to replace the whole WASI binary to run on the IC, how do you decide their Candid types and the endpoint API? If we plan to use the WASI binary as a library, we don't have a good story for Wasm linking yet.
+
+-------------------------
+
+sgaflv | 2023-02-19 21:43:50 UTC | #6
+
+[quote="chenyan, post:5, topic:18583, full:true"]
+Interesting idea! I think group 1 is also tricky to implement. If the goal is to replace the whole WASI binary to run on the IC, how do you decide their Candid types and the endpoint API? If we plan to use the WASI binary as a library, we don’t have a good story for Wasm linking yet.
+[/quote]
+
+The concrete goal is to support the `wasm32-wasi` compilation target for canisters. This will allow a canister to use a library that requires WASI, which is currently impossible with the target `wasm32-unknown-unknown`. Note that the library here means not a Wasm file but rather an actual library defined in the source language of the canister. For example, a Rust canister could embed a rust port of the sqlite library [rusqlite](https://github.com/rusqlite/rusqlite) that supports the WASI target.
+
+In theory it might be possible to support libraries defined in Wasm files, which, as you have mentioned, would require some Wasm linker, this is out of scope in this project.
+
+
+[quote="chenyan, post:5, topic:18583, full:true"]
+I think group 1 is also tricky to implement. 
+[/quote]
+
+For now I am aiming for the simplest possible implementation of the polyfill functions, which means the args_get() and environ_get() would return empty results.
+
+-------------------------
+
+paulyoung | 2023-02-19 21:53:42 UTC | #7
+
+For the `fd_*` stuff you might be interested in https://github.com/codebase-labs/icfs
+
+-------------------------
+
+cymqqqq | 2023-02-20 01:16:22 UTC | #8
+
+Good work! I have a question here:
+
+[quote="sgaflv, post:1, topic:18583"]
+3. Run the Wasm binary on the IC.
+[/quote]
+Run the wasm binary on the IC, do you mean a canister? if so, how do you generate the candid file?
+
+-------------------------
+
+skilesare | 2023-02-20 11:55:14 UTC | #9
+
+Would this even work with motoko? Seems the referenced library could do something unexpected..maybe yield flow to something that never returns?
+
+-------------------------
+
+sgaflv | 2023-02-20 11:55:23 UTC | #10
+
+[quote="paulyoung, post:7, topic:18583, full:true"]
+For the `fd_*` stuff you might be interested in [GitHub - codebase-labs/icfs: Internet Computer File System ](https://github.com/codebase-labs/icfs)
+[/quote]
+
+Thank you! I will take a look, does it support folders?
+
+-------------------------
+
+paulyoung | 2023-02-20 17:04:32 UTC | #11
+
+Yes. There’s an example showing how you can provide a POSIX-style API:
+
+https://github.com/codebase-labs/icfs/blob/8371ab72995ea4cd0d786de606a1e6b97a41be0a/examples/fatfs/test.ic-repl#L30-L#40
+
+There’s also an issue for making a more idiomatic Rust API: https://github.com/codebase-labs/icfs/issues/23
+
+-------------------------
+
+icpp | 2023-02-20 22:07:47 UTC | #12
+
+@sgaflv ,
+
+This is great news!
+
+We use the wasi-sdk to compile C++ to wasm, and we currently stub those methods you mentioned. 
+
+Even when the file system is not used at all, the wasi-sdk linker still might include calls to fd_* functions. For extra safety we also trap the execution with a clear message.
+
+Looking forward to be able to use the full wasi-sdk capabilities!
+
+-------------------------
+
+paulyoung | 2023-02-21 19:21:29 UTC | #13
+
+[`wasm-snip`](https://github.com/rustwasm/wasm-snip) can sometimes help simplify things when imports show up but those code paths aren’t used.
+
+-------------------------
+
+sgaflv | 2023-02-22 19:20:36 UTC | #14
+
+[quote="cymqqqq, post:8, topic:18583"]
+Run the wasm binary on the IC, do you mean a canister? if so, how do you generate the candid file?
+[/quote]
+
+The goal is to allow building canisters that contain `wasm32-wasi` target dependencies, but otherwise you are developing the canister by the usual canister development flow.
+
+-------------------------
+
+sgaflv | 2023-02-22 19:27:44 UTC | #15
+
+[quote="skilesare, post:9, topic:18583, full:true"]
+Would this even work with motoko? Seems the referenced library could do something unexpected…maybe yield flow to something that never returns?
+[/quote]
+
+As far as I know Motoko does not compile to `wasm32-wasi` (it also [doesn't have FFI](https://forum.dfinity.org/t/any-possible-to-invoke-rust-code-in-motoko/5751/4?u=sgaflv)). My initial focus is low-level languages like Rust and C++.
+
+-------------------------
+
+skilesare | 2023-02-22 19:37:19 UTC | #16
+
+There is definitely a --wasi-system-api flag for outputting to wasi.  I'd say that @claudio or @matthewhammer would have more info.
+
+If there are a few small things that could be added to get motoko into the mix it would be really helpful.
+
+-------------------------
+
+sgaflv | 2023-02-22 19:38:09 UTC | #17
+
+Great! Many thanks! I might have more questions when I start working on the `fd_` functions.
+
+-------------------------
+
+skilesare | 2023-02-22 19:43:20 UTC | #18
+
+I also don't know if this has any crossover with what @v1ctor has done on https://forum.dfinity.org/t/assigned-icdevs-org-bounty-34-wasmer-motoko-10-000/17887, but if it does it would be nice to build on the work that has already been done over there.  I think this is likely the other side of the coin from this work, but I want to make sure you guy know about each other and can compare notes.
+
+-------------------------
+
+sgaflv | 2023-02-22 19:55:16 UTC | #19
+
+Thank you for the information, I will take a look at that project and see if there is something in common that can be reused. At the moment I don't have a clear picture how it would work in Motoko, but supporting `wasm32-wasi` is a good sign!
+
+-------------------------
+
+rossberg | 2023-02-22 21:10:51 UTC | #20
+
+One important detail I'm still missing from the workflow described in the OP is this: at the end of the day, any program useful on the IC will need to interact with the IC's system API in some way, i.e., at least be able to receive and respond to ingress messages. That is rather different from how programs interact with more traditional environments. What is the plan for bridging that gap?
+
+-------------------------
+
+skilesare | 2023-02-22 21:17:49 UTC | #21
+
+I for one would love to write Motoko programs that **Don't** need the IC system APIs...or at least that have the details abstracted away into a runtime that lets me do strongly typed async, actor-based programming on any platform and have other programs import my code and use it for other non-ic based tasks....of course, I need some way for that program to tell the outside world that something interesting happened.
+
+-------------------------
+
+icpp | 2023-02-23 03:13:54 UTC | #22
+
+> Incorporate a build step to my command line tool to replace WASI dependencies.
+
+Will you support the CLI on Linux, Mac and Windows?
+
+That would be important so we can include it as a step inside our tooling which supports all platforms.
+
+We write our CLI in Python and for now distribute via PyPI.
+
+-------------------------
+
+ulan | 2023-02-23 18:16:19 UTC | #23
+
+> One important detail I’m still missing from the workflow described in the OP is this: at the end of the day, any program useful on the IC will need to interact with the IC’s system API in some way, i.e., at least be able to receive and respond to ingress messages.
+
+I've been chatting with @sgaflv offline about this project. One thing that's not clear from the description and may be a source of confusion is that the project is not about taking any WASI binary and  automatically generating an IC canister out of it.
+
+The actual goal is to allow an existing IC canister to use libraries that support `wasm32-wasi` as the compilation target (but don't support `wasm32-unknown-unknown`). In other words, when the project is done, developers should be able to compile IC canisters to `wasm32-wasi` and with some post-processing run the canister on the IC. The canister would still need to use the System API to interact with the IC.
+
+-------------------------
+
+mparikh | 2023-02-23 21:05:41 UTC | #24
+
+[quote="ulan, post:23, topic:18583"]
+allow an existing IC canister to use libraries that support `wasm32-wasi` as the compilation target (but don’t support `wasm32-unknown-unknown`).
+[/quote]
+
+I think that this is great tldr. 
+
+However to make it into a **useful** wasm32-wasi compilation target,  it seems to me that some of implementing functions would need to use underlying IC calls (such as random_get()). 
+
+So really the question is which of the functional groups (outlined above) which will be really implemented as MVP and which would left for another day.
+
+-------------------------
+
+paulyoung | 2023-02-23 21:42:39 UTC | #25
+
+[quote="sgaflv, post:1, topic:18583"]
+Getting randomness:
+
+* random_get()
+[/quote]
+
+In case this is helpful:
+
+https://github.com/codebase-labs/ic-auth-tokens/blob/76113cbaa8b788b1989a9d5ef0868cdb12ee46af/crates/ic-auth-tokens/src/lib.rs#L77-L95
+
+-------------------------
+
+sgaflv | 2023-02-24 20:52:00 UTC | #26
+
+[quote="icpp, post:22, topic:18583"]
+Will you support the CLI on Linux, Mac and Windows?
+[/quote]
+
+Yes, the command-line tool will be cross-platform
+
+-------------------------
+
+sgaflv | 2023-02-24 21:01:11 UTC | #27
+
+[quote="mparikh, post:24, topic:18583"]
+However to make it into a **useful** wasm32-wasi compilation target, it seems to me that some of implementing functions would need to use underlying IC calls (such as random_get()).
+
+So really the question is which of the functional groups (outlined above) which will be really implemented as MVP and which would left for another day.
+[/quote]
+
+Yes, you are right. The `wasm-wasi` functions will be implemented on top of the System API. The plan is to implement all of the functions except for the sockets. As I mentioned in the project description, the initial implementation of the `random_get()` will be based on a pseudo-randomness and will not be secure.
+
+-------------------------
+
+sgaflv | 2023-02-24 21:05:12 UTC | #28
+
+[quote="paulyoung, post:25, topic:18583"]
+In case this is helpful:
+[/quote]
+
+Thanks! I was considering a similar implementation. However, the canister might call `random_get()` during initialization before calls to the management canister are allowed. @ulan mentioned to me that this problem may be solved in the future by supporting `raw_random()` in the System API as a synchronous call.
+
+-------------------------
+
+rossberg | 2023-02-25 10:09:26 UTC | #29
+
+[quote="sgaflv, post:27, topic:18583"]
+As I mentioned in the project description, the initial implementation of the `random_get()` will be based on a pseudo-randomness and will not be secure.
+[/quote]
+
+Yes, I saw. However, you seem to imply that this only affects the initial implementation. But I wonder how this can be worked around at all, given that proper randomness requires an asynchronous call to the Management canister. I doubt that is going to change.
+
+-------------------------
+
+ulan | 2023-02-25 12:40:51 UTC | #30
+
+> @ulan mentioned to me that this problem may be solved in the future by supporting `raw_random()` in the System API as a synchronous call.
+
+> But I wonder how this can be worked around at all, given that proper randomness requires an asynchronous call to the Management canister. I doubt that is going to change.
+
+The execution layer of replica gets random bits as input in each round [[code](https://github.com/dfinity/ic/blob/master/rs/execution_environment/src/scheduler.rs#L1273)]. These bits are passed to the management canister to handle `raw_rand()` requests. I think we could use some of these bits to provide randomness to canister message execution synchronously. Having random bits during canister installation would be useful in many cases. We definitely need to check this with security/crypto experts because I am not sure if this would break some security properties of `raw_rand()`.
+
+-------------------------
+
+lastmjs | 2023-02-25 14:32:52 UTC | #31
+
+I'm very excited about this effort, I imagine this will help [Azle](https://github.com/demergent-labs/azle) and [Kybra](https://github.com/demergent-labs/kybra) tremendously in the future as we attempt to provide support for as many npm and PyPI packages as possible.
+
+As for the randomness, it would be fantastic to be able to retrieve randomness synchronously during init. In the mean time, we've overcome this issue in Azle and Kybra by setting a timer of duration 0 during init and post_upgrade that immediately retrieves randomness and seeds an rng that we hook up to our custom_random function for the rand crate to then use under-the-hood.
+
+I'm not sure if this technique could be used for this system API functionality, but it seems to be working very well so far.
+
+-------------------------
+
+matthewhammer | 2023-03-01 23:52:54 UTC | #32
+
+[quote="lastmjs, post:31, topic:18583"]
+setting a timer of duration 0 during init and post_upgrade that immediately retrieves randomness and seeds an rng that we hook up to our custom_random function for the rand crate to then use under-the-hood.
+[/quote]
+
+That seems like a great technique, especially since you say it actually works.
+
+[quote="lastmjs, post:31, topic:18583"]
+it seems to be working very well so far.
+[/quote]
+
+Do you test for edge cases that have races?
+(a need for randomness before the timer-fed seeding step is done?)
+
+-------------------------
+
+lastmjs | 2023-03-02 00:41:20 UTC | #33
+
+[quote="matthewhammer, post:32, topic:18583"]
+Do you test for edge cases that have races?
+(a need for randomness before the timer-fed seeding step is done?)
+[/quote]
+
+We have not. Our RNG will use a seed of 0s until the timer callback executes. So I believe it's possible that message could get in before the callback executes. Nothing would crash or panic necessarily, but those values could possibly be predicted until the seed is changed by the callback.
+
+-------------------------
+
+matthewhammer | 2023-03-03 17:22:46 UTC | #34
+
+[quote="lastmjs, post:33, topic:18583"]
+Nothing would crash or panic necessarily, but those values could possibly be predicted until the seed is changed by the callback.
+[/quote]
+
+Makes sense.
+
+If the initializer gives their own temp seed, one could use that and then overwrite it with the better one.  Would that work?  As you say, it wouldn't be normally needed, but maybe would help cover this edge case if it were a security concern for anyone auditing the way the code works. WDYT?
+
+In any case, thanks for for this clarification.
+
+-------------------------
+
+lastmjs | 2023-03-04 06:54:57 UTC | #35
+
+That makes sense to me, if the init and post upgrade had a parameter for some random bytes you should be able to do that pretty easily.
+
+Ooh, I think we could fix the issue for post upgrade actually by saving the seed in stable memory during pre upgrade and writing it back in post upgrade. It's probably only necessary then during init.
+
+-------------------------
+
+matthewhammer | 2023-03-04 13:04:30 UTC | #36
+
+[quote="lastmjs, post:35, topic:18583"]
+I think we could fix the issue for post upgrade actually by saving the seed in stable memory during pre upgrade and writing it back in post upgrade. It’s probably only necessary then during init.
+[/quote]
+
+Cool!  Then it's not really an issue (since initialization only happens once, the chance of "attack" then seems very controllable and minimal).
+
+-------------------------
+
+lastmjs | 2023-05-09 17:21:14 UTC | #37
+
+Any update on when we'll get WASI on the IC?
+
+-------------------------
+
+lastmjs | 2023-05-09 18:45:43 UTC | #38
+
+Does anyone know why candid won't compile for wasm32-wasi? https://github.com/dfinity/candid/issues/426
+
+Seems like a problem in the num-bigint crate, but I haven't been able to figure it out yet.
+
+-------------------------
+
+lastmjs | 2023-05-10 15:24:29 UTC | #39
+
+I've found a workaround to the issue, but it should probably be addressed in Candid before Wasi can go to production on the IC: https://github.com/dfinity/candid/issues/426
+
+-------------------------
+
+lastmjs | 2023-05-10 19:37:38 UTC | #40
+
+@sgaflv I just wanted to say you're doing an awesome job! I have the polyfill working with Kybra and we're compiling to wasm32-wasi which is just amazing.
+
+-------------------------
+
+lastmjs | 2023-05-10 19:38:34 UTC | #41
+
+This is helping us to hopefully enable a huge chunk of the Python stdlib. Also wasm32-wasi I hope helps us overcome some pesky issues related to enabling randomness and time in our dependencies.
+
+-------------------------
+
+sgaflv | 2023-05-10 23:18:35 UTC | #42
+
+@lastmjs  Thank you for your feedback. I am glad you were able to compile the project and it looks promising to you. 
+
+I think the project is almost ready. I've managed to run the rusqlite inside a canister. There are a few polyfill functions that still need to be implemented as well as more testing and better documentation are pending. It will probably take a few more weeks to complete.
+
+Thank you for looking into the candid issue, I vaguely remember seeing the error message some time ago, but I don't remember how I fixed it. I will look into it.
+
+For others who are also interested in trying this out:
+- https://github.com/wasm-forge/wasi2ic 
+- https://github.com/wasm-forge/ic-wasi-polyfill
+- https://github.com/wasm-forge/stable-fs
+- https://github.com/wasm-forge/demo3
+
+I look forward to hearing feedback!
+
+-------------------------
+
+lastmjs | 2023-05-12 18:37:31 UTC | #43
+
+I have a question about seeding the randomness. If you look here: https://github.com/wasm-forge/ic-wasi-polyfill/blob/main/src/lib.rs#LL1090C41-L1090C54
+
+it is using `rand::rngs::StdRng::seed_from_u64`. Why are you using `from_u64` and not `from_seed` which would allow passing in a `vec` or randomness like we get from the management canister's `raw_rand`? That's how we've been doing randomness, and I'm not sure if I can just reduce that randomness down to a `u64`.
+
+I'm trying to hook this up with our current implementation that uses a timer of delay 0 after init and post_upgrade to seed good randomness.
+
+-------------------------
+
+lastmjs | 2023-05-12 18:40:44 UTC | #44
+
+Yes it seems like if you use `seed_from_u64` then we only have 64 bits or 8 bytes to work with, but `raw_rand` gives us 32 bytes, so we can't take advantage of all of the randomness possible on the IC. Seems like this is weakening the security.
+
+-------------------------
+
+lastmjs | 2023-05-12 18:52:35 UTC | #45
+
+Also is it safe to call `ic_wasi_polyfill::init` multiple times? We're calling it once in init and post_upgrade with a seed of `0`, and then once in that timer callback of delay 0 with an actual seed value.
+
+-------------------------
+
+sgaflv | 2023-05-13 10:06:50 UTC | #46
+
+> it is using `rand::rngs::StdRng::seed_from_u64`. Why are you using `from_u64` and not `from_seed` which would allow passing in a `vec` or randomness like we get from the management canister’s `raw_rand`? That’s how we’ve been doing randomness, and I’m not sure if I can just reduce that randomness down to a `u64`.
+
+> Yes it seems like if you use `seed_from_u64` then we only have 64 bits or 8 bytes to work with, but `raw_rand` gives us 32 bytes, so we can’t take advantage of all of the randomness possible on the IC. Seems like this is weakening the security
+
+Yes, you are right! It is a good idea to use `from_seed` instead. For now it was done using `u64`  for simplicity.
+
+-------------------------
+
+sgaflv | 2023-05-13 10:15:20 UTC | #47
+
+[quote="lastmjs, post:45, topic:18583, full:true"]
+Also is it safe to call `ic_wasi_polyfill::init` multiple times? We’re calling it once in init and post_upgrade with a seed of `0`, and then once in that timer callback of delay 0 with an actual seed value.
+[/quote]
+
+It is not save to call `init` multiple times, because we might do something that only works once in that method. I will add an extra function to be able to update the random seed instead.
+
+-------------------------
+
+lastmjs | 2023-05-13 14:11:43 UTC | #48
+
+Okay perfect! Thank you
+
+-------------------------
+
+ilbert | 2023-05-14 09:50:14 UTC | #49
+
+Great job @sgaflv! I have a question for you.
+
+Recently, I managed to port Oxigraph's [RDF database](https://www.w3.org/RDF/) to the IC, as you can see at [ic-oxigraph](https://github.com/omnia-network/ic-oxigraph). The original [oxigraph](https://github.com/oxigraph/oxigraph) library can run in JS environments using [js_sys](https://crates.io/crates/js_sys), so I'm pretty sure it doesn't target `wasm32-wasi` by default.
+
+As you can see from the [README](https://github.com/omnia-network/ic-oxigraph#whats-been-ported), what basically needed to be ported were the random number generator and the `Date::now()` functions, and it was not that hard.
+
+I'd like to understand if there's a way to use your **wasi2ic** tool to make it more stable while also benefit from future updates and improvements.
+
+As a general overview btw, I believe having **RDF databases** on the IC can help people create and deploy decentralized (knowledge) graphs from which multiple project could benefit.
+
+-------------------------
+
+lastmjs | 2023-06-06 17:56:38 UTC | #50
+
+I would love this FYI, been dealing with this problem since Sudograph in Summer 2021
+
+-------------------------
+
+lastmjs | 2024-01-06 00:52:30 UTC | #51
+
+@sgaflv @ulan or anyone else, I can't seem to get the stable filesystem to work. I've tried some very basic reading and writing across deploys in Azle and in a very simple Rust canister and it just doesn't work. I've opened an issue in the ic-wasi-polyfill repo: https://github.com/wasm-forge/ic-wasi-polyfill/issues/13
+
+Please help, getting close to providing Azle with a Node.js fs implementation hooked up to stable memory.
+
+-------------------------
+
+sgaflv | 2024-01-06 19:43:44 UTC | #52
+
+Hi Jordan, sorry for the inconvenience. I think I found the problem, I am working on the fix now.
+
+-------------------------
+
+sgaflv | 2024-01-07 12:30:53 UTC | #53
+
+Should be working now, just take the latest ic-wasi-polyfill version 0.3.13.
+
+-------------------------
+
+lastmjs | 2024-01-08 14:51:43 UTC | #54
+
+Perfect! Thanks for the fast turn around, I will try it out and report back.
+
+-------------------------
+
+lastmjs | 2024-01-15 21:44:25 UTC | #55
+
+FYI so far it is working, we haven't done extensive testing but the initial problem is gone. Thanks!
+
+-------------------------
+
+kristofer | 2024-02-22 08:44:25 UTC | #56
+
+Hey @sgaflv, `ic-wasi` looks great! I just tried running the demo with the Boa JS engine. This is exactly what I need to be able to run untrusted JS code for my upcoming project [CATTS](https://kristoferlund.se/blog/240214-catts) – Composite Attestations Engine. In this I need to allow the user to define "processors" with arbitrary code that processes and transforms some JSON data.
+
+-------------------------
+
+q2333gh | 2024-02-22 08:59:19 UTC | #57
+
+waoo ! amazing ! Thank you for your great product!
+Is this on github opensource yet ? even its in progress.
+
+-------------------------
+
+lastmjs | 2024-02-22 13:40:29 UTC | #58
+
+Hey, curious why you're using Boa and also why not Azle in this case? You can just eval code in Azle.
+
+Besides that though, I highly recommend QuickJS over Boa. We used Boa for a very long time in Azle, and swapped it for QuickJS back in August/September 2023.
+
+Boa has various bugs (though we have also found two major bugs in QuickJS that have been fixed fortunately), is very inefficient, and is generally immature compared with QuickJS.
+
+I especially recommend wasmedge-quickjs which is what we use to provide a lot of the Nodejs APIs in Azle.
+
+The end goal is SpiderMonkey or V8, SpiderMonkey will probably come first.
+
+-------------------------
+
+skilesare | 2024-02-22 14:23:37 UTC | #59
+
+CATTS looks awesome! I was just listening to some GreenPill podcasts about it and envisioning this a very similar same service on the IC. What a joy to find it already underway!
+
+I scanned the docs...one thing I was thinking about is that with these services that have API endpoints....does that break some kind of trust at any point?  I wonder if it would be better to validate against a couple of rpc gateways the actual storage or function call data using https://forum.dfinity.org/t/evm-rpc-canister/23313/30 to get better trust that it is on chain(or better yet if we had an onchain copy of ETH history we could query like the BTC UTXOs.  I guess it would probably get too big for some of the L2s.
+
+(This doesn't have to do with wasi so maybe we should move to a different thread, but this is a great use case to make to the community that we need further development of these services.  The IC is a perfect L2 relayer if we can get reliable data!)
+
+-------------------------
+
+kristofer | 2024-02-22 17:01:21 UTC | #60
+
+[quote="lastmjs, post:58, topic:18583"]
+Hey, curious why you’re using Boa and also why not Azle in this case? You can just eval code in Azle.
+[/quote]
+
+The short answer is .. I like Rust, for all the reasons people in general like rust. 😀 No garbage collection, strong typing, no `undefined` etc. So I prefer building in Rust. But, these small code snippets, the "processors" will be written by anyone. JS in that case I believe to be the most accessible language. 
+
+Thanks for the tips regarding Boa and the other JS engines. I noticed that SpiderMonkey supports compiling to wasi, perhaps I'll give that a try. QuickJS I plan to look at as well.
+
+-------------------------
+
+q2333gh | 2024-03-06 05:27:10 UTC | #61
+
+check out this interesting : 
+
+https://internetcomputer.org/blog/news-and-updates/team-spotlight-node
+
+![image|690x397](upload://rfbC7pBm3iM9VEhNS1Ti2ulaypV.png)
+
+-------------------------
+
+icpp | 2024-06-24 11:02:29 UTC | #62
+
+@lastmjs ,
+
+I am digging into the use of wasi2ic within both Kybra and Azle.
+
+I noticed that both are using the feature `transient` for the ic-wasi-polyfill, with reference to this issue:
+- [Renable stable files once fs-stable is more stable (#1731)](https://github.com/demergent-labs/azle/issues/1731)
+
+What exactly is the impact of using this feature, and do you know if there is work on-going to fix it?
+
+-------------------------
+
+lastmjs | 2024-06-24 11:40:34 UTC | #63
+
+If you turn that off the polyfill will use the stable memory file system. We tried it and unfortunately found it to be unstable (ha) in various ways that did not make us feel comfortable using it yet.
+
+@sgaflv can give you more details on timelines and current state of the polyfill and its stability.
+
+-------------------------
+
+sgaflv | 2024-06-24 11:46:54 UTC | #64
+
+@lastmjs I am currently working on improving the work of stable-fs. I will provide a new version by the end of this month and will check that the issues are resolved.
+
+-------------------------
+
+icpp | 2024-06-28 19:11:44 UTC | #65
+
+@sgaflv , @lastmjs 
+
+Just a quick note that I was able to integrate the polyfill and wasi2ic into icpp-pro, the CDK for C++.  
+
+It is all still in my dev environment, and I need to do a lot more testing, but first experiments show that it is working really well also in the C++ world, and I believe this is going to help a lot with porting C++ libraries to the IC.
+
+I took a lot of inspiration from kybra, and icpp-pro now installs rust + rust dependencies in a `.icpp` subfolder of the user's home directory. 
+
+When a user builds their wasm, everything is transparently included. They don't need to do anything to their code.
+
+Some things that work now (tested it):
+- std::cout   :  Prints to dfx console
+- file open/close/write/read 
+- ...
+
+-------------------------
+
+icpp | 2024-06-28 19:12:14 UTC | #66
+
+@sgaflv ,
+
+Will stable-fs also work for a C++ canister?
+
+If so, do you happen to have a simple demo example available? 🙏*(please?)*
+
+The demo2 that you created was extremely helpful in figuring out how to get it all to work.
+
+-------------------------
+
+sgaflv | 2024-06-29 11:08:47 UTC | #67
+
+yes, it should work with the file system as well. Sounds like a good idea to create an extra demo for that (or maybe make the demo2 more advanced). I will add an issue for that.
+
+-------------------------
+
+kristofer | 2024-07-12 14:45:41 UTC | #68
+
+I am trying out an idea where the user keeps a local copy of sqlite in sync with the main copy running inside the canister. It might be an interesting design pattern for personal apps where the db is known to be small. 
+
+All works well, mostly. I am not able to upgrade the canister. The DB is still there after the upgrade but seems to have lost one of its tables. 
+
+```rust
+#[init]
+fn init() {
+    ic_wasi_polyfill::init(&[0u8; 32], &[]);
+
+    DB.with_borrow_mut(|db| {
+        *db = Some(Connection::open(DB_FILE).unwrap());
+        let db = db.as_mut().unwrap();
+
+        modules::change::init_db(db);
+        modules::chat::init_db(db);
+    });
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+    ic_wasi_polyfill::init(&[0u8; 32], &[]);
+
+    DB.with_borrow_mut(|db| {
+        *db = Some(Connection::open(DB_FILE).unwrap());
+    });
+}
+``` 
+
+Am I missing something here? Or maybe issues are related to the unstableness described by @lastmjs above?
+
+Frontend: https://vicki-naaaa-aaaal-qjgma-cai.icp0.io
+Backend: https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=ufmog-ciaaa-aaaal-qjglq-cai
+
+https://github.com/kristoferlund/ic-sqlite-chat
+
+-------------------------
+
+icpp | 2024-07-15 00:58:47 UTC | #69
+
+@kristofer ,
+I wonder if your issue is related to something @ulan fixed and described [here](https://forum.dfinity.org/t/technical-working-group-deai/24621/114?u=icpp)
+
+-------------------------
+
+kristofer | 2024-07-15 07:26:38 UTC | #70
+
+Thanks for the tip. Yes, assigning the wasi memory a `MemoryId` sounds like good practice. I added that, problem remains though.
+
+More details on the sqlite error code below. Seems sqlite can't access the db file after upgrade. I have verified using `std:fs` that the file still exists and file size remains unchanged etc.
+
+```bash
+(1802) SQLITE_IOERR_FSTAT
+The SQLITE_IOERR_FSTAT error code is an extended error code for 
+SQLITE_IOERR indicating an I/O error in the VFS layer while trying to 
+invoke fstat() (or the equivalent) on a file in order to determine 
+information such as the file size or access permissions.
+```
+
+-------------------------
+
+sgaflv | 2024-07-15 19:41:10 UTC | #71
+
+Hello Kristofer,
+
+I've checked your example. Unfortunately there seems for be a bug in the way the stable-fs is storing the data in stable structures, which leads to loosing files after canister upgrade. I am working on a fix now.
+
+You have an awesome sqlite example! If you don't mind, I'd mention it on the wasi2ic page.
+
+-------------------------
+
+kristofer | 2024-07-15 20:28:51 UTC | #72
+
+Thanks for looking into this! And yes, please do mention my example if you will. 🤩
+
+Perhaps canister upgrade could be added to your demo3 as well?
+
+-------------------------
+
+sgaflv | 2024-07-16 00:27:30 UTC | #73
+
+@kristofer 
+Good point, I'll update demo3. Check out the latest published ic-wasi-polyfill version 0.4.3, see if it resolves your issue.
+
+-------------------------
+
+kristofer | 2024-07-16 06:21:44 UTC | #74
+
+Yes, great! Issue resolved!
+
+-------------------------
+
+ulan | 2024-07-16 11:10:55 UTC | #75
+
+@lastmjs: fyi, this should also fix the flaky issue you were observing. ^
+
+-------------------------
+
+icpp | 2024-07-17 11:13:39 UTC | #76
+
+@sgaflv ,
+
+FYI, the integration of ic-wasi-polyfill & wasi2ic into icpp-pro is finished, and released (as a pre-release initially, but it is working great so far)
+
+You can check out the wonderfully simple C++ code, with stdio, file-io, file upload/download that this now enables in the [icpp-demos/canisters/files](https://github.com/icppWorld/icpp-demos/tree/main/canisters/files/src) example canister. 
+
+Also fyi, with extreme little effort I was now able to get files to upload to a C++ LLM that I am working on.
+
+I can't thank you enough for building wasi2ic. :grinning: :pray:
+
+-------------------------
+
+lastmjs | 2024-07-17 11:57:39 UTC | #77
+
+Yes it's amazing! I really hope it can all get integrated into dfx eventually so that Wasi becomes the defacto standard on ICP and it just works.
+
+-------------------------
+
+icpp | 2024-07-17 14:03:16 UTC | #78
+
+@sgaflv ,
+from C++, we call raw_init, like this:
+
+```
+int main() {
+  raw_init(nullptr, 0);
+  return 0;
+}
+```
+Is that still correct?
+
+I am concerned about the discussion above regarding Rust based aplications, that one should call [init_with_memory](https://github.com/wasm-forge/ic-wasi-polyfill/blob/417c48e24402949b3fe2eefb5e25cc6f6d671beb/src/lib.rs#L1710) or [init_with_memory_manager](https://github.com/wasm-forge/ic-wasi-polyfill/blob/417c48e24402949b3fe2eefb5e25cc6f6d671beb/src/lib.rs#L1721).
+
+Not sure if this applies to C++ as well.
+
+-------------------------
+
+ulan | 2024-07-17 14:40:15 UTC | #79
+
+@icpp it is only important if your C++ application also wants to directly access the stable memory. The Rust memory manager allows to share the stable memory between the application and the ic-wasi-polyfill library such that they don't overwrite each other's data in the stable memory.
+
+If your C++ application stores data in the stable memory using the standard file system and doesn't call the stable memory API functions, then it is all good and will work correctly because ic-wasi-polyfill will manage the stable memory.
+
+-------------------------
+
+mycelia | 2024-07-18 02:28:05 UTC | #80
+
+I'm really fascinated by the technology behind this!. Could you explain how WASI fits into the ICP ecosystem? I'm curious about what this enables and how it is better than other WASI usages.
+
+-------------------------
+
+sgaflv | 2024-07-18 20:21:04 UTC | #81
+
+Hi @mycelia,
+the main motivation is to enable running wasi-oriented projects (such as sqlite) in a canister. Since WASI is not supported directly by IC, the project helps to transform Wasm binaries. You can check out the introduction [here](https://www.youtube.com/watch?v=oQb5TUiby7Q) and the project [here](https://github.com/wasm-forge).
+
+-------------------------
+
+icpp | 2024-07-18 20:29:15 UTC | #82
+
+@ulan thank you for that explanation. 
+
+`icpp-pro` does not enable writing to stable memory directly, so we should be good then.
+
+I will add it to the docs though, to warn people not to implement something themselves to write to stable memory, and just use the standard file system.
+
+-------------------------
+

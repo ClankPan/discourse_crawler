@@ -1,0 +1,111 @@
+bdemann | 2023-12-13 17:37:02 UTC | #1
+
+I have found a small regression in how rust canisters handle vecs of null or emptyish objects. Everything works fine in ic-cdk-0.9.2 but breaks in ic-cdk-0.10 and is still broken in 0.12.0. 
+
+When I try to run a command like 
+```bash
+dfx canister call null_vecs_backend vec_of_null '(vec{null;null;null})'
+```
+I get the following error:
+```bash
+The replica returned a replica error: Replica Error: reject code CanisterError, reject message Canister be2us-64aaa-aaaaa-qaabq-cai trapped explicitly: failed to decode call arguments: Custom(Fail to decode argument 0 from table0 to vec record { null; null; null }
+
+Caused by:
+    vec length of zero sized values too large), error code None
+```
+
+Here is a simple rust canister that exhibits the problem:
+### A snippet from my Cargo.toml
+```toml
+# Works
+# candid = "0.8"
+# ic-cdk = "0.9.2"
+
+# Doesn't work
+# candid = "0.9.0"
+# ic-cdk = "0.10.0"
+
+# Still doesn't work
+candid = "0.10.0"
+ic-cdk = "0.12.0"
+```
+### My full rust canister
+```rust
+use candid::CandidType;
+use serde::Deserialize;
+
+#[derive(CandidType, Deserialize)]
+pub struct EmptyRec {}
+
+#[derive(CandidType, Deserialize)]
+pub struct NullRec {
+    null_field: (),
+}
+
+//dfx canister call null_vecs_backend vec_of_null '(vec{null;null;null})'
+#[ic_cdk::query]
+fn vec_of_null(_params: Vec<()>) -> () {}
+
+//dfx canister call null_vecs_backend vec_of_empty_record '(vec{record{}; record{}})'
+#[ic_cdk::query]
+fn vec_of_empty_record(_params: Vec<EmptyRec>) -> () {}
+
+//dfx canister call null_vecs_backend vec_of_null_record '(vec{record{null_field=null: null}; record{null_field=null}})'
+#[ic_cdk::query]
+fn vec_of_null_record(_params: Vec<NullRec>) -> () {}
+
+//dfx canister call null_vecs_backend vec_of_null_tuple '(vec{record{null; null; null}; record{null; null; null}})'
+#[ic_cdk::query]
+fn vec_of_null_tuple(_params: Vec<((), (), ())>) -> () {}
+```
+
+Note: vec of empty tuple doesn't work either, but I'm not sure how to represent that in rust, so it's not in this example.
+
+If these vecs have no elements then the call will go through just fine
+ie this works
+```bash
+dfx canister call null_vecs_backend vec_of_null '(vec{})'
+```
+while this does not
+```bash
+dfx canister call null_vecs_backend vec_of_null '(vec{null})'
+```
+
+Does anyone have any insight into what is causing this problem?
+
+-------------------------
+
+chenyan | 2023-12-14 15:53:17 UTC | #2
+
+Right. On the canister side, we don't allow sending `vec{null}` to prevent potential DoS attacks. `null` values takes no bytes on the wire, people can easily send huge amount of null to exhaust canister cycles or memory. We want to prevent that. Do you have a real use case that you need to use `vec null`?
+
+-------------------------
+
+lastmjs | 2023-12-14 16:05:33 UTC | #3
+
+So our main issue here is that we're running intense property tests across Azle (and eventually Kybra) and thus we are running into these issues. The Candid spec allows these things but the implementations don't, so it's difficult for us to deal with these inconsistencies. 
+
+It would be nice to have the spec changed or something, as we aren't aware of these implementation details that deviate from the spec, and we'll have to put in exceptions in our tests.
+
+So, we don't have a use case, we're just trying to test everything.
+
+-------------------------
+
+lastmjs | 2023-12-14 16:06:25 UTC | #4
+
+Could a better solution be to just put a reasonable limit on vec { null } and other ecords? Like 1000 elements or something? This would solve both of our issues I feel.
+
+-------------------------
+
+chenyan | 2023-12-14 16:11:55 UTC | #5
+
+I agree. This is not ideal. The spec actually limits the size: https://github.com/dfinity/candid/blob/master/spec/Candid.md#memory (See the note paragraph). We allow this limit on the client side, but set it to 0 at the canister side. We hope to unify this limits as we know more about the security implications.
+
+-------------------------
+
+lastmjs | 2023-12-14 16:32:39 UTC | #6
+
+Okay, this is good to know. For now in our tests we can put in some cases that limit the lengths similar to the spec, thanks!
+
+-------------------------
+

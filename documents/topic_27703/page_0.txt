@@ -1,0 +1,332 @@
+q2333gh | 2024-02-29 03:03:33 UTC | #1
+
+The reason why i do this is i accidently write crappy codes inside  #pre_upgrade function 
+So pre_upgrade will definite trap when ugrading canister. 
+
+I have read ic-manage-canister api doc  on `install_code` api .
+And i find out some ways to might achive goal:
+## method1: 
+Can i do something like that above to skip_pre_upgrade?
+I dont know the correct syntax
+```bash
+btwl@btwl-virtual-machine ~/c/i/tax_lint (master) [2]> 
+dfx canister install backend --mode upgrade --argument 'skip_pre_upgrade=true'  
+error: a value is required for '--mode <MODE>' but none was supplied
+  [possible values: install, reinstall, upgrade, auto]
+
+For more information, try '--help'.
+```
+
+## method2:
+using rust lib of ic-agent-rs and ic-utils
+
+## method3: 
+using management canister api from dfx 
+something might look like :    but i dont quite know the syntax 
+```bash
+dfx canister \
+--ic \ 
+call aaaaa-aa install_code\
+ '(record {
+  canister_id = principal "v7g7o-oiaaa-aaaag-qcj3q-cai"; 
+  mode = variant { upgrade = opt record { skip_pre_upgrade = opt true} };
+  wasm_module = /home/btwl/code/ic/tax_lint/target/wasm32-unknown-unknown/release/backend.wasm;
+  arg =  "???"
+    })'\
+  --wallet $(dfx identity --ic get-wallet) \
+  --candid /home/btwl/code/ic/tax_lint/backend/canisters/backend/my_tests/test_in_cmd/dfx_calls/manage_can.did
+```
+
+## method4 
+motoko also a try
+
+### And ohters dont know yet...
+
+-------------------------
+
+q2333gh | 2024-02-22 07:25:12 UTC | #3
+
+## method2: 
+still got some FIXME yet. dont have complete workeable solution. 
+And great thanks to @openchat codebase and team product. below code ref from openchat
+```rust
+use candid::Principal;
+#[allow(unused_imports)]
+// use ic_agent::{ Identity};
+#[allow(unused_imports)]
+use ic_utils::call::AsyncCall;
+use ic_utils::interfaces::management_canister::builders::InstallMode;
+use ic_utils::interfaces::ManagementCanister;
+use std::env;
+use std::fs::read;
+
+// sometime debug cache err:
+// cargo clean -p canister_upgrader && cargo build --package canister_upgrader
+#[tokio::main]
+async fn main() {
+  let args: Vec<String> = env::args().collect();
+  let online_mode = &args[1];
+
+  let url_local = String::from("https://127.0.0.1:40010");
+  let url_ic = String::from("https://ic0.app/");
+  // INFO this is local or ic canister_id
+  let canister_id_local =
+    Principal::from_text("be2us-64aaa-aaaaa-qaabq-cai").unwrap();
+  let canister_id_ic =
+    Principal::from_text("v7g7o-oiaaa-aaaag-qcj3q-cai").unwrap();
+  let url;
+  let canister_id;
+
+  if online_mode == "0" {
+    println!("local network mode");
+    url = url_local;
+    canister_id = canister_id_local;
+  } else if online_mode == "1" {
+    println!("ic network mode");
+    url = url_ic;
+    canister_id = canister_id_ic;
+  } else {
+    panic!("args input err!!");
+  }
+
+  let controller = String::from("btwlz");
+
+  // INFO this need use input passwd in terminal if have passwd. takes about 4s to run 
+  let identity = get_dfx_identity(&controller);
+  let agent = build_ic_agent(url, identity).await;
+  let management_canister = ManagementCanister::create(&agent);
+
+  let wasm_file_path = "/home/btwl/code/ic/tax_lint/target/wasm32-unknown-unknown/release/backend.wasm";
+  let wasm_bytes = read(wasm_file_path).expect("wasm file not exsit");
+
+  match management_canister
+    .install_code(&canister_id, &wasm_bytes)
+    .with_mode(InstallMode::Upgrade {
+      skip_pre_upgrade: Some(true), // Some(true)
+    })
+    .call_and_wait()
+    .await
+  {
+    Ok(_) => println!("Wasm upgraded with skip_pre_upgrade ! "),
+    Err(error) => println!("Upgrade failed: {error:?}"),
+  };
+}
+
+use ic_agent::agent::http_transport::reqwest_transport::ReqwestHttpReplicaV2Transport;
+use ic_agent::{Agent, Identity};
+use itertools::Itertools;
+use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use std::str::FromStr;
+pub async fn build_ic_agent(url: String, identity: Box<dyn Identity>) -> Agent {
+  let mainnet = is_mainnet(&url);
+  let transport = ReqwestHttpReplicaV2Transport::create(url)
+    .expect("Failed to create Reqwest transport");
+  let timeout = std::time::Duration::from_secs(60 * 5);
+
+  let agent = Agent::builder()
+    .with_transport(transport)
+    .with_boxed_identity(identity)
+    .with_ingress_expiry(Some(timeout))
+    .build()
+    .expect("Failed to build IC agent");
+
+  if !mainnet {
+    let rk_path = "/home/btwl/code/canister_upgrader_independent2/btwlz_pk.pem";
+    let rk = read(rk_path).expect("file not exsit");
+    agent.set_root_key(rk);
+  }
+
+  agent
+}
+pub fn is_mainnet(url: &str) -> bool {
+  url.contains("ic0.app")
+}
+
+pub fn get_dfx_identity(name: &str) -> Box<dyn Identity> {
+  let logger = slog::Logger::root(slog::Discard, slog::o!());
+  let mut identity_manager =
+    dfx_core::identity::IdentityManager::new(&logger, &None).unwrap();
+  identity_manager
+    .instantiate_identity_from_name(name, &logger)
+    .unwrap()
+}
+// ic_utils lib hot fix patch : git commit:
+// b74445e1da0a6afefc3a08372f74e8ea416cd1ba
+
+```
+
+with cargo.toml:
+```toml
+[package]
+name = "canister_upgrader_independent2"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+####problem with Identity dyn casting
+# dfx-core = { git = "https://github.com/dfinity/sdk", rev = "49f10217736f3e743f44a81bc621075706f918f1" } #latest-2024-2-22
+# ic-utils =  { git = "https://github.com/dfinity/agent-rs.git", rev = "b74445e1da0a6afefc3a08372f74e8ea416cd1ba" } # hot-fix version
+# ic-agent =  { git = "https://github.com/dfinity/agent-rs.git", rev = "b74445e1da0a6afefc3a08372f74e8ea416cd1ba" } # hot-fix version
+
+####problem with skip_pre_upgrade 
+dfx-core = { git = "https://github.com/dfinity/sdk", rev = "c7fa9267950836fb2e8af2f03a6531ead9289f81" } # openchat use
+ic-agent = "0.33.0"
+ic-utils = "0.33.0"
+
+candid = "0.10.3"
+
+itertools = "0.12.1"
+slog = "2.7.0"
+
+```
+
+-------------------------
+
+Severin | 2024-02-20 10:12:18 UTC | #4
+
+Turns out dfx does not support the flag and the `ic_utils` library has the type wrong so it's not a trivial change to add the flag to dfx.
+
+@q2333gh you need to pin your version of `ic_utils` to the commit in [this PR](https://github.com/dfinity/agent-rs/pull/516) otherwise it won't work. And the args will be the args taken by your `init` or `post_upgrade` function
+
+-------------------------
+
+q2333gh | 2024-02-21 09:50:46 UTC | #5
+
+And then how should i use this flag in method2 mentioned above using ic-utils lib in rust code .  i dont quite know the syntax yet. :grinning:
+
+-------------------------
+
+Severin | 2024-02-21 09:53:10 UTC | #6
+
+[quote="q2333gh, post:3, topic:27703"]
+`.with_mode(InstallMode::Upgrade)`
+[/quote]
+
+I think that would be 
+
+```rust
+.with_mode(InstallMode::Upgrade{
+  skip_pre_upgrade: Some(true),
+})
+
+```
+
+-------------------------
+
+q2333gh | 2024-02-22 07:11:28 UTC | #7
+
+I have use this commit tag in ic-agent and ic-utils lib: 
+```toml
+ic-agent =  { git = "https://github.com/dfinity/agent-rs.git", rev = "b74445e1da0a6afefc3a08372f74e8ea416cd1ba" }
+ic-utils =  { git = "https://github.com/dfinity/agent-rs.git", rev = "b74445e1da0a6afefc3a08372f74e8ea416cd1ba" }
+```
+got almost one last bug remaining : 
+
+```rust
+pub fn get_dfx_identity(name: &str) -> Box<dyn Identity> {
+  let logger = slog::Logger::root(slog::Discard, slog::o!());
+  let mut identity_manager =
+    dfx_core::identity::IdentityManager::new(&logger, &None).unwrap();
+  identity_manager
+    .instantiate_identity_from_name(name, &logger)
+    .unwrap()
+}
+```
+```log
+error[E0277]: the trait bound `dfx_core::identity::Identity: ic_agent::Identity` is not satisfied
+   --> src/main.rs:101:3
+    |
+101 | /   identity_manager
+102 | |     .instantiate_identity_from_name(name, &logger)
+103 | |     .unwrap()
+    | |_____________^ the trait `ic_agent::Identity` is not implemented for `dfx_core::identity::Identity`
+    |
+    = help: the following other types implement trait `ic_agent::Identity`:
+              Box<(dyn ic_agent::Identity + 'static)>
+              BasicIdentity
+              DelegatedIdentity
+              AnonymousIdentity
+              Prime256v1Identity
+              Secp256k1Identity
+              Arc<(dyn ic_agent::Identity + 'static)>
+              &dyn ic_agent::Identity
+    = note: required for the cast from `Box<dfx_core::identity::Identity>` to `Box<(dyn ic_agent::Identity + 'static)>`
+```
+
+and the bug occur at this 2 versions of libs:
+
+```toml 
+# runs dyn bug above 
+# dfx-core = { git = "https://github.com/dfinity/sdk", rev = "49f10217736f3e743f44a81bc621075706f918f1" } #latest-2024-2-22
+# ic-utils =  { git = "https://github.com/dfinity/agent-rs.git", rev = "b74445e1da0a6afefc3a08372f74e8ea416cd1ba" } # hot-fix version
+# ic-agent =  { git = "https://github.com/dfinity/agent-rs.git", rev = "b74445e1da0a6afefc3a08372f74e8ea416cd1ba" } # hot-fix version
+
+#runs ok. but unable with syntax : ` skip_pre_upgrade: Some(true),`  
+dfx-core = { git = "https://github.com/dfinity/sdk", rev = "c7fa9267950836fb2e8af2f03a6531ead9289f81" } # openchat use
+ic-agent = "0.33.0"
+ic-utils = "0.33.0"
+#
+
+```
+
+ic-utils v0.33.0 err:
+```json
+Upgrade failed: 
+TransportError(
+    reqwest::Error { 
+        kind: Request, 
+        url: Url { 
+            scheme: "https", 
+            cannot_be_a_base: false, 
+            username: "", 
+            password: None, 
+            host: Some(Ipv4(127.0.0.1)), 
+            port: Some(40010), 
+            path: "/api/v2/canister/be2us-64aaa-aaaaa-qaabq-cai/call", 
+            query: None, 
+            fragment: None 
+        }, 
+        source: hyper::Error(
+            Connect, 
+            Custom { 
+                kind: Other, 
+                error: Custom { 
+                    kind: InvalidData, 
+                    error: InvalidMessage(InvalidContentType) 
+                } 
+            }
+        ) 
+    }
+)
+
+```
+
+-------------------------
+
+Severin | 2024-02-22 10:00:59 UTC | #8
+
+That version already [implements identity](https://github.com/dfinity/sdk/blob/49f10217736f3e743f44a81bc621075706f918f1/src/dfx-core/src/identity/mod.rs#L267). Could this be a problem with version mismatches?
+
+If you're willing to do a very hacky solution I think the easiest thing would be to `cargo clean`, go into the cargo cache for ic-utils (just jump to declaration on the type) and patch `InstallMode` there
+
+-------------------------
+
+q2333gh | 2024-02-22 10:03:03 UTC | #9
+
+yeah. i tried the "hacky" way~ . like it .
+
+-------------------------
+
+q2333gh | 2024-02-22 12:12:49 UTC | #10
+
+I tried for hours but still can get it right. :sob:
+
+-------------------------
+

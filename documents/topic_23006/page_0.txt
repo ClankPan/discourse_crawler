@@ -1,0 +1,164 @@
+bdemann | 2023-09-13 15:27:56 UTC | #1
+
+What type of topic is this?  
+Support 
+
+I have been using the @dfinity/candid npm package to encode and decode javascript values into candid values for Azle. It's going great! From here I want to be able to convert those candid types to the textual syntax for a candid file. I know that the agent can convert a candid file to javascript so I am hoping that there is something that would be able to do essentially the reverse. I was hoping that the display() function that is built into the IDL classes would work, it is almost what I want, but it doesn't always display valid candid types. For example when I try to display a recursive class I get a bunch of μ prefixed names and for fucs it will diplay → instead of -> and other things like that that prevent it from being valid candid.
+
+Are there any libraries that would help me out with this?
+
+-------------------------
+
+lastmjs | 2023-09-13 16:56:23 UTC | #2
+
+Just backing Ben up here, we've made really good progress with this for Azle, but there are a few issues like the recursion and not being able to escape Candid keys with quotes.
+
+We're really hoping to have a robust way to go from IDL -> Candid.
+
+@kpeacock
+
+-------------------------
+
+sea-snake | 2023-09-13 17:04:57 UTC | #3
+
+Going from IDL to candid is straighforward when you have the interfaceFactory.
+
+In the example JSON lib linked below the IDL interfaceFactory to instantiate custom classes for each IDL type is used. And then toJSON/fromJSON is called for each IDL custom class within the instance tree.
+
+You can basically implement custom classes that get instantiated with a toCandid method. That should be able to output your Candid string without too many complications. Keep in mind there 2 pieces of data for every node within your IDL instance tree, the arguments passed when the node is created e.g. "the nat is 8 bits" and the data the node holds e.g. 231, see candid lib source code for the exact args passed to the IDL node class and the data it holds.
+
+In theory, these additional methods could be added to the candid lib if they're useful in the candid library for a larger audience.
+
+@lastmjs The RecClass is used for recursive types in the candid lib.
+
+Example Candid and JS:
+```
+type Node = record {
+  child_node: Node;
+}
+```
+
+```
+const Node = IDL.Rec();
+Node.fill(IDL.Record({ 'child_node' : Node }));
+```
+
+(feedback on ICRC-26 regarding lossy JSON encoding for Candid is welcome)
+
+https://github.com/slide-computer/candid-json
+
+-------------------------
+
+sea-snake | 2023-09-13 17:07:46 UTC | #4
+
+[quote="bdemann, post:1, topic:23006"]
+I know that the agent can convert a candid file to javascript
+[/quote]
+
+Currently I'm using the rust lib in a wasm instance for this, is this now possible directly in JS from the agent lib?
+
+-------------------------
+
+lastmjs | 2023-09-13 19:53:26 UTC | #5
+
+I think we're just referring to `didc bind` of `dfx generate`, however those tools are generating bindings for source code languages from did files.
+
+But we want to go from a source code language to Candid.
+
+We already have our solution working quite well, we're just wondering if there's an easier way that wouldn't require as much custom code.
+
+-------------------------
+
+bdemann | 2023-09-13 19:57:01 UTC | #6
+
+@sea-snake I'm looking into your interfaceFactory to see if that will help
+
+In the meantime I have some example code that will hopefully better demonstrate what we are trying to do.
+
+```
+import { IDL } from "@dfinity/candid";
+
+/*
+createRecIdl().display()
+Desired Output:
+type rec_0 = record {myNat: nat; mySelf: rec0}
+
+Actual Output:
+record {myNat:nat; mySelf:μrec_0.record {myNat:nat; mySelf:rec_0}}
+
+*/
+function createRecIdl() {
+  const idl = IDL.Rec();
+  idl.fill(IDL.Record({myNat: IDL.Nat, mySelf: idl}));
+  return idl.getType();
+}
+
+/*
+createFuncIdl().display()
+Desired Output:
+type BasicFunc = func () -> ();
+or at least
+func () -> ()
+
+Actual Output:
+() → ()
+*/
+function createFuncIdl() {
+    return IDL.Func([], [])
+}
+
+/*
+createFuncIdl().display()
+Desired Output:
+type rec_0 = record {myNat: nat; mySelf: rec0}
+type BasicFunc = func () -> ();
+service {myQuery:(BasicFunc) -> () query; myUpdate:(rec_0}) -> () }
+or
+type rec_0 = record {myNat: nat; mySelf: rec0}
+service {myQuery:(func () -> ()) -> () query; myUpdate:(rec_0}) -> () }
+
+Actual Output:
+service {myQuery:(() -> () ) -> () query; myUpdate:(record {myNat:nat; mySelf:rec_0}) -> () }
+*/
+function createServiceIdl() {
+    return IDL.Service({myQuery: IDL.Func([createFuncIdl()], [], ['query']), myUpdate: IDL.Func([createRecIdl()], [])})
+}
+
+console.log(createRecIdl().display())
+console.log(createFuncIdl().display())
+console.log(createServiceIdl().display())
+```
+
+-------------------------
+
+sea-snake | 2023-09-13 20:04:27 UTC | #7
+
+[quote="bdemann, post:6, topic:23006"]
+`import { IDL } from "@dfinity/candid";`
+[/quote]
+
+If you use IDL from `@dfinity/candid` you'll be limited to functionality within those IDL classes. Only way I've been able to work around that is by calling the interfaceFactory with my own custom list of classes with different functionality.
+
+Currently trying to make an example for generating candid from a interfaceFactory input. I'll link a gist when I've managed to get something working.
+
+-------------------------
+
+sea-snake | 2023-09-13 21:11:46 UTC | #8
+
+@bdemann @lastmjs Implementing the recursive part was rather fun 😅
+
+Here's my attempt at an implementation based on the inner working concepts of the Candid lib: 
+https://gist.github.com/sea-snake/74386d073c44cd7c89570b4d5dbf8b4b
+
+-------------------------
+
+sea-snake | 2023-09-13 22:20:04 UTC | #9
+
+[quote="lastmjs, post:2, topic:23006"]
+not being able to escape Candid keys with quotes
+[/quote]
+
+Above example doesn't look into that edge case but it should be straightforward to add in the record and variant class.
+
+-------------------------
+

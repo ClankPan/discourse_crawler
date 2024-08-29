@@ -1,0 +1,229 @@
+Hazel | 2023-02-26 15:55:44 UTC | #1
+
+Staring a discussion to propose a simple standard for publishing and receiving canister events. 
+
+ 
+# Publisher
+## `icrc6_subscription_action`
+```candid
+type SubscriptionRequest = variant {
+    Subscribe : record {
+        canister : principal;
+        method : text;
+    };
+    Unsubscribe : record {
+        canister : principal;
+        method : text;
+    };
+};
+
+type SubscriptionError = variant {
+    NotAuthorized;
+};
+
+type SubscriptionResponse = variant {
+    Ok : null;
+    Err : opt SubscriptionError;
+};
+
+service : {
+    icrc6_subscription_action : (SubscriptionRequest) -> (SubscriptionResponse);
+}
+```
+
+# Subscriber
+## `icrc6_handler`
+```candid
+
+type Event = record {
+    event_schema : text;
+    event_type : text;
+    created_at : nat64;
+    data : vec nat8;
+};
+
+type PublisherNotification = variant {
+    NewSender  : record {p : principal};
+};
+
+type PublisherMessage = variant {
+    Event : Event;
+    Notification : opt PublisherNotification;
+};
+
+service : {
+    icrc6_handler: (PublisherMessage) -> ();
+}
+
+```
+
+-------------------------
+
+rossberg | 2023-02-26 07:44:28 UTC | #2
+
+A couple of drive-by comments:
+
+- Candid is higher-order, so you can make SubscriptionRequest properly typed by passing real method handles of type `(PublisherMessage) → ()` instead of a canister/method records.
+
+- Why have the indirection through the SubscriptionRequest type instead of two methods?
+  ```
+  type Publisher = service {
+    icrc6_subscribe : (handler : (PublisherMessage) → ()) → (SubscriptionResponse);
+    icrc6_unsubscribe : (handler : (PublisherMessage) → ()) → (SubscriptionResponse);
+  }
+  ```
+
+- If you want the SubscriptionError type to be extensible in the future (without breaking clients), you need to wrap it in an option:
+  ```
+  type SubscriptionResponse = variant {
+    Ok;
+    Err : opt SubscriptionError;
+  };
+  ```
+  This wat, when you later add a new case to the error type, an old client will continue to work and just see `null`.
+
+- The same for PublisherNotification.
+
+-------------------------
+
+skilesare | 2023-02-26 14:13:19 UTC | #3
+
+What is the difference between event_schema and event_type?
+
+I think the bigger conversation to have here is if we want to encourage this pattern given the architecture of the IC.  There are likely some small use cases where there are no issues, but I think it it likely that most scenarios inevitably run into scalability issues.
+
+The pattern we've been playing with at Origyn is to make it so that a publisher doesn't need to know who is subscribed. Events go to an an anssigned gateway and then are distributed. This greatly increases the simplicity of publishing events for programmers and the gateway can take care of any scalability challenges that arise. This has the advantage of also keeping your service from having to worry about rouge canisters blocking.
+
+We will try to get the repo together for open sourcing.  This could have/should have been a day one service for the IC and I think it is a candidate for a system level set of canisters. In the short term it is deployable in a private configuration for anyone that wants to support scalable event delivery.
+
+-------------------------
+
+Hazel | 2023-02-26 15:54:53 UTC | #4
+
+Thanks for the feedback! Keep it coming :slight_smile: 
+
+[quote="rossberg, post:2, topic:18697"]
+A couple of drive-by comments:
+
+* Candid is higher-order, so you can make SubscriptionRequest properly typed by passing real method handles of type `(PublisherMessage) → ()` instead of a canister/method records.
+
+```
+type Publisher = service {
+  icrc6_subscribe : (handler : (PublisherMessage) → ()) → (SubscriptionResponse);
+  icrc6_unsubscribe : (handler : (PublisherMessage) → ()) → (SubscriptionResponse);
+}
+```
+
+[/quote]
+
+This was my first thought. But, last time I checked Motoko couldn't extract the principal from the candid `func` type. This might not ever be an issue. Happy to use `func` but I wanted to keep things as future proof as possible. Thoughts? 
+
+[quote="rossberg, post:2, topic:18697"]
+Why have the indirection through the SubscriptionRequest type instead of two methods?
+[/quote]
+
+My intention here was to limit the amount of possible implementation errors by wrapping all actions inside the `variant` type; Rust forces developers to handle all cases explicitly, and I think Motoko does too? Similar thought process with the `PublisherMessage`.
+
+[quote="rossberg, post:2, topic:18697"]
+* If you want the SubscriptionError type to be extensible in the future (without breaking clients), you need to wrap it in an option:
+
+```
+type SubscriptionResponse = variant {
+  Ok;
+  Err : opt SubscriptionError;
+};
+```
+
+This wat, when you later add a new case to the error type, an old client will continue to work and just see `null`.
+[/quote]
+
+Glad you caught my intentions will update, thank you!
+
+-------------------------
+
+Hazel | 2023-02-26 16:11:38 UTC | #5
+
+[quote="skilesare, post:3, topic:18697, full:true"]
+What is the difference between event_schema and event_type?
+[/quote]
+
+Good question, maybe we only need `event_schema` and a common shape  `dl.friends.v1.send_message` :thinking:?
+
+[quote="skilesare, post:3, topic:18697, full:true"]
+I think the bigger conversation to have here is if we want to encourage this pattern given the architecture of the IC. There are likely some small use cases where there are no issues, but I think it it likely that most scenarios inevitably run into scalability issues.
+
+The pattern we’ve been playing with at Origyn is to make it so that a publisher doesn’t need to know who is subscribed. Events go to an an anssigned gateway and then are distributed. This greatly increases the simplicity of publishing events for programmers and the gateway can take care of any scalability challenges that arise. This has the advantage of also keeping your service from having to worry about rouge canisters blocking.
+
+We will try to get the repo together for open sourcing. This could have/should have been a day one service for the IC and I think it is a candidate for a system level set of canisters. In the short term it is deployable in a private configuration for anyone that wants to support scalable event delivery.
+[/quote]
+
+At this point I think we stand to gain a lot more by pushing forward something simple like this and being explicit about potential limitations. This schema actually lends itself quite nicely to scaling too. If a publisher starts reaching serious limitations they could deploy canisters implementing the above standard to fan out events.Take all subscribers, partition, and update all subscribers using `PublisherNotification::NewSender`. 
+
+Now, If we think a bit more about `SubscriptionRequest` we could potentially allow for future iterations to include a `topics : vec string` to reduce the over the wide loads to individual subscribers. 
+
+```candid
+type PublisherNotification = variant {
+    NewSender  : record {p : principal};
+};
+
+type PublisherMessage = variant {
+    Event : Event;
+    Notification : opt PublisherNotification;
+};
+```
+
+-------------------------
+
+Hazel | 2023-02-26 17:38:51 UTC | #6
+
+Hey all, mind if we continue the discussion here?
+
+https://github.com/dfinity/ICRC/issues/12
+
+-------------------------
+
+rossberg | 2023-02-26 19:39:35 UTC | #7
+
+[quote="Hazel, post:4, topic:18697"]
+[quote="rossberg, post:2, topic:18697"]
+Why have the indirection through the SubscriptionRequest type instead of two methods?
+[/quote]
+
+My intention here was to limit the amount of possible implementation errors by wrapping all actions inside the `variant` type;
+[/quote]
+
+Yeah, I don't know if that provides more checking, at least not assuming a proper tool chain. If you assume that the implementation is checked against the specified Candid interface types, then such a check should naturally include checking that the specified methods themselves are provided. The Motoko compiler and/or dfx should be able to do that.
+
+-------------------------
+
+Hazel | 2023-02-26 20:44:04 UTC | #8
+
+That’s fair. I don’t have strong opinions either way.
+
+-------------------------
+
+Seb | 2023-03-12 21:12:33 UTC | #9
+
+I'm curious to know what are the main scalability issues mentioned with this pattern: 
+
+- Is this about the number of canister that can be reached by one `Publisher` canister?
+- Is is about the number of events that can be propagated into one `Subscriber` (limit of number of messages in a intercanister queue)?
+- Is is about the delays of event propagations across multiple canisters with each update call adding it's delay?
+
+-------------------------
+
+Hazel | 2023-03-12 22:06:39 UTC | #10
+
+All of the above are potential issues. The most likely issue I'd expect developers to run into is a single `Publisher` trying to push an event to a large number of `Subscribers`. This would only be an issue in the naive approach (1 Publisher with no fan out canisters). 
+
+
+> Is is about the number of events that can be propagated into one `Subscriber` (limit of number of messages in a intercanister queue)?
+
+This also *could* be an issue if the subscriber cant keep up with the rate of publication. e.g. a subscriber has to do a lot of computationally intensive compute work per message. This can be easily resolved by the subscriber breaking out the task into multiple canisters.
+
+> Is is about the delays of event propagations across multiple canisters with each update call adding it’s delay?
+
+This shouldn't ever really be an issue. Unless you start spanning multiple subnets.. However, every canister on the IC are subjected to these conditions. If a subscriber really needed to speed things up they could build an off-chain service to inject the events into the needed canisters all at once.. Or, just add more fanout :tm:
+
+-------------------------
+

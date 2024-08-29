@@ -1,0 +1,309 @@
+Gekctek | 2023-03-17 01:03:39 UTC | #1
+
+To start out, Im a big fan of Motoko and want it to thrive. I have been building motoko libraries because I love its potential but it is immature at this point. So the following is only intended to be me laying out what I see some potential adoption issues are and wanting to figure out a way to solve them. All I say is with love and I think the Motoko/Dfinity teams are doing great work.
+
+My main question is what is the long term roadmap for Motoko
+
+One question that has been bothering me for a while is what is the elevator pitch for Motoko? If I were to go up to a developer and convince them to learn and use Motoko, what would be the selling point?
+
+My short list:
+  - Type safety focused
+  - Powerful variants
+  - WASM out of the box
+  - Easy IC development
+  - Consumes few cycles relative to other languages
+
+So whats the issue? 
+1) Most projects I see is using Rust. Mainly due to the immaturity of the language and ecosystem. 
+
+That might be ok, because these things take time but it seems that dfinity (from what ive seen) is also using Rust. So if mainly small projects/devs who are just playing around, doesn't that really slow down Motoko maturity? 
+
+2) (This one I find to be the bigger issue) Motoko is an IC programming language, not an actor based language that has integration/sdk with the IC. 
+
+This makes development a lot easier for newcomers and there maybe can be optimizations to make Motoko the best IC language BUT my perspective is that it makes it super niche. If I am trying to convince someone to use Motoko, they have to fully devote themselves to the IC. Learning a language takes time and development takes time. So if a dev can't use Motoko elsewhere, unless they really like it or are committed to be pure IC, its a big downside.
+
+
+This has been bothering me in general for a while but I decided to do this post because I wanted to evaluate what it would be like to get Motoko to work with the Filecoin FVM. The WASM actors are not yet launched and the documentation is scarce but I managed to piece things together. I then explored the motoko compiler to see what it would take. Essentially at this point it would require a FVM specific flag when running the compiler and that would modify some functionality to use the imports of the FVM WASM VM. 
+So in order to do this
+1) A 1-1ish sys call swap has to happen in the compiler (problems, see below)
+or
+2) Make motoko have to support sdk code to allow for integrations with other blockchains/systems
+or
+3) ? Curious other peoples thoughts
+
+So i did an evaluation of point 1 and ran into some 1-1 compatibility issues
+Here is a non comprehensive list of the functionality that Motoko uses for the IC and what sys calls translate to the FVM. 
+TL;DR They are too different to do an easy swap
+```
+- import sys functions (wasm imports)
+- print to the console
+  - IC: ic0.debug_print : (src : i32, size : i32) -> ();
+  - FVM: debug.log : (src: i32, size: u32) -> (errorNumber: i32);
+- performance counter (also record mutator/collector instructions)
+  - IC: ic0.performance_counter : (type : i32) -> (counter : i64);
+  - FVM: ?
+- trap
+  - IC: ic0.trap : (src : i32, size : i32) -> ();
+  - FVM: vm.exit : (code: u32, block_id: u32, src: i32, size: u32) -> ();
+- init - Initializes the canister
+  - IC: func export of pre/post upgrade, timer, heartbeat, etc...
+  - FVM: ?
+- self reference canister
+  - IC: Clone the canister bytes(?) to be used as a reference using
+    - ic0.canister_self_size : () -> i32;
+    - ic0.canister_self_copy : (dst : i32, offset : i32, size : i32) -> ();
+      - Return type: `Blob`? or `Principal`?
+  - FVM: ?
+- Get time
+  - IC: ic0.time : () -> (timestamp : i64);
+  - FVM: network.context : (dst: i32) -> (errorNumber: i32);
+    - Return type: `struct NetworkContext { epoch: i64, timestamp: u64, base_fee: TokenAmount, chain_id: u64, network_version: NetworkVersion }`
+- Get caller id
+  - IC:
+    - ic0.msg_caller_size : () -> i32
+    - ic0.msg_caller_copy : (dst : i32, offset: i32, size : i32) -> ()
+      - Return type: `Principal bytes`
+  - FVM:
+    - vm.message_context : (dst: i32) -> (errorNumber: i32);
+      - Return type: `struct MessageContext { origin: u64, nonce: u64, caller: u64, receiver: u64, method_number: u64, value_received: TokenAmount, gas_premium: TokenAmount, flags: ContextFlags }`
+- Get method name
+  - IC:
+    - ic0.msg_method_name_size : () -> i32
+    - ic0.msg_method_name_copy : (dst : i32, offset : i32, size : i32) -> ();
+      - Return type: `string`
+  - FVM
+    - vm.message_context : (dst: i32) -> (errorNumber: i32);
+      - Return type: `struct MessageContext { origin: u64, nonce: u64, caller: u64, receiver: u64, method_number: u64, value_received: TokenAmount, gas_premium: TokenAmount, flags: ContextFlags }`
+- Get method args
+  - IC:
+    - ic0.msg_arg_data_size : () -> i32;
+    - ic0.msg_arg_data_copy : (dst : i32, offset : i32, size : i32) -> ();
+      - Return type: `Blob`
+  - FVM
+    - On invoke, the block id is passed to the actor. Use that to get the block info, then get the block
+    - ipld.block_stat : (dst: i32, block_id: u32) -> (errorNumber: i32);
+      - Return type: `struct IpldStat { codec: u64, size: u32 }`
+    - ipld.block_read : (dst: i32, id: u32, offset: u32, dst: i32, max_size: u32) -> (errorNumber: i32);
+      - Return type: `i32` which is the end index? `Returns the difference between the length of the block and offset + max_len. This can be used to find the end of the block relative to the buffer the block is being read into:`
+      - The data bytes is defined by the codec from block_stat
+- Reject Message
+  - IC:
+    - ic0.msg_reject : (src : i32, size : i32) -> ();
+  - FVM
+    - ?
+- Get Canister Cycle balance
+  - IC:
+    - ic0.canister_cycle_balance128 : (dst : i32) -> ();
+      - Return type: `i128`
+  - FVM: N/A
+- Add cycles to next call
+  - IC:
+    - ic0.call_cycles_add128 : (amount_high : i64, amount_low : i64) → ()
+  - FVM: N/A
+- Accept cycles from message
+  - IC:
+    - ic0.msg_cycles_accept : (max_amount : i64) → (amount : i64)
+  - FVM:
+    - gas.charge : (name_offset: i32, name_length : u32, amount : u64) -> (errorNumber: i32);
+- Check available cycles from message
+  - IC:
+    - ic0.msg_cycles_available128 : (dst : i32) → ()
+      - Return type: `i128`?
+  - FVM:
+    - gas.available : (dst : i32) -> (errorNumber: i32);
+      - Return type: `u64`
+- Check amount of cycles that was refunded from request
+  - IC:
+    - ic0.msg_cycles_refunded128 : (dst : i32) → ()
+      - Return type: `i128`?
+  - FVM: N/A
+- Set certified data
+  - IC:
+    - ic0.certified_data_set : (src: i32, size : i32) -> ()
+  - FVM: N/A
+- Get certified data
+  - IC:
+    - ic0.data_certificate_present : () -> i32
+    - ic0.data_certificate_size : () -> i32
+    - ic0.data_certificate_copy : (dst: i32, offset: i32, size: i32) -> ()
+      - Return type: `Blob`
+  - FVM: N/A
+- Stable memory
+  - IC:
+    - ic0.stable_size : () -> (page_count : i32);
+    - ic0.stable_grow : (new_pages : i32) -> (old_page_count : i32);
+    - ic0.stable_write : (offset : i32, src : i32, size : i32) -> ();
+    - ic0.stable_read : (dst : i32, offset : i32, size : i32) -> ();
+      - Return type: `Blob`
+    - ic0.stable64_size : () -> (page_count : i64);
+    - ic0.stable64_grow : (new_pages : i64) -> (old_page_count : i64);
+    - ic0.stable64_write : (offset : i64, src : i64, size : i64) -> ();
+    - ic0.stable64_read : (dst : i64, offset : i64, size : i64) -> ();
+      - Return type: `Blob`
+  - FVM: `IPLD Everything`. From what I understand, the state is defined by creating blocks, linking them and then setting the root CID of the actor will be a stable 'save'
+    - ipld.block_create : (dst : i32, codec: u64, src : i32, size : u32) -> (errorNumber: i32);
+      - Return type: `u32`
+    - ipld.block_link : (dst : i32, id: u32, hash_func: u64, hash_len : u32, cid : i32, cid_max_len : u32) -> (errorNumber: i32);
+      - Return type: `u32`
+    - ipld.block_open : (dst : i32, cid : i32) -> (errorNumber: i32);
+      - Return type: `struct IpldOpen { codec: u64, id: u32, size: u32 }`
+    - ipld.block_read : (dst: i32, id: u32, offset: u32, dst: i32, max_size: u32) -> (errorNumber: i32);
+      - Return type: `i32` which is the end index? `Returns the difference between the length of the block and offset + max_len. This can be used to find the end of the block relative to the buffer the block is being read into:`
+      - The data bytes is defined by the codec from block_stat
+    - ipld.block_stat : (dst: i32, block_id: u32) -> (errorNumber: i32);
+      - Return type: `struct IpldStat { codec: u64, size: u32 }`
+    - sself.set_root : (cid : i32) -> (errorNumber: i32);
+- Call actor
+  - IC: 
+    - ic0.call_new : (callee_src  : i32, callee_size : i32, name_src : i32, name_size : i32, reply_fun : i32, reply_env : i32, reject_fun : i32, reject_env : i32) -> ();
+    - ic0.call_on_cleanup : (fun : i32, env : i32) -> ();
+    - ic0.call_data_append : (src : i32, size : i32) -> ();
+    - ic0.call_cycles_add : (amount : i64) -> ();
+    - ic0.call_cycles_add128 : (amount_high : i64, amount_low: i64) -> ();
+    - ic0.call_perform : () -> ( err_code : i32 );
+  - FVM
+    - send.send : (dst: i32, recipient_offset: i32, recipient_len: u32, method: u64, params: u32, value_hi: u64, value_lo: u64, gas_limit: u64, flags: SendFlags) -> (errorNumber: i32);
+      - Return type: `struct Send {  exit_code: u32,  return_id: u32,  return_codec: u64, return_size: u32 }`
+```
+
+I am not a language designer or a compiler expert but all I really want to get from this post is 
+- getting feedback to see if Im crazy and Motoko will be just fine one the current direction
+- are there things behind the scenes/on the roadmap that will help some of these concerns
+- Thoughts on Motoko as a more general language that can more easily allow for sdk integrations with other systems. Though it is not trivial to change Motoko from an IC first language to a more general language, how feasible is it at this point.
+
+Any thoughts would be great, I would just like to get a conversation around this. 
+The FVM, Holochain and other WASM blockchains and actor based systems seem like good fits for motoko, and I want it to thrive. Lets make it happen
+
+-------------------------
+
+LightningLad91 | 2023-03-17 11:38:17 UTC | #2
+
+[quote="Gekctek, post:1, topic:18975"]
+I have been building motoko libraries because I love its potential
+[/quote]
+
+Hello @Gekctek. First, I want to say thank you for all the work you do building these libraries. They are really useful and I've learned a lot from reviewing your work.
+
+[quote="Gekctek, post:1, topic:18975"]
+This makes development a lot easier for newcomers and there maybe can be optimizations to make Motoko the best IC language BUT my perspective is that it makes it super niche. If I am trying to convince someone to use Motoko, they have to fully devote themselves to the IC. Learning a language takes time and development takes time. So if a dev can’t use Motoko elsewhere, unless they really like it or are committed to be pure IC, its a big downside.
+[/quote]
+
+I agree with this. Before I started helping Poked Studio I had never done any real development work; most of my professional career has been spent working at the system level. I chose to learn Motoko instead of Rust based on a recommendation by @lastmjs. It was a great choice at the time because I needed to quickly learn how to work with EXT canisters. But, now that it's been almost a year I'm finding myself torn between continuing to do work in Motoko or transition to learning Rust. 
+
+I'm trying to put myself on a path towards working on the IC full time. I really believe it offers something unique in the space. At the same time, I realize the risk I'm taking by committing to a language that isn't used outside of the IC. So it's a tough choice to make; especially when I only really have 2-3 hours a day to spend learning/building anything outside of my day job.
+
+Anyways, I just wanted to say I appreciate you writing this post. It certainly resonates with me.
+
+-------------------------
+
+claudio | 2023-03-17 14:35:43 UTC | #3
+
+I think it's fair to say that we designed Motoko the language to be relatively general purpose, and not too tied to the IC, but the actual implementation is fairly IC specific in the very last stages of compilation. 
+
+If the alternative target platform is a good fit, it might be possible to abstract out some commonalities and target both. Or provide a shim that emulates the IC api in terms of FVM etc.
+
+We have thought about liberating Motoko from the IC by providing an alternative implementation of the ic system calls to allow, e.g. testing Motoko locally, but that's probably a much smaller job than actually re-targeting a different system API directly.
+
+I'm curious, where did you find those FVM details? Is there big picture description of the FVM API one can look at? I think looking for a 1-1 match between low-level calls is too much to expect.
+
+-------------------------
+
+Gekctek | 2023-03-17 16:27:43 UTC | #4
+
+Ok, i think my biggest fear is gone with the fact that the core is more general purpose. I was afraid it would be too much of a shift. 
+
+For the FVM, all the hype right now is the FEVM (EVM on filecoin) vs the FVM WASM it seems, so Im not sure how finalized the API is.
+The two places I was able to find are the specs themselves
+https://github.com/filecoin-project/fvm-specs
+Though the problem with those is they are very high level and dont have a WASM function spec in there, but they point to their reference sdk in Rust
+https://docs.rs/fvm_sdk
+And specifically the 'sys' module of the library
+
+So besides just shifting from one smart contract/blockchain to another. What would the biggest hurdles be for having Motoko be a generic WASM language. So in my mind, the thing that would give it flexibility and allow the community to build sdks would be specifying WASM export functions and import functions. Like if an `actor`'s public methods could just be exposed as WASM export functions and there could be manual calls to the imported functions in code. 
+Im sure there is a lot happening behind the scenes with actors and maybe that isnt the right route, but if the WASM import/export could be configurable with code that could be super powerful
+
+-------------------------
+
+claudio | 2023-03-17 19:53:12 UTC | #5
+
+Thanks for the links!
+
+I too can't get much out of that level of description. It's not even clear to me whether sending messages is asynchronous (as you'd expect from actors), or actual synchronous, as this implementation suggests:
+
+https://docs.rs/fvm_sdk/latest/src/fvm_sdk/send.rs.html#3-74
+
+Motoko's public methods are already exposed as wasm export functions, but the host of the actor has to provide an implementation of the ic0 functions (the IC System API) to let those functions access their arguments and reply or reject messages (and send other messages, maybe only to self).
+
+I think there's actually very little that prevents one from writing a simple host that say, takes the wasm for Motoko actor, a wasm module, instantiates and  calls its canister_init method to initialize state and then stores the state of the Motoko actor in memory while processing incoming messages one at time. The host would need to provide a mailbox for external clients to post candid encoded messages to the actor, and a simple event loop to forward each payload to the appropriate wasm export.
+
+Writing a simple node js host to do this is actually one of our side projects at the moment, but it's early days. But I don't see any fundamental obstacle, beyond lack of developer resources.
+
+-------------------------
+
+Gekctek | 2023-03-17 20:22:24 UTC | #6
+
+I might have to play with the node motoko 
+Im assuming its this
+https://github.com/dfinity/node-motoko/
+
+-------------------------
+
+Gekctek | 2023-03-17 20:24:14 UTC | #7
+
+Also I agree with the FVM docs/sdk. It doesnt seem like its fully documented whatsoever. They say its going to launch mid 2023, but we will have to see i guess
+
+-------------------------
+
+skilesare | 2023-03-17 21:08:06 UTC | #8
+
+We spoke with the filecoin guys at eth denver. They are not nearly as far along as I thought they were. Right now to get your Wasm into their system you have to convince all the client operators to load it. They are a long way from having general purpose WASM being pushed into their network. Which is great for us! Because I think this is exactly what we should do. Thanks for pulling these resources together. I'd love to see Motoko break out of the IC box.
+
+They've had a big release, which may have just happened on the 14th, and asked for me to reach out after that. They seemed interested in collaborating.
+
+I'd also love to see how these functions you've highlighted line up with the other systems that have been proved in https://github.com/av1ctor/icdevs-wasmer/.  It would be fun to write some actor based servers that run on windows. 😀
+
+-------------------------
+
+Gekctek | 2023-03-17 21:41:00 UTC | #9
+
+Nice work, I reached out to them on their forums to try to start getting more details and where in general they are with WASM. Good to know.
+
+The Wasmer bounty actually was one of the things that inspired me to look deeper into this. 
+With that it seems like one of the big issues was exposing public methods. Right now as far as I can tell actors methods are the only things that get exposed so that project put in a hack to make sure the methods arent cleaned up in the WASM (due to not being used) and run a post process on the WASM (WAT) to export those methods.
+
+Ill have to play around with it some more and see what some good options are
+
+-------------------------
+
+v1ctor | 2023-03-17 22:47:05 UTC | #10
+
+It would be great if we could export the public functions when compiling with the -wasi-system-api option (adding an -export-all option perhaps?).
+
+I tried myself to add that option and keep the public symbols, but OCaml was a pain to configure and to hack so I gave up.
+
+Now to support actors, any IC system function imported must be implemented or mocked. When not compiling with -wasi-system-api, Wasmer won't load the wasm module generated, because it needs at least one import from the "wasi_unstable" namespace to consider it a WASI module, so the wasm file has to be patched to include at least the "fd_write" import (used mostly to print messages to the console).
+
+-------------------------
+
+icaten | 2023-03-17 23:11:05 UTC | #11
+
+I don't know if anyone saw this, but I thought it was interesting that the generated language certainly looks _a lot_ like Motoko, particularly with how it's possible lambda's could be implemented with => 
+
+https://lukebechtel.com/blog/gpt4-generating-code
+
+-------------------------
+
+jleni | 2023-03-29 08:55:37 UTC | #12
+
+At Zondax we work in several ecosystems, including ICP and Filecoin. 
+
+We have been very much involved in FVM and FeVM (evm compatible version) . In the case of pure FVM, we build an AssemblyScript SDK that allows writing contracts in AssemblyScript to target FVM. It is fully functional but a bit on-hold given that EVM took precedence.
+
+So our work then moved to exposing everything through solidity and we built that too. We are coming back to AssemblyScript in the following weeks. 
+
+Having said that we are very much open to collaboration and anything that can be done in any of these two ecosystems.
+
+Just for context, in the case of ICP, we've built the ICP Ledger app, we are building a C/C++ agent library and are about to kick start as a node provider installing some nodes in the following weeks.
+
+-------------------------
+

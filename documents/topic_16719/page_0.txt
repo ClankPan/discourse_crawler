@@ -1,0 +1,191 @@
+peterparker | 2022-11-20 12:14:43 UTC | #1
+
+Is there a way within a Rust canister to read the list of controllers of the canister without async?
+
+I would like to check if the caller is a controller.
+
+```
+#[update]
+fn hello() {
+   let caller = api::caller();
+
+  // if !controllers.includes(caller) => trap
+}
+
+-------------------------
+
+Severin | 2022-11-21 08:34:11 UTC | #2
+
+I do not think so. You can only access the list of controllers through the Management Canister, and that's an async interface. But you can cache that information for e.g. an hour so you don't have to do the async call all the time.
+
+-------------------------
+
+peterparker | 2022-11-21 08:58:29 UTC | #3
+
+Thanks for confirmation, had the same feeling, a pity. I cannot have async call since I'll need the information in a query call (I guess), so I'll have to duplicate the info within the canister.
+
+-------------------------
+
+GLdev | 2022-11-21 11:04:17 UTC | #4
+
+Are you spawning the new canisters from somewhere you control? If so, you can include a list of controllers at spawn time, and avoid the async call. More info on this [here](https://forum.dfinity.org/t/getting-a-canisters-controllers-from-rust/11873).
+
+edit: This approach only works if the flow of adding new controllers is handled by the canister itself after init, and it will miss controllers added by dfx. It is a pitty that there isn't a canister-side API to get it's own controllers.
+
+-------------------------
+
+peterparker | 2022-11-21 18:11:11 UTC | #5
+
+Thanks for the post! If I get your post right, that's indeed what I had in mind - i.e. passing the list of controllers I would like to whitelist for calls as init param.
+
+```
+#[init]
+fn init(my_whitelist: Vec<Principal>) {
+  // populate state
+}
+```
+
+P.S.: Did not knew about `let call_arg = ic_cdk::api::call::arg_data::<(Option<SendArgs>,)>().0;`, pretty cool 👍
+
+-------------------------
+
+GLdev | 2022-11-21 19:08:39 UTC | #6
+
+[quote="peterparker, post:5, topic:16719"]
+that’s indeed what I had in mind - i.e. passing the list of controllers I would like to whitelist for calls as init param
+[/quote]
+
+Cool, then this should work. There are, however, some caveats. On the spawner canister you have to keep track of the principals you want to add as controllers, and do it in **2** places, to maintain further functionality with dfx / direct calling of the newly spawned canister.
+
+In order to spawn a new canister the spawner canister needs to make 2 calls to the management canister: ```create_canister``` and ```install_code```. 
+
+First, in order for the system (i.e. the management canister) to register a principal as a controller of a canister (with full controller powers) it needs to be added in the ```create_canister``` call.
+
+```
+#[derive(CandidType, Debug, Clone, Deserialize)]
+pub struct CreateCanisterSettings {
+    pub controllers: Option<Vec<Principal>>, //<--- HERE
+    pub compute_allocation: Option<Nat>,
+    pub memory_allocation: Option<Nat>,
+    pub freezing_threshold: Option<Nat>,
+}
+
+#[derive(CandidType, Clone, Deserialize)]
+pub struct CreateCanisterArgs {
+    pub cycles: u64,
+    pub settings: CreateCanisterSettings,
+}
+```
+
+Whatever controllers you add here will have full controller status (that means they will be able to directly call the canister from dfx / whatever).
+
+One issue is that the newly spawned canister can only receive arguments from the install_code (*I think*). So we need to also add the same controllers to the ```install_code``` call.
+
+```
+#[derive(CandidType, Deserialize)]
+enum InstallMode {
+    #[serde(rename = "install")]
+    Install,
+    #[serde(rename = "reinstall")]
+    Reinstall,
+    #[serde(rename = "upgrade")]
+    Upgrade,
+}
+
+#[derive(CandidType, Deserialize)]
+struct CanisterInstall {
+    mode: InstallMode,
+    canister_id: Principal,
+    #[serde(with = "serde_bytes")]
+    wasm_module: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    arg: Vec<u8>, // <-- HERE
+}
+```
+
+This "arg" gets passed down to the newly spawned canister, and it can read it from init() (as a sidetrack, also from pre_ and post_upgrade).
+
+The way I managed to send this was like so:
+
+```
+#[derive(CandidType, Deserialize)]
+struct CanisterInstallSendArgs {
+    greet: String,
+    controllers: Vec<Principal>,
+}
+
+let canister_install_args = Encode!(&CanisterInstallSendArgs {
+                greet: "Hello from Index".to_string(),
+                controllers: vec![Principal::from_text(
+                    "l6s27-7ndcl-nowe5-xeyf7-ymdnq-dkemz-jkhfw-zr5wu-jvf2p-aupzq-2qe",
+                )
+                .unwrap(),],
+            })
+            .unwrap();
+```
+
+Where ```CanisterInstallSendArgs``` is something you define. I added a "greet" there just to test things out. This struct is what you get on the other side, from init().
+
+Keep in mind that it's on you to make sure the principal vecs look the same in both calls. 
+
+Also, as I mentioned previously, if someone adds a new controller via dfx it will be missed by this approach.
+
+Speaking of init(), there's a prettier way of accessing the args than that ugly thing I used first time :) Check out [this](https://forum.dfinity.org/t/how-to-pass-install-arguments-from-dfx/12977) post for details. tl;dr; you can decorate the init() function with the ```#[candid_method(init)]``` macro, and the service will be correctly interpreted in the .did file and allow you to send install_code arguments from dfx as well. (rust to rust would work with just what I described above)
+
+-------------------------
+
+peterparker | 2022-11-21 19:57:35 UTC | #7
+
+Ah super cool, thanks for the details!!!!!!
+
+`Encode!` is a part of the `ic_cdk` or `candid` crate? how to you import it if I may ask?
+
+-------------------------
+
+GLdev | 2022-11-21 21:01:53 UTC | #8
+
+```use candid::{CandidType, Encode, Nat};```
+
+-------------------------
+
+peterparker | 2022-11-21 21:08:34 UTC | #9
+
+Neat! Thanks for all the tips 🙏
+
+-------------------------
+
+peterparker | 2022-11-24 08:13:06 UTC | #10
+
+It works like a charm @GLdev, you are a hero!
+
+```
+// Canister that creates the canister
+
+#[derive(CandidType, Deserialize)]
+pub struct BucketArgs {
+    pub user: Principal
+}
+
+let arg: Vec<u8> = Encode!(&BucketArgs {
+      user: api::caller()
+}).unwrap();
+
+let arg = InstallCodeArgument {
+   mode: CanisterInstallMode::Install,
+   canister_id,
+   wasm_module: wasm.clone().into(),
+   arg,
+};
+
+// Canister that gets created
+#[init]
+fn init() {
+  let call_arg = arg_data::<(Option<BucketArgs>,)>().0;
+  let user = call_arg.unwrap().user;
+
+  print(format!("Args. {}", user.to_text()));
+}
+```
+
+-------------------------
+

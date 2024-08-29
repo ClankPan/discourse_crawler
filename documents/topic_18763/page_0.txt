@@ -1,0 +1,434 @@
+Cryptouf | 2023-03-01 10:27:44 UTC | #1
+
+Hi, 
+
+I heard about the GS23 paper, which described a new threshold ecdsa implementation, and was super excited to understand more about it. So I tried to go over the github https://github.com/dfinity/ic , but I did not found enough documentation to help me. I only found this (https://docs.dfinity.systems/cargo-docs), but it seems it is password protected, and I am not able to access with my forum account (maybe it needs another account). 
+Is there any link explaining the purpose of each part « the goal of this folder is X, the goal of this file is Y, … »? 
+Is there any advice/direction that you could give me so I have better chances to succeed?
+My first goal would be to implement dkg in an isolated environement. 
+
+Thank you !
+
+-------------------------
+
+franzstefan | 2023-03-02 16:49:12 UTC | #2
+
+Hi @Cryptouf! You can find our core implementation of the threshold ECDSA (tECDSA) protocol in the `ic-crypto-internal-threshold-sig-ecdsa` library crate, which lives in [rs/crypto/internal/crypto_lib/threshold_sig/tecdsa](https://github.com/dfinity/ic/tree/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa). At the beginning of the contained [src/lib.rs](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/lib.rs) you find some high-level documentation explaining the purpose of the various parts.
+
+To see the protocol in action, you can look at the various tests in that crate. For example, in `tests/protocol` you find a test called [should_basic_signing_protocol_work](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/protocol.rs#L211) that first performs some pre-computation by running several DKGs, and then threshold-signs a message and finally verifies the combined signature.
+
+We also provide some documentation on tECDSA in https://github.com/dfinity/ic/blob/master/rs/interfaces/src/crypto/sign/canister_threshold_sig.rs. This is where we define the traits for implementing the tECDSA protocol on the Internet Computer's crypto component, i.e., on a higher layer in the protocol stack where we don't directly deal with raw keys but with nodes. If you want to see the protocol in action on that layer, I suggest you look at the tests in https://github.com/dfinity/ic/blob/master/rs/crypto/tests/canister_threshold_sigs.rs. Particularly the test `should_verify_sig_shares_and_combined_sig_successfully` might be interesting to you, as it exercises the entire protocol including pre-computation, threshold signing, and signature verification.
+
+-------------------------
+
+Cryptouf | 2023-03-06 10:42:53 UTC | #3
+
+This really helpful, I will study this. Thank you for your detailed answer !
+
+-------------------------
+
+Cryptouf | 2023-05-12 12:19:16 UTC | #4
+
+Hi @franzstefan , 
+
+as I am still working on this, I am facing some issues. 
+
+First one concern verification steps. The [create_dealings](https://github.com/w3-key/ic/blob/82e6629d86473b18e3f9e682cefbff48603c34de/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/test_utils.rs#L544) function is calling a `privately_verify_dealing` function which rely on a `decrypt_and_check` function, but then in open dealing, they re-use the [decrypt_and_check](https://github.com/w3-key/ic/blob/82e6629d86473b18e3f9e682cefbff48603c34de/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/transcript.rs#L500) function. Why is it done two times?
+
+Second one is in [transcript verification](https://github.com/w3-key/ic/blob/82e6629d86473b18e3f9e682cefbff48603c34de/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/test_utils.rs#L484). There is a check to verify if two transcripts are [equals](https://github.com/w3-key/ic/blob/82e6629d86473b18e3f9e682cefbff48603c34de/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/lib.rs#L419), but they are constructed in the same way with the same arguments so they should always be equals. I don't understand what is tested here. 
+
+Thank you for your help !
+
+-------------------------
+
+andrea | 2023-05-16 12:53:25 UTC | #5
+
+Hi @Cryptouf! Thanks for your interest in the protocol!
+
+> First one concern verification steps.
+
+I could not follow the link, but I assume you are referring to this [function](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/test_utils.rs#L513). It is worth noting that this function is **only used in tests** and its purpose is to check that everything works as expected, i.e. it creates some dealings and checks that they pass public and private verification. Moreover, if the test requires it, it also allows to corrupt some of the dealings (i.e. mess up with the some of the ciphertexts) and then it checks that the corrupted dealings no longer pass the private verification.  
+
+> Why is it done two times?
+
+This question is still valid, however the above test utility may be a bit confusing because it emulates the dealing creation/verification protocol for all the nodes, and thus it may not be clear that there is some interaction between different nodes. Decryption of a dealing may happen in three different situations:
+
+* [Verification](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/lib.rs#L589) of a private dealing: any receiver privately verify the dealing by checking the correctness of the ciphertext. This is done by decrypting it and checking that the share is consistent with commitment included in the dealing. Even though a receiver verified this dealing, it could happen that this dealing is not selected to be included in the transcript and therefore this share will not be used. For this reason the nodes do not actually store the share at this stage. In fact, the verification function does not even return the share, it just verifies it internally.
+* During the [loading](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/lib.rs#L456) of a transcript: this happens after the nodes reached consensus on which dealings have been included in a transcript. In this step the nodes decrypt *all the dealings* in the transcript to obtain the shares from all the different dealings. These are then combined and the resulting share is stored on the node. 
+* During the [opening](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/lib.rs#L1055) phase of the complaint protocol: it could happen that a dealing cannot be decrypted by a receiver, even though it has been included in a transcript. If this happens, the receiver can make a complaint against a specific dealing and broadcast it to the other receivers. The receivers can verify the correctness of the complaint and then help the complainer to reconstruct its own share. In this phase the openers, i.e. the receivers of a complaint, can use the `open_dealing` function to extract the share for that specific dealing and send this to the complainer. Since the nodes only store the combined secret they have to recompute this on demand. 
+
+Another couple of remarks:
+* Even if the nodes store the shares for all individual dealings in a transcript, it may be that the complainer is behind the rest of the subnet and therefore the opener may no longer have the share available and in the worst case they would have to recompute it.
+* Optimistically, the protocol should almost never go to the complaint phase because malicious dealers could be punished. Which is why we don't heavily optimize for this scenario.
+
+-------------------------
+
+andrea | 2023-05-16 12:57:56 UTC | #6
+
+[quote="Cryptouf, post:4, topic:18763"]
+Second one is in [transcript verification ](https://github.com/w3-key/ic/blob/82e6629d86473b18e3f9e682cefbff48603c34de/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/test_utils.rs#L484).
+[/quote]
+
+Again, it may not be clear that some operations are done by different nodes. During transcript creation, the blockmaker would construct a transcript and send this out to other nodes in the subnet as part of a block. The validators of the subnet would then verify the block proposal, i.e. verify all messages included in the block, which may include a transcript proposal. Since the creation of the transcript is deterministic (given the same set of dealings), they can verify the transcript by recomputing it and checking that the result matches the proposed transcript.
+
+Hope this helps!
+
+-------------------------
+
+Cryptouf | 2023-05-18 15:01:43 UTC | #7
+
+Thank you for your answer @andrea !
+Indeed, what was hard to understand where exactly there was an emulation to simulate different participants running different parts of this code.
+Globally, this is what I understood :
+
+
+* Each dealer run the create_dealing function, and subsequently post the result on chain. In the emulated version, the dealer_index is selected through a loop iteration. In a real-world scenario, how is the dealer index assigned to each participant?
+* For every dealing that has been posted on chain, P_i decrypt_and_check his part.  If the result is not matching the commitments, we go to complaints phase ( I have not understood all this part : I don't see the FixBadShares implementation in the tecdsa folder. I only see generate_complaints ) . If the result is matching, then we go to the ACS part : P_i sign a message saying that the share of P_j is valid using a threshold bls sceme (again, I have not gone through all this part, so I don't know exctaly when happens the dkg for the bls scheme), on post that signature on chain.
+* Once there are enough signatures for P_j, he can aggregate them into a certificate (with the threshold bls scheme) and post the result on chain. Every participant who is able to post a certificate on chain is now member of the verified dealers. 
+* Once we have at least t certificates, we can create a transcript with the list of verified dealers. My question here is : when do we know that we have enough verified dealers? iIf we have t certificates posted online, that some dealers calculate a transcript, then that someone else post its certificate, we could have two group of people who agree on a different transcript. How do we find a consensus? Which step do we have to wait until the list of verified dealer cannot be modified?
+* Once everyone has agreed on a transcript, every verified dealer compute its secret share locally
+
+Then, this process is repeated in a reshare_of_masked  version so we can have the final version of the shares. Why do we need to do this? Why can't we just run the random protocol? In the paper, it is explained section A.3 that we can sometime "relax the hiding property". Why relax it, if it introduce more communications rounds, and less security?
+
+In the process that I have described, I have not talked about optimizations yet : participants do not directly post on chain the bls signature for a dealing. They wait to have a batch of k dealers, and then they post all the signature in one transaction. How do we choose k? There are also other optimizations that I have not understood yet, particularly the DispersedLedger AVID optimization. Where is that part implemented in the repo?
+
+Thanks again for your valuable input @andrea
+
+-------------------------
+
+andrea | 2023-05-19 09:57:39 UTC | #8
+
+>  In a real-world scenario, how is the dealer index assigned to each participant?
+
+It's up to the consensus layer to determine who participates in a given instance of the IDKG protocol. At the moment we only have two cases: the participants of IDKG are either all members of the same subnet or 2 distinct subnets (i.e. the dealers from one subnet and the receivers on a different one). As part of the consensus protocol, nodes in a subnet agree on a registry version (which is included in a block) that specifies the members of all subnets at a given time. Whenever a subnet initiates an IDKG protocol all nodes construct an `IDkgTranscriptParams`, which is used to agree on the set of dealers and receivers as well as other general info. The receiver's index corresponds to their position in the sorted set of all receivers node ID. The *dealer's* index is only relevant when we either do a resharing of a previous transcript, or the product of 2 previous transcripts. This is equal to the position each dealer had (as a receiver) in the previous transcript, i.e. the one being reshared or multiplied.   
+
+> For every dealing that has been posted on chain, P_i decrypt_and_check his part
+
+Small clarification: most of the protocol actually happens off-chain to reduce latency. E.g., dealings are not individually put on chain. What goes on chain is the final transcript, which includes the set of dealings that must be used. So the complaint phase can only happen on a dealing included in a transcript. Note that also the complaint phase happens entirely off-chain.
+
+ > I don’t see the FixBadShares implementation
+
+It is part of the same library. The fix bad share protocol requires the following sub-routines to:
+
+* Issue a complaint, implemented by the `generate_complaint` function.
+* Verify a complaint, implemented by the `verify_complaint` function.
+* Force-open a dealing, implementing by the `open_dealing` function.
+* Verify the opening of a (forced-open) dealing, implemented by the `verify_dealing_opening`.
+* Compute the secret share using the openings for bad shares, which is implemented by the `compute_secret_shares_with_openings`.
+
+>  If the result is matching, then we go to the ACS part
+
+Not exactly. The complaint phase would only happen *after* the ACS. Before agreeing on the set of dealing to use (i.e. agree on a transcript), receiver only sign share that pass private verification. If a dealing does not pass this, the receivers won't sign it. Even though a dealing does not privately verify for a certain receiver, it could still verify for all the others. Therefore it is possible such dealing could end up in a transcript. It's only after they agreed on a transcript that the receiver may issue complaints about specific dealings.
+
+> using a threshold bls sceme [..] on post that signature on chain.
+
+Actually the "support" signature the receivers apply to the dealings is just a standard ed25519 signature, not a BLS threshold signature. At some point we used BLS *multi*-signatures, however the cost of the signature verification shares is one of the bottlenecks of the protocol, and verifying one BLS sig is about 2 order of magnitude more expensive than ed25519. Signatures are not individually posted on chain (again this is to minimize latency). First they are broadcasted to the other nodes, then anybody who has collected enough support shares can then "aggregate" them into a certificate. Eventually, a blockmaker will have enough certified dealings to construct a transcript and they can include this in their block proposal, and to add this to the chain.
+
+> when do we know that we have enough verified dealers? 
+
+I think this is now mostly answered from the above, but let me summarize it again. Only the final transcript goes on chain and all other artefacts are just broadcasted to all the participants. The nodes collect the various dealings, the signature shares, and combine these signatures into certificates. Once a blockmaker has enough dealings and certificates, then they can propose a new transcript by including it in a block. The other nodes would only accept this if the dealings and certificates are valid, and if it contains enough dealings. The minimum number of dealings to be collected is defined as the `collection_threshold` which can be computed, for example, from the `IDkgTranscriptParams`. After a transcript is included in a finalized blocks, the node would not try to collect any more dealings and would not accept a new transcript (for the same instance of the protocol).
+
+> Why do we need to do this? Why can’t we just run the random protocol? 
+
+This explained, a bit informally in the docs [here](https://github.com/dfinity/ic/blob/master/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/lib.rs). The paper describes a dedicated OpenPower sub-protocol, which is used to reveal the public key of a key generated via the Random protocol. This is needed, e.g., because during signing you need to know the public key corresponding to the secret. However, we decided not to implement such protocol and instead to reuse the reshare_of_masked protocol. The resharing protocol reveals the public key, exactly as in the OpenPower protocol, but it also enables the resharing of the secret key. The main reason behind this was to minimize the number of sub-protocols used in IDKG and to simplify their orchestration. Note that the resharing protocol is needed anyway, e.g. in case of a membership change in the subnet. 
+
+> Why relax it, if it introduce more communications rounds, and less security?
+
+We don't do any trade off of security here. The hiding property is important during the generation of the key, e.g. not to introduce biases on the public key (which could actually lead to some attacks). Once the key is generated it cannot be changed and therefore we can change commitment scheme to an unmasking one. The only thing that is now revealed is the corresponding public key, which is exactly what it would be revealed by the OpenPower protocol. In fact, the same commitment scheme is used in that sub-protocol. 
+
+> How do we choose k? There are also other optimizations that I have not understood yet, particularly the DispersedLedger AVID optimization. Where is that part implemented in the repo?
+
+I think the paper specifies what is, asymptotically, the best choice of k. In practice, we would need to evaluate the concrete latency/throughput tradeoffs to set the k value. However note that these have not been implemented yet. We are currently still in the process of evaluating what is the best strategy to improve the concrete efficiency of the protocol.
+
+-------------------------
+
+Cryptouf | 2023-05-25 16:01:05 UTC | #9
+
+> Actually the “support” signature the receivers apply to the dealings is just a standard ed25519 signature, not a BLS threshold signature
+
+Have you tried any of the known optimizations for BLS multi-signatures before switching to ed25519? I am talking about the following:
+
+* [Fast verification of multiple BLS signatures](https://ethresear.ch/t/fast-verification-of-multiple-bls-signatures/5407)
+* Subset-optimized BLS Multi-signature with Key Aggregation (where instead of randomizing the aggregated signatures, we have a one-time randomization phase of the public keys which has significant savings during aggregation and verification https://eprint.iacr.org/2023/498.pdf
+
+-------------------------
+
+andrea | 2023-05-26 07:30:03 UTC | #10
+
+
+Yes, we took into account batch verification techniques like the first one you mentioned. A more general treatment of these can be found in this [paper](https://eprint.iacr.org/2007/172). Note that the bottleneck of the protocol is the verification of the signature *shares*, not of the combine multisig. Of course you could try to skip the verification of the shares and try to combine and verify. However, if the combined verification fails, you still need to verify all the shares individually. So in the worst case the complexity is not better.
+
+Regarding the second link, I think it has the same efficiency of the BLS multisig we are using. In our scheme we use proof of possession of the keys (which are verified once and for all), so that it is possible to combine the public keys by simply multiplying them. This is the same aggregation used in that paper. The difference is that they use a randomization of the key instead of a proof of possession. However, this randomization of the key looks very similar to a proof of possession. So I think the main difference is in how they prove security of the scheme.
+
+For the subnet sizes we dealing with now it is more efficient to use ed255219, since it is a couple orders of magnitude more efficient than BLS. Note that we use batch verification even for ed25519. If we get to a point where we deal with much larger subnets, then BLS could become more convenient. However I suspect it is more likely that we would have implemented batch dealings at that point, so this would be less relevant.
+
+-------------------------
+
+mathcrypto | 2023-05-26 15:46:51 UTC | #11
+
+What's the point of fixing the bad shares if the transcript is already published? Are these shares used elsewhere afterwards?
+
+-------------------------
+
+mathcrypto | 2023-05-29 16:56:15 UTC | #12
+
+Also, I know your threshold scheme is an (f + 1)-out-of-n.  Is f ≤ t − 1? and n > 2t − 1? I can't find such information in your paper
+
+-------------------------
+
+Cryptouf | 2023-06-02 11:55:14 UTC | #13
+
+The reason why @mathcrypto is asking if n>= 2t-1 is that, when we run [this](https://github.com/dfinity/ic/blob/70a0d613873b8db9a3db7d5b2537802fd1262d82/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/protocol.rs#L211) test with `node = 10`, `threshold = 6`, and `number_of_dealings_corrupted = 0`, we get an InsufficentDealing error. After investigation, we found out that this error comes from the [multiply function](https://github.com/dfinity/ic/blob/70a0d613873b8db9a3db7d5b2537802fd1262d82/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/test_utils.rs#L255), in the [`create_transcript` function](https://github.com/dfinity/ic/blob/70a0d613873b8db9a3db7d5b2537802fd1262d82/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/src/transcript.rs#L279) . Is this normal? From your original code, we only changed values for `threshold` and `number_of_dealings_corrupted` .
+
+-------------------------
+
+andrea | 2023-06-05 17:45:22 UTC | #14
+
+[quote="mathcrypto, post:11, topic:18763, full:true"]
+What’s the point of fixing the bad shares if the transcript is already published? Are these shares used elsewhere afterwards?
+[/quote]
+
+I am not sure I fully understand the question, what do you mean by "elsewhere"? The shares are used in the online phase of the threshold ECDSA signing protocol, so each node needs to be able to decrypt all the dealings included in a transcript to be able to participate in the protocol. 
+
+I'll try to explain a bit why the reconstruction phase is needed, maybe it clarifies things a bit. Once we agree on a transcript we must use it, meaning that we have to use all the dealings included in it. Receivers collect support shares for the various dealings, however it is not guaranteed that every dealing was approved by the same set of receivers. For example, if we have seven nodes `N_1, .. N_7`, so f=2, and we collect f+1 dealings, each with support from 2f+1 receivers. Then it could happen that each dealing has only approval from the following receivers:
+
+```
+dealing_1= {N_1, N_2, N_3, N_4, N_5}
+dealing_2= {N_1, N_2, N_3,           N_6, N_7}
+dealing_1= {          N_3, N_4, N_5, N_6, N_7}
+```
+
+As you can see we only have a single node that is guaranteed to be able to decrypt from every dealing. However 1 node is not sufficient to run the online signing phase of the protocol. In general, we may encounter a situation were we get stuck and not enough nodes can actually decrypt their shares from all the dealings. However, since we collect support shares from 2f+1 nodes for each dealing, we know that at least f+1 of them are honest. These honest nodes are enough to unblock other receivers and help them reconstruct their share.
+
+Of course we could have a different strategy where the nodes first agree on a set of dealings and then issue complaints/supports on all the dealings. However this would require multiple rounds of consensus, which would increase the latency of the protocol.
+
+-------------------------
+
+andrea | 2023-06-06 07:16:33 UTC | #15
+
+From the [paper](https://eprint.iacr.org/2022/506.pdf) abstract:
+> it works with n parties with up to f < n/3 Byzantine corruptions;
+
+And from the paper introduction:
+> Our new protocol is, in fact, an (f + 1)-out-of-n threshold signature scheme
+
+
+So the threshold is less than 1/3 of the nodes. 
+> when we run [this](https://github.com/dfinity/ic/blob/70a0d613873b8db9a3db7d5b2537802fd1262d82/rs/crypto/internal/crypto_lib/threshold_sig/tecdsa/tests/protocol.rs#L211) test with `node = 10` , `threshold = 6` , and `number_of_dealings_corrupted = 0`
+
+With 10 nodes you can have at most threshold 3+1, so threshold 6 is too high. One reason is that in the multiplication protocol we are trying to get shares for the product of 2 previously shared secrets, which essentially involves computing the product of the two polynomials used in the secret sharing. Since you use threshold 6, the two polynomials have degree 5 and their product has degree 10. To interpolate this polynomial we need at least 11 points, which means collecting 11 dealings. However, since you only have 10 nodes you cannot get enough dealings to successfully reconstruct the correct polynomial.
+
+Another remark: the `number_of_dealings_corrupted` is the number of dealings we actively corrupt within the test, it is not the number of corrupt dealers we can tolerate in the protocol.
+
+-------------------------
+
+mathcrypto | 2023-07-11 13:12:09 UTC | #16
+
+@andrea I have a question please. 
+
+In the dealing verification process: if the decryption (share) is correct, it will send back to the dealer a “dealing verification share”, which is a BLS signature (or eddsa) on a message that attests to the correctness of its share. What happens in the case of unsuccessful verification?
+
+Does the faulty signature (unsuccessful verification) gets included anyway in the the 2f+1 dealing verification shares which will then form a “verification certificate” if the recipient decides to include it? 
+or only gets accepted and added if other participants can verify whether a signature is valid or not?
+The risk would be not everybody would get the same resulted certificate.
+
+Still not sure if we should compare certificates before adding dealers to verified dealers list or the opposite, adding them then updating the list if they are identified? In the second case, the transcript would be already created with the wrong dealings.
+
+-------------------------
+
+andrea | 2023-07-11 13:38:13 UTC | #17
+
+> Does the faulty signature (unsuccessful verification) gets included anyway in the the 2f+1 dealing verification shares
+
+No, only valid signatures are collected and counts towards the "verification threshold", which is `2f+1`.
+
+> The risk would be not everybody would get the same resulted certificate.
+
+Yes, locally every node could see different support signatures. However it does not matter as the nodes then agree on a single transcript which consists of a set of verified dealings (i.e. with at least 2f+1 signatures). Also the signature shares are included in the transcript, so that anybody can check the dealings have enough support. 
+
+> In the second case, the transcript would be already created with the wrong dealings.
+
+What do you mean by "wrong dealings"? As long as a dealing has enough support is consider valid. Once the nodes agree on a set of valid dealings, they don't update the set anymore.
+
+-------------------------
+
+Cryptouf | 2023-08-14 10:22:19 UTC | #18
+
+> One reason is that in the multiplication protocol we are trying to get shares for the product of 2 previously shared secrets, which essentially involves computing the product of the two polynomials used in the secret sharing
+
+After verification, it appears I am able to run the scheme with 10 nodes and threshold = 5. It is valid with your rule as I have two polynomials of degree 4, and I need at least 9 points to reconstruct the product of their polynomial. 
+
+What are the other reasons that make the bound non-breakable? Is that normal that there isn't a check in the code for the other reasons, which would raise an error for my working (10,5) scheme? 
+
+Finally, have you explored some solutions to remove the f<n/3 bound, as described [here](https://eprint.iacr.org/2022/619.pdf) for example?
+
+-------------------------
+
+Cryptouf | 2023-08-22 10:25:05 UTC | #19
+
+In this case, we have 7 nodes, and the collection threshold is 3. Would it be preferable to collect more dealings before moving on? 
+Imagine that the 4th collected dealing was :
+
+`dealing_4 = { N_1, N_2, N_3, N_4, N_5, N_6, N_7}`
+
+Maybe it would be quicker to wait for that dealing, instead of being in a situation in which almost every node has to go through a complaint step?
+
+-------------------------
+
+andrea | 2023-08-23 16:57:46 UTC | #20
+
+Hey @Cryptouf 
+
+> What are the other reasons that make the bound non-breakable?
+
+For each dealing we need to collect support shares from the receivers. How many shares should we collect? In the protocol we collect 2f+1, which is actually the maximum assuming up to f corruptions: if you want to collect more support shares then the protocol cannot guarantee liveness, since you would need the participation of possibly corrupt parties to make progress. Therefore in the protocol we have that each dealing has support from 2f+1 receivers, however you don't know a priori how many of the supporters are honest. Since we assume up to f corruptions, then it means we have at least f+1 honest supporters for each dealing. So in the worst case the f+1 honest supporters need to be able to sign, which means that the threshold can be at most f+1. AFAIK this issue applies in general to interactive DKG protocols. 
+
+> Is that normal that there isn’t a check in the code for the other reasons, which would raise an error for my working (10,5) scheme?
+
+There are several checks in place. We run the protocol on certain agreed parameters, for which we verify several invariants upon creation. See e.g. [here](https://github.com/dfinity/ic/blob/07180f2fa4e5434e77c960e4b3f6c5d53e48df48/rs/types/types/src/crypto/canister_threshold_sig/idkg.rs#L324).
+
+> Finally, have you explored some solutions to remove the f<n/3 bound, as described [here ](https://eprint.iacr.org/2022/619.pdf) for example?
+
+Yes we did explore solutions to increase the safety threshold. However, they inherently require to reduce the liveness/availability threshold. This was explained, e.g., in this [forum post](https://forum.dfinity.org/t/threshold-ecdsa-signatures/6152/245?u=andrea) where we highlighted the possibility of increasing the security threshold while sacrificing on liveness. This for example could be useful to reshare towards smaller subnets, while keeping a comparable security threshold. Note that reducing liveness also increases the risk of losing the key, e.g. in case too many nodes break, which is also a risk to take into account.
+
+-------------------------
+
+andrea | 2023-08-23 17:05:16 UTC | #21
+
+> Would it be preferable to collect more dealings before moving on?
+
+How do you know how long to wait until the next dealing comes? What if the next dealing is the problematic one? You cannot fully verify them by yourself, since this depends on private verification of the dealing. 
+
+> Maybe it would be quicker to wait for that dealing, instead of being in a situation in which almost every node has to go through a complaint step?
+
+The current protocol optmizes the efficiency of the optimistic case. Note that in case you do have cheating dealers in a protocol instance, you can actually identify them and thus remove them from the protocol.
+
+-------------------------
+
+andrea | 2023-08-23 17:12:21 UTC | #22
+
+[quote="Cryptouf, post:18, topic:18763"]
+After verification, it appears I am able to run the scheme with 10 nodes and threshold = 5. It is valid with your rule as I have two polynomials of degree 4, and I need at least 9 points to reconstruct the product of their polynomial.
+[/quote]
+
+Note that with these parameters, you cannot achieve liveness. If you have 10 nodes, you are expecting to collect at least 9 dealings. Which means you can tolerate at most 1 corrupt party (note that corrupt/faulty nodes may never send a single message in the protocol). If you assume that more than 1 party can corrupt, then you protocol cannot achieve liveness, i.e. it could never terminate.
+
+-------------------------
+
+Cryptouf | 2023-08-25 11:17:53 UTC | #23
+
+Thank you @andrea !
+
+>For each dealing we need to collect support shares from the receivers. How many shares should we collect? In the protocol we collect 2f+1, which is actually the maximum assuming up to f corruptions: if you want to collect more support shares then the protocol cannot guarantee liveness, since you would need the participation of possibly corrupt parties to make progress. Therefore in the protocol we have that each dealing has support from 2f+1 receivers, however you don’t know a priori how many of the supporters are honest. Since we assume up to f corruptions, then it means we have at least f+1 honest supporters for each dealing. So in the worst case the f+1 honest supporters need to be able to sign, which means that the threshold can be at most f+1. AFAIK this issue applies in general to interactive DKG protocols.
+
+Is this related to the section 3.4 of the paper?
+What seems weird to me is the fact that we need 2f+1 support shares, but we say that the threshold is f+1. If at some point in the protocol, we need 2f+1 users, it means that the "global" threshold is 2f+1, even if the ecdsa threshold is f+1?
+Maybe it's because we need 2f+1 support shares, but only f+1 out of these should rely on honest supporters?
+
+> This was explained, e.g., in this forum post
+
+Will read it in details, thanks for sharing ! 
+
+>How do you know how long to wait until the next dealing comes? What if the next dealing is the problematic one?
+
+I don't know, my idea was about running the two processes in the same time, and see which one ends first. 
+
+>Note that with these parameters, you cannot achieve liveness. If you have 10 nodes, you are expecting to collect at least 9 dealings. Which means you can tolerate at most 1 corrupt party (note that corrupt/faulty nodes may never send a single message in the protocol). If you assume that more than 1 party can corrupt, then you protocol cannot achieve liveness, i.e. it could never terminate.
+
+And even if I tolerate at most 1 corrupt party, this means that there is no need to have a threshold higher that 2, so I can directly use a (10,2) scheme instead of that (10,5) scheme, right?
+
+-------------------------
+
+andrea | 2023-08-25 15:11:02 UTC | #24
+
+[quote="Cryptouf, post:23, topic:18763"]
+Maybe it’s because we need 2f+1 support shares, but only f+1 out of these should rely on honest supporters?
+[/quote]
+
+Yes, that is the reason. You collect 2f+1, so that you know you can rely on at least f+1 of them. 
+
+> And even if I tolerate at most 1 corrupt party, this means that there is no need to have a threshold higher that 2, so I can directly use a (10,2) scheme instead of that (10,5) scheme, right?
+
+Yes. But note that with 10 nodes the protocol can tolerate up to 3 dishonest parties, meaning setting the threshold to 4.
+
+-------------------------
+
+mathcrypto | 2023-08-29 08:27:32 UTC | #25
+
+@andrea So if we use schemes (10,2) or (10,3) we are risking the security of the protocol or they are also good as (10,4) scheme? since the protocol can tolerate up to 3 dishonest parties, we can assume f=1 or f=2 or f=3
+
+-------------------------
+
+andrea | 2023-08-29 09:19:54 UTC | #26
+
+The threshold should be higher than the maximum number of corrupt parties you can/want to tolerate. If you have threshold `t`, it means that you tolerate up to `t-1` corrupt parties, while `t` corrupt parties can break the security of the protocol. So if you use threshold 2 you can only tolerate a single corrupt party, with threshold 3 you can only tolerate 2 corrupt parties, and so on. Moreover, with 10 nodes the maximum threshold you can achieve is 4.
+
+In principle you can decide to use a threshold which smaller than the maximum (e.g. to make the protocol faster), however you are trading off efficiency with security.
+
+-------------------------
+
+Cryptouf | 2023-09-04 08:59:25 UTC | #27
+
+[quote="andrea, post:24, topic:18763"]
+You collect 2f+1, so that you know you can rely on at least f+1 of them.
+[/quote]
+
+Right now, this supporting part is related to each participant verifying the dealing that he received, so that every dealer can aggregate these verifications into a certificate. Let's suppose we remove this part : we do not verify each dealing that is broadcasted by every dealer. This means that one malicious actor that provides a false dealing is able to block the whole protocol. Are there any other drawbacks?
+
+-------------------------
+
+andrea | 2023-09-04 17:16:12 UTC | #28
+
+[quote="Cryptouf, post:27, topic:18763"]
+This means that one malicious actor that provides a false dealing is able to block the whole protocol.
+[/quote]
+
+To me it seems already a pretty big drawback! This means that you cannot even guarantee that you can complete the protocol unless you assume all participants are honest. Note also that the security proof uses explicitly the fact that the dealings are privately verified by the receivers. So the current security proof would not carry to the modified protocol.
+
+-------------------------
+
+Cryptouf | 2023-09-19 14:47:03 UTC | #29
+
+Hi again @andrea, 
+
+can you tell me where in the white paper it is explained that the dealings needs to be privately verified in order for the security proof to be valid? I would like to understand what part of that proof would fail to the modified protocol. 
+And yes, this is a huge drawback, but in some cases it may not be a problem : if all dealers are in the same family, or owned by the same person for example.
+
+-------------------------
+
+andrea | 2023-09-21 05:49:23 UTC | #30
+
+[quote="Cryptouf, post:29, topic:18763"]
+if all dealers are in the same family, or owned by the same person for example.
+[/quote]
+
+I am not sure it improves security to have multiple dealers controlled by the same party. In any case, these are stronger assumptions than the ones made in the protocol.
+
+> can you tell me where in the white paper it is explained that the dealings needs to be privately verified 
+
+For example in Section 9, in the security proof of theorem 4 (Game 3 and Game 4), it is explicitly used that the dealings produced by the adversary have been verified by honest receivers. There may be other places though.
+
+-------------------------
+
+Cryptouf | 2023-09-22 13:26:15 UTC | #31
+
+>In any case, these are stronger assumptions than the ones made in the protocol.
+
+Of course, this is not meant to be the general case. I was wondering if we could remove some steps **only** in the case where all dealings are owned by the same person. 
+
+> in Section 9, in the security proof of theorem 4 (Game 3 and Game 4)
+
+
+Thank you !
+
+-------------------------
+
+Cryptouf | 2024-05-24 16:22:33 UTC | #32
+
+Hello @andrea, 
+
+I am wondering why we use lambda in the protocol. In the whitepaper, in section 2.5.2, Note 1, we see that we divide both numerator and denominator by lambda, and we are left with rho, alpha, kappa, and theta. If we remove lambda, we could only generate sharings of alpha and kappa, saving a lot of steps. Also, by removing the multiply step, we can afford to have a higher threshold. 
+What is the reason you introduced lambda? What is the drawback if we remove it?
+
+-------------------------
+

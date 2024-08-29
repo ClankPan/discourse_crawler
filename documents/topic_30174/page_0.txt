@@ -1,0 +1,263 @@
+peterparker | 2024-04-30 14:50:29 UTC | #1
+
+I have implemented Juno Analytics / Orbiter ([source code](https://github.com/junobuild/juno/tree/main/src/orbiter)) with `ic-stable-structures = "0.5.6"` using a bounded size and a custom serialize and deserialize implementation ([source](https://github.com/junobuild/juno/blob/main/src/orbiter/src/impls.rs)).
+
+Can I just upgrade to the latest version of the crate, set those types to `Bound::Unbounded`, remove my custom "byte by byte" serializer code, and expect everything to be fine, or am I about to unleash hell on earth?
+
+In short, can I simply migrate old Bounded data to Unbounded?
+
+-------------------------
+
+Samer | 2024-04-30 19:32:16 UTC | #2
+
+I think you would still need your impl of `Storable` but not sure if it is possible. 
+
+Curious to know this @ielashi
+
+-------------------------
+
+peterparker | 2024-04-30 19:41:09 UTC | #3
+
+Yeah it's what I mean, just updating my implementation of `Storable` from Bounded to Unbounded.
+
+[https://github.com/junobuild/juno/pull/522/files](https://github.com/junobuild/juno/pull/522/files)
+
+-------------------------
+
+peterparker | 2024-05-01 06:12:47 UTC | #4
+
+At first sight, it does not seem to work. I wrote a PicJS test to assert such an upgrade is possible but get a deserialization error on upgrade.
+
+>  FAIL  src/tests/orbiter.upgrade.spec.ts > Orbiter upgrade > v0.0.6 -> v0.0.7 > should still list all page views after upgrade
+Error: Canister lxzze-o7777-77777-aaaaa-cai trapped explicitly: Panicked at 'Failed to deserialize from bytes: Semantic(None, "invalid type: integer `0`, expected map")', /Users/daviddalbusco/projects/juno/juno/src/libs/shared/src/serializers.rs:32:26
+
+-------------------------
+
+peterparker | 2024-05-01 08:03:45 UTC | #5
+
+Oh I think I understand now.
+
+```
+ ✓ should still list all page views after upgrade 3650ms
+
+ Test Files  1 passed (1)
+```
+
+Yes, it seems seems you can implement `Unbounded` in a trait that was previously `Bounded`.
+
+But, I cannot just drop the custom deserialization at the same time. Not sure if it's something that should remain or can somehow be migrated too.
+
+I did not implemented a test yet that adds a new variable within the struct that is now Unbounded. That's something I should still try but, also have to check how to solve this with the serialization.
+
+-------------------------
+
+peterparker | 2024-05-01 12:28:56 UTC | #6
+
+So, this is what I've developed today.
+
+1. As I said in my previous post, I implemented `Unbounded` types. PR [#522](https://github.com/junobuild/juno/pull/522).
+
+Basically replaced `BoundedStorable`:
+
+```
+impl BoundedStorable for PageView {
+    const MAX_SIZE: u32 = PAGE_VIEW_MAX_SIZE as u32;
+    const IS_FIXED_SIZE: bool = false;
+}
+```
+
+With `Unbounded`:
+
+```
+const BOUND: Bound = Bound::Unbounded;
+```
+
+2. While the data becomes unbounded, in reality, they remain bounded because I couldn't just replace the custom deserializer with a generic serializer (Ciborium) due to the way I serialized my data, or at least, that's how I understand the error I reported this morning. So, in another PR [#523](https://github.com/junobuild/juno/pull/523), I implemented fallback serialization for backward compatibility.
+
+Basically the following:
+
+```
+fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        from_reader(&*bytes).unwrap_or_else(|_| deserialize_bounded_page_view(bytes))
+}
+```
+
+i.e., deserialize with Ciborium if it does not work, try to deserialize with the custom bytes length deserializer. This has the downside of making the deserialization more costly and less efficient for existing data, but given the use case, I think it's an acceptable tradeoff and also kind of safer than adding some magic number to perform this or that deserialization.
+
+3. Once I finished with the above, I realized that I might face some issues after an upgrade if one canister tries to update an existing `Bounded` data. I fear that for such a use case either the data will be duplicated (given that the key serialization was modified) or somehow would break because I'm not sure what happens if I update a non-fixed entry which was previously saved with a fixed size.
+
+Long story short, I did the following in another PR [#524](https://github.com/junobuild/juno/pull/524):
+
+a. I reverted my keys to remain bounded, which is fine given that they are less likely to evolve in the future.
+
+So replaced for the keys (and only the keys):
+
+```
+const BOUND: Bound = Bound::Unbounded;
+```
+
+With:
+
+```
+const BOUND: Bound = Bound::Bounded {
+        max_size: ANALYTIC_SATELLITE_KEY_MAX_SIZE as u32,
+        is_fixed_size: false,
+    };
+```
+
+Then, for the data, I created an enum:
+
+```
+    #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+    pub enum MemoryAllocation {
+        Unbounded,
+        Bounded,
+    }
+```
+
+and extended my struct with the information as optional:
+
+```
+pub memory_allocation: Option<MemoryAllocation>,
+```
+
+That way, when I deserialize manually the old data, I set the value to bounded:
+
+```
+pub fn deserialize_bounded_page_view(bytes: Cow<[u8]>) -> PageView {
+
+     ...
+
+     PageView {
+        ...
+        memory_allocation: Some(MemoryAllocation::Bounded),
+    }
+}
+```
+
+I did not change the serializer - i.e., I don't save "Bounded" in memory - that way, the fixed size remains the size.
+
+In my store, I implemented a bit of logic to reuse or assign an allocation:
+
+```
+let memory_allocation: Option<MemoryAllocation> = match current_page_view.clone() {
+        None => Some(MemoryAllocation::Unbounded),
+        Some(current_page_view) => current_page_view.memory_allocation,
+    };
+```
+
+Finally, in my implementation, I used the information to either use the custom serialization or the generic.
+
+```
+impl Storable for PageView {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        match self.memory_allocation {
+            Some(MemoryAllocation::Bounded) => serialize_bounded_page_view(self),
+            _ => serialize_to_bytes(self),
+        }
+    }
+```
+
+Following this pattern, I can add new optional types to my struct.
+
+Wrote some PicJS / PocketIC tests to assert upgrade, so far everything seems fine.
+
+However, if anybody is reading these lines and notices anything incorrect, please scream!!!!!
+
+-------------------------
+
+Samer | 2024-05-01 15:19:04 UTC | #7
+
+Thank you for sharing it!
+
+-------------------------
+
+peterparker | 2024-05-02 13:19:35 UTC | #8
+
+So, after sleeping on it, I ultimately figured out that introducing a `MemoryAllocation` within the structs wasn't such a good idea. Sure, it would allow me to avoid API-breaking changes, but the downside is that it requires persisting more data in the stable memory, which has a cost. Therefore, despite the fact that breaking changes are painful, I decided to replace that approach with a tagged union (I think that's what it’s called).
+
+1. I removed the enum `MemoryAllocation` and any usage
+
+2. I introduced a new enum for the union which, actually contains the same struct but allows me to distinguish between those.
+
+```
+#[derive(CandidType, Serialize, Deserialize, Clone)]
+pub enum StoredPageView {
+     Unbounded(PageView),
+     Bounded(PageView),
+}
+```
+
+3. I updated the `Storable` implemention to deserialize / serialize the wrapped struct.
+
+```
+impl Storable for StoredPageView {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        match self {
+            StoredPageView::Unbounded(page_view) => serialize_to_bytes(page_view),
+            StoredPageView::Bounded(page_view) => serialize_bounded_page_view(page_view),
+        }
+    }
+
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        from_reader(&*bytes)
+            .map(StoredPageView::Unbounded)
+            .unwrap_or_else(|_| StoredPageView::Bounded(deserialize_bounded_page_view(bytes)))
+    }
+
+    const BOUND: Bound = Bound::Unbounded;
+}
+```
+
+4. I replaced the struc in my tree map:
+
+```
+// From
+pub type PageViewsStable = StableBTreeMap<AnalyticKey, PageView, Memory>;
+
+// To
+pub type PageViewsStable = StableBTreeMap<AnalyticKey, StoredPageView, Memory>;
+```
+
+5. I finally proceeded by adapting existing code to the breaking changes till the canister endpoints. To ease the readability, I also introduced two implementation to access easily the wrapped value and get an hint if bounded or not.
+
+```
+impl StoredPageView {
+    pub fn inner(&self) -> &PageView {
+        match self {
+            StoredPageView::Unbounded(page_view) | StoredPageView::Bounded(page_view) => page_view,
+        }
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        matches!(self, StoredPageView::Bounded(_))
+    }
+}
+```
+
+6. Finally adapter the test but, still need to handle those breaking changes accross the all platform and libraries.
+
+Let's hope that's my final iteration :rofl:
+
+-------------------------
+
+peterparker | 2024-05-02 14:45:10 UTC | #9
+
+After discussing with @frederikrothenberger, he suggested not exposing the internal enum structure to the consumers as it's relatively inelegant. So, for this version, we decided to map the results to maintain backward-compatible endpoints. I can potentially perform some Canbench comparisons or tests to determine if mapping the types has a significant impact on execution. Nevertheless, compared to my previous code, one important change is modifying the implementation to now borrow the value, which allows mapping without the need to clone those.
+
+```
+impl StoredPageView {
+    pub fn inner(self) -> PageView {
+        // Same same
+``` 
+
+Great, so that's the final iteration. Let's merge the train of PRs.
+
+-------------------------
+
+peterparker | 2024-05-02 15:41:41 UTC | #10
+
+I would bet this thread won't be useful to anyone in the future, but just in case, this is the final PR that I just merged into the main branch: [https://github.com/junobuild/juno/pull/522](https://github.com/junobuild/juno/pull/522)
+
+-------------------------
+

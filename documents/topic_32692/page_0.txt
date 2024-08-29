@@ -1,0 +1,211 @@
+bdemann | 2024-07-03 23:00:27 UTC | #1
+
+Discussion | Support 
+
+It would be very handy for Azle developers to be able to automatically generate TypeScript types and candid IDLs automatically based on a candid file. I have been looking into didc to see if it can accomplish this, and it almost does. The TypeScript types are great and generated exactly how we would need them, but the IDLs that are generated are only used in the generated idlFactory and not directly exposed to the developer.
+
+For example if I take the ic.did from the management canister and run
+
+```
+didc ic.did -t js
+```
+
+I get an idlFactory that has all of the IDLs defined but they are scoped such that I can't access them.
+
+If we take a look at a simplified version that just has bitcoin_get_balance, this is what I get
+
+``` javascript
+export const idlFactory = ({ IDL }) => {
+    const bitcoin_network = IDL.Variant({
+        mainnet: IDL.Null,
+        testnet: IDL.Null
+    });
+    const bitcoin_address = IDL.Text;
+    const bitcoin_get_balance_args = IDL.Record({
+        network: bitcoin_network,
+        address: bitcoin_address,
+        min_confirmations: IDL.Opt(IDL.Nat32)
+    });
+    const satoshi = IDL.Nat64;
+    const bitcoin_get_balance_result = satoshi;
+    return IDL.Service({
+        bitcoin_get_balance: IDL.Func(
+            [bitcoin_get_balance_args],
+            [bitcoin_get_balance_result],
+            []
+        )
+    });
+};
+```
+
+But what I would like to produce is something like this
+
+``` javascript
+export const bitcoin_network = IDL.Variant({
+    mainnet: IDL.Null,
+    testnet: IDL.Null
+});
+export const bitcoin_address = IDL.Text;
+export const bitcoin_get_balance_args = IDL.Record({
+    network: bitcoin_network,
+    address: bitcoin_address,
+    min_confirmations: IDL.Opt(IDL.Nat32)
+});
+export const satoshi = IDL.Nat64;
+export const bitcoin_get_balance_result = satoshi;
+
+export const idlFactory = ({ IDL }) => {
+    return IDL.Service({
+        bitcoin_get_balance: IDL.Func(
+            [bitcoin_get_balance_args],
+            [bitcoin_get_balance_result],
+            []
+        )
+    });
+};
+```
+
+Does anyone know if didc or some other tool can do this? Or would it be possible to change didc to output the js bindings like this?
+
+-------------------------
+
+chenyan | 2024-07-04 16:23:29 UTC | #2
+
+It should be easy to do by rearranging the code a bit, particularly this line: https://github.com/dfinity/candid/blob/master/rust/candid_parser/src/bindings/javascript.rs#L253.
+
+Just curious, why do you need access to this type objects? The type script binding should give you type information already?
+
+-------------------------
+
+bdemann | 2024-07-08 20:53:07 UTC | #3
+
+I am hoping to be able to use those types for the first param of IDL.encode and IDL.decode
+
+-------------------------
+
+lastmjs | 2024-07-29 14:49:30 UTC | #4
+
+We need the IDL objects themselves, not just the TypeScript types
+
+-------------------------
+
+lastmjs | 2024-08-06 11:23:18 UTC | #5
+
+@chenyan do you think we could get this soon? This would help Azle, as we would like to start generating the IDL.Type objects instead of manually implementing them for canisters like the management canister and icrc canisters.
+
+Without this change we'll either have to implement these IDL.Type objects manually, or we would have to generate the types and manually change the files after-the-fact to expose what we need.
+
+-------------------------
+
+lastmjs | 2024-08-06 11:28:01 UTC | #6
+
+Here's an example of the inconvenience we have: tSchnorr seems to have just gone production-ready. So we need to update our management canister IDL.Type objects so that devs can easily import them from the azle library without having to implement and generate these types themselves. This is a very nice developer experience.
+
+But we will have to go and manually implement the tSchnorr types and IDL.Type objects and add them into Azle, or generate the types and IDL.Type objects and manually export them, to get the tSchnorr functionality.
+
+Ideally we would just obtain the latest did file and use the entirely automatic generation.
+
+-------------------------
+
+chenyan | 2024-08-06 20:44:12 UTC | #7
+
+@kpeacock IIRC, we put these type definitions inside the `idlFactory`, because the factory is taking the actual `{ IDL }` implementation as a parameter. Do you see a way to make this change without breaking existing code?
+
+-------------------------
+
+kpeacock | 2024-08-06 20:52:59 UTC | #8
+
+Yes, although the design of relying on having `IDL` be passed instead of imported from `@dfinity/candid` directly makes it harder. If we just imported it, we could remove the factory entirely.
+
+For the sake of backwards compatibility, we could duplicate everything.
+
+```ts
+import {IDL} from `@dfinity/candid`
+export const bitcoin_network = IDL.Variant({
+    mainnet: IDL.Null,
+    testnet: IDL.Null
+});
+export const bitcoin_address = IDL.Text;
+export const bitcoin_get_balance_args = IDL.Record({
+    network: bitcoin_network,
+    address: bitcoin_address,
+    min_confirmations: IDL.Opt(IDL.Nat32)
+});
+
+...
+export const idlFactory = ({ IDL }) => {
+    const bitcoin_network = IDL.Variant({
+        mainnet: IDL.Null,
+        testnet: IDL.Null
+    });
+    const bitcoin_address = IDL.Text;
+    const bitcoin_get_balance_args = IDL.Record({
+        network: bitcoin_network,
+        address: bitcoin_address,
+        min_confirmations: IDL.Opt(IDL.Nat32)
+    });
+});
+```
+
+-------------------------
+
+sea-snake | 2024-08-07 08:35:21 UTC | #9
+
+Alternatively you could have something like an idlTypeFactory function similar to IdlFactory that returns a key/value map of type/idl. This would avoid the need for any import while still returning the types and make it possible to pass your own custom IDL implementation.
+
+-------------------------
+
+lastmjs | 2024-08-07 12:36:13 UTC | #10
+
+Ideally we could generate the file and do `export * from './generated-file'`, or do as little mangling as possible. So I wonder if having the explicit `export const` above would be best for us.
+
+-------------------------
+
+sea-snake | 2024-08-07 13:04:47 UTC | #11
+
+Still wondering how these IDL objects are actually used in practice? Any example where you'd want to import these objects and use them? 
+
+I did read regarding the IDL.encode and IDL.decode above, but is this to encode/decode function arguments or anything else beyond that?
+
+For encoding function arguments of a specific function you can probably already do the following:
+
+```ts
+const service = idlFactory(IDL);
+const function = service._fields.find(([name]) => name === "my_function")?.[1];
+if (!function) throw "not found";
+const encodedArgs = IDL.encode(function.argTypes, args);
+const decodedRets = IDL.decode(function.retTypes, rets);
+```
+
+-------------------------
+
+lastmjs | 2024-08-07 14:04:57 UTC | #12
+
+It is completely core to Azle's 1.0 syntax, here is one example and a directory or two up has many examples: https://github.com/demergent-labs/azle/blob/main/tests/end_to_end/candid_rpc/class_syntax/async_await/src/async_await.ts#L4
+
+We use the IDL objects as the core mechanism for Azle devs to specify Candid decoding and encoding. They are used directly in the canister method decorators and in APIs like call and notify.
+
+So if we can generate these type objects from .did files then devs (including us the core Azle devs) could import and use the IDL objects directly without modification, which would be excellent.
+
+-------------------------
+
+sea-snake | 2024-08-07 15:44:12 UTC | #13
+
+So azle doesn't generate the did file for you based on these annotations?
+
+-------------------------
+
+lastmjs | 2024-08-07 17:32:22 UTC | #14
+
+Azle will generate the did file yes. Azle generates did files automatically for Azle canisters.
+
+We also want the ability to generate these types from other canisters, like the management canister, ICRC canisters, etc otherwise the Azle dev would have to implement the IDL type objects.
+
+-------------------------
+
+lastmjs | 2024-08-20 16:30:00 UTC | #15
+
+Any update on this? Should we create an issue somewhere?
+
+-------------------------
+

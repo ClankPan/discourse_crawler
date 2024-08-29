@@ -1,0 +1,163 @@
+mariop | 2022-06-29 08:29:27 UTC | #1
+
+Hi everyone,
+
+We would like to propose a change to the [ICRC-1 Token Standard](https://github.com/dfinity/ICRC-1) to replace specific metadata endpoints such as `name` and `symbol` with a generic and extensible `metadata` API. There is a PR. with the changes [here](https://github.com/dfinity/ICRC-1/pull/10). The API would look like this:
+
+```
+type Value = variant { Int: int; Nat : nat; Text : text; Blob : blob };
+
+metadata : () -> (vec { text; Value }) query;
+```
+
+`metadata` is essentially a list of key-values. The list size is limited to 2MiB because that's what can be put in a single response.
+
+The idea behind this is that we don't need to fix the metadata of the canister because the metadata is optional (a service can reject a ledger without certain keys though) and we could add new key-values in future.
+
+What do you think?
+
+EDIT: changed the API to the one proposed by @skilesare and @roman-kashitsyn. The original was
+
+```
+metadata: () -> (vec { record { text; text }}) query;
+metadataKeys: () -> (vec { text });
+metadataByKey : (text) -> (opt text) query;
+```
+
+but we agreed that we just need `metadata` and that it would be nice to have different types of values.
+
+-------------------------
+
+bitdivine | 2022-06-17 12:11:46 UTC | #2
+
+Do you also want `metadataKeys: () -> (vec { text })` ?
+
+-------------------------
+
+mariop | 2022-06-17 12:26:02 UTC | #3
+
+Yes, I've added the method to the proposal. Thank you @bitdivine !
+
+-------------------------
+
+jzxchiang | 2022-06-18 21:38:01 UTC | #4
+
+I think `metadataKeys` should be marked as a `query` method as well.
+
+-------------------------
+
+skilesare | 2022-06-19 14:22:14 UTC | #5
+
+Great idea! Any advantage to making the value a variant? It would simplify programming in the other end is you did something like candy.(probably simpler would be ok). Text parsing(especially in motoko) is a bit dismal.
+
+-------------------------
+
+Maxfinity | 2022-06-19 17:09:08 UTC | #6
+
+[quote="bitdivine, post:2, topic:13866, full:true"]
+Do you also want `metadataKeys: () -> (vec { text })` ?
+[/quote]
+Perhaps name and symbol should be have their own end points in addition to this. This format would encourage people to write whatever they wanted into the metadata, but name and symbol should not be optional in my opinion.
+
+-------------------------
+
+roman-kashitsyn | 2022-06-21 14:49:15 UTC | #7
+
+[quote="Maxfinity, post:6, topic:13866"]
+Perhaps name and symbol should be have their own end points in addition to this.
+[/quote]
+
+I'm not a big fan of keeping `symbol` and `name` if we decide to have `metadata`:
+  * Metadata becomes spread across multiple endpoints, which seems confusing to me.
+  * It's quite likely that if you need symbol, you also need the name. Why send two messages and pay extra latency (and increase the load on the Ledger, which is the main bottleneck in the whole system) when you can fetch the full metadata in one go?
+  * Both `name` and `symbol` are optional in [ERC-20](https://eips.ethereum.org/EIPS/eip-20#methods), probably because they are not crucial to payment flows. I believe we should keep these metadata optional as well, and then the metadata map approach is much more natural for expressing optionality.
+
+-------------------------
+
+bitdivine | 2022-06-27 01:32:55 UTC | #8
+
+Another thought about the API:  This is not a local programming API, it is a remote one which means that every single call has a non-trivial cost.  Getting say 5 values means making 5 query calls or, if a certified value is needed and certification is not supported at the outset, 5 update calls.  This makes me think that we should support getting multiple specified keys in one call.  That means that instead of, or in addition to, `getMetadataByKey : (text) -> (opt text) query` there should be:
+
+```
+getMetadataByKeys: (vec { text }) -> (vec { opt text }) query
+```
+Assuming that if there are say 5 keys, there will be 5 values returned in the same order.  We could also return a map.  An array is more efficient in terms of bytes on the wire and CPU cycles, a map gives the client fewer opportunity for bugs (asking for keys w,x,y,z and then reading x,y,z,w).  I personally would normally go for the efficient form; it is easier to add a library method to provide an idiot-proof interface than to make an inefficient API faster.  That said, the computational overhead here is small.
+
+Arguments against:
+- This is not cache friendly.  Different apps can call different sets of values.  In theory, with the 20 or so values that I suspect will live there, there can be a million different combinations instead of 21 (1 per key plus one for the whole metadata).  In practice I suspect that callers will mostly ask for standard subsets of the data.
+- "If you need more than one key, just get all the metadata and filter client-side" - that depends on whether those 5 keys in my example pull back a small fraction of the data.  The whole point of the API to get a single value is that the whole metadata is likely to be larger than the data typically required by a client.  My suspicion is that a client will typically need more than one value, so if we are to make the typical case easy and fast, getting several values in one go makes sense.
+
+What do you think? Esp. @mariop (proposer) and @roman-kashitsyn (implementer?).
+
+-------------------------
+
+roman-kashitsyn | 2022-06-27 12:13:51 UTC | #9
+
+[quote="bitdivine, post:8, topic:13866"]
+What do you think?
+[/quote]
+
+Honestly, I think we are starting to over-engineer. I'm not even a big fan on `metadataKeys` and `metadataByKey`.
+
+If it was up to me to decide, I'd put only one endpoint into the standard:
+
+```
+metadata: () -> (vec { record { text; text }}) query;
+```
+
+The IC will force the implementors to fit all the metadata into a single response, which cannot be more than 2 MiB at the moment. Given how much stuff you can fit into 2 MiB (the Wolfenstein 3d game had 60 levels and needed ~1.23MiB), I think it's more than enough for everyone.
+
+If you need large data files in the metadata, use URLs as values.
+
+-------------------------
+
+skilesare | 2022-06-27 13:41:51 UTC | #10
+
+So what your saying is that all tokens should have Wolfienstien 3D built into them. I like it! :upside_down_face:
+
+On a serious note, and there isn't really a way to control this, but I've typically seen get_metrics to hold things that change a bunch and meta_data as stuff that doesn't(at least for a token).  This 2MB limitation and one call works well if everyone kind of conforms to that and we can cache the values without having to call it over and over.
+
+-------------------------
+
+mariop | 2022-06-27 15:35:55 UTC | #11
+
+[quote="skilesare, post:10, topic:13866"]
+This 2MB limitation and one call works well if everyone kind of conforms to that and we can cache the values without having to call it over and over.
+[/quote]
+
+Indeed but I think it's reasonable. Metadata should not be too big. There is still the possibility to add more endpoint if needed but let's keep metadata manageable.
+
+-------------------------
+
+roman-kashitsyn | 2022-06-28 12:34:52 UTC | #12
+
+[quote="skilesare, post:5, topic:13866, full:true"]
+Great idea! Any advantage to making the value a variant? It would simplify programming in the other end is you did something like candy.(probably simpler would be ok). Text parsing(especially in motoko) is a bit dismal.
+[/quote]
+
+I like this idea.
+The full API could look this way:
+```
+type Value = variant { Nat : nat; Text : text; Blob : blob };
+metadata : () -> (vec { text; Value }) query;
+```
+This also allows for an efficient encoding of binary data.
+
+-------------------------
+
+AdamS | 2022-06-28 18:46:43 UTC | #13
+
+I'd put an Int in there too; DIP's full nat8/nat16/etc set is probably overboard but you shouldn't have to dip into blobs to represent signed numbers.
+
+-------------------------
+
+roman-kashitsyn | 2022-06-29 08:19:52 UTC | #14
+
+I've updated the [proposal in the ICRC-1 repo](https://github.com/dfinity/ICRC-1/pull/10/files/3ee7d03dac54d865253c86f813e62c90127f2c02) to include all the feedback:
+
+* Remove excessive metadata access methods, leave only `metadata`.
+* Make metadata values more structured, allow `nat`, `int`, `text`, and `blob` as values.
+* Keep the well-known metadata endpoints (`name`, `symbol`, `decimals`) (I'd be interested to know why you would use them instead of a single metadata endpoint).
+
+-------------------------
+

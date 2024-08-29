@@ -1,0 +1,301 @@
+timo | 2022-08-30 10:54:16 UTC | #1
+
+Has anyone made a doubly-linked list in Motoko already? Just wondering if someone has a link before I write my own. I am looking for an ordered datastructure (queue) where you can also delete elements in the middle.
+
+-------------------------
+
+icme | 2022-08-30 11:34:57 UTC | #2
+
+As long as you’re ok with imperative data structures, I made a [stable LinkedList library here](https://github.com/canscale/LinkedList) (assuming the types you put within the LL are stable).
+
+By stable, I mean a data structure that will live in the wasm heap and safely serialize to/from stable memory during upgrades.
+
+-------------------------
+
+timo | 2022-08-30 12:07:38 UTC | #3
+
+Thanks, looks good. Yes, I was thinking of an imperative data structure.
+
+Now I am wondering how would you do deletions? Say you have a DoublyLinkedListElement in the middle then you can remove it from the list by modifying its neighbours. Only if the element happens to be the head or tail then you need to have the DoublyLinkedList too of which the DoublyLinkedListElement is an element so that you can modify the head or tail. So the remove function gets two arguments (DoublyLinkedListElement, DoublyLinkedList). But then the problem is that it becomes possible to call remove with two arguments that don't belong together, e.g an element from a different list. It just gets a little ugly. Wondering if there's something more elegant.
+
+-------------------------
+
+icme | 2022-08-30 12:31:48 UTC | #4
+
+I’m pretty sure you can make something like this that will suit the use case.
+
+```
+public func delete<T>(l: DoublyLinkedList<T>, x: T, equals: (T, T) -> Bool): (DoublyLinkedList<T>, ?T) {
+```
+
+Feel free to take a stab at it if you’d like to contribute a PR. Otherwise, if you open an issue I can knock it out pretty quickly when I get some spare time.
+
+-------------------------
+
+timo | 2022-08-30 13:10:09 UTC | #5
+
+I want O(1) deletion for an element for which I have a reference. I assume the list can be very large.
+
+Here's my code, basically same approach as yours, just experimental.
+```
+import { isNull } "mo:base/Option";
+
+type Node = {
+  var previous: ?Node; // points towards head
+  var next: ?Node; // points towards tail
+  value : Nat;
+  };
+
+let pool = object OrderedPool {
+  public var head : ?Node = null;
+  public var tail : ?Node = null;
+  // push = append to tail
+  public func push(val : Nat) {
+    let new_node = {
+      var previous : ?Node = tail;
+      var next : ?Node = null;
+      value = val
+    };
+    switch (tail) {
+      case (null) { head := ?new_node }
+      case (?t) { t.next := ?new_node }
+    }
+    tail := ?new_node;
+  };
+  // pop = remove from head
+  public func pop() : ?Nat {
+    switch (head) {
+      case (null) { null };
+      case (?h) {
+        let val = h.value;
+        if (isNull(h.next)) { tail := null }
+        head := h.next;
+        ?val
+      };
+    }
+  };
+  // remove node
+  public func remove(node : Node) {
+    switch (node.previous) {
+      case (?y) { y.next := node.next }
+      case (null) { head := node.next }
+    };
+    switch (node.next) {
+      case (?y) { y.previous := node.previous }
+      case (null) { tail := node.previous }
+    }
+  };
+};
+```
+It works. Just weird that it is possible to call `remove` with a node from a different object than this pool, in which case it can mess up the other object.
+
+-------------------------
+
+rossberg | 2022-08-30 15:12:46 UTC | #6
+
+If all you need is an ordinary queue, then doubly-linked lists are overkill. Here is a simpler and probably equally efficient implementation of an imperative queue:
+```
+  class Queue<T>() {
+    var front = List.nil<T>();
+    var back = List.nil<T>();
+
+    public func enqueue(x : T) {
+      front := List.push<T>(front, x);
+    };
+
+    public func dequeue() : ?T {
+      if (List.isNil(back)) {
+        back := List.reverse<T>(front);
+        front := List.nil<T>();
+      };
+      let (x, newback) = List.pop<T>(back);
+      back := newback;
+      return x;
+    };
+  }
+```
+Though this might not fit your bill if you indeed need random access deletion. I believe for that, there are also good data structures, but they would be tree-shaped. @matthewhammer probably knows better than me.
+
+That is to say, doubly-linked lists are rarely needed and often not the preferable choice in a modern language.
+
+-------------------------
+
+timo | 2022-08-30 20:17:01 UTC | #7
+
+Yes, I need random access deletion. But I don't need searching for the element by a key because I already have a reference to the element directly. So a tree may be overkill, too. Maybe it's just a special situation (aka the "rare" in "doubly-linked lists are rarely needed").
+
+-------------------------
+
+icme | 2022-08-30 21:12:13 UTC | #8
+
+If all you care about is the order of insertion, you might actually just be able to use @ZhenyaUsenko's [Deterministic HashMap](https://github.com/ZhenyaUsenko/motoko-hash-map). It provides both some efficiencies over the current HashMap in base, and also has an internal [`link` property](https://github.com/ZhenyaUsenko/motoko-hash-map/blob/5698affdf92afe542722e1074bc338feee34e005/src/Map/Map.mo#L7) with [different indices (i.e. 0, 1)](https://github.com/ZhenyaUsenko/motoko-hash-map/blob/5698affdf92afe542722e1074bc338feee34e005/src/Map/Map.mo#L28) that allow you to iterate by direction.
+
+Otherwise, it sounds like what you want is a LinkedHashMap.
+
+This would give you O(1) lookups plus fine grained control over insertion into your LL, you'll want to implement that prev/next functionality into the types you insert into the HashMap.
+
+Out of curiosity and to agree with @rossberg's statement, what's wrong with using a balanced tree data structure like a Red-Black Tree or BTree? That sorts your data and provides O(logn) lookup/deletion, whereas hash maps are worst case O(n) due to array doubling. 
+
+You would just need to provide lexicographically sortable string keys to the sorted data structure.
+
+-------------------------
+
+icme | 2022-08-30 21:10:13 UTC | #9
+
+[quote="timo, post:5, topic:15185"]
+```
+let pool = object OrderedPool {
+  public var head : ?Node = null;
+  public var tail : ?Node = null;
+  // push = append to tail
+  public func push(val : Nat) {
+```
+[/quote]
+
+Just a heads up, one of the issues with this approach (including functions in your `object OrderedPool`), is that your data structure will not be stable https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/language-manual#stability. You need to rip the functions out of the object for it to be stable.
+
+-------------------------
+
+timo | 2022-08-31 09:39:29 UTC | #10
+
+Yes, I can use any storage structure based on keys and then put the ordering information into the value types (referencing the neighbours by their keys, not directly). I will consider that.
+
+[quote="icme, post:8, topic:15185"]
+hash maps are worst case O(n) due to array doubling
+[/quote]
+
+You mean when a bucket is full?
+
+As for the storage structure, I do want O(logn) worst-case. Though I wonder if it matters because the garbage collection will always be O(n) and that has to be included in the worst-case.
+
+I currently don't care about stability. Upgrades aren't relevant.
+
+[quote="icme, post:8, topic:15185"]
+data structure like a Red-Black Tree or BTree
+[/quote]
+
+RBTree from base has the problem that the current (adaptive) implementation doesn't delete keys. Which BTree implementation in Motoko do you use (if there is one)?
+
+-------------------------
+
+rossberg | 2022-08-31 10:53:26 UTC | #11
+
+[quote="icme, post:8, topic:15185"]
+hash maps are worst case O(n) due to array doubling.
+[/quote]
+
+Under normal circumstances, that is not relevant, since this cost is amortised over n insertions. But it may matter with the IC currently, because of incidental block limits. Once we have deterministic time slicing, that worry should be gone, however. * *fingers crossed* *
+
+That said, hash tables are another data structure that tends to be overused, and I generally agree that tree-based ones are often the better choice. :)
+
+-------------------------
+
+matthewhammer | 2022-09-01 16:55:30 UTC | #12
+
+[quote="timo, post:7, topic:15185, full:true"]
+Yes, I need random access deletion. But I don’t need searching for the element by a key because I already have a reference to the element directly. So a tree may be overkill, too. Maybe it’s just a special situation (aka the “rare” in “doubly-linked lists are rarely needed”).
+[/quote]
+
+How big will the queue become?  Are you concerned about the asymptotics of it?
+
+If you can tolerate a functional data structure (so not too big, because of Motoko GC issues we have today at 100s of MBs) then you may try this functional sequence:
+
+https://github.com/matthewhammer/motoko-sequence/blob/master/src/Sequence.mo
+
+It's taken from the same POPL 1989 paper as the (binary hash) `Trie` in `base`, where it acts as a counter part to that map data structure for representing incrementally-changing sequences:
+
+http://matthewhammer.org/courses/csci7000-s17/readings/Pugh89.pdf
+
+FWIW, I believe this same data structure is also known as a [Cartesian Tree](https://en.wikipedia.org/wiki/Cartesian_tree), and I'm not aware of any important difference between what Pugh describes and this Wikipedia article, though I am much more familiar with the paper.
+
+I have not yet implemented "delete", but you can do a random-access delete by splitting the tree, popping off the end of one side of the split, and then re-merging.
+
+Similarly, insertion into the middle can work the same way.
+
+The main downside of this structure for a queue with those operations is that I'm not yet sure how you'd map the logical "places" in the queue to and from the positions, as if the queue were an array.  That's how the splitting operation works for identifying the position of the split.
+
+[quote="rossberg, post:11, topic:15185"]
+That said, hash tables are another data structure that tends to be overused, and I generally agree that tree-based ones are often the better choice. :slight_smile:
+[/quote]
+
+:heart_decoration:   :deciduous_tree: :heart: 
+
+Totally agree!
+
+-------------------------
+
+chenyan | 2022-09-01 23:34:33 UTC | #13
+
+> FWIW, I believe this same data structure is also known as a [Cartesian Tree](https://en.wikipedia.org/wiki/Cartesian_tree), and I’m not aware of any important difference between what Pugh describes and this Wikipedia article, though I am much more familiar with the paper.
+
+Ah, I never realized that connection. I think Pugh's paper is more like a [Rope](https://en.wikipedia.org/wiki/Rope_(data_structure)), which is the same data structure we used to represent `Text` in Motoko, so that you get random access, insertion and deletion all in `O(logn)` time.
+
+@timo If you require O(1) deletion time and already have a reference to the node, doubly linked list is probably the way to go. But if you can tolerate for O(log n) deletion, then rope is a much better choice and doesn't require a reference to the node. Plus you get random access, and compute any monoid or semigroup operation over subsequence all in O(log n) time, which is not possible with linked list.
+
+-------------------------
+
+chenyan | 2022-09-02 04:45:49 UTC | #14
+
+A functional way of implementing doubly linked list would be to put the linked list into a zipper:
+
+```
+import List "mo:base/List";
+
+class ListZipper<T>(list : List.List<T>) {
+  var pos = list;
+  var context = List.nil<T>();
+  func getCurrentNode() : ?T {
+    switch pos {
+      case null null;
+      case (?(h, _)) ?h;
+    };
+  };
+  func forward() {
+    switch pos {
+      case null ();
+      case (?(h, t)) {
+        pos := t;
+        context := ?(h, context);
+      };
+    };
+  };
+  func backward() {
+    switch context {
+      case null ();
+      case (?(h, t)) {
+        pos := ?(h, pos);
+        context := t;
+      };
+    };
+  };
+  func remove() {
+    switch pos {
+      case null ();
+      case (?(h, t)) {
+        pos := t;
+      };
+    };
+  };
+};
+
+
+```
+
+-------------------------
+
+timo | 2022-09-02 09:33:45 UTC | #15
+
+[quote="matthewhammer, post:12, topic:15185"]
+How big will the queue become? Are you concerned about the asymptotics of it?
+[/quote]
+
+Tens of millions of elements. Well, I realized that since I want an absolute memory bound I need an absolute bound on the number of elements n in the data structure. Then I am interested in how the data structure performs when it is full. So the O-notation complexity becomes irrelevant because I am only interested in the performance in absolute terms for one value of n (the maximum). I am not interested in the asymptotic behaviour. What does matter though is that the work (cycles) is bounded regardless of how the data structure was filled. So it must be "self-balancing" in the sense that worst-case fill order results in the same performance when its full as average-case fill order.
+
+[quote="matthewhammer, post:12, topic:15185"]
+If you can tolerate a functional data structure (so not too big, because of Motoko GC issues we have today at 100s of MBs) then you may try this functional sequence
+[/quote]
+
+Are the GC issues only there for functional data structure? I thought they are also there for an Array for example.
+
+-------------------------
+

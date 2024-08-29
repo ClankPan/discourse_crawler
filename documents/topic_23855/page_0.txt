@@ -1,0 +1,91 @@
+kristofer | 2023-10-18 09:22:47 UTC | #1
+
+I've been trying to configure a random number generator for generating nonce strings. I seed it using `raw_rand` and store it in a thread local static.
+
+```rust
+thread_local! {
+  static RNG: RefCell<Option<ChaCha20Rng>> = RefCell::new(None);
+}
+
+// from init fn
+ic_cdk_timers::set_timer(Duration::ZERO, || {
+    ic_cdk::spawn(async {
+        let (seed,): ([u8; 32],) =
+            ic_cdk::call(Principal::management_canister(), "raw_rand", ())
+                .await
+                .unwrap();
+        RNG.with(|rng| *rng.borrow_mut() = Some(ChaCha20Rng::from_seed(seed)));
+    })
+});
+```
+
+In canister calls I then use this `generate_nonce` function. 
+
+```
+fn generate_nonce() -> Result<[u8; 10], String> {
+    let mut buf = [0u8; 10];
+    RNG.with(|rng| rng.borrow_mut().as_mut().unwrap().fill_bytes(&mut buf));
+    Ok(buf)
+}
+```
+
+**Problem:**
+- Calling `generate_nonce` in two separate canister calls returns the same nonce
+- Calling `generate_nonce` two times within the same canister call returns different nonces (as expected)
+
+The RNG state does not seem to be persisted in between canister calls. @AdamS I tried to follow one of your examples when setting this up. Any ideas?
+
+-------------------------
+
+ulan | 2023-10-18 09:59:18 UTC | #2
+
+> * Calling `generate_nonce` in two separate canister calls returns the same nonce
+
+@kristofer : thanks for the report! Just to clarify, are observing this issue in dfx or on the mainnet?
+
+-------------------------
+
+kristofer | 2023-10-18 10:13:02 UTC | #3
+
+[quote="ulan, post:2, topic:23855"]
+@kristofer : thanks for the report! Just to clarify, are observing this issue in dfx or on the mainnet?
+[/quote]
+
+In dfx, haven't pushed to mainnet yet.
+
+-------------------------
+
+berestovskyy | 2023-10-18 10:15:49 UTC | #4
+
+Are those query or update calls?
+
+A minimal example reproducing the issue would help here...
+
+-------------------------
+
+kristofer | 2023-10-18 10:24:29 UTC | #5
+
+Will do, stay tuned.
+
+-------------------------
+
+kristofer | 2023-10-18 10:52:25 UTC | #6
+
+Here is a minimal repo with a query call: https://github.com/kristoferlund/rng
+
+-------------------------
+
+ulan | 2023-10-18 11:45:46 UTC | #7
+
+Thanks for preparing the repo. The issue is in the query call. All RNG modifications done by a query are discarded at the end of a query. That's because queries are read-only by design.
+
+If you change this [line](https://github.com/kristoferlund/rng/blob/245f73525234b209370393f31356fa2370caee21/src/rng_backend/src/lib.rs#L20) from `query` to `update`, then it should work as expected.
+
+-------------------------
+
+kristofer | 2023-10-18 11:59:55 UTC | #8
+
+Ah, that makes sense of course. Thanks!
+
+-------------------------
+

@@ -1,0 +1,335 @@
+skilesare | 2023-10-04 22:01:57 UTC | #1
+
+Prelude: This post has a real financial impact(I think potentially on the order of ICP 100k+ of maturity) across a number of people, which can raise the temperature of the room. These kinds of situations are inevitable as the IC grows and I’d encourage everyone to approach this as a learning experience that raises some important questions about how we approach interoperability and upgradeability.
+
+TLDR: ICDevs missed some votes because the Interface and Types for NNS proposals changed and I make suggestions for how to keep that from happening in the future with the NNS and in the hot IC utility you are building for you DAO. 
+
+Between September 8th and September 29th, ICDevs missed a number of Votes. This post is to explain what happened and how to keep it from happening in the future, and to initiate a discussion around a world of global system interoperability and the demands that are placed upon software architecture.
+
+Background: In March of 2023 ICDevs wrote and deployed an “eventually reject” canister. https://forum.dfinity.org/t/an-update-to-icdevs-named-neuron-voting/19103. This canister operated on a timer and would call the NNS System APIs asking for a list of open votes. The timer went off every 8 hours. If the canister found that a proposition was within 12 hours of closing, it would vote to reject the proposal. 
+
+This was set up for a few practical reasons. Voting takes a lot of attention. As a one-person org, I like to take vacations, and sometimes these last longer than 4 days. I try to keep up with voting even when on vacation, but the thought of one slipping through the cracks was always a bit anxiety-inducing. 
+
+The second reason was that because we have to reject SNS proposals and we want to give the community as much time to cast their votes as possible, we wanted to wait a reasonable amount of time before rejecting those. 3.5 days seemed like enough time. This system worked great for a number of months and you can go back in time on https://nmiv5-haaaa-aaaam-abgaa-cai.raw.ic0.app/ and see the number of times the canister saved my bacon(or that we pocket vetoed an SNS vote).
+
+A couple of weeks ago, @wpb pinged me to ask why ICDevs hadn’t voted on one of the SNS proposals. We did not abstain from voting on purpose. I began to investigate and it looks like the canister stopped resetting the timer around September 8th. 
+
+This was a bit frustrating as several votes had been missed. Missed votes mean missed rewards. I created the following thread to try to figure out what went wrong https://forum.dfinity.org/t/reason-possibility-for-timer-being-canceled-by-replica/23191/6. My determination at the time was that a network request must have timed out and that it was likely a one-time thing. I reset the canister and decided to pay a bit more attention to proactively voting.
+
+When I went to check again, I found that the timer was broken again and it had not been running for almost 7 days. This was triggered when I had harvested the maturity from the ICDevs treasury and it was about 60% of what I had expected it to be. 
+
+First of all, I know a lot of people follow ICDevs and this has a real, material financial impact on people’s maturity when something like this happens. I owe everyone an apology that this was not caught sooner. My time has been stretched pretty thin and the grand plans of having a multi-person organization that provides broad coverage for things like this have been significantly impaired by the price action of ICP and what it has done to the 100% ICP maturity-based treasury that ICDevs operates on. I’d encourage everyone to make sure they set a broad set of followees (at least 3) so that if one does not vote, your votes still get cast.
+
+Root Cause: Upon further investigation, I found that the issue that caused the canister to fail was the implementation of the One Step SNS proposal as well as changes to the list_proposal function that was published sometime after August 28th after the NNS canister upgrade was passed. 
+
+These changes to interfaces without maintaining backward compatibility are a bit head-scratching. It was my understanding, especially for system-based APIs, that any significant changes to APIs should require a new, versioned endpoint. When you change APIs you invalidate the interoperability that is generally promised but the IC’s architecture. If our canister had been blackholed we would have never been able to upgrade it to the new api. Fortunately, we had not done so and I’ve updated the canister with the new Governance Types. The full list of changes can be found at https://github.com/icdevs/eventually_reject/commit/1d4d74dbd0141ecad3a0cd1bdb1371dff1f84320#diff-651139b51d17cd363ac3120c82a3c8bb60a7df3b653a8df3345cb2b6552f510c. It looks like several other additions and changes may affect other canisters that participate in governance(I’ll have to go back, but I suspect that axon is likely broken now as well).
+
+So there are two issues at play:
+
+1. How to upgrade function signatures
+2. How to upgrade types
+
+Either of them can break the compatibility of an automation canister.
+
+First, let’s talk about function signatures. If you change a function signature that another application depends on, you break that application. That is bad enough if the application is a web app. You’ll have to rally and push out application changes. But what about Internet Computer services or utilities? Especially blackholed canisters or canisters under the control of DAOs? Maybe DAOs can vote to upgrade, but if the change is unexpected, your entire DAO app may be broken while you wait for the upgrade to pass. Blackholed canisters are just out of luck. You’re going to have to deploy an alternate and rally the community to consider the new canister as canonical, and if it is an important canister you need to hope that any dependent systems have a configuration variable so that they can change the canister id of the service.
+
+To fix this you need to version your functions. For example, in the latest version of OGY Governance, we wanted to change the way stake balances were exposed. Instead of changing the get_balances function signature, we created a get_balances_v1_5 endpoint and made sure that the old endpoint continued to work.
+
+Upgrading Types is another matter and I’m less confident in my opinion, but also far more opinionated here. Strongly typed programming is well-loved and cherished by programmers and it certainly can lead to cleaner, easier-to-debug code. But…it has serious consequences when it makes contact with the real world. 
+
+Sometimes a lawyer walks into the room and tells you that you have to do X, Y, and Z, and no debating about architectural integrity or difficulty of type refactoring is going to change his position. Sometimes you want to add a proposal type. What to do with all the dependent code and systems that rely on knowing the strong type of the systems they rely on? It is one thing to try to manage these when you are a singular organization; a different beast when you have interdependent defi being deployed, run, and operated by DAOs.
+
+We’ve come up with some migration patterns to deal with type upgrades inside our canisters, but these don’t extend to dependent services. Our Eventually Reject canister doesn’t know what to do with a #CreateServiceNervousSystem request, and worse, it traps it in a place we can’t handle it…when the motoko code is parsing the response from the NNS server. (Not sure what rust would do here, but I’m guessing you don’t get to trap and handle…if I’m wrong, then maybe a solution here is to find a way for Motoko to trap candid mismatches.).
+
+IC Axiom: If you are going to use strong typing and variants in a service you want other people to use and consume from automated canisters(think canister bots in defi) you better be sure you have all the possibilities baked in before you deploy because adding new variant types may not crash your upgrades, but they sure will crash the canister ecosystem that emerges around your services.
+
+What is the solution? When extensibility may be possible, we might want to highly consider something like ICRC16(https://github.com/dfinity/ICRC/issues/16). This likely needs to be extended with things like schemas and transform libraries(similar to how we had xml, xsd, and xslt). By using dynamic types, dependent services can program what happens when a node in a data structure shows up that they are not expecting. Our eventually reject canister didn’t really even care about the type of proposal, it just needed to pay attention to the expiration date and proposal ID. Everything else was just noise to that particular use case. You don’t get to decide what use cases the users of your IC service will use and if you use strong typing that may change in the future you are tying one hand behind their backs.
+
+We’ve gone a good way down using ICRC16-like Values in the ICRC3/7/8 working groups. (As an aside, we keep getting poked in the forms about ‘how can it take so long to come up with a standard’….this post is the answer. You have to try to think of EVERYTHING and you get to meet for an hour every 2 weeks). 
+
+These Values(especially if extended to ICRC16) allow us to represent almost any data structure in an extensible way….and if we want to add a transaction type in the future, the added item won’t break the function call from an indexing canister before the canister even gets its hands on the data. Don’t get me wrong, if you don’t know what you are doing, you can still break your canister and end up trapping somewhere because you don’t handle each possibility….but if you do know what you are doing you can fail gracefully and keep your canister up and running even if it can’t handle the newest hotness(which you likely don’t care about because your service existed before it did).
+
+These two things cross over a bit as well. Note that updating a function input type with a new variant won’t break other applications calling your service as they just will never know to include the new variant. Since they don’t ever call it it won’t break. But reading out a new variant will break as soon as you have one of the new variants in your data. Don’t let ‘kinda safe’ into your code or it will bite you later on for a reason you aren’t thinking of now.
+
+Final suggestions:
+
+So in the future, I’d propose the following suggestions for the NNS team(and anyone else who is building anything resembling a utility or service on the IC).
+
+1. Version your functions and maintain backward compatibility. (Dom said to: Open internet services, Williams explained, “can share functionality and data with other services using APIs that they cannot later revoke or degrade, enabling services to build on top of each other without having to trust one another, and providing for a real programmable web with incredible network effects.” - https://medium.com/dfinity/dominic-williams-internet-computer-dfinity-plan-to-redesign-the-internet-5604b3861dbe)
+
+2. Consider a type un-safe endpoints to interact with NNS governance that won’t break in the future when you add new governance types(maybe this has already been considered for SNSs that have dynamic and different proposal types(Looks like Generic Proposal types are used https://internetcomputer.org/docs/current/developer-docs/integrations/sns/managing/making-proposals/#generic-proposals ... I'm curious why this type wasn't used for the single shot SNS call?).
+
+This would look like adding a list_proposals_type_unsafe_v1 function that returns Values according to defined schemas as we’ve done with ICRC3: https://github.com/dfinity/ICRC-1/tree/icrc-3/standards/ICRC-3#account-schema (But I think the full ICRC16 provides some more ICy like goodies that would be good long term).
+
+I’m happy to hear any suggestions/comments/criticisms. Now that I know to look for these kinds of updates I’ll attempt to be more diligent in looking for changes to the schema as they will further break the eventual reject.
+
+-------------------------
+
+wpb | 2023-10-04 23:45:40 UTC | #2
+
+Hey @christian just wanted to ping you on this one since the Taggr Network neuron has some automated voting features too.  I don't think the Taggr Network neuron voting has been affected, but this might be something you want to know about just in case.
+
+-------------------------
+
+christian | 2023-10-05 07:42:47 UTC | #3
+
+Thanks for the ping Wenzel! The code I ported to Taggr from my TG bot is very simple and mostly fetches just the first level data of the proposal object. Maybe this is why it seems to still work. Could you please share which proposals missed by ICDev?
+
+-------------------------
+
+rossberg | 2023-10-05 09:15:19 UTC | #4
+
+Let me remark that the upgrade type check on Candid signatures was designed to prevent this very situation. It captures exactly those changes to an interface that are safe to make without possibly breaking downstream clients (and we even proved this formally). No canister that has _any_ clients should ever change its interface in a way that violates this check. This should better be verified before every upgrade. And if it's not possible to change a function signature in a way conforming to this check, then a new, versioned function endpoint needs to be introduced, as @skilesare said.
+
+-------------------------
+
+wpb | 2023-10-05 12:41:28 UTC | #5
+
+I first noticed the lack of voting on proposal 124514.  There were a lot of named neurons that didn’t vote, which was unusual.  ICDevs has been transparent about their Eventually Reject policy on SNS proposals for a long time, so it was especially surprising that they didn’t vote…they never miss a vote.  This may have been the first SNS proposal after the single proposal SNS launch went live.
+
+https://dashboard.internetcomputer.org/proposal/124514?s=100
+
+-------------------------
+
+skilesare | 2023-10-05 13:33:58 UTC | #6
+
+I think the first was Seers: https://dashboard.internetcomputer.org/proposal/124483. We voted No on Boom DAO which went live on 9/3. I'm guessing the August 28th replica version went live on 9/4 and that had the new Variant type in it.
+
+-------------------------
+
+skilesare | 2023-10-05 18:07:21 UTC | #7
+
+After a couple discussions I've put together this sample on Motoko playground:  https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/?tag=1031265151
+
+It looks like you can use variants as long as you are willing to make them opt Variant.  If something is added that you don't know about your variant will be set to null by the runtime and you can handle it.  This is how the ICRC2 on ICP get_blocks is going to be handled.  If you have a scanning canister that is processing blocks, you will eventually get a null for operation: opt operation.  Start checking now how you handle it.  If you trap then your scanner will likely stall or lose the block.
+
+-------------------------
+
+msumme | 2023-10-05 21:20:00 UTC | #8
+
+@skilesare What response were you decoding?  The thing that changed should have been an `opt variant` which should have just decoded as null.
+
+Or was it a different change than the new Action variant that caused the problem? 
+
+I'm working on a response to the rest of your points, but I wanted to also get more information to 
+ make sure we understand what happened.
+
+-------------------------
+
+infu | 2023-10-06 14:24:44 UTC | #9
+
+I felt the rule wasn't given enough attention, so I immortalized it on a T-shirt.
+
+![image|526x500](upload://zKHg88mjeCpiZxzEKYPaa0fwMOY.jpeg)
+
+-------------------------
+
+skilesare | 2023-10-06 15:17:22 UTC | #10
+
+I've mocked up what we were doing here and can reproduce a trap:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/?tag=535463954
+
+If you take include_reward_status down to just 1, which currently has no SNS proposals in it, things return fine. If you add in all the reward statuses and it starts to return SNS proposals it will trap with:
+
+Call was rejected:
+Request ID: 524bdce8a3d88d1bb10ac93e150c37881bfe7538fbad21ed93e1bb67f0465b55
+Reject code: 5
+Reject text: Canister mexqz-aqaaa-aaaab-qabtq-cai trapped explicitly: IDL error: byte tag not 0 or 1
+
+
+Note for everyone else attempting to learn from the thread:
+
+In the realm of smart contract development, the way we handle optional parameters can significantly impact the clarity and logic of our code. 
+
+Consider an NFT distribution contract that enables sending NFTs to a specified set of principals. Suppose, at a later stage, you decide to introduce a new field named `isAtomic`, aimed at reversing the transaction if an error occurs (e.g., attempting to distribute an NFT you don’t own). This new field would need to be declared as optional (`opt`) to maintain compatibility with existing client interfaces. Here's how it might look:
+
+```plaintext
+distribute( record {
+    accounts: [Account];
+    tokenIDs: [Text];
+    isAtomic: ?bool; //new optional value
+});
+```
+
+However, a challenge arises. If a client using an older version of the contract interacts with it, the `isAtomic` field will be seen as `null` by your code. The critical question here is: how should your code interpret this `null` value? Should it default to `true` or `false`? This scenario underscores the importance of clearly understanding and handling user intent in your code.
+
+The core idea revolves around ensuring that user intent is accurately captured and interpreted, regardless of the version of the contract they are interacting with. This approach promotes clearer, more logical code, and reduces the likelihood of unintended behaviors.
+
+Here’s another example. Suppose you have a field defined as `{item_type: opt variant;}`. If your code receives a `null` value due to a missing variant, this absence of information can pose a challenge. Not only is the intent hidden from your code, but it’s also obscured from any operators managing the system. This can be particularly problematic in systems like Axon, which facilitates DAOs in voting on NNS proposals.
+
+If the `item_type` is null because an Axon instance hasn’t been updated, the DAO could find itself in a scramble. Though they might look up the information elsewhere, this workaround won’t always be viable, especially in less accessible systems. A better approach would be to define the type as a text or an extensible object, which would allow an automated system to categorize the item into a management queue. This queue could then be managed externally in a manner that comprehends the user intent, bridging the gap between automated processes and manual intervention when necessary.
+
+Just some more thoughts for discussion.
+
+-------------------------
+
+msumme | 2023-10-06 22:21:00 UTC | #12
+
+What's so odd about this is that the thing that was added is a new Action in the proposal, but that action is `opt Action`.  And given that this seems to be happening at the response decoding level, I wonder if there is something in particular that is interesting about Motoko.  
+
+In your playground that is reproducing the trap, I see this: 
+```
+public type Proposal = {
+    url : Text;
+    title : ?Text;
+    action : ?Action;
+    summary : Text;
+  };
+```
+I'm not a Motoko expert, but doesn't that mean the Action is optional?  So why does that example trap, but the other examples you gave actually decode it as null?  
+
+It would seem that both ought to work in the same way.  There must be some subtlety here in the declarations that I don't understand.
+
+-------------------------
+
+msumme | 2023-10-06 23:32:04 UTC | #13
+
+Hi @skilesare. While I am not completely sure about what happened in the particular example you cited (and we are looking into this), I do want to respond more generally about API stability.
+
+I first want to say that API stability is very important. The NNS team recognizes the need to keep APIs stable.
+
+But I want to discuss why we think it's important, and give some more context for our decision-making.
+
+### Platform Adoption as Success Metric
+
+I would argue that API stability is a value resulting from a very practical consideration around platform adoption.
+
+If your frontend code is the only user of your API, and you have no desire to support other users, you could change it at will in whatever way makes the rest of the application easier to develop.
+
+However, when an API is public, and starts to be used by many parties, API stability becomes important because developers will not develop against an API if it keeps changing. It is disruptive to the ecosystem.
+
+As IC community members, we want the ecosystem to thrive, and we want to avoid any disruptive changes that require a response by the community as much as possible. You pointed out some circumstances where that might be impossible (legal or security issues that somehow require breaking changes). But we want it to be the exception, if not something that simply doesn’t happen.
+
+However, just as importantly, developers won't develop on a platform if it's stagnating and no new features are being released. The IC is providing support for increasingly sophisticated use cases, and as a cutting edge technology which is gaining more and more adoption, this also must be considered critical. If it does not, it will not continue gaining traction, as it has.
+
+So what do you do with competing values?
+
+### Dealing with Competing Values
+
+In the case mentioned, we realized at the time that adding that variant could cause problems with Candid decoders, as there was an issue that prevented the `opt variant` from decoding as null as it should. (I thought that issue was fixed in more recent versions (which would explain why one of your motoko playgrounds decoded null correctly)).
+
+We had to decide between some unpleasant options: delaying the SNS One Proposal feature to do a substantial amount of architectural work, or making a change that could have an impact on API clients.
+
+Given the importance of continuing to develop the SNS for the overall ecosystem's health (so far have 9+ projects that have successfully launched an SNS), it seemed that delaying would cause negative repercussions.
+
+To account for the impact to users, we [announced](https://forum.dfinity.org/t/nns-updates-announcing-nns-updates-breaking-changes-on-next-release/19601) in April that there would be a breaking API change caused by this work, and what downstream clients needed to do in order to avoid being impacted.
+
+Due to the nature of that change, no clients would actually be affected until a proposal of the new kind CreateServiceNervousSystem was created and the client attempted to decode it.
+
+In effect, this meant that for any developer who noticed the change, they had about 4 months to make changes. This was rolled out in this way to try to have as little impact as possible on applications on the IC.
+
+### What we could have done better
+
+Where there seems to have been a disconnect is that some projects didn't get the information in time, and ICDevs seems to have been affected in this way.
+
+We had decided to use the forum, so that it would be publicly visible, but maybe that was not enough.
+
+Moving forward, we will have a [single thread](https://forum.dfinity.org/t/nns-updates-aggregation-thread/23551) that announces all of the NNS Updates with breaking changes, so that developers can subscribe to a single post and get notifications.
+
+We are open to other suggestions though. What, in your opinion, would help to make sure that upcoming changes are easier to discover and be notified about?
+
+### Balancing Long-term API Stability and Changes
+
+Our team recognizes that what happened with 1-proposal is not ideal. This has happened in a few other cases where new proposals had to be added to the NNS. I hope this is now resolved at the Candid decoding level so that variants can be safely added.
+
+However, we have been questioning (and long before this post brought it up) the original architectural decisions made in NNS canisters that make the APIs hard to change independently of the application logic of the canisters. As opportunities allow, we will be addressing those shortcomings to further reduce disruptions, ideally to zero, of any changes except those dictated by security or legal concerns (which also generally can be done without breaking clients).
+
+We agree with your observations about how endpoints should evolve, in a backwards compatible way, and about versioning endpoints to add new functionality. The NNS team has been thinking and discussing what we would like to do in the NNS along the same lines this year already.
+
+I think, as my personal opinion, that some APIs will eventually have to be deprecated. There is no way to know how different the world will be in 10 years, and while we could, in theory, never change an API, that has to be balanced with letting the platform stagnate and not meet the needs of developers 10 years hence.
+
+That’s a discussion for the community as it moves forward and decides what the future of the IC looks like. It’s a platform built to allow evolution and community ownership.
+
+Because the NNS is a DAO meant to allow the IC to change at the pace of the internet, to be able to support uses that today are unimagined, you might expect that there will eventually be changes that prevent it from being interoperable with very old applications that never update.
+
+-------------------------
+
+wpb | 2023-10-07 03:53:18 UTC | #14
+
+[quote="msumme, post:13, topic:23510"]
+Moving forward, we will have a [single thread](https://forum.dfinity.org/t/nns-updates-aggregation-thread/23551) that announces all of the NNS Updates with breaking changes, so that developers can subscribe to a single post and get notifications.
+
+We are open to other suggestions though. What, in your opinion, would help to make sure that upcoming changes are easier to discover and be notified about?
+[/quote]
+
+Perhaps you could create a new proposal type or topic and store information about NNS updates with breaking changes as NNS proposals.  It could be an effective way to announce these changes in a way that is formally communicated to everyone and ensure they are always searchable.  Since this type of announcement proposal would be submitted after the change has already been discussed, communicated, and implemented, this kind of NNS proposal could also contain all references (forum, NNS update proposal, dev docs, etc) needed for a developer to find more information about the change.
+
+-------------------------
+
+claudio | 2023-10-08 18:31:48 UTC | #15
+
+Thanks for the report.
+
+We think this may be a Motoko candid decoding bug. 
+
+Candidate draft fix here:
+
+https://github.com/dfinity/motoko/pull/4238
+
+Unfortunately, I'll be on a transatlantic flight soon, so won't be able to make much more progress until I'm back home late Monday/Tuesday.
+
+-------------------------
+
+skilesare | 2023-10-09 14:37:52 UTC | #16
+
+Thanks for taking the time to write this up.
+
+After having more clarity on how the opts are supposed to work going in and coming out, this looks like a motoko bug and @claudio is working on it.  I did not understand the proper opt behavior before writing the post and you guys obviously had thought through that pretty thoroughly.  This opt upgrade is an important operational concept and it is fairly advanced.  It isn't something you're going to run into until you start upgrading services.
+
+I think the single thread is a great idea and I'm subscribing to it now.  It is an interesting problem in the long term.  I may have seen the April post, but even at that point, I didn't put two and two together(obvious in retrospect, not as obvious when it isn't prioritized.
+
+In the long term we may need some kind of code scanning tool to try to be proactive in these kids of things. It is almost like the system needs to know what code you are using so that it can pro-actively warn you about these changes.(something like how NPM warns you if you have security vulnerabilities).
+
+"WARN: you use a candid type that is superseded in a subsequent release. Check your code for unexpected behavior"
+
+Perhaps the code interpreter could even try to see if you're using a certain guid for actors and if the type you have matches the published type on the IC.  If the types don't match a compile warning could be generated. I think @rvanasa has done a good bit with the VS plugin.  Perhaps this is something for the feature list?
+
+-------------------------
+
+rvanasa | 2023-10-09 17:37:11 UTC | #17
+
+Noted! I'll start thinking about ways to include this in the VS Code extension.
+
+-------------------------
+
+msumme | 2023-10-09 23:58:05 UTC | #18
+
+[quote="skilesare, post:16, topic:23510"]
+In the long term we may need some kind of code scanning tool to try to be proactive in these kids of things. It is almost like the system needs to know what code you are using so that it can pro-actively warn you about these changes.(something like how NPM warns you if you have security vulnerabilities).
+[/quote]
+
+I really like that idea.  It would probably require some conventions becoming officially and widely adopted, but in principle it shouldn't be that hard to compare your local IDL definitions to the one of the canister in mainnet.  At least for some canisters, the `.did` file is attached as metadata (and the dashboard already uses that).
+
+That would also serve a purpose even if there were never breaking changes, which would be to discover new features.
+
+-------------------------
+
+icpp | 2023-10-10 23:36:11 UTC | #19
+
+Did someone add a new unit test to the candid test suite?
+
+This is something every CDK should thoroughly test.
+
+-------------------------
+
+skilesare | 2023-10-18 14:08:37 UTC | #20
+
+@claudio Were you able to take a look at if this was a motoko error or not?
+
+-------------------------
+
+icpp | 2023-10-20 01:53:15 UTC | #21
+
+This thread made me reread this blog posts about upgrading record based interfaces and the special treatment of opt.
+
+https://www.joachim-breitner.de/blog/784-A_Candid_explainer__Opt_is_special
+
+-------------------------
+
+claudio | 2023-10-28 18:20:40 UTC | #22
+
+Sorry, for the later response. Yes, this was a Motoko bug and is fixed in 0.10.1 (released 2 weeks ago).
+
+-------------------------
+

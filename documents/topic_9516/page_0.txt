@@ -1,0 +1,300 @@
+berestovskyy | 2021-12-09 12:42:55 UTC | #1
+
+**TL;DR** Recently the subnet blockchain **mpubz** on the Internet Computer had a [production issue](https://status.internetcomputer.org/incidents/4gfdffqkrgfg), and (part of) the fix was the complexity adjustments for some of the System API calls:
+
+|System API Call | Old Complexity<br>(Instructions)|New Complexity<br>(Instructions)
+|-----------------------|---------------------------------------------|------------------------------------------
+| ic0.msg_arg_data_copy | 1 | 20
+| ic0.msg_method_name_copy | 1 | 20
+| ic0.msg_reply_data_append | 1 | 20
+| ic0.stable_read | 1 | 20
+| ic0.stable_write | 1 | 20
+
+It’s a very sensitive topic for the community, not only from a financial point of view, but also from a technical standpoint. Unfortunately, the complexity adjustments were required to fix the production defect.
+
+Please read on for more details.
+
+# Background
+
+Recently, execution rounds on one of the subnet blockchains on the IC started taking a very long time to finish (around 50s vs the target of about 1s). Here is a short recap of the root cause.
+
+A subnet node executes a message. The message handler in Canister Smart Contract has a long loop of 1-byte stable reads (see the image below). For each system API call, it needs to exit the WebAssembly module, execute native code on the Internet Computer, and then continue the execution of the WebAssembly.
+
+![Screenshot 2021-11-30 at 12.13.28|690x479](upload://83Qc3h1jJy3glAqEUDrPKsAe4MK.png)
+
+Every such 1-byte stable read is much more CPU complex than an average WASM instruction. But that was not the issue. To prevent the canister from executing messages forever, every Canister **already has limits** in place. Though, to be deterministic across replicas, those limits are in WASM Instruction, not in seconds.
+
+One of those limits we have is the **5B Instructions per Message limit**. In case with the stable read in a loop, it will take almost a minute to hit the limit and to finish the execution round, while the target is just 1 second per round.
+
+To **make sense** out of those instruction limits, the complexity of each System API call **must correctly reflect** the actual node CPU/memory/disk/network complexity.
+
+Hence, one of the postmortem items was to measure the actual complexity of the System API calls, and to update them accordingly.
+
+# Measuring the System API Calls Complexity
+
+How to compare the complexity of WASM Instructions? The natural choice would be to go with the number of WASM Instructions per Second (IPS) as the main metric. First, a baseline must be set up, then a benchmark should be run for each system API call, and the results compared to the baseline.
+
+How to set a baseline? Just an empty WASM loop with a counter of iteration seems to be a good choice: there is a load for a counter, increment, store it, branch... Maybe not a very representative WASM workload, but it’s good enough for this not-that-scientific benchmark. And it also allows to embed system API calls into the loop quite easily.
+
+![Screenshot 2021-11-30 at 12.30.57|688x500](upload://w93cebdIlu8Lkg6sLg7sMlRlsYd.png)
+
+With a bit of math, the complexity adjustment for each System API call could be calculated:
+
+![Screenshot 2021-11-30 at 12.39.49|690x64](upload://mhu8MRn5Vm4zcd8VcSEvEQpdbHP.png)
+
+If you’re interested in more details, please see [EXECUTE_UPDATE.md on GitHub](https://github.com/dfinity/ic/blob/master/rs/execution_environment/benches/EXECUTE_UPDATE.md).
+
+# Results
+
+Using production metrics, the average number of executed instructions per second in production is known. So that light blue area in the middle of the graph below is the “target”. Both basic WASM instructions and more complex system API calls should be within this light blue area.
+
+![Screenshot 2021-11-30 at 12.45.38|690x344](upload://GdoqZgRR9lVfoLPYtEpNsliw8s.png)
+
+Please see the first navy blue bar. That's the result for the **baseline** benchmark with an empty loop. The benchmark result is 3.4B Instructions per Second. The result is within the production light blue area, so it confirms the baseline benchmark makes sense.
+
+Now see the second result, the **ic0.stable_size** system API call. It's a relatively cheap syscall, it just exits the wasm module, grabs the size, and gets back to execution.
+
+The benchmark shows that by adding the ic0.stable_size call inside the baseline loop, the loop becomes 3.4 times slower (3.4B vs 1B). The reason is that the complexity of the ic0.stable_size call is just one WASM Instruction, while in reality the operation is much more CPU complex.
+
+Applying the formula from the previous slide, the **"complexity adjustment" for the ic0.stable_size is +24**. In other words, this syscall should be attributed for 24 instructions more to make it "fair" and be aligned with the baseline.
+
+Please see the third bar, the **1-byte ic0.stable_read** production issue we already discussed at the beginning. The IPS here drops to just 100M Instructions per second. In other words, the loop with stable read inside is 34 times slower than the baseline loop. It also means that it will take 50 seconds to hit the 5B limit of instructions per message (5B/100M), while our target round duration is just 1 second.
+
+Applying the formula again, the complexity of **the 1-byte ic0.stable_read should be increased by 442 instructions** more for this 1-byte ic0.stable_read.
+
+The last bar, **ic0.stable_read of a big chunk of stable memory**. Here the situation is completely the opposite. As the complexity of stable reads includes every byte we read, the complexity of this syscall is extremely high. And, applying the formula, the complexity of the **8K ic0.stable_read should be lowered by 7K instructions** to be aligned with the baseline.
+
+# What’s Next?
+
+The results are polarized: the complexity for some System API calls must be increased, while for some use cases the complexity is too high in comparison with the baseline.
+
+The most important result though is that the problem is **acknowledged**, and now **there are tools** in place to compare the results before and after the adjustments. Also, around **40 system API calls are benchmarked**. To close the production issue, the complexity of **5 system calls was adjusted** as shown at the beginning. Not adjusting the complexity could lead to future production issues, and possible Denial of Service attacks.
+
+Please note, the calculated complexity adjustment for 1-byte ic0.stable_read was **+442** instructions, while it was adjusted to just **+20**. It was done to avoid any production Canister breaks.
+
+Clearly, it’s not the end of the story. The performance improvements of the Internet Computer is a work in progress, the Internet Computer becomes faster and safer. There will be some great wins, and unfortunate mistakes ahead.
+
+It’s an exciting journey, and we’re happy to be here, with you.
+
+-------------------------
+
+nomeata | 2021-12-09 13:09:11 UTC | #2
+
+Good work, and thanks for keeping us in the loop with such a detailed post!
+
+-------------------------
+
+GLdev | 2021-12-09 13:09:49 UTC | #3
+
+Do you have any indication of what caused such a performance hit, in terms of canisters and their code? Was someone stable_writing on every execution round? Are there any design patterns that while *possible* from a technical standpoint, should be avoided from a performance consideration? (e.g. in the post-mortem of the high traffic incident from the launch of icpunks one note hinted towards less-than-optimal practices on the dev side (multiple reads per session, that ended up compounding the problem).
+
+On the metrics & benchmarking progress: there are a bunch of areas where more benchmarking would really help the community. There are a lot of open questions about cycle consumption, heartbeats, optimization, etc. Is anyone from the foundation tracking this, and planning to release some data and some numbers for the dev community to follow? Is there interest in the dev community to come up with some tests and have the foundation sponsor the costs?
+
+-------------------------
+
+berestovskyy | 2021-12-09 14:48:14 UTC | #4
+
+The root case was a canister doing a bunch of tiny stable memory operations. It was not a malicious code, but just a super inefficient way of using the stable memory to the extent it was slowing down the whole subnet...
+
+There are a few points to improve form there. On one side, by increasing the complexity of those system API calls, we're closing a potential DoS attack vector. On the other side, we're putting a lot of efforts to make the orthogonal persistency faster ([see recent perf optimizations](https://www.youtube.com/watch?v=xxeKGqwDi_4)) and safer ([see canister sandboxing](https://www.youtube.com/watch?v=hkSY-HtAfuM)).
+
+Those talks touch a bit the design patterns to avoid. There is also a related post [on this forum](https://forum.dfinity.org/t/watch-out-for-foot-guns-with-canister-upgrades/8954).
+
+True, there are a lot of open questions on dev tooling side. We have plans to improve there, so stay tuned!
+
+-------------------------
+
+levi | 2021-12-09 22:02:03 UTC | #5
+
+[quote="berestovskyy, post:1, topic:9516"]
+The last bar, **ic0.stable_read of a big chunk of stable memory** . Here the situation is completely the opposite. As the complexity of stable reads includes every byte we read, the complexity of this syscall is extremely high. And, applying the formula, the complexity of the **8K ic0.stable_read should be lowered by 7K instructions** to be aligned with the baseline.
+[/quote]
+
+Is the complexity of the big stable read (one stable read call for a big amount of data) lowered? Or is it raised 20x now? What is the biggest read we can do of the stable-memory within one call (with one stable-memory call. not in a loop of one byte) ?
+
+-------------------------
+
+berestovskyy | 2021-12-10 00:59:09 UTC | #6
+
+No worries, Levi,
+Our primary goal was not to raise the complexity `20x`, but to analyze the situation, fix the production issue, and prevent potential DoS attacks.
+
+While doing so, we found out that in some cases system API calls complexity might be a bit too high. That's the case before and after this adjustment. There might be follow-up proposals from our side, as it seems this topic requires a more systematic approach.
+
+We're also open for the community to come up with a proposal on how to address this issue. All the data we have is shared in this post and [on GitHub](https://github.com/dfinity/ic/blob/master/rs/execution_environment/benches/EXECUTE_UPDATE.md).
+
+Regarding the raise:
+
+1. Before the complexity of an empty loop with a counter was `9 instructions`.
+    Now the same loop after the adjustment: `9 instructions` (as we adjusted just some syscalls)
+    The raise for an empty loop is `9/9 = 1x`
+2. Before a loop with a 1-byte stable read was: 9 (loop) + 1 (syscall) + 1(byte) = `11 instructions`
+    Now the same loop after the adjustment: 9 + 20 (syscall) + 1 (byte) = `30 instructions`
+    The raise for 1-byte stable read is `30/11 = 2.72x`
+3. Before a loop with a 8K stable read was: 9 (loop) + 1 (syscall) + 8K (bytes) = `~8K instructions`
+    Now the same loop after the adjustment: 9 + 20 (syscall) + 8K (bytes) = `~8K instructions`
+    As the complexity is dominated by the size of the data, the raise for 8K read is `~1x`.
+
+As far as I can see in the code, there are no limits on the biggest read we can do, but there are other limits in place, i.e. the 5B instructions per message limit mentioned in the post.
+
+To emphasis, the complexity of big reads/writes before and after this adjustment is basically the same, i.e. the raise is `~1x`.
+
+I hope this addresses your concerns, Levi.
+
+-------------------------
+
+levi | 2021-12-10 02:23:12 UTC | #7
+
+Hi Andriy, Thank you, I am clear now on this change, your post is great.
+
+-------------------------
+
+jzxchiang | 2021-12-12 06:34:27 UTC | #8
+
+Every System API call takes a different amount of time to execute 1 wasm instruction on average, and that wasn't reflected before.
+
+Is that an accurate summary? Great writeup btw, I learned a lot.
+
+> Though, to be deterministic across replicas, those limits are in WASM Instruction, not in seconds.
+
+This is a great point.
+
+> Before a loop with a 8K stable read was: 9 (loop) + 1 (syscall) + 8K (bytes) = `~8K instructions`
+
+I'm surprised an 8K stable read needs 8K wasm instructions. Is there really no way to do a single wasm "load" with a bigger size? Not sure what the exact wasm instruction being called here is, since stable memory is not the same as wasm linear memory, so probably not vanilla i32.load?
+
+-----
+
+A couple of random questions:
+
+* Why did you only benchmark a subset of syscalls and not others like `ic0.msg_reject_msg_copy`?
+* Why were the `stable64_` syscall costs not increased? Is it because 64-bit stable memory is not yet available?
+* Why was `ic0.canister_status` not increased? It had a +389 cost adjustment as well, and is a common syscall I imagine.
+
+-------------------------
+
+berestovskyy | 2021-12-13 22:19:11 UTC | #9
+
+Now I see it might be even more confusing 🤣
+
+Ok, so there are WAMS instructions, which are loads, stores, adds, calls, etc we execute inside the Canisters. There are many references, here just [one of them](https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md)
+
+And there are System API Calls, like "ic0.stable_read", which is part of the [Internet Computer specification](https://docs.dfinity.systems/spec/public/). The system calls are implemented as a native code executed by the Internet Computer, i.e. those are not WASM Instructions.
+
+When a Canister wants to read a stable emory, it calls "ic0.stable_read", so we exit the Canister, run the native code on the Internet Computer, and then resume the execution of the Canister.
+
+This "ic0.stable_read" call is just one WASM instruction, while in reality the Internet Computer does a lot of work to deliver a chunk of stable memory. To compensate for the work, Internet Computer counts every "ic0.stable_read" as 1 WASM Instruction, and then adds on top the amount of memory we read, i.e. counts every byte as 1 extra WASM Instruction.
+
+So 1 byte stable read was 1 Instruction for the system call + 1 Instruction for the byte, now it's 20 Instructions for the call and 1 Instruction for the byte.
+8K stable read was 1 WASM Instruction for the call + 8K Instructions for the 8K bytes, now it's 20 Instructions for the call + 8K Instructions for the bytes.
+
+Answering your questions:
+1. Not all system API was benchmarked, as some of them are not part of the update API, and some are not easy to benchmark in a loop. The `ic0.msg_reject_msg_copy` call is not supported in the updates.
+2. Both 32- and 64-bit stable reads were adjusted. Here are the [exact adjustments made](https://github.com/dfinity/ic/blob/master/rs/embedders/src/wasmtime_embedder/system_api_charges.rs).
+3. Many system calls need to be adjusted. We did the bare minimum to fix the production issue and potential DoS attacks. The rest might be either adjusted later, or the performance of those system calls might be improved.
+
+Anyway, it's not the end of the story, we will keep you posted 😉
+
+-------------------------
+
+jzxchiang | 2021-12-14 07:51:36 UTC | #10
+
+> This “ic0.stable_read” call is just one WASM instruction, while in reality the Internet Computer does a lot of work to deliver a chunk of stable memory. To compensate for the work, Internet Computer counts every “ic0.stable_read” as 1 WASM Instruction, and then adds on top the amount of memory we read, i.e. counts every byte as 1 extra WASM Instruction.
+
+Oh wow, that was the key. Thanks for clarifying.
+
+Random question: which wasm instruction do you use to make the System API call, e.g. ic0.stable_read? Is it some instruction for calling external modules? (Not familiar with wasm, clearly.)
+
+-------------------------
+
+berestovskyy | 2021-12-14 10:28:57 UTC | #11
+
+To make a System API call we use WASM [call instruction](https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#call). First we need to [import an external function](https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#import-section), and then we just `call` intra- or inter-modular function.
+
+So there is no special instruction to call an external module.
+
+-------------------------
+
+berestovskyy | 2022-03-24 17:10:59 UTC | #12
+
+Another heads-up folks,
+
+Just like before, more System APIs were benchmarked, and as a result, five more System Calls complexities were slightly adjusted:
+
+System API Call | Old Complexity (Instructions) | New Complexity (Instructions)
+---------------------- | ---------------------------------------| --------
+ic0.msg_reject_msg_copy()     |        1 |  21
+ic0.msg_reject()                        |        1 |  21
+ic0.trap()                                   |        1 |  21
+ic0.call_simple()                       |        1 |  21
+ic0.call_data_append().           |        1 |  21
+
+As previously, we don't expect any surprises, but please let us know if there are  any.
+
+For the details, please see the original post in this thread.
+
+-------------------------
+
+skilesare | 2022-03-25 13:59:40 UTC | #13
+
+[quote="berestovskyy, post:12, topic:9516"]
+ic0.msg_reject()
+[/quote]
+
+Does this mean that early throw/asserts are now 20x more expensive? This was the best way to rate limit in motoko since we don’t have message inspect(or for inter canister ddos protection). 20x may still be cheap, but trying to get a benchmark.
+
+> ic0.call_data_append()
+
+Under what circumstances is this called? It looks like this could make large calls much more expensive if data is appended in chunks.
+
+-------------------------
+
+berestovskyy | 2022-03-25 21:30:34 UTC | #14
+
+1. Just like you said and discussed previously, 20x sounds scary, but still super cheap. 20 more instructions it's 8 Cycles more per each system call. Normally, we don't expect too many calls per message, so the overall increase per message should be really negligible.
+
+2. The `call_data_append()` is just like previously adjusted `msg_reply_data_append()` but for inter-canister calls. So it's used when one Canister sends a message to another one.
+
+In both cases, we don't expect any technical issues or noticeable price increase. Now we have 100% System APIs covered with benchmarks, so the main purpose of these adjustments is to prevent potential DoS attacks for some very expensive System calls.
+
+If there are use cases where those adjustments are noticeable worser, please let us know.
+
+-------------------------
+
+gabe | 2022-04-27 14:42:03 UTC | #15
+
+Does this mean that if I want to calculate the cycles consumption of a function in a canister, I can no longer count the number of instructions in the Wasm module for that function and [convert it to cycles](https://smartcontracts.org/docs/developers-guide/computation-and-storage-costs.html#_details_cost_of_compute_and_storage_transactions_on_the_internet_computer)? I would have to account for that some instructions should count as x20, is that correct?
+
+-------------------------
+
+berestovskyy | 2022-04-28 15:24:55 UTC | #16
+
+hey @gabe 
+Each System API call is a function call from the WebAssembly standpoint. The number of instructions each call takes depends on the work done.
+
+Converting instructions to the cycles is always a straightforward operation, i.e. `cycles = instructions / 10 * 4`. It's just the complexity of each System API or a library call depends on the arguments and the current Canister state.
+
+Say the same `stable_read` system API call might read 1B or 10KB of data, hence it will take ~20 or ~10K instructions.
+
+Another example, if you're looking up a key A in an empty tree, it will take ~100 instructions (my best guess). But if there are 1M entries in the tree, the same `lookup(A)` might take 1K instructions.
+
+-------------------------
+
+nomeata | 2022-04-28 19:34:27 UTC | #17
+
+[quote="berestovskyy, post:16, topic:9516"]
+Converting instructions to the cycles is always a straightforward operation, i.e. `cycles = instructions / 10 * 4` .
+[/quote]
+
+I wouldn’t say “always”, as I expect different instructions to have different costs in the future, as the cost model is refined.
+
+I think really the only good answer is “run it and see”, and maybe a second-best answer “read the source code” (sorry, too lazy to find the link).
+
+-------------------------
+
+gabe | 2022-04-29 08:18:56 UTC | #18
+
+This made it much clearer to me. Thank you for the clarification!
+
+-------------------------
+

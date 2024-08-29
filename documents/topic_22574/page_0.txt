@@ -1,0 +1,735 @@
+AliSci | 2023-09-06 06:52:18 UTC | #1
+
+I am using https://medium.com/@ilbert/websockets-on-the-ic-getting-started-5f8bcdfaabdc this tutorial in order to send message from backend
+
+```rs
+#[update]
+#[candid_method(update)]
+fn accept_frind_request(fridnd_id: Principal, msg: AppMessage) -> String {
+// ... accept_frind_request login here
+// ws code
+    ID_STORE.with(|user_files| {
+        let user_files = user_files.borrow();
+        let key = user_files.get("client_key").unwrap();
+        send_app_message(key.clone(), msg);
+        "ok".to_string()
+    });
+
+    "Err".to_string()
+}
+```
+```rs
+pub fn on_open(args: OnOpenCallbackArgs) {
+    let msg = AppMessage {
+        text: String::from("is open"),
+    };
+    send_app_message(args.client_key.clone(), msg);
+    ID_STORE.with(|mut id_store| {
+        id_store
+            .borrow_mut()
+            .insert("client_key".to_string(), args.client_key);
+    });
+}
+```
+I tried to store the `client_key` from on_open but in fact on_open is never used.
+* **Goal** I want to `send_app_message(key.clone(), msg);` a message to the user to niffy them that their friend request has been excpeted. Also, the message should be send to spesfic user (channel) and others should not be able to access it.
+can I also use `caller()` instead of client_key?
+
+-------------------------
+
+ilbert | 2023-09-08 08:14:43 UTC | #2
+
+It's great that you tried our tutorial!
+
+[quote="AliSci, post:1, topic:22574"]
+I tried to store the `client_key` from on_open but in fact on_open is never used.
+[/quote]
+This is something that shouldn't happen. Every time a new client connects, the **on_open** callback is called by the CDK on the canister. If this doesn't happen, it means that the connection is still not fully established. This appears to be a bug, that we also have encountered and that we're fixing. As a temporary workaround, [reinstalling the canister](https://internetcomputer.org/docs/current/developer-docs/setup/manage-canisters#reinstall-a-canister) should fix it (but you're going to loose all the canister data, so be careful!).
+
+We're working on a more robust protocol for the IC WebSocket, that we'll release soon. We'll also update the tutorial accordingly. With this update, you'll be able to use the **client's principal** instead of that `client_key`. So, to answer your question:
+
+[quote="AliSci, post:1, topic:22574"]
+can I also use `caller()` instead of client_key?
+[/quote]
+No, you can't with the current version. What you can do for now is to create a map client principal -> client_key in order to find the right client_key to pass to the `send_app_message` function.
+
+[quote="AliSci, post:1, topic:22574"]
+Also, the message should be send to spesfic user (channel) and others should not be able to access it.
+[/quote]
+If you call the `ws_send` passing a specific client_key, the underlying IC WebSocket protocol takes care of delivering it to the right client and only that one.
+
+P.S.: I've reached you out in DM if you want to have a call together, so that we can help you out better.
+
+-------------------------
+
+ilbert | 2023-09-13 11:02:02 UTC | #3
+
+@AliSci we've updated the [tutorial](https://medium.com/@ilbert/websockets-on-the-ic-getting-started-5f8bcdfaabdc) with the new versions (commit hashes) of both the JS SDK and the Rust CDK that should fix the bug. Reporting them here also:
+
+- **Rust CDK**: `a1d05625f96faa12cad484afcdd01ddad39bb28c`
+- **Javascript SDK**: `41e37667c36d26a535d4247e37711f4bad2184a8`
+
+Here's how you can update the SDKs in your project.
+
+### Rust canister:
+In the canister's Cargo.toml, change the ic-websocket-cdk dependency to be:
+```toml
+ic-websocket-cdk = { git = "https://github.com/omnia-network/ic-websocket-cdk-rs", rev = "a1d05625f96faa12cad484afcdd01ddad39bb28c" }
+```
+and then run:
+```bash
+cargo update
+```
+
+### Javascript Frontend:
+Simply run:
+```bash
+npm install --save https://github.com/omnia-network/ic-websocket-sdk-js#41e37667c36d26a535d4247e37711f4bad2184a8
+```
+
+Let me know if it works.
+
+-------------------------
+
+AliSci | 2023-09-15 02:56:05 UTC | #4
+
+```rs
+error[E0308]: mismatched types
+   --> src/ic_websocket_example_backend/src/handlers.rs:41:41
+    |
+41  |     if let Err(e) = ws_send(client_key, msg) {
+    |                     -------             ^^^ expected `Vec<u8>`, found `AppMessage`
+    |                     |
+    |                     arguments to this function are incorrect
+    |
+    = note: expected struct `std::vec::Vec<u8>`
+               found struct `AppMessage`
+note: function defined here
+   --> /Users/ahmed/.cargo/git/checkouts/ic-websocket-cdk-rs-b5112c5b627c7f56/a1d0562/src/ic-websocket-cdk/src/lib.rs:953:8
+    |
+953 | pub fn ws_send(client_key: ClientPublicKey, msg_bytes: Vec<u8>) -> CanisterWsSendResult {
+    |        ^^^^^^^
+
+```
+
+-------------------------
+
+ilbert | 2023-09-16 13:00:32 UTC | #5
+
+You have to serialize the message to a **Candid** bytes array before sending it. This will change in the next release.
+To serialize the message, you can use the [candid::encode_one](https://docs.rs/candid/latest/candid/utils/fn.encode_one.html) function, like we do in the [ic_websocket_example](https://github.com/omnia-network/ic_websocket_example/blob/e13b783a43ec4d982db572105c9443dc2dd6f781/src/ic_websocket_example_backend/src/canister.rs#L17):
+```rust
+let msg_bytes = encode_one(&msg).unwrap()
+if let Err(e) = ws_send(client_key, msg_bytes) {
+    println!("Could not send message: {}", e);
+}
+```
+To make things simpler, you can define an implementation for your AppMessage struct, like:
+https://github.com/omnia-network/ic_websocket_example/blob/e13b783a43ec4d982db572105c9443dc2dd6f781/src/ic_websocket_example_backend/src/canister.rs#L15-L19
+
+Please note that you'll have to serialize/deserialize the message also on the frontend. Have a look at the **idl.ts** file of the **ic_websocket_example**:
+https://github.com/omnia-network/ic_websocket_example/blob/e13b783a43ec4d982db572105c9443dc2dd6f781/src/ic_websocket_example_frontend/src/utils/idl.ts
+
+Again, in the next version both the serialization and deserialization of your messages will be handled automatically by the SDKs, so that you don't have to care about it.
+
+-------------------------
+
+AliSci | 2023-09-17 08:17:43 UTC | #6
+
+You still have a bug I think.
+```rs
+error[E0277]: the trait bound `ic_websocket_cdk::CanisterWsRegisterArguments: CandidType` is not satisfied
+#[update]
+#[candid_method(update)]
+fn ws_register(args: CanisterWsRegisterArguments) -> CanisterWsRegisterResult {
+    ic_websocket_cdk::ws_register(args)
+}
+```
+
+-------------------------
+
+ilbert | 2023-09-18 06:56:25 UTC | #7
+
+Are you using the **candid** crate or the re-exports from the **id_cdk** crate?
+
+In the latter case, please switch to the **candid** crate.
+
+In the former case, which version of the **candid** crate are you using? The IC WebSocket CDK is using the version [0.9.3](https://docs.rs/candid/0.9.3/candid/index.html), so I'd suggest you to use the same version for your canister.
+
+Let me know.
+
+-------------------------
+
+AliSci | 2023-09-18 09:50:06 UTC | #8
+
+```rs
+use ic_cdk_macros::*;
+
+use handlers::{on_close, on_message, on_open};
+use ic_websocket_cdk::{
+    CanisterWsCloseArguments, CanisterWsCloseResult, CanisterWsGetMessagesArguments,
+    CanisterWsGetMessagesResult, CanisterWsMessageArguments, CanisterWsMessageResult,
+    CanisterWsOpenArguments, CanisterWsOpenResult, CanisterWsRegisterArguments,
+    CanisterWsRegisterResult, WsHandlers,
+};
+
+use candid::candid_method;
+
+
+mod handlers;
+
+// Paste here the principal of the gateway obtained when running the gateway
+pub const GATEWAY_PRINCIPAL: &str = "<gateway-principal>";
+
+#[init]
+fn init() {
+    let handlers = WsHandlers {
+        on_open: Some(on_open),
+        on_message: Some(on_message),
+        on_close: Some(on_close),
+    };
+    ic_websocket_cdk::init(handlers, GATEWAY_PRINCIPAL);
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+    let handlers = WsHandlers {
+        on_open: Some(on_open),
+        on_message: Some(on_message),
+        on_close: Some(on_close),
+    };
+    ic_websocket_cdk::init(handlers, GATEWAY_PRINCIPAL);
+}
+
+// method called by the client SDK when instantiating a new IcWebSocket
+#[update]
+#[candid_method(update)]
+fn ws_register(args: CanisterWsRegisterArguments) -> CanisterWsRegisterResult {
+    ic_websocket_cdk::ws_register(args)
+}
+
+// method called by the WS Gateway after receiving FirstMessage from the client
+#[update]
+#[candid_method(update)]
+fn ws_open(args: CanisterWsOpenArguments) -> CanisterWsOpenResult {
+    ic_websocket_cdk::ws_open(args)
+}
+
+// method called by the Ws Gateway when closing the IcWebSocket connection
+#[update]
+#[candid_method(update)]
+fn ws_close(args: CanisterWsCloseArguments) -> CanisterWsCloseResult {
+    ic_websocket_cdk::ws_close(args)
+}
+
+// method called by the frontend SDK to send a message to the canister
+#[update]
+#[candid_method(update)]
+fn ws_message(args: CanisterWsMessageArguments) -> CanisterWsMessageResult {
+    ic_websocket_cdk::ws_message(args)
+}
+
+// method called by the WS Gateway to get messages for all the clients it serves
+#[query]
+#[candid_method(query)]
+fn ws_get_messages(args: CanisterWsGetMessagesArguments) -> CanisterWsGetMessagesResult {
+    ic_websocket_cdk::ws_get_messages(args)
+}
+```
+
+```
+[package]
+name = "ic_websocket_example_backend"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ic-websocket-cdk = { git = "https://github.com/omnia-network/ic-websocket-cdk-rs", rev = "a1d05625f96faa12cad484afcdd01ddad39bb28c", version = "0.1.0" }
+
+serde_cbor = "0.11.2"
+
+dotenv = "0.15.0"
+lazy_static = "1.4"
+serde = "1.0.176"
+
+candid = "0.9.3"
+ic-cdk = "0.9.2"
+ic-cdk-macros = "0.7.0"
+ic-cdk-timers = "0.2.0"
+```
+I am doing it just like this https://github.com/omnia-network/ic_websocket_example/blob/e13b783a43ec4d982db572105c9443dc2dd6f781/src/ic_websocket_example_backend/src/lib.rs
+
+-------------------------
+
+ilbert | 2023-09-18 10:10:53 UTC | #9
+
+What's the error now?
+
+By the way, you should also update the following dependencies, according to the versions used by the IC WebSocket CDK:
+- [ic_cdk@0.10.0](https://docs.rs/ic-cdk/0.10.0/ic_cdk)
+- [ic_cdk_macros@0.7.1](https://docs.rs/ic-cdk-macros/0.7.1/ic_cdk_macros)
+- [ic_cdk_timers@0.4.0](https://docs.rs/ic-cdk-timers/0.4.0/ic_cdk_timers)
+
+-------------------------
+
+AliSci | 2023-09-18 10:14:23 UTC | #10
+
+It is The same error, nothing changed and
+
+-------------------------
+
+ilbert | 2023-09-20 14:11:12 UTC | #11
+
+@AliSci is your code publicly available? Or is there a way I can see it? I think this way I can help you better.
+
+Please also keep in mind that we'll release the next version of the protocol (and so the SDKs and the Gateway) by the end of September and all these bugs should be solved. Thanks for your patience :smiley:
+
+-------------------------
+
+AliSci | 2023-10-01 01:49:43 UTC | #12
+
+Hi, did u finish the updates? I noticed few pushes in ur GitHub bit not sure.
+
+-------------------------
+
+ilbert | 2023-10-08 11:37:51 UTC | #13
+
+<s>Yeah we're still working on it, but if you want to try it out here are the git branches to use for SDKs and gateway:
+- Rust CDK: https://github.com/omnia-network/ic-websocket-cdk-rs/tree/feat/authenticated-messages
+- JS SDK: https://github.com/omnia-network/ic-websocket-sdk-js/tree/feat/custom-ws-agent (here make sure to update any `@dfinity/...` package dependency to **v0.19.2**)
+- Gateway: https://github.com/omnia-network/ic-websocket-gateway/tree/ic-ws-establishment.
+There's also a new hosted version of the gateway: [wss://gatewayv1.icws.io](wss://gatewayv1.icws.io) (principal: `lg3nb-si435-jnrox-6qdrd-i6tuh-73huj-vg32b-l3cqf-kpyf4-7c6zg-nae` ).
+
+We're also updating the example, here's the branch: https://github.com/omnia-network/ic_websocket_example/tree/v1.
+
+We would really appreciate your feedback, if you want to try them out.</s>
+
+---
+# Update
+Please see my new reply at https://forum.dfinity.org/t/how-to-send-a-message-in-websockets-on-the-internet-computer/22574/15.
+
+-------------------------
+
+AliSci | 2023-10-08 06:48:54 UTC | #14
+
+the link, https://github.com/omnia-network/ic_websocket_example/tree/v1 does not work it says page not found 
+I would work on it in november so I will be wating for u
+
+-------------------------
+
+ilbert | 2023-10-08 11:38:20 UTC | #15
+
+My [previous reply](https://forum.dfinity.org/t/how-to-send-a-message-in-websockets-on-the-internet-computer/22574/13) is now **outdated**.
+
+We're slowly rolling out the new version with the new protocol, we've shut down the temporary **gatewayv1** and updated the gateway at [wss://gateway.icws.io](wss://gateway.icws.io) with the latest version.
+
+We've updated the tutorial with the latest changes: https://medium.com/@ilbert/websockets-on-the-ic-getting-started-5f8bcdfaabdc, so please follow it.
+
+-------------------------
+
+AliSci | 2023-10-15 00:42:51 UTC | #16
+
+I followed the steps but now I am getting this, 
+![Screenshot 2023-10-15 at 3.35.23 AM|690x405](upload://6y9skyAwOuzymLp80usuAJA9SU4.jpeg)
+- I installed this `"ic-websocket-js": "github:omnia-network/ic-websocket-sdk-js#5995efdef8e68ffef104149c1c7447771c3f911b",`
+   - which is the latiest versoin from github.
+and I am facing an issue when I import `generateRandomIdentity` from it
+- I also tried version `68412f03bc3040ce89d63ae13a59917a3e81278f` from the tutorial but the same issue.
+![Screenshot 2023-10-15 at 3.37.10 AM|690x457](upload://tAbHmesHWSDoxXz5mh5CHiSrk6Q.png)
+
+
+Did U already tested the new package?
+
+-------------------------
+
+ilbert | 2023-10-15 08:44:52 UTC | #17
+
+The correct **ic-websocket-js** version to use is the https://github.com/omnia-network/ic-websocket-sdk-js/tree/68412f03bc3040ce89d63ae13a59917a3e81278f, as stated in the tutorial. Please don't use the main branch's version, as it's still not up to date with the latest changes to the protocol.
+
+This is the same version [used in the ic_websocket_example](https://github.com/omnia-network/ic_websocket_example/blob/ae5e942663223241f381f5c982061ae17cb8f694/src/ic_websocket_example_frontend/package.json#L20) and works as expected.
+
+Have you tried reinstalling the packages by deleting the `node_modules/` folder and running `npm install` again afterwards?
+
+-------------------------
+
+AliSci | 2023-10-16 00:32:26 UTC | #18
+
+Now, I am getting this error
+```
+Error: Failed while trying to deploy canisters.
+Caused by: Failed while trying to deploy canisters.
+  Failed to build all canisters.
+    Failed while trying to build all canisters.
+      The post-build step failed for canister 'bd3sg-teaaa-aaaaa-qaaba-cai' (ic_websocket_example_2_frontend) with an embedded error: Failed to build frontend for network 'local'.: The command '"npm" "run" "build"' failed with exit status 'exit status: 1'.
+Stdout:
+
+> ic_websocket_example_2_frontend@0.2.0 prebuild
+> dfx generate
+
+
+> ic_websocket_example_2_frontend@0.2.0 build
+> webpack
+
+asset index.js 1.61 MiB [compared for emit] (name: index) 1 related asset
+asset .ic-assets.json5 5.4 KiB [compared for emit] [from: src/ic_websocket_example_2_frontend/src/.ic-assets.json5] [copied]
+asset index.html 707 bytes [compared for emit]
+runtime modules 1.25 KiB 6 modules
+javascript modules 1.25 MiB
+  modules by path ./node_modules/ 1.25 MiB 209 modules
+  modules by path ./src/ 3.96 KiB 3 modules
+  optional modules 30 bytes [optional] 2 modules
+  + 3 modules
+json modules 161 KiB
+  ./node_modules/bip39/src/wordlists/czech.json 18.6 KiB [optional] [built] [code generated]
+  ./node_modules/bip39/src/wordlists/chinese_simplified.json 8.01 KiB [optional] [built] [code generated]
+  ./node_modules/bip39/src/wordlists/chinese_traditional.json 8.01 KiB [optional] [built] [code generated]
+  ./node_modules/bip39/src/wordlists/korean.json 17.7 KiB [optional] [built] [code generated]
+  ./node_modules/bip39/src/wordlists/french.json 20 KiB [optional] [built] [code generated]
+  + 6 modules
+
+ERROR in ./node_modules/@dfinity/identity-secp256k1/lib/cjs/hdkey.js 14:17-34
+Module not found: Error: Can't resolve 'crypto' in '/Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/identity-secp256k1/lib/cjs'
+
+BREAKING CHANGE: webpack < 5 used to include polyfills for node.js core modules by default.
+This is no longer the case. Verify if you need this module and configure a polyfill for it.
+
+If you want to include a polyfill, you need to:
+        - add a fallback 'resolve.fallback: { "crypto": require.resolve("crypto-browserify") }'
+        - install 'crypto-browserify'
+If you don't want to include a polyfill, you can use an empty module like this:
+        resolve.fallback: { "crypto": false }
+resolve 'crypto' in '/Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/identity-secp256k1/lib/cjs'
+  Parsed request is a module
+  using description file: /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/identity-secp256k1/package.json (relative path: ./lib/cjs)
+    Field 'browser' doesn't contain a valid alias configuration
+    resolve as module
+      /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/identity-secp256k1/lib/cjs/node_modules doesn't exist or is not a directory
+      /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/identity-secp256k1/lib/node_modules doesn't exist or is not a directory
+      /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/identity-secp256k1/node_modules doesn't exist or is not a directory
+      /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/@dfinity/node_modules doesn't exist or is not a directory
+      /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/node_modules doesn't exist or is not a directory
+      looking for modules in /Users/ahmed/Desktop/ic_websocket_example_2/node_modules
+        single file module
+          using description file: /Users/ahmed/Desktop/ic_websocket_example_2/package.json (relative path: ./node_modules/crypto)
+            no extension
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/crypto doesn't exist
+            .js
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/crypto.js doesn't exist
+            .ts
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/crypto.ts doesn't exist
+            .jsx
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/crypto.jsx doesn't exist
+            .tsx
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/crypto.tsx doesn't exist
+        /Users/ahmed/Desktop/ic_websocket_example_2/node_modules/crypto doesn't exist
+      /Users/ahmed/Desktop/node_modules doesn't exist or is not a directory
+      looking for modules in /Users/ahmed/node_modules
+        single file module
+          using description file: /Users/ahmed/package.json (relative path: ./node_modules/crypto)
+            no extension
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/node_modules/crypto doesn't exist
+            .js
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/node_modules/crypto.js doesn't exist
+            .ts
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/node_modules/crypto.ts doesn't exist
+            .jsx
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/node_modules/crypto.jsx doesn't exist
+            .tsx
+              Field 'browser' doesn't contain a valid alias configuration
+              /Users/ahmed/node_modules/crypto.tsx doesn't exist
+        /Users/ahmed/node_modules/crypto doesn't exist
+      /Users/node_modules doesn't exist or is not a directory
+      /node_modules doesn't exist or is not a directory
+ @ ./node_modules/@dfinity/identity-secp256k1/lib/cjs/secp256k1.js 10:32-50
+ @ ./node_modules/@dfinity/identity-secp256k1/lib/cjs/index.js 17:13-35
+ @ ./node_modules/ic-websocket-js/lib/esm/identity.js 1:0-67 3:11-40
+ @ ./node_modules/ic-websocket-js/lib/esm/index.js 5:0-27 5:0-27
+ @ ./src/ic_websocket_example_2_frontend/src/index.js 2:0-68 7:15-26 9:14-36
+
+webpack 5.88.2 compiled with 1 error in 1000 ms
+
+Stderr:
+Generating type declarations for canister ic_websocket_example_2_frontend:
+  src/declarations/ic_websocket_example_2_frontend/ic_websocket_example_2_frontend.did.d.ts
+  src/declarations/ic_websocket_example_2_frontend/ic_websocket_example_2_frontend.did.js
+  src/declarations/ic_websocket_example_2_frontend/ic_websocket_example_2_frontend.did
+Generating type declarations for canister ic_websocket_example_2_backend:
+  src/declarations/ic_websocket_example_2_backend/ic_websocket_example_2_backend.did.d.ts
+  src/declarations/ic_websocket_example_2_backend/ic_websocket_example_2_backend.did.js
+  src/ic_websocket_example_2_backend/ic_websocket_example_2_backend.did
+
+```
+
+-------------------------
+
+ilbert | 2023-10-16 07:10:06 UTC | #19
+
+Have your tried installing [@dfinity/identity-secp256k1](https://www.npmjs.com/package/@dfinity/identity-secp256k1) package as a dependency?
+
+```bash
+npm install @dfinity/identity-secp256k1@0.19.2
+```
+
+I've also updated the tutorial.
+
+The fact that ic-websocket-js is still not published on npm gives us all these dependencies errors, so please be patient.
+
+-------------------------
+
+AliSci | 2023-10-17 00:35:16 UTC | #20
+
+[quote="ilbert, post:19, topic:22574"]
+ic-websocket-js
+[/quote]
+
+Ok when U publish on `ic-websocket-js` on npm I will use it then I really wish to keep trying but I can't afford this. However, thank you so much for your help and for the websocket package really great job.
+
+-------------------------
+
+iamenochchirima | 2023-10-17 06:08:26 UTC | #21
+
+Hi @AliSci , Can you please try installing those packages
+`npm install crypto` and `npm install crypto-browserify`
+
+And then add this to you webpack.config:
+
+  `crypto: require.resolve("crypto-browserify"),`, under fallback.
+
+That was the fix in my case.
+
+-------------------------
+
+AliSci | 2023-10-18 01:08:52 UTC | #22
+
+```
+index.js:43838 Refused to connect to 'ws://127.0.0.1:8080/' because it
+```
+![Screenshot 2023-10-18 at 4.06.46 AM|690x406](upload://8C0ZQg28q39McRhiJYcEAxeJr2m.jpeg)
+![Screenshot 2023-10-18 at 4.07.31 AM|690x414](upload://9Ss3xGaacJ5jBYSlhthMucRtJlS.png)
+
+-------------------------
+
+iamenochchirima | 2023-10-18 05:51:13 UTC | #23
+
+Hi @AliSci , I think @ilbert will provide a more detailed and even more correct and precise response,  but for the mean time I'll just share what I think is the issue here. Please try to revisit Step 4: on the medium tutorial, specifically the part of removing `.ic-assets.json5` file, if you have already removed it, try removing the the dist directory and redeploy. Or you can try to modify the .ic-assets.json5 file  by adding this `ws://127.0.0.1:8080/` at the `Content-Security-Policy` line at `connect-src 'self'` like this `connect-src 'self' https://icp0.io https://*.icp0.io ws://127.0.0.1:8080/`. If you have 2 assets.json5, do this in both of them, and redeploy. 
+Also, for quick testing locally, I think you might be able to temporarily avoid this issue by using npm start instead using this local replica url, you might want to try that as well.
+
+As for the `Uncaught ReferenceError: IDL is not defined` error, I'm not really sure what could be going wrong there without seeing the code.
+
+-------------------------
+
+ilbert | 2023-10-18 07:15:16 UTC | #24
+
+@iamenochchirima you explained the `Content-Security-Policy` solution correctly!
+
+
+Regarding this error, instead:
+[quote="iamenochchirima, post:23, topic:22574"]
+As for the `Uncaught ReferenceError: IDL is not defined` error, I’m not really sure what could be going wrong there without seeing the code.
+[/quote]
+you just need to import IDL from **@dfinity/candid** to solve it:
+```typescript
+import { IDL } from "@dfinity/candid";
+```
+The tutorial is not so clear on this point, we're updating it.
+
+-------------------------
+
+ilbert | 2023-10-18 07:18:45 UTC | #25
+
+By the way, we've published the packages on the registries :tada: :
+
+- **JS SDK**: https://www.npmjs.com/package/ic-websocket-js
+- **Rust CDK**: https://crates.io/crates/ic-websocket-cdk
+
+Motoko CDK will soon be published on [mops](https://mops.one).
+
+Please expect frequent (minor) updates in the next weeks.
+
+-------------------------
+
+ilbert | 2023-10-18 07:21:16 UTC | #26
+
+And we've opened a [Discord server](https://discord.gg/yBaGTkSvZ8) for everything related to IC WebSockets, see you also there!
+
+-------------------------
+
+ilbert | 2023-10-18 17:48:43 UTC | #27
+
+Check this out guys!
+https://forum.dfinity.org/t/ic-websocket-stable-release/23872
+
+-------------------------
+
+AliSci | 2023-10-19 00:42:43 UTC | #28
+
+[quote="ilbert, post:24, topic:22574"]
+```
+import { IDL } from "@dfinity/candid";
+```
+[/quote]
+@ilbert 
+Oh my gosh it works now>>> thank you so much guys.
+One last thing please
+I want to make and update method like this
+```rs
+#[update]
+fn send_message(text: String) {
+...
+}
+```
+which take a string and just send a message how can I achieve that?
+
+-------------------------
+
+ilbert | 2023-10-19 07:12:57 UTC | #29
+
+[quote="AliSci, post:28, topic:22574"]
+I want to make and update method like this
+
+```
+#[update]
+fn send_message(text: String) {
+...
+}
+```
+
+which take a string and just send a message how can I achieve that?
+[/quote]
+
+To send a message from the canister to a connected client (*you must know its principal*), you can simply use the `ws_send` method! In your case:
+```rust
+#[update]
+fn send_message(text: String) -> ic_websocket_cdk::CanisterWsSendResult {
+    let msg_bytes = candid::encode_one(&text).unwrap();
+    // here you need to get the client's principal to which you want to send the message to
+    // the client must be connected to the canister via WebSocket
+    let client_principal = ...;
+    ic_websocket_cdk::ws_send(client_principal, msg_bytes)
+}
+```
+
+We also did something similar for the canister that we use in the integration tests, to programmatically make the canister send a bunch of messages to a connected client:
+https://github.com/omnia-network/ic-websocket-cdk-rs/blob/v0.1.3/tests/src/lib.rs#L84-L93
+
+-------------------------
+
+AliSci | 2023-10-22 01:45:36 UTC | #30
+
+[quote="ilbert, post:29, topic:22574"]
+`client_principal: ClientPrincipal`
+[/quote]
+
+ok so u mean in the frontend I should 
+```js
+const authClient = await AuthClient.create();
+const client_principal = authClient.princpal();
+// then call my actor
+await websocket_backend.send_message(client_principal,message);
+```
+
+-------------------------
+
+ilbert | 2023-10-22 08:03:51 UTC | #31
+
+You should record the client's principal once it connects to the canister and the **on_open** callback is fired, like we do in the test canister in the gateway repo:
+https://github.com/omnia-network/ic-websocket-gateway/blob/c3d835fd265b3110de7f2747af25eee71d53b5aa/tests/test_canister_rs/src/test_canister_rs/src/canister.rs#L26-L37
+
+This way, you can map the connected clients' principals with some data/identifiers you use in your canister, so that you can look for them later to know their principal and properly call the [ic_websocket_cdk::ws_send](https://docs.rs/ic-websocket-cdk/0.1.3/ic_websocket_cdk/fn.ws_send.html) method.
+
+What is your use case here? Who is supposed to call the `send_message` update method? If it's the client itself, it doesn't make sense because the flow becomes:
+- client calls `send_message` with its principal to make the canister send a message
+- canister sends a message to that principal
+- same client receives that message :thinking: 
+
+If you instead want to send a message **from the client to the canister**, you should use the `send` method of the IcWebSocket JS instance (see the [example](https://github.com/omnia-network/ic_websocket_example/blob/b87fc372f819b2fcba97cebea36265b2c2f1ecea/src/ic_websocket_example_frontend/src/main.ts#L105) for reference), like you would do in a traditional websocket application.
+
+-------------------------
+
+AliSci | 2023-10-24 01:25:29 UTC | #32
+
+```js
+ws.onmessage = async (event) => {
+    console.log("Received message:", event.data);
+
+    // serialize the message with candid before sending it
+    const messageToSend = IDL.encode([AppMessageIdl], [
+        {
+            text: event.data.text + "-pong test message here",
+        }
+    ]);
+    ws.send(new Uint8Array(messageToSend));
+};
+````
+I got the `event.data` in form of array instead of text ? How can I parse that?
+
+-------------------------
+
+AliSci | 2023-10-24 01:30:31 UTC | #33
+
+also I can do channel messages? right? because I want to a send a message to a group of people not just one person .
+
+-------------------------
+
+AliSci | 2023-10-24 01:34:28 UTC | #34
+
+One more issue when I send a message it send fine , but when i send another message to the same `client_principal` again it shows 
+```
+"client with principal yqohg-fuhxk-4j44w-rzoqt-ma5qb-fio7j-5mk26-am4ql-crjqw-z23uj-mae doesn't have an open connection"'
+```
+
+-------------------------
+
+ilbert | 2023-10-24 08:41:11 UTC | #35
+
+As [we do in the example](https://github.com/omnia-network/ic_websocket_example/blob/d7230150fc49c87658b66dab0eb5528a742900ee/src/ic_websocket_example_frontend/src/utils/idl.ts#L14), you can do it by simply using the IDL.decode function:
+```typescript
+const receivedMessage = IDL.decode([AppMessageIdl], event.data)[0] as unknown as AppMessage;
+```
+
+From the next minor release, you won't have to do it anymore as we'll handle serialization and deserialization automatically for you in the JS client.
+
+-------------------------
+
+ilbert | 2023-10-24 08:45:08 UTC | #36
+
+As of right now, you can't have channels in IC WebSocket. But you can easily handle them by creating custom maps `group_id`->`client_principal` and adding clients accordingly when the `on_open` callback is fired. Then, when you want to send a message to a group of client, you can simply iterate on the map entries and invoke the `ws_send` for each `client_principal`. Does this help?
+
+-------------------------
+
+ilbert | 2023-10-24 08:49:21 UTC | #37
+
+This is a weird error. Can you please paste here the piece of code that generates it and the full logs?
+I'm expecting that on the client side there are some logs (most likely errors) that should tell you why the IC WebSocket connection has been closed.
+
+We also send messages in batches to the same client in our integration tests, without getting any error:
+https://github.com/omnia-network/ic-websocket-cdk-rs/blob/a12e00b919170eab6cb3f6dbed78b1446e3dc666/tests/src/lib.rs#L86-L91
+
+-------------------------
+
+AliSci | 2023-10-26 09:21:22 UTC | #38
+
+Bro thank you so much I achieved my milestone now. I will also make a video tutorial for that to help other people.
+
+-------------------------
+
+ilbert | 2023-10-26 18:11:33 UTC | #39
+
+:tada: That's great @AliSci! Let's also have a chat together if you like! Feel free to book a session on my calendar: https://cal.com/lucabertelli/ic-websocket.
+
+-------------------------
+

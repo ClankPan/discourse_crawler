@@ -1,0 +1,214 @@
+lara | 2023-08-28 18:47:31 UTC | #1
+
+***TL;DR** This post proposes to update the voting eligibility definition in the NNS and SNS governance so that only neurons with positive voting power are allowed to vote. Currently, there are some edge cases where neurons without stake can cast a vote with zero voting power.*
+
+# Background on voting
+
+In the NNS and SNS governance, voting currently works as follows: anyone with an eligible neuron that has enough stake to pay for the proposal fee can submit a proposal. At the proposal submission time, the governance canister will create a ballot for each eligible neuron that stores the neuron’s voting power at this point in time. This results in all neurons voting on a proposal with the voting power that they had at the time when the proposal was submitted.
+
+For this process, the following definitions of eligibility and voting power are currently used.
+* A neuron is eligible to vote if its dissolve delay is greater or equal than the minimum dissolve delay. This design ensures that only those neurons can vote who are committed to the DAO and thus incentivized to vote in the long-term interest of the DAO.
+  * In the NNS this minimum dissolve delay is 6 months.
+  * For SNSs, each SNS community can set this value as part of the governance configurations. See the [developer documentation on nervous system parameters](https://internetcomputer.org/docs/current/developer-docs/integrations/sns/managing/managing-nervous-system-parameters) for more details.
+* A neuron’s voting power is defined by the neuron’s stake multiplied by a bonus if the neuron has a dissolve delay and a bonus if the neuron has age: `neuron_stake * dissolve_delay_bonus * age_bonus`.
+  * In the NNS, the dissolve delay bonus is a linear function of the dissolve delay with values between 1 (for zero dissolve delay) and 2 (for 8 years dissolved delay). The age bonus in the NNS is a linear function with values between 1 for no age and 1.25 for an age of 4 years. See [here](https://internetcomputer.org/docs/current/developer-docs/integrations/sns/tokenomics/rewards/#recap-on-nns-voting-rewards) for more details.
+  * For SNSs, each SNS community can set this value as part of the governance configurations. See the [developer documentation on nervous system parameters](https://internetcomputer.org/docs/current/developer-docs/integrations/sns/managing/managing-nervous-system-parameters) for more details.
+
+# **Drawback of the current definition**
+
+According to the current definition, the decision whether to create a ballot for a neuron is only considering the minimum dissolve delay. This has the effect that ballots may be created for neurons that do not have any stake and hence do not have any voting power.
+To illustrate this on an example in the NNS, consider the following use case:
+
+1. Alice dissolves her NNS neuron and disburses the staked tokens into an account.
+2. Since disbursed neurons are not deleted, Alice increases the dissolve delay of the neuron to 1 year. (Note that neurons with zero stake and zero maturity are not displayed on the [NNS frontend dapp](https://nns.ic0.app/), but Alice can do so if she manages her neuron with a command line tool such as [quill](https://github.com/dfinity/quill/tree/master) as the neuron still exists in the backend canister).
+3. Bob submits a proposal. The governance canister will check Alice’s neuron and see that its dissolve delay is more than 6 months (in [this check](https://github.com/dfinity/ic/blob/2f9686d00de12d8e1fb1688dd07f24fb0e065af1/rs/nns/governance/src/governance.rs#L5618)). Hence, a ballot is created for Alice’s neuron.
+4. Alice can cast a vote on Bob’s proposal. This vote will not count towards the result as Alice does not have any voting power due to her neuron’s stake being zero. However, Alice’s vote may still have an indirect effect on the voting result through following: if Charlie is following Alice on the topic of this proposal, then Alice’s voting will trigger a vote being cast for Charlie. Moreover, although Alice’s vote does not have an effect, casting it will use cycles in the SNS governance canister.
+
+The main concern is that while the eligibility definition should ensure that only neurons committed to the DAO can vote, the current design allows neurons with no stake, and thus no commitment to the DAO, to vote.
+Moreover, these ballots consume resources: the casting of votes for such neurons uses cycles in the case of SNS DAOs (NNS canisters do not use any cycles) and, even if no votes are cast, the ballots use memory.
+
+# **New proposed definitions**
+
+For the above reasons, we propose to update the definition of eligibility to vote as follows:
+
+* **A neuron should be eligible to vote if its dissolve delay is greater or equal than the minimum dissolve delay AND if it has positive voting power.** This definition implies that only neurons with stake and hence neurons that are committed to the DAO are allowed to vote and influence the voting result. 
+  * In the NNS, this would mean that only neurons with at least 6 months dissolve delay and some stake are eligible to vote.
+  * For SNSs, this would mean that only neurons with the minimum dissolve delay as chosen in the SNS’s [nervous system parameters](https://internetcomputer.org/docs/current/developer-docs/integrations/sns/managing/managing-nervous-system-parameters) that also have some stake can vote.
+* A neuron’s voting power would still be defined as it is now.
+
+# **How this changes behavior**
+
+Note that this change would not have an effect on voting for any neurons that have positive stake.
+It would also not change any APIs as voting power is still defined in the same way.
+
+The only differences are:
+* Neurons with zero stake: cannot vote anymore.
+  * This includes neurons that have zero stake because they submitted a proposal and the proposal fee was subtracted from their effective stake.
+* Neurons who follow a neuron that votes but has zero stake (similar to the neuron of Charlie in the above example): will not vote automatically. The behavior of the following neuron is then similar to
+  * following a neuron that has a dissolve delay lower than the minimum needed for voting, for example a dissolved neuron.
+  * following a neuron that does not vote.
+
+# **Proposed Next Steps**
+
+We propose to discuss these changes in this forum thread. If there is consensus, we plan to implement them in NNS governance and SNS governance and to propose them to the NNS in regular releases of those canisters.
+
+We are looking forward to your questions and suggestions!
+
+-------------------------
+
+wpb | 2023-08-29 02:14:43 UTC | #2
+
+Wow, this is a very interesting edge case.  Well done on clearly presenting the issue @lara .  I have no concerns about the proposed solution.  It seems like a logical path forward.
+
+-------------------------
+
+Seers | 2023-08-29 07:46:23 UTC | #3
+
+Hi @lara: 
+- Do you know what is the impact in VP? 
+- How much resources are these neurons using? 
+
+Without this information I would prefer to reject this proposal, just to be safe. Also, I kind of like the idea that someone without a stake can have VP.
+
+-------------------------
+
+krzysztofzelazko | 2023-08-29 08:35:29 UTC | #4
+
+@lara, I propose automatic wiping of neurons with a 0 stake.
+There are many NNS neurons that were only created with the "Spawn neuron" option for maturity disburse and they also take up space in the memory.
+
+-------------------------
+
+lara | 2023-08-29 12:37:17 UTC | #5
+
+Thanks for the feedback!
+
+> * Do you know what is the impact in VP?
+> * How much resources are these neurons using?
+
+We don't know the details but have a task to evaluate this more if this is needed.
+I was wondering though how relevant the exact numbers are in the following sense: *if* we think that the current implementation does not satisfy the intended incentive systems, then it might make sense to consider this change no matter how many neurons are affected. 
+Of course maybe the community just disagrees with the intent itself.
+As mentioned we already have a task to evaluate this, so if people think this is important we can think about how we could find out more.
+
+>Without this information I would prefer to reject this proposal, just to be safe.
+
+Could you maybe elaborate on what you think might be unsafe? Do you mean that the risk is that some neurons would not vote anymore as they were following neurons without stake? 
+Maybe you can explain more why you think that would be bad/risky? The neurons could just follow other neurons when they notice this, right? 
+I just wonder if I miss an argument here. In my option it is in a neuron's interest to follow a neuron that has some stake in the game and therefore is incentivices to vote in the long-term interest of the DAO. This might be an opportuinty for neurons to notice if their followees do not satisfy this and adjust their settings accordingly.
+
+> Also, I kind of like the idea that someone without a stake can have VP.
+
+Just to make sure there are no misunderstandings: neurons without stake also have no voting power. But maybe you refer to the indirect voting power they have through following?
+Can you maybe elaborate on why you think this is a beneficial property?
+
+-------------------------
+
+lara | 2023-08-29 12:49:14 UTC | #6
+
+Thanks for the idea!
+Indeed, we plan to look into this in a separate effort.
+
+However, I don't think this would fully solve the discussed issue due to some cases where a neuron should not be wiped even though it has zero stake:
+* If a neuron makes a proposal, due to the fee that is accounted at proposal submission, the neuron might have zero stake for a bit but might have stake again when the proposal is adopted (as only rejectes proposals have the cost). During the proposal time, such neurons should not be wiped. 
+* There might be neurons with (unstaked) maturity but zero stake. These neurons should not be wiped as they still have some use.
+
+Therefore I think we still have to treat the case of zero-stake neurons.
+
+-------------------------
+
+Seers | 2023-08-29 16:25:33 UTC | #7
+
+Hey @lara, thanks for the detailed unpacking.
+
+[quote="lara, post:5, topic:22433"]
+Of course maybe the community just disagrees with the intent itself.
+[/quote]
+Yes, in my case, I don't see an issue with allowing somebody to vote with no stake, as they can vote with a very low stake regardless. What would be the minimum? Non-zero? 1 ICP? Can it increase? I feel it's better to no draw any line. In terms of code, I find it simpler as it currently stands, because you don't have to handle two cases. 
+
+That's why I was expecting to see information indicating that they consume excessive resources, which would suggest that making the change is better. However, I suppose the same reasoning applies to neurons with very low stakes.
+> 
+> Could you maybe elaborate on what you think might be unsafe? Do you mean that the risk is that some neurons would not vote anymore as they were following neurons without stake?
+
+Yes, it would be nice to check that there is no neuron without stake but with high VP. Probably it's easy to verify this. Noticing the change might take some time and in general it's better to avoid VP changes triggered by code updates.
+
+> 
+> In my option it is in a neuron’s interest to follow a neuron that has some stake in the game and therefore is incentivices to vote in the long-term interest of the DAO...
+ 
+> Can you maybe elaborate on why you think this is a beneficial property?
+
+I think that if the minimum stake is too low, it doesn't matter. If it's too high, some people might label it as a plutocracy. For example, consider a highly knowledgeable scientist with many followers who wants to share their opinion and vote but isn't interested in holding tokens. 
+
+But It's just a minor detail.
+
+
+ 
+> 
+> But maybe you refer to the indirect voting power they have through following?
+
+Yes, indirect VP.
+
+Thanks for taking the time!
+
+-------------------------
+
+justmythoughts | 2023-08-29 16:43:45 UTC | #8
+
+If neurons are choosing to follow the dissolved neuron that has 0 ICP, I’m not sure I see the issue.
+
+I believe it’s up to neuron followees to make this decision, anything else feels like a “gotya” for passive voters (say the DFINITY neuron dissolves & restakes in a different neuron).
+
+-------------------------
+
+lara | 2023-08-29 17:58:24 UTC | #9
+
+Thanks for taking the time to add further clarifications. I think I now understand you point of view a lot better!
+
+-------------------------
+
+Accumulating.icp | 2023-08-29 19:16:37 UTC | #10
+
+Thank you for providing this information @lara ,
+
+I have a question regarding the implication of this to my Named Neuron in light of this change.
+
+My Named Neuron falls within one of these edge cases - being a merged neuron. The name neuron had the ICP “removed” & it was added into another. As such, this resulted in the Named Neuron becoming an “invisible neuron” (not viewable from NNS UI as it has 0 ICP & VP). 
+
+My short term solution for this, was to configure it to follow my (new) neuron, which then directs the (invisible) empty neuron to cast its 0 VP vote, which in turn triggered the voting power of the named neuron. 
+
+It seems that the positive voting power adjustment disables this setup - would it be possible to create a “view empty neuron” button within the UI that shows these neurons, making them easily manageable, rather than having to work through quill to “solve” these issues? Is there an alternative recommended work around that would be more time efficient (from a user perspective)?
+
+-------------------------
+
+wpb | 2023-08-29 22:43:18 UTC | #11
+
+Have you tried sending 1 ICP to the account associated with your named neuron?  Since the neuron exists and it is just invisible to the dashboard because it has zero ICP, then it seems you should be able to top it up by sending ICP to the account.
+
+-------------------------
+
+Accumulating.icp | 2023-08-30 01:21:11 UTC | #12
+
+Thanks for the recommendation - I personally solved the issue via quill, however I imagine that this could also be a valid solution to retrieve the UI within the NNS (that will probably be much easier & less time consuming).
+
+-------------------------
+
+wpb | 2023-08-30 01:41:22 UTC | #13
+
+Ah even better since you can use quill to control the neuron.  You can verify that you can still query private information about your neuron by using the list-neurons command in quill.  Then you can get the account ID for your neuron using the public-ids command in quill.  Then you can send ICP to that account ID using the NNS dApp.  Finally, you need to use the neuron-stake command in quill to initiate the top up.  If it works, then you will be able to vote directly with that neuron or add a hotkey to an NNS dApp controlled neuron to vote using the NNS dApp.
+
+-------------------------
+
+kvic | 2023-09-01 03:24:45 UTC | #14
+
+Great work on bringing this to everyone's attention. Should it not apply to anyone creating a discussion or responding?
+
+-------------------------
+
+lara | 2023-09-08 13:22:36 UTC | #15
+
+Thanks everyone for participating in this discussion with questions, ideas, and opinions! 
+It sounds like at this point there is no clear consensus whether this change would be beneficial. 
+I therefore suggest that we don't proceed with the change right now and think a bit more about potential gains and drawbacks.
+
+-------------------------
+

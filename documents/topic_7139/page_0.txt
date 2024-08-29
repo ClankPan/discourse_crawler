@@ -1,0 +1,178 @@
+heldrida | 2021-09-10 14:35:38 UTC | #1
+
+Hi,
+
+I'd like to find a working example of a client-side call to the IC Management API, canister_status endpoint, using the @dfinity/agent library.
+
+Currently, I get the following error:
+
+```js
+Uncaught (in promise) Error: Call was rejected:
+  Request ID: fcd619917bbae7a933d8d1333d5ad154d42cc5087f933885a7802c9f9663ce35
+  Reject code: 
+  Reject text: Canister xxxxx has no update method 'canister_status'
+```
+
+Used a partial idl factory for the ic management API:
+
+```
+      const idlFactory = ({ IDL }) => {
+        // eslint-disable-next-line camelcase
+        const canister_id = IDL.Principal;
+        // eslint-disable-next-line camelcase
+        const definite_canister_settings = IDL.Record({
+          freezing_threshold: IDL.Nat,
+          controllers: IDL.Vec(IDL.Principal),
+          memory_allocation: IDL.Nat,
+          compute_allocation: IDL.Nat,
+        });
+        return IDL.Service({
+          canister_status: IDL.Func(
+            [IDL.Record({ canister_id })],
+            [
+              IDL.Record({
+                status: IDL.Variant({
+                  stopped: IDL.Null,
+                  stopping: IDL.Null,
+                  running: IDL.Null,
+                }),
+                memory_size: IDL.Nat,
+                cycles: IDL.Nat,
+                settings: definite_canister_settings,
+                module_hash: IDL.Opt(IDL.Vec(IDL.Nat8)),
+              }),
+            ],
+            [],
+          ),
+        });
+      };
+```
+
+The call is made through the @dfinity/agent, with my own identity in which controls the target (effective) canister id. Initially, used the `aaaaa-aa`, but after reading ( https://sdk.dfinity.org/docs/interface-spec/index.html#http-effective-canister-id ), used the target canister id (effective canister id).
+
+A working example would be nice, it's been a bit boring as I was expecting it to be a bit simpler and the dfx command (ok that the target canister id is not passed as an argument to the call).
+
+```sh
+dfx canister --network=ic --no-wallet call aaaaa-aa canister_status "(record { canister_id= principal \"xxxxx\" })"
+```
+
+-------------------------
+
+peterparker | 2022-03-31 12:18:48 UTC | #2
+
+Late to the party but since I implemented this today here's my solution.
+
+1. Get the interface spec - the [id.did](https://github.com/dfinity/interface-spec/blob/700213318abb873c4db891da06cb3c28ced73638/spec/ic.did) file
+2. Generate `did.d.ts` and `did.js` from Candid file, for example with [Canlista](https://k7gat-daaaa-aaaae-qaahq-cai.ic0.app/docs/) UI
+3. The typescript code:
+
+```
+import {CallConfig, Identity} from '@dfinity/agent';
+import {Principal} from '@dfinity/principal';
+import {_SERVICE as IcManagerActor} from '../../canisters/ic/ic.did';
+import {idlFactory as IcManagerFactory} from '../../canisters/ic/ic.utils.did';
+import {createActor} from '../../utils/actor.utils';
+import {getIdentity} from '../auth/auth.providers';
+
+const MANAGEMENT_CANISTER_ID = Principal.fromText('aaaaa-aa');
+
+// Source nns-dapp - dart -> JS bridge
+const transform = (_methodName: string, args: unknown[], _callConfig: CallConfig) => {
+  const first = args[0] as any;
+  let effectiveCanisterId = MANAGEMENT_CANISTER_ID;
+  if (first && typeof first === 'object' && first.canister_id) {
+    effectiveCanisterId = Principal.from(first.canister_id as unknown);
+  }
+  return {effectiveCanisterId};
+};
+
+const createIcManagerActor = ({identity}: {identity: Identity}): Promise<IcManagerActor> => {
+  return createActor<IcManagerActor>({
+    config: {
+      canisterId: MANAGEMENT_CANISTER_ID,
+      callTransform: transform,
+      queryTransform: transform
+    },
+    idlFactory: IcManagerFactory,
+    identity
+  });
+};
+
+export const canisterStatus = async (canisterId: string) => {
+  // authClient?.getIdentity();
+  const identity: Identity | undefined = getIdentity();
+
+  if (!identity) {
+    throw new Error('No internet identity to get canister status');
+  }
+
+  const actor: IcManagerActor = await createIcManagerActor({identity});
+
+  const response = await actor.canister_status({
+    canister_id: Principal.fromText(canisterId)
+  });
+
+  console.log(response);
+
+  // note: if error 403 => user is not the controller of the canister
+};
+```
+
+Note: I assume it works out. At the end of the day I am not going to use following code for my app because your identity needs to be the controller for the canister to query it which is not my use case 🤪
+
+-------------------------
+
+peterparker | 2023-09-01 04:45:36 UTC | #3
+
+Update: since few months there is now a JS library - parts of ic-js - for interfacing with the IC: https://github.com/dfinity/ic-js/tree/main/packages/ic-management
+
+To get the status it's now as easy as following:
+
+```
+import { ICManagementCanister } from "@dfinity/ic-management";
+import { createAgent } from "@dfinity/utils";
+
+const agent = await createAgent({
+  identity,
+  host: HOST,
+});
+
+const { canisterStatus } = ICManagementCanister.create({
+  agent,
+});
+
+const { status, memory_size, ...rest } = await canisterStatus(YOUR_CANISTER_ID);
+```
+
+-------------------------
+
+sea-snake | 2023-09-01 08:39:00 UTC | #4
+
+Is this the same status as you can get from `CanisterStatus`?
+
+https://github.com/dfinity/agent-js/blob/ac767561bd50882734c75572c7a0c36b663ffcf7/e2e/node/basic/canisterStatus.test.ts#L4
+
+-------------------------
+
+peterparker | 2023-09-01 10:04:49 UTC | #5
+
+Not sure about the content but, at least from the response no. That agent-js function returns a Map, the ic-js library returns structured data decoded with candid.
+
+The `@dfinity/ic-management` exposes also more features - i.e. all features available to manage a canister:
+
+* [create](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-create)
+* [createCanister](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-createcanister)
+* [updateSettings](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-updatesettings)
+* [installCode](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-installcode)
+* [uninstallCode](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-uninstallcode)
+* [startCanister](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-startcanister)
+* [stopCanister](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-stopcanister)
+* [canisterStatus](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-canisterstatus)
+* [canisterInfo](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-canisterinfo)
+* [deleteCanister](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-deletecanister)
+* [provisionalCreateCanisterWithCycles](https://github.com/dfinity/ic-js/tree/main/packages/ic-management#gear-provisionalcreatecanisterwithcycles)
+
+Shout-out to @NathanosDev for contributing to that particular lib.
+
+-------------------------
+

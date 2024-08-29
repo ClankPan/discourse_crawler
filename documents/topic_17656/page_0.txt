@@ -1,0 +1,302 @@
+saikatdas0790 | 2022-12-26 12:54:21 UTC | #1
+
+When using stable-structures' stable BTreeMap, we need to specify the max size for the key and value as shown here:
+https://github.com/dfinity/stable-structures/blob/3d22d483b9c55b79f7b869e3cf930883687d9fda/examples/src/vecs_and_strings/src/lib.rs#L13-L14
+
+Can we increase the allocated size for the value post creation?
+
+My use case is, right now I am storing a custom struct with 2 fields currently and I've specified the max size for it now. But, in the future, I might be looking to add another field to the custom struct. To do that, I might need to increase the size of the value to accommodate the new field? Is this possible and will this work?
+
+Secondly, can I drop an existing stable BTreeMap and remove it from the memory? Additionally, I remember from a conversation with @ulan, canisters can right now only grow their memory usage and not free up unused stable memory, hence not pay for storage not being used.
+
+What's the behaviour for stable BTreeMap? Is there a way to drop an existing collection? Can the allocated stable memory for it be reused by another collection?
+
+Having these details added to the docs/examples would be really helpful.
+
+@ielashi Thoughts?
+
+-------------------------
+
+ielashi | 2022-12-28 00:47:33 UTC | #2
+
+[quote="saikatdas0790, post:1, topic:17656"]
+Can we increase the allocated size for the value post creation?
+
+My use case is, right now I am storing a custom struct with 2 fields currently and I’ve specified the max size for it now. But, in the future, I might be looking to add another field to the custom struct. To do that, I might need to increase the size of the value to accommodate the new field? Is this possible and will this work?
+[/quote]
+
+This is currently not possible unfortunately. Once you've set a max key/value size, these cannot be increased, so if you anticipate adding more fields, you have three options:
+
+1) Set a large value size in advance to accommodate future fields. This is the simplest and what I'd recommend.
+2) Add a new BTree containing the new fields. For example, if you currently have a `BTreeMap<K, V1>` and you want to add a field `V2`, you can introduce a `BTreeMap<K, V2>` to add the new value.
+3) Migrate to a new BTree containing the updated fields and max sizes, perhaps by writing a `heartbeat` that migrates a few entries on each round. This is the most complex of the solutions, but still manageable.
+
+Point 3 above brings me to your second question:
+
+[quote="saikatdas0790, post:1, topic:17656"]
+Secondly, can I drop an existing stable BTreeMap and remove it from the memory? Additionally, I remember from a conversation with @ulan, canisters can right now only grow their memory usage and not free up unused stable memory, hence not pay for storage not being used.
+[/quote]
+
+It is correct that memory at the moment cannot shrink, but there's no technical reason to not allow this in the future. If you're using the `MemoryManager` for your stable structures, you can reinitialize a `BTreeMap` (hence, dropping the existing collection), by using `StableBTreeMap::new`, which overwrites whatever `StableBTreeMap` that was already there, so this allows you to reuse a memory that was previously allocated by a prior `StableBTreeMap`, but it won't shrink your canister's memory.
+
+-------------------------
+
+saikatdas0790 | 2023-01-08 12:19:36 UTC | #3
+
+Hi @ielashi,
+
+Another quick question.
+
+[quote="ielashi, post:2, topic:17656"]
+Set a large value size in advance to accommodate future fields. This is the simplest and what I’d recommend.
+[/quote]
+
+If I'm doing this right now and let's say the value being stored in the map contains a struct with 2 fields.
+
+In the future, updating to a struct with 3 fields is just adding the field to the existing struct, right? Or, are there other considerations to be made?
+
+Specifically:
+- What happens to existing entries that are currently stored with the 2 fields? 
+- When fetched, do they panic or do they simply use some sort of default value that I can specify? 
+- Is there a prescribed mechanism to go and backfill older entries with the newly created third field on the struct?
+
+-------------------------
+
+mparikh | 2023-01-08 17:32:45 UTC | #4
+
+[Edit]
+
+See if you can use protobuf driven optional values?
+And i suppose implement BondableStorage.
+
+And as for updating old entries in that context, there are two scenarios.
+
+(A) the fields in new entries are dependent on the fields in old entries...in which case you would need an intertrim data structure making both set of fields visible so that you can transform from old entry to new entry.
+
+(B) the fields in the new entries are independent from the old entries...in which case, you can simply ignore ("drop")  the fields in old entry that don't matter
+ The new fields in old entry will then be default.
+
+-------------------------
+
+saikatdas0790 | 2023-01-09 04:31:35 UTC | #5
+
+@mparikh Thank you for the inputs.
+
+[quote="mparikh, post:4, topic:17656"]
+See if you can use protobuf driven optional values?
+And i suppose implement BondableStorage.
+[/quote]
+
+I'm not quite sure, I understand. Would it be possible for you to provide a code snippet to illustrate this? Thank you :slight_smile:
+
+[quote="mparikh, post:4, topic:17656"]
+And as for updating old entries in that context, there are two scenarios.
+
+(A) the fields in new entries are dependent on the fields in old entries…in which case you would need an intertrim data structure making both set of fields visible so that you can transform from old entry to new entry.
+
+(B) the fields in the new entries are independent from the old entries…in which case, you can simply ignore (“drop”) the fields in old entry that don’t matter
+The new fields in old entry will then be default.
+[/quote]
+
+That's the thing. Instead of guessing likely behaviour, I'm checking with @ielashi because he's the author of the library and knows the exact behaviour. 
+This eliminates any guesswork and any opaque/confusing bugs in the future which might cause costly failures/downtime owing to unexpected behaviour
+
+-------------------------
+
+mparikh | 2023-01-09 05:36:41 UTC | #6
+
+suppose I want to model a blog 
+
+in my first attempt, my **v1** of blog looked, nominally, like
+
+```
+pub struct Blog {
+    pub created_ts: u32,
+    pub updated_ts: u32,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+}
+```
+
+And lets suppose that a  bunch of  **v1** Blogs were inserted into BTreeMap.
+
+Then in my **v2** of blog, I wanted to drop the updated_ts and add a contributor.
+
+i.e. my v2 looks like 
+
+
+```
+pub struct Blog {
+    pub created_ts: u32,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub contributor: String
+}
+```
+
+Then I insert a bunch of **v2** blogs. But with this data structure, how do I read the old (**v1**) version of blogs? And can I read some portions of **v2**  (such as title) if I have only have **v1**... are really the key questions.
+
+
+Assuming a protobuf implementation such as prost (https://lib.rs/crates/prost) , the **v1** of Blog could look like:
+
+
+```
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Blog {
+    #[prost(uint32, tag = "1")]
+    pub created_ts: u32,
+    #[prost(uint32, tag = "2")]
+    pub updated_ts: u32,
+    #[prost(string, tag = "3")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub body: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub author: ::prost::alloc::string::String,
+}
+```
+
+
+& the **v2** could look like
+```
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Blog {
+    #[prost(uint32, tag = "1")]
+    pub created_ts: u32,
+    #[prost(string, tag = "3")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub body: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub author: ::prost::alloc::string::String,
+
+    #[prost(string, tag = "6")]
+    pub contributor: ::prost::alloc::string::String,
+   
+}
+```
+
+Through the use of encode/decode on Blog, you would be able convince yourself that the serialization/deserialization does work as claimed. In the following snippet, I used the **v1** version of Blob to persist to file. This version is reading from file the **v1** but reading it as **v2**.
+
+```
+    let mut buf :Vec<u8> = Vec::new();    
+    let mut file = File::open("some.bin").unwrap();
+    let _x = file.read_to_end(&mut buf).unwrap();
+
+
+    let mut new_blog2 = Blog::decode(&*buf).unwrap();
+    println!("title after decoding --> {}", new_blog2.title);
+
+    new_blog2.contributor = "bob@acme.com".to_owned();
+
+```
+
+The next thing is integrating prost along with stable-structures...https://github.com/dfinity/stable-structures/tree/main/examples and look at Custom Types. The main thing is to implement Storable & BoundedStorable for Blog with relevant encode/decode.
+
+hth
+
+-------------------------
+
+ielashi | 2023-01-09 09:51:02 UTC | #7
+
+[quote="saikatdas0790, post:3, topic:17656"]
+In the future, updating to a struct with 3 fields is just adding the field to the existing struct, right? Or, are there other considerations to be made?
+
+Specifically:
+
+* What happens to existing entries that are currently stored with the 2 fields?
+* When fetched, do they panic or do they simply use some sort of default value that I can specify?
+* Is there a prescribed mechanism to go and backfill older entries with the newly created third field on the struct?
+[/quote]
+
+The answers to these questions is determined by your implementation of the `Storable` trait. As a reminder, storing a type in the `StableBTreeMap` requires implementing the `Storable` trait, which is defined as follows:
+
+```rust
+pub trait Storable {
+    /// Converts an element into bytes.
+    fn to_bytes(&self) -> Cow<[u8]>;
+
+    /// Converts bytes into an element.
+    fn from_bytes(bytes: Vec<u8>) -> Self;
+}
+```
+
+* If you have different versions of the same type, then your `from_bytes` implementation should detect these different versions and deserialize them accordingly.
+* I would avoid backfilling if possible as that adds unnecessary complications. Instead, consider making your new field optional or assigning a default value.
+
+@mparikh shared a great example using protobuf. Alternatively, if you're using a data format in the `Storable` trait that relies on `serde`, such as `ciborium`, then you can add easily add a new field by adding the `#[serde(default)]` directive.
+
+Here's an example where we add a new field `c` to the struct. `serde` will use the default value of `c` here, which is `0` in the case of `u64`:
+
+```
+// Before
+struct Data {
+  a: u64,
+  b: u64,
+}
+
+// After
+struct Data {
+  a: u64,
+  b: u64,
+
+  #[serde(default)]
+  c: u64, // old structs without this field will have a value of zero here.
+}
+
+// Or
+struct Data {
+  a: u64,
+  b: u64,
+
+  #[serde(default)]
+  c: Option<u64>, // old structs without this field will have a `None` here.
+}
+```
+
+-------------------------
+
+saikatdas0790 | 2023-01-09 15:30:50 UTC | #8
+
+Thank you so much for the detailed example. Definitely clarified what you pointed towards earlier.
+
+-------------------------
+
+saikatdas0790 | 2023-01-09 15:35:14 UTC | #9
+
+Got it. This answers my question completely.
+
+Am definitely leaning more towards providing defaults instead of doing more optional value checks at the call site. But depends on the field as well.
+
+I'm following along with the quick start example you provided above, so these instructions work really well for me as my implementation uses the exact same dependencies and mechanisms for serialization and deserialization.
+
+Thank you so much for clarifying.
+
+-------------------------
+
+Samer | 2024-03-04 19:29:43 UTC | #10
+
+@saikatdas0790 or anyone else
+
+I'm just wondering how much stable memory are people effectively utilizing in practice? 
+
+What I mean is: what is your ratio of:
+**stored data size** / **allocated stable storage for that data** 
+
+I have found that by implementing `Storable` with [Bounded fixed size](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/storable/enum.Bound.html) that is not a nice multiple of the [default bucket size](https://github.com/dfinity/stable-structures/blob/3c9c2e7b003d09168e6e9b18f8c14366bf6ba13b/src/memory_manager.rs#L63), my utilization is 60%. That is, I stored 6GB of data but the size of the **virtual memory** is 10GB.
+
+That's quite low, so we need to take into account the size of our values and possibly choose a [custom bucket size.](https://docs.rs/ic-stable-structures/latest/ic_stable_structures/memory_manager/struct.MemoryManager.html#method.init_with_bucket_size)
+
+@ielashi 
+Are there any plans for further customization of default chunk sizes and perhaps other optimazition options?
+
+-------------------------
+
+ielashi | 2024-03-06 15:11:45 UTC | #11
+
+@Samer Perhaps this question belongs better to a separate topic. Can you share the structure you're storing? I don't there's much of a correlation between your utilization percentage and the bucket size of the memory manager. What is strongly correlated is the page size that's used internally in BTreeMap, which can be different depending on the type you're storing.
+
+-------------------------
+

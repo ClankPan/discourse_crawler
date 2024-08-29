@@ -1,0 +1,152 @@
+jzxchiang | 2021-12-12 21:54:59 UTC | #1
+
+The [docs](https://smartcontracts.org/docs/base-libraries/Option.html#unwrap) say that `Option.unwrap` is unsafe and fails if the argument is null.
+
+Isn't that the point? It's much more convenient than some switch or do ? block when you actually want to trap if the argument is null. Not sure what I'm missing here.
+
+-------------------------
+
+rossberg | 2021-12-13 08:09:31 UTC | #2
+
+It's unsafe because it can trap unexpectedly. Of course, it is occasionally convenient, but the problem is that it is way _too_ convenient! In practice, that leads to programmers vastly overusing it, hiding many potential bugs in their programs, and essentially undermining all the extra safety that explicit option types are supposed to introduce in the first place.
+
+Null errors are by far the most common bug in most languages that enable them, which is why Hoare called the idea of implicit null his [billion dollar mistake](https://www.infoq.com/presentations/Null-References-The-Billion-Dollar-Mistake-Tony-Hoare/).
+
+In a language with explicit option types, if you are dealing with such an option type, you usually have reason to expect that it _can_ be null, and you should handle that case accordingly. Because in places where you "know" that null can't occur, the
+option type shouldn't be used in the first place.
+
+-------------------------
+
+kritzcreek | 2021-12-13 08:42:54 UTC | #3
+
+> In a language with explicit option types, if you are dealing with such an option type, you usually have reason to expect that it *can* be null, and you should handle that case accordingly. Because in places where you “know” that null can’t occur, the
+option type shouldn’t be used in the first place.
+
+If you find yourself having a hard time with writing code like that, I always like to recommend this blog post: ["Parse don't validate"](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/)
+
+It uses Haskell, but the ideas in it apply to most programming languages with a decent type system (which includes Motoko ;) ).
+
+-------------------------
+
+jzxchiang | 2021-12-14 07:34:58 UTC | #4
+
+Well, one example I've encountered where you "know" that a null can't occur:
+
+Imagine you have two maps:
+
+1. `Trie<UserId, UserProfile>`
+2. `Trie<CommentId, Comment>`
+
+where:
+
+```
+type Comment = {
+    ...
+    commentId: CommentId;
+    userId: UserId;
+};
+```
+Only logged in users (i.e. users with profiles) can comment, so `comment.userId` should always refer to a valid `userId` in the first map.
+
+So now imagine you have a query function like this:
+
+```
+public query func getCommenterProfile(commentId: CommentId): async ?UserProfile {
+    do ? {
+        let comment = Trie.find<CommentId, Comment>(commentMap, key(commentId), Text.equal)!;
+        let commenterProfile = Option.unwrap(
+            Trie.find<UserId, UserProfile>(userMap, key(comment.userId), Text.equal
+        );
+        commenterProfile;
+    };
+};
+```
+This is a situation I'd say makes more sense to use `Option.unwrap` for the second `Trie.find` instead of explicitly handling the null.
+
+Why? Because if the first `Trie.find` returns null, that's probably the user's fault, i.e. they passed in the wrong `commentId`.
+
+But if the second `Trie.find` returns null, that's the programmer's fault. At no point should there ever be a `userId` in a comment that points to a user with no profile, at least that's not the intent of the programmer. So in this case, `Option.unwrap` lets the programmer conveniently skip handling the null and simply trap if it does happen. Kind of like a 500 instead of a 400, which I thought fundamentally is the difference between trapping and returning null anyways.
+
+Sorry for the long-ish post. What do you think of this example? I encounter this a lot in my code.
+
+-------------------------
+
+rossberg | 2021-12-14 08:53:55 UTC | #5
+
+Oh, I am fully aware that there are examples like this. I encounter them, too. But the convenience of saving one line of code for such examples does not offset the terrible global effect that the existence of unwrap has.
+
+I have lost count of how many times I've seen questions along the lines of "How do I get rid of the `?`", and the first 3 replies being "unwrap". If it already isn't the first thing they find themselves when searching the library. Not just in Motoko, but in other similar languages, too. In most cases that's a fatally wrong "solution", but if you provide this primitive, it becomes the "obvious" one. Even experienced programmers (including myself at times) are regularly seduced into misusing it. Its convenience ruins the incentives to write correct code.
+
+FWIW, you could write your example as follows:
+```
+let ?commenterProfile = Trie.find<UserId, UserProfile>(userMap, key(comment.userId), Text.equal);
+```
+Then you'll also trap on null, but the compiler can still warn you that the null case isn't covered.
+
+-------------------------
+
+jzxchiang | 2021-12-15 02:12:17 UTC | #6
+
+[quote="rossberg, post:5, topic:9615, full:true"]
+FWIW, you could write your example as follows:
+```
+let ?commenterProfile = Trie.find<UserId, UserProfile>(userMap, key(comment.userId), Text.equal);
+```
+Then you'll also trap on null, but the compiler can still warn you that the null case isn't covered.
+[/quote]
+
+Whoa, can you explain this? I've seen `?` used to prefix variable names, but only in the context of a switch expression. I couldn't find any good documentation on this, besides it being called "option injection" (I think...)
+
+-------------------------
+
+rossberg | 2021-12-15 08:08:11 UTC | #7
+
+It's just pattern matching. The left-hand side of a `let` is a pattern, too, and any pattern you can write in a switch case you can also write here. This allows you to destructure tuples and objects, for example, but it also other things like options. However, you usually want patterns in these positions to be total (i.e., cover all cases), otherwise they can trap. The compiler will warn you.
+
+In general, every binder for regular, immutable variables is in fact a pattern. This includes not just `let` but also function arguments:
+```motoko
+type Point = (Nat, Nat);
+type Dist = {#meter : Nat};
+func f((x, y) : Point, #meter(n) : Dist) { ... }
+```
+
+-------------------------
+
+jzxchiang | 2021-12-15 08:16:52 UTC | #8
+
+Interesting thanks, didn't realize how versatile pattern matching actually was.
+
+Is there any benefit in using Option.wrap over ? for trapping on nulls (besides not having the compiler warning), or are they both equally discouraged?
+
+In the contrived example I presented, I'm not sure there is a better way of handling a null user profile than to trap...
+
+-------------------------
+
+rossberg | 2021-12-15 08:32:03 UTC | #9
+
+[quote="jzxchiang, post:8, topic:9615"]
+Is there any benefit in using Option.wrap over ? for trapping on nulls (besides not having the compiler warning)
+[/quote]
+
+You mean Option.unwrap? No, the ability for the type system to detect and warn you (or other devs maintaining your code) that there is a potential bug lurking is the crucial difference.
+
+-------------------------
+
+timo | 2022-01-03 10:43:26 UTC | #10
+
+What about
+```
+public query func getCommenterProfile(commentId: CommentId): async ?UserProfile {
+    do ? {
+        let comment = Trie.find<CommentId, Comment>(commentMap, key(commentId), Text.equal)!;
+        switch(Trie.find<UserId, UserProfile>(userMap, key(comment.userId), Text.equal) {
+           case (null) { Prelude.unreachable() };
+           case (?commenterProfile) { commenterProfile }
+        }
+    };
+};
+```
+Is this better than `let ?commenterProfile = ...` or not? It is more explicit in showing the programmer's intent (that something shouldn't happen), but it hides the compiler warning.
+
+-------------------------
+

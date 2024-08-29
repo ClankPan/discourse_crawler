@@ -1,0 +1,149 @@
+qwertytrewq | 2023-10-06 11:26:33 UTC | #1
+
+I successfully deployed my app to localhost, but when I try to deploy to the `ic` network, I have weird errors:
+
+```text
+$  dfx deploy --network ic main
+WARN: The default identity is not stored securely. Do not use it to control a lot of cycles/ICP. Create a new identity with `dfx identity new` and use it in mainnet-facing commands with the `--identity` flag
+Deploying: CanDBIndex NacDBIndex main order payments pst
+Creating canisters...
+Creating canister NacDBIndex...
+Error: Failed while trying to deploy canisters.
+Caused by: Failed while trying to deploy canisters.
+  Failed while trying to register all canisters.
+    Failed to create canister 'NacDBIndex'.
+      The replica returned a replica error: reject code CanisterError, reject message Canister nx4xj-pyaaa-aaaap-qbpyq-cai is out of cycles: requested 3_100_000_000_000 cycles but the available balance is 1_489_868_472_464 cycles and the freezing threshold 2_252_090_640 cycles, error code None
+```
+
+My code nowhere asks for `3_100_000_000_000` cycles. In `NacDBIndex` initialization code I don't ask for cycles. I also don't create any new canisters in `NacDBIndex` initialization code.
+
+My balance is enough:
+```text
+$ dfx ledger --network ic balance
+1.19786348 ICP
+```
+(2.81186473T cycles).
+
+What's wrong?
+
+-------------------------
+
+Severin | 2023-10-06 11:40:46 UTC | #2
+
+When you use `dfx deploy` your ICP balance is irrelevant. The balance of your cycles wallet matters. You can check it with `dfx wallet --network ic balance` and I would expect that it has ~1.5T cycles in it.
+
+The 3.1T comes from dfx using this many cycles by default to create a canister. If you want to use a different amount, use `--with-cycles <amount>`, and don't forget that 0.1T will be deducted from that amount to pay for canister creation
+
+-------------------------
+
+qwertytrewq | 2023-10-06 12:58:51 UTC | #3
+
+Thank you, that problem was solved. Now a new problem:
+
+```text
+$ dfx deploy --ic --with-cycles 110000000000 frontend
+...
+Installing canisters...
+Module hash 2ee9c1699a02f78de8f3b76d24c2bba488cb857f14d01a3840043124aaf22358 is already installed.
+Module hash 8538716649ea18a3b5ca2a2a04b5e5905ea28e00348ecedb23fd1ffc034e39a3 is already installed.
+Installing code for canister frontend, with canister ID i6wid-dyaaa-aaaap-qbqba-cai
+Error: Failed while trying to deploy canisters.
+Caused by: Failed while trying to deploy canisters.
+  Failed while trying to install all canisters.
+    Failed to install wasm module to canister 'frontend'.
+      Failed during wasm installation call: The replica returned a replica error: reject code CanisterError, reject message Canister installation failed with `Canister i6wid-dyaaa-aaaap-qbqba-cai is out of cycles: requested 80_000_590_000 cycles but the available balance is 9_217_014_000 cycles and the freezing threshold 50_250 cycles`, error code None
+```
+
+I added enough cycles to the frontend using `--with-cycles`, but it does not work anyway. I even tried to delete `frontend` canister, in order for it to be recreated with the right amount of cycles, but that didn't help.
+
+-------------------------
+
+qwertytrewq | 2023-10-06 13:03:37 UTC | #4
+
+I further have:
+```
+. .env && dfx canister call --network ic CanDBIndex init "(vec { principal \"ruuoz-anyad-jumcs-huq7s-3eh7h-ja6j2-cmp2n-elv23-tghui-mve6f-xqe\"; principal \"$CANISTER_ID_MAIN\"; principal \"$CANISTER_ID_ORDER\" })"
+WARN: The default identity is not stored securely. Do not use it to control a lot of cycles/ICP. Create a new identity with `dfx identity new` and use it in mainnet-facing commands with the `--identity` flag
+Error: Failed update call.
+Caused by: Failed update call.
+  The replica returned a replica error: reject code CanisterReject, reject message Canister installation failed with `Canister izxox-oaaaa-aaaap-qbqbq-cai is out of cycles: requested 80_000_590_000 cycles but the available balance is 10_000_000_000 cycles and the freezing threshold 41_070 cycles`, error code None
+```
+
+How do I override `10_000_000_000` (apparently, the amount passed to an actor constructor of another canister)? I never specified to top up for a so small sum, and have no idea where it goes from.
+
+-------------------------
+
+Severin | 2023-10-09 08:23:57 UTC | #5
+
+[quote="qwertytrewq, post:3, topic:23537"]
+I added enough cycles to the frontend using `--with-cycles`, but it does not work anyway
+[/quote]
+
+Looks like 110B wasn't enough cycles. It costs 100B to create the canister, leaving the newly created canister with 10B. As you can see, it wants to have 80B available to install your wasm. This is because the execution environment reserves the maximum amount of cycles your call could consume and will then free the unused cycles again. I recommend you try to create the canister with at least 200B cycles so that the installation then succeeds
+
+-------------------------
+
+qwertytrewq | 2023-10-09 11:48:13 UTC | #6
+
+```sh
+dfx deploy --ic --with-cycles 210000000000 frontend
+...
+```
+`Failed during wasm installation call: The replica returned a replica error: reject code CanisterError, reject message Canister installation failed with [Canister i6wid-dyaaa-aaaap-qbqba-cai is out of cycles: requested 80_000_590_000 cycles but the available balance is 8_434_028_000 cycles and the freezing threshold 50_250 cycles], error code None`
+also does not work.
+
+Why? Now it seems to pass enough cycles.
+
+-------------------------
+
+Severin | 2023-10-09 12:18:32 UTC | #7
+
+If the canister is already created `--with-cycles` has no effect. You can also use `dfx canister deposit-cycles` to send the canister some more cycles
+
+-------------------------
+
+builder.icp | 2024-07-12 22:23:58 UTC | #8
+
+Hey, so I just experienced the same situation as [this guy](https://forum.dfinity.org/t/lost-all-my-cycles-when-deploying-to-the-network/5536?u=builder.icp).
+
+It's my first time deploying and I had 15 TC. Deployment failed (I got an error, whereas `dfx deploy` works locally :thinking: ) and my cycle balance is now 3 TC...
+
+How can I debug this without burning tonnes of cycles ? (that's 2+ ICP tokens burnt with no benefit..). 
+
+Also, can someone reassure me that those costs are huge because it's the first time creating the canisters (I have 4) ?
+
+Thanks
+
+-------------------------
+
+Severin | 2024-07-15 10:31:17 UTC | #9
+
+Is there something in `canister_ids.json`? If yes, then the canister are created and you can simply redeploy to those when you fixed the error. What was your error?
+
+3TC is actually expected since creating a new canister uses 3TC per canister (unless you tell dfx something else)
+
+-------------------------
+
+builder.icp | 2024-07-16 14:55:02 UTC | #10
+
+Yes, there is: so it means the canisters were created despite the error I guess :thinking: 
+
+Also, you say creating a new canister costs 3TC whereas I see 100BC in the [documentation](https://internetcomputer.org/docs/current/developer-docs/gas-cost#canister-creation). I've also heard something about the difference being refunded. Is it refunded to the canister maybe ?
+
+Thanks!
+
+-------------------------
+
+Severin | 2024-07-16 14:57:16 UTC | #11
+
+Pure canister creation is 100B, but then your canister has no cycles/gas, so you can't do anything with it. If you do `dfx canister --ic status <canister name>` you can see that your canisters should have a balance of ~2.9T. That's where the rest went
+
+-------------------------
+
+builder.icp | 2024-07-16 15:11:53 UTC | #12
+
+Perfect, thanks! :ok_hand:
+I just redeployed and no error this time !
+
+-------------------------
+

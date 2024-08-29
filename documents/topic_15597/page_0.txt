@@ -1,0 +1,130 @@
+saikatdas0790 | 2022-09-23 07:26:27 UTC | #1
+
+So, currently we have a way to identify the caller for an incoming request to a canister.
+
+In Rust, you can get this with:
+```rust
+ic_cdk::caller();
+```
+
+However, the identifier we get is a principal and there's no attached metadata along with it. The bare minimum helpers we should have are:
+- Is this an anonymous identity?
+- Is this a user principal?
+- Is this a principal belonging to a canister?
+
+I imagine there's a way to detect a user vs a canister principal owing to how their lengths differ.
+
+However, what would be even more helpful is we could also get a helper that could tell us **if the incoming request if from a canister that belongs to the current project**.
+
+Since there could be two kinds of canisters in this case, I imagine they need to be handled differently:
+- Canisters with defined canister IDs defined in the `dfx.json` file
+- Canisters that are dynamically spawned by another canister
+
+The benefit of having this available is that inter-canister calls (which is the only way of scaling) can become much more secure by default since only certain methods on a canister are intended to be called through an inter-canister call but currently they have to be made public and anybody can call them and then the method needs to have authorization logic inside it to determine the caller. 
+
+Sometimes this isn't possible without further inter-canister calls which have to be **update calls** making the original call have very high latencies (>10 sec)
+
+The above solution would expose the entire `dfx.json` project as a holistic backend that has its own microservices (canisters) doing their own thing but can securely call each other and treating the entire set of canisters deployed as part of this DFX project as a trusted environment. And, these canisters can also be called by external services individually.
+
+In my opinion, this and **inter-canister query calls** are a prerequisite before hyper scale apps with multi canister backends can be built on the IC.
+
+-------------------------
+
+icme | 2022-09-23 14:18:21 UTC | #2
+
+Do all of your canister need to have this knowledge of all other application canisters, or just one canister?
+
+1. If just one (index) canister, you can just store a lookup mapping in that canister and use it to verify application owned canisters.
+
+2. (This is a more crude approach) If all canisters, you can share a key pair amongst the canisters in your cluster and encrypt/decrypt messages being sent to ensure the message is coming from an application owned canister.
+
+3. If this check is infrequent, you can also use an inter-canister call to check the map locates in the index canister (approach listed in 1).
+
+-------------------------
+
+saikatdas0790 | 2022-09-23 14:37:20 UTC | #3
+
+That's the thing. It's not about my specific problem. It's about a universal developer experience.
+
+Having to duplicate indexes across all canisters or figuring out a secure key exchange mechanism and e2e encryption needs to be abstracted away from the dev. And not have them write boilerplate over and over.
+
+If the network has this info, why not let the canister utilize it to figure out what canisters lie within a trust boundary. Makes everybody's lives easier.
+
+-------------------------
+
+icme | 2022-09-23 14:59:59 UTC | #4
+
+
+[quote="saikatdas0790, post:3, topic:15597"]
+If the network has this info, why not let the canister utilize it to figure out what canisters lie within a trust boundary
+[/quote]
+
+How would the network have this info though?
+
+In an IC dapp, not all canisters may controlled by the developer: some may be blackholed, or some may be user controlled.
+
+Imo regardless if this is a library or an IC features the constraints of this boundary needs to be concretely defined by the developer. Similar to defining access control to services in AWS/GCP.
+
+-------------------------
+
+PaulLiu | 2022-09-23 15:36:29 UTC | #5
+
+If only certified values are first-class objects (i.e. they can be passed as call arguments)... then you can have the main canister certify a caller (be it user principal or canister id), and this caller would just pass this certified object along with a call. To verify, you just need to check a number of things:
+1. who certified it
+2. whom is certified
+3. whom is certified == caller
+4. certificate is not expired
+
+In theory you could do this already, but verifying IC certificate from within a wasm program is not easy... will be better if system supports certified object by default.
+
+(You could also think of certificate delegation (the tech used by II) as a special case of this, but it is only usable by ingress messages)
+
+-------------------------
+
+saikatdas0790 | 2022-09-23 16:23:22 UTC | #6
+
+So, if I understand what you suggested, a canister in the project can be used as the certifying canister and it can issue certificates for other canisters and then other canisters just need to verify some sort of proof that the certificates were issued by the issuing canister?
+
+If the IC enabled this, it would simplify access control a lot for projects with a fleet of canisters to manage
+
+-------------------------
+
+saikatdas0790 | 2022-09-23 16:39:25 UTC | #7
+
+For, canisters specified in the `dfx.json` file, this information is already available.
+
+For canisters dynamically spawned by another canister, I am not sure. In case it doesn't have this info, maybe it should
+
+For contrast, traditional clouds have Virtual Private Networks for this exact purpose. For example, this:
+https://cloud.google.com/vpc/docs/subnets
+
+Contrasting with a similar offering by an edge computing provider, Cloudflare, they offer a product called durable objects that use the actor paradigm
+https://blog.cloudflare.com/introducing-workers-durable-objects/
+
+They offer a similar capability using their homegrown framework
+https://github.com/cloudflare/dog
+
+Basically the ask here is:
+
+For large projects with many canisters, individual canisters are individual work units that perform specialized functions as part of a larger whole. If your app were small enough, you would put everything in a single canister and be able to make some functions public and keeps some functions as private to be called internally. Now, as you scale, you need to shard functionality into separate canisters to be able to scale. But they are still part of the same larger whole. Hence they should have an ability to be able to call each other behind a trusted boundary as opposed to treating each other the same as a third party canister.
+
+-------------------------
+
+roman-kashitsyn | 2022-09-24 09:57:48 UTC | #8
+
+> If only certified values are first-class objects (i.e. they can be passed as call arguments)… then you can have the main canister certify a caller (be it user principal or canister id), and this caller would just pass this certified object along with a call.
+
+Currently, the system can issue certificates only in non-replicated query calls. I don't see any reasonable way to make certificates available in replicated context. There is a circular dependency: you need to finish execution before you can get a certificate, yet you need a certificate to finish the execution.
+
+-------------------------
+
+domwoe | 2023-03-24 17:39:03 UTC | #9
+
+[quote="saikatdas0790, post:1, topic:15597"]
+Sometimes this isn’t possible without further inter-canister calls which have to be **update calls** making the original call have very high latencies (>10 sec)
+[/quote]
+
+It seems to be a very widespread belief that inter-canister calls add a lot of latency. While this is certainly true for inter-subnet calls, this is not necessarily true for intra-subnet calls. If the subnet is not under high load, all messages could be executed in the same round of execution, adding no extra latency to the original ingress message.
+
+-------------------------
+

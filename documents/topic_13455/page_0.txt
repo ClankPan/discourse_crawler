@@ -1,0 +1,143 @@
+icme | 2022-06-03 06:56:18 UTC | #1
+
+I've recently started playing around with throwing a larger amount of data at my local replica, and have run into a variety of errors, one of which is similar to the error experienced by this user https://forum.dfinity.org/t/motoko-stress-testing/10762
+
+For those interested, you can find my methodology and results, including the reporting of errors at this [google doc report link](https://docs.google.com/document/d/1zwPOK-R1cEe7qBl6-CVGFZsC2WNtO4GohCE6UznDp7M/edit?usp=sharing), which has commenter access (please view and give feedback).
+
+Through a NodeJS script, I'm making parallel/concurrent update requests to the backend at roughly the same time directed at a single backend endpoint.
+
+## Summary:
+
+I experience no errors until I hit over 200 concurrent update requests (messages). After this, the replica both processes an increasing number of requests and rejects an increasing number of requests until roughly 1000 concurrent requests, after which the replica processes a decreasing number of requests, until 10,000 concurrent requests, which completely locks down the server and the replica processes 0 requests.
+
+
+## What I was originally trying to do
+
+I originally thought that by throwing more concurrent requests at my local replica, after a certain threshold is hit the remaining requests would be processed in a future round, and not necessarily dropped. This testing showed me that at least through my script, sending enough rapid fire requests just clogs up the replica and local dfx instance.
+
+# Additional questions
+
+1. Is it possible to locally simulate sending enough message requests that overflow are included in the following consensus round and not just dropped?
+
+2. Before I start my cycle burn on the main network, what results/behavior should I expect to be different vs. the results I received testing locally?
+
+3. Should I plan to keep a message queue in my frontend to handle message failures like this and perform retries?
+
+-------------------------
+
+stefan-kaestle | 2022-06-10 13:26:07 UTC | #2
+
+Hi @icme,
+
+Thanks for exploring scalability of the IC.
+What you have observed is not totally surprising. We have measured some 650 updates/s per subnetwork on mainnet a while ago.
+
+One difference between your measurement on your local machine vs mainnet is that on mainnet, we need to broadcast update messages to each machine before they can be added to a block in consensus.
+
+Eventually, we have to reject messages though, since we don't want to grow queues indefinitely (that would make for a very easy DoS attack vector).
+
+What shouldn't be is that the number of updates that are processed successfully decreases. We would want the system to fail gracefully in the sense that we reject things we cannot handle only.
+
+May I ask which canister you are using for your benchmark? I could run some experiments internally if that would be useful for you.
+
+Cheers,
+ Stefan
+
+-------------------------
+
+jzxchiang | 2022-06-12 18:03:44 UTC | #3
+
+[quote="stefan-kaestle, post:2, topic:13455"]
+What shouldn’t be is that the number of updates that are processed successfully decreases. We would want the system to fail gracefully in the sense that we reject things we cannot handle only.
+[/quote]
+
+I've also noticed this when bombarding my local dfx replica as well. After a certain point, I'm forced to wipe out and restart the replica with `dfx start --clean`. Otherwise, it keeps logging the "queue is full" error.
+
+-------------------------
+
+icme | 2022-06-12 18:48:04 UTC | #4
+
+Hi @stefan-kaestle, thanks for your help!
+
+All of this testing is happening locally, as I don't want to burn too many cycles before having all the local kinks worked out.
+
+One of the initial inspirations for me doing this testing was that I wanted to backfill a large amount of data (~1GB per canister). The data is order dependent (i.e. sorted/ordered in a data structure in the canister), and given the 2MB message size limit I wanted to see if I could parallelize this process. This way, I can just send up in parallel tens to hundreds of 5-100KB sized messages at a time to my canister and hopefully they would be queued up, and I could just have my front-end client wait for them to be completed before repeating the process.
+
+[quote="stefan-kaestle, post:2, topic:13455"]
+What you have observed is not totally surprising. We have measured some 650 updates/s per subnetwork on mainnet a while ago.
+[/quote]
+
+What was surprising for me was when testing **locally**, at > 200 simultaneous requests I started seeing errors. Unlike my original inspiration for this testing of having 5-100KB per request, I was only sending up a small record (at most a few hundred bytes of data per request).
+
+[quote="stefan-kaestle, post:2, topic:13455"]
+May I ask which canister you are using for your benchmark? I could run some experiments internally if that would be useful for you.
+[/quote]
+
+I am using a local canister for this testing, and have not yet tested this on the main network. The nice thing about local testing is I'm able to see not just the errors on the frontend, but also some logging on the backend for certain errors (see the google docs link in my [original post](https://forum.dfinity.org/t/errors-when-stress-testing-locally/13455?u=icme)).
+
+This testing happened in the context of a larger codebase. However, to replicate it just set up a canister with a single endpoint that's receiving data and inserting it into a Red-Black Tree or other efficient data structure, and then do something like this.
+
+```
+async func loadTesting() {
+  n = 500; // try n = 200, 300, 1000, etc.
+  const promises = [];
+  for (let i = start; i < n; i += 1) {
+    // parallellize update requests
+    promises.push(yourActorCanister.someUpdateEndpoint(i));
+  };
+  // collect all responses
+  let results = await Promise.allSettled(promises);
+  console.log(results);
+};
+```
+
+-------------------------
+
+stefan-kaestle | 2022-06-13 08:09:18 UTC | #5
+
+Okay, thanks for reporting and all the additional details. One more question: you wrote your canister in Motoko, correct?
+
+Ideally, it would be awesome if you could isolate the code that causes this behavior and send it to me, so I can do some stress testing on it with our benchmarking suite.
+Otherwise, I can also do a canister with similar logic myself. That will take a while long though.
+
+As for the queue: if the replica would allow to queue gigabytes of data for each canister, it would quickly run out of memory, which would jeopardize the stability of the replica, so we can't really allow that.
+
+It is also expected that it will take a while for the replica to recover after you stop your stressing, because all the queues you have been filling with messages before need to be drained.
+
+Here again, if we would allow more outstanding messages, it would take longer to drain those, which would then make the replica appear less responsive. That's why we have bounded input queues.
+
+Hope that makes sense :slight_smile: 
+
+Re
+
+> Otherwise, it keeps logging the “queue is full” error.
+
+@jzxchiang : does this error stay forever? Eventually queues should free up again. If they don't that'd be a bug.
+
+-------------------------
+
+icme | 2022-06-15 21:46:12 UTC | #6
+
+@stefan-kaestle 
+[quote="stefan-kaestle, post:5, topic:13455"]
+you wrote your canister in Motoko, correct?
+[/quote]
+Correct
+
+[quote="stefan-kaestle, post:5, topic:13455"]
+Ideally, it would be awesome if you could isolate the code that causes this behavior and send it to me, so I can do some stress testing on it with our benchmarking suite.
+Otherwise, I can also do a canister with similar logic myself. That will take a while long though.
+[/quote]
+
+I sent you a DM with some code that's pretty much (minus a few installs and project setup) there if you're familiar with TypeScript and Motoko. If that's too much to set up, I'll find some time in a week or two to send you code for an exact reproduction of the tests
+
+-------------------------
+
+stefan-kaestle | 2022-06-16 08:04:29 UTC | #7
+
+Thank you very much.
+
+This looks excellent! I'll get back to you once I managed to run this.
+
+-------------------------
+

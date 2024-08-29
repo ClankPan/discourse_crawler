@@ -1,0 +1,411 @@
+lastmjs | 2022-05-03 14:56:17 UTC | #1
+
+Here is some of the JS generated with `dfx generate` that I have and want to use in a Node.js environment:
+
+```javascript
+import { Actor, HttpAgent } from "@dfinity/agent";
+
+// Imports and re-exports candid interface
+import { idlFactory } from './management_canister.did.js';
+export { idlFactory } from './management_canister.did.js';
+// CANISTER_ID is replaced by webpack based on node environment
+export const canisterId = process.env.MANAGEMENT_CANISTER_CANISTER_ID;
+
+/**
+ * 
+ * @param {string | import("@dfinity/principal").Principal} canisterId Canister ID of Agent
+ * @param {{agentOptions?: import("@dfinity/agent").HttpAgentOptions; actorOptions?: import("@dfinity/agent").ActorConfig}} [options]
+ * @return {import("@dfinity/agent").ActorSubclass<import("./management_canister.did.js")._SERVICE>}
+ */
+ export const createActor = (canisterId, options) => {
+  const agent = new HttpAgent({
+    ...options?.agentOptions,
+    // host: 'http://localhost:8000'
+  });
+  
+  // Fetch root key for certificate validation during development
+  if(process.env.NODE_ENV !== "production") {
+    agent.fetchRootKey().catch(err=>{
+      console.warn("Unable to fetch root key. Check to ensure that your local replica is running");
+      console.error(err);
+    });
+  }
+
+  // Creates an actor with using the candid interface and the HttpAgent
+  return Actor.createActor(idlFactory, {
+    agent,
+    canisterId,
+    ...options?.actorOptions,
+  });
+};
+  
+/**
+ * A ready-to-use agent for the management_canister canister
+ * @type {import("@dfinity/agent").ActorSubclass<import("./management_canister.did.js")._SERVICE>}
+ */
+ export const management_canister = createActor(canisterId);
+
+```
+
+The problem here is that `createActor` is called when importing the file, but `createActor` needs some more properties (like `host`) to run correctly in a Node.js environment. This renders it impossible to use this automatically generated code without modifying it manually.
+
+Here's what I have to do to use `createActor` correctly in Node.js:
+
+```typescript
+const management_canister = createActor(
+    'rrkah-fqaaa-aaaaa-aaaaq-cai', {
+        agentOptions: {
+            host: 'http://localhost:8000'
+        }
+    }
+);
+```
+
+Is there a way around this? Otherwise I think this is a bug.
+
+-------------------------
+
+lastmjs | 2022-05-03 21:35:05 UTC | #2
+
+@kpeacock does this look like an issue to you?
+
+-------------------------
+
+paulyoung | 2022-05-03 21:59:26 UTC | #3
+
+[quote="lastmjs, post:1, topic:12686"]
+Is there a way around this?
+[/quote]
+
+Can’t you call `Actor.createActor` manually?
+
+The exported `createActor` function looks like it’s only providing some convenience.
+
+-------------------------
+
+kpeacock | 2022-05-03 23:14:59 UTC | #4
+
+It is an issue - I have a work item to create a node-friendly export option with a configuration setting in the `dfx.json` config, or simply to disable the default export.
+
+As @paulyoung said though, the index file is mainly for convenience and education - it's not possible to solve all use cases with code generation. I recommend writing your own `createActor` constructor in a separate file and importing the `.did.js` declarations, as I do in this example codebase:
+
+https://github.com/krpeacock/dfx-template-node/blob/main/src/node/actor.mjs#L3
+
+-------------------------
+
+lastmjs | 2022-05-04 00:02:55 UTC | #5
+
+Thanks! Though the Node.js environment breaking for IMO simple reasons is something that I imagine can be fixed without too much effort.
+
+The global fetch issue and being forced to pass in a host I believe are the two main differences between Node.js and the browser.
+
+-------------------------
+
+kpeacock | 2022-05-04 16:29:40 UTC | #6
+
+Agreed. Also, global fetch is fixed in Node 18, which I can now recommend after testing it last week
+
+-------------------------
+
+lastmjs | 2022-05-04 16:56:07 UTC | #7
+
+I'll try Node 18 in just a couple minutes, that would be great news
+
+-------------------------
+
+lastmjs | 2022-05-04 17:02:39 UTC | #8
+
+I just switched to Node 18 and removed the following code in my tests:
+
+```typescript
+import fetch from 'node-fetch';
+(global as any).fetch = fetch;
+```
+
+All I did was remove those two lines and switch to Node 18. Now I get the following error:
+
+```bash
+Unable to fetch root key. Check to ensure that your local replica is running
+TypeError: fetch failed
+    at Object.processResponse (node:internal/deps/undici/undici:5575:34)
+    at node:internal/deps/undici/undici:5901:42
+    at node:internal/process/task_queues:140:7
+    at AsyncResource.runInAsyncScope (node:async_hooks:202:9)
+    at AsyncResource.runMicrotask (node:internal/process/task_queues:137:8)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5) {
+  cause: ConnectTimeoutError: Connect Timeout Error
+      at Timeout.onConnectTimeout [as _onTimeout] (node:internal/deps/undici/undici:2282:28)
+      at listOnTimeout (node:internal/timers:566:11)
+      at processTimers (node:internal/timers:507:7) {
+    code: 'UND_ERR_CONNECT_TIMEOUT'
+  }
+}
+ test update failed Error: Fail to verify certificateompleted in 2ms
+```
+
+In addition to that Node 18 gives this warning:
+
+```
+(node:246264) ExperimentalWarning: The Fetch API is an experimental feature. This feature could change at any time
+```
+
+Maybe it isn't best to rely on that yet?
+
+-------------------------
+
+kpeacock | 2022-05-04 17:02:37 UTC | #9
+
+You also need to use `127.0.0.1` instead of `localhost`, I've discovered
+
+-------------------------
+
+lastmjs | 2022-05-04 17:05:04 UTC | #10
+
+That did not work unfortunately, here's my setup:
+
+```javascript
+import {
+    run_tests,
+    Test
+} from 'azle/test/new-test';
+import { createActor } from '../src/dfx_generated/update';
+
+const update_canister = createActor(
+    'rrkah-fqaaa-aaaaa-aaaaq-cai', {
+        agentOptions: {
+            host: 'http://127.0.0.1:8000'
+        }
+    }
+);
+```
+
+-------------------------
+
+kpeacock | 2022-05-04 17:07:06 UTC | #11
+
+Odd - that looks fine to me
+
+-------------------------
+
+lastmjs | 2022-05-04 17:12:42 UTC | #12
+
+Actually, it looks like the problem is because in my tests I do a `dfx deploy` and then immediately use `@dfinity/agent` to do some calls. In Node 14 everything worked, but in Node 18 there is a timeout...I'm debugging to find out what's going on. If I don't deploy first I can call the canister methods just fine.
+
+-------------------------
+
+kpeacock | 2022-05-04 17:15:42 UTC | #13
+
+For your debugging purposes - the `fetchRootKey` failure tends to be because the local replica http proxy itself is not responsive for whatever reason - it's prior to any specific canister interactions
+
+-------------------------
+
+lastmjs | 2022-05-04 17:19:12 UTC | #14
+
+Ah, it's happening just when I do a dfx deploy for some reason...
+
+-------------------------
+
+lastmjs | 2022-05-04 17:20:27 UTC | #15
+
+I think I know what's wrong, let me post here to show what's up
+
+-------------------------
+
+lastmjs | 2022-05-04 17:24:41 UTC | #16
+
+Here's the full code for the tests for a simple canister:
+
+```javascript
+import { execSync } from 'child_process';
+import {
+    run_tests,
+    Test
+} from 'azle/test/new-test';
+import { createActor } from '../src/dfx_generated/update';
+
+const update_canister = createActor(
+    'rrkah-fqaaa-aaaaa-aaaaq-cai', {
+        agentOptions: {
+            host: 'http://127.0.0.1:8000'
+        }
+    }
+);
+
+const tests: Test[] = [
+    {
+        name: 'deploy',
+        prep: async () => {
+            execSync(`dfx deploy`, {
+                stdio: 'inherit'
+            });
+        }
+    },
+    {
+        name: 'update',
+        test: async () => {
+            const result = await update_canister.update('Why hello there');
+
+            return {
+                ok: result === undefined
+            };
+        }
+    },
+    {
+        name: 'query',
+        test: async () => {
+            const result = await update_canister.query();
+
+            return {
+                ok: result === 'Why hello there'
+            };
+        }
+    }
+];
+
+run_tests(tests);
+```
+
+`run_tests` will execute each test in order, and it will wait for one test to complete before going on to the next test. Here's what I think the problem is. `createActor` does an async request to the replica, but when calling `createActor` you can't `await` it at the point of calling it. So, my first test was calling `dfx deploy` just after my code called `createActor`, and thus `createActor` could not call `fetchRootKey`.
+
+I would suggest fixing this somehow...either forcing the user to await `createActor` or something, but that was confusing.
+
+And perhaps this manifested in Node 18 because it's just faster for some reason.
+
+-------------------------
+
+lastmjs | 2022-05-04 17:28:40 UTC | #17
+
+This is going to add a few seconds (5 for now just to be sure) on all of my tests because I don't have a good way of knowing when `createActor` has finished everything that it needs to. If it returned a promise then I could wait properly.
+
+-------------------------
+
+lastmjs | 2022-05-04 17:29:37 UTC | #18
+
+This whole `fetchRootKey` thing seems to cause a lot of problems, it would be nice to just get rid of that concept locally somehow. I would imagine there's a more elegant solution available than dealing with it like we are currently.
+
+-------------------------
+
+lastmjs | 2022-05-04 17:45:56 UTC | #19
+
+btw `localhost` is working fine for me in Node 18:
+
+```javascript
+const update_canister = createActor(
+    'rrkah-fqaaa-aaaaa-aaaaq-cai', {
+        agentOptions: {
+            host: 'http://localhost:8000'
+        }
+    }
+);
+```
+
+-------------------------
+
+kpeacock | 2022-05-04 19:05:36 UTC | #20
+
+For that, we'd need to know the context that we're operating in - I don't want to bake in `process.env` assumptions into the actual `agent-js` itself.
+
+Furthermore, there's no way to know what the root key of a local environment is without making an async call to the network, since it will change each time it is spun up. The only network we can be sure of is mainnet. I feel the pain, but I don't know of a way around it.
+
+>  If it returned a promise then I could wait properly.
+
+That should be doable - it would break the existing api if we changed it in the declarations, but you can always define your own actor with 
+
+```js
+export const createActor = async (canisterId, options) => {
+  const agent = new HttpAgent({ ...options?.agentOptions });
+
+  // Fetch root key for certificate validation during development
+  if (process.env.NODE_ENV !== "production") {
+    await agent.fetchRootKey().catch((err) => {
+      console.warn(
+        "Unable to fetch root key. Check to ensure that your local replica is running"
+      );
+      console.error(err);
+    });
+  }
+
+  // Creates an actor with using the candid interface and the HttpAgent
+  return Actor.createActor(idlFactory, {
+    agent,
+    canisterId,
+    ...options?.actorOptions,
+  });
+};
+```
+
+-------------------------
+
+lastmjs | 2022-05-04 19:23:59 UTC | #21
+
+[quote="kpeacock, post:20, topic:12686"]
+Furthermore, there’s no way to know what the root key of a local environment is without making an async call to the network, since it will change each time it is spun up. The only network we can be sure of is mainnet. I feel the pain, but I don’t know of a way around it.
+[/quote]
+
+Can you explain the issue with having a hard-coded key for the local replica environment? Is there some issue with the local dfx replicas all having the same key for development?
+
+Seems like a simple fix to just hard-code that if using dfx. I understand that there might be other deployments of the IC, such as test networks or who knows other production or private networks later on. But I think there should be an option to hard-code it for this case.
+
+-------------------------
+
+kpeacock | 2022-05-04 20:07:16 UTC | #22
+
+How does JavaScript know that we're using dfx?
+
+-------------------------
+
+lastmjs | 2022-05-04 20:22:34 UTC | #23
+
+Yeah good point, but perhaps there's a simple setting we could pass into the agent on creation.
+
+-------------------------
+
+lastmjs | 2022-05-04 20:24:27 UTC | #24
+
+Perhaps the agent can just use the hard-coded keys basing it off of the URL (isn't that how it knows to use the hard-coded production key?), if it's a URL that looks local (localhost or 127.0.01 etc) then it can use the hard-coded development key. And only outside of those two situations (which currently would be very rare), a custom key can be fetched.
+
+-------------------------
+
+lastmjs | 2022-05-04 20:25:29 UTC | #25
+
+It knows we're using the production IC somehow, I assume based on the URL. Same type of process can be used to determine if we're local right?
+
+-------------------------
+
+kpeacock | 2022-05-04 22:13:50 UTC | #26
+
+URL is only a thing in a browser context though. Also, when custom domains come into play, it becomes even more complicated.
+
+the `host` passed to the `httpAgent` would be the best existing feature to hook into, but at the moment that's private, so the only time we'd know whether to use it for `fetchRootKey` would be to check it in the `createActor` args, so that might be a safe enough enhancement
+
+-------------------------
+
+Safik | 2022-05-20 12:04:29 UTC | #27
+
+Hi. I have a question (or suggestion) in the local environment if several Actors (Canisters) are randomly generating identifiers. Is it possible to somehow hard-link them in the dfx.json file?
+
+
+For example
+
+```
+const canister_id_service_dbs = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+const canister_id_service_token = "r7inp-6aaaa-aaaaa-aaabq-cai";
+```
+Each time you have to reassign to correctly generated ones (this is in the local environment)
+
+I would like something similar to canister_ids.json
+
+-------------------------
+
+lastmjs | 2022-09-01 20:18:55 UTC | #28
+
+Is this available yet?
+
+-------------------------
+
+kpeacock | 2022-09-01 22:00:49 UTC | #29
+
+Weirdly, we seem to have released 0.11.2 recently, but it doesn't seem to have the feature yet. The feature will be in 0.12.0, and you can try it out today by installing `0.12.0-beta.1`
+
+-------------------------
+

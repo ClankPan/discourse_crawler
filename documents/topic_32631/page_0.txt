@@ -1,0 +1,193 @@
+qwertytrewq | 2024-07-02 15:21:59 UTC | #1
+
+We should be able to attach to update calls (query calls, too) a hash, so that if this hash does not match the WASM hash of the canister, the update or query call should fail.
+
+This is to prevent the race condition of calling an updated canister, while old version (or nothing) should be called.
+
+It is especially useful in context of Seb's project of "owned canisters", because the user may update his canister at any moment and external (not user owned) canisters may rely on it.
+
+-------------------------
+
+NathanosDev | 2024-07-02 21:14:13 UTC | #2
+
+Is there any reason not to just implement this yourself in your canister logic?
+
+-------------------------
+
+qwertytrewq | 2024-07-02 22:16:45 UTC | #3
+
+1. It should work for third-party canisters.
+2. It should not be breakable by a hacker changing the canister logic.
+3. It should be resistant to race conditions.
+
+-------------------------
+
+NathanosDev | 2024-07-03 06:04:52 UTC | #4
+
+Your first point makes sense to me as a reason to do this on the protocol level, but I can't follow your reasoning on the other two points.
+
+Why is this more hackable or subject to race conditions when implemented on the application layer?
+
+-------------------------
+
+qwertytrewq | 2024-07-03 08:42:32 UTC | #5
+
+[quote="NathanosDev, post:4, topic:32631"]
+Why is this more hackable or subject to race conditions when implemented on the application layer?
+[/quote]
+
+2. Consider a canister that worked well in the past but now updated (by a malicious person, for instance) to block updates of the calling canister by not returning from any called method. In this case checking by "application logic" makes no sense and is even harmful.
+
+3. Race condition: start upgrading a canister, query "application logic", upgrading finishes (to a malicious code), the application is called. So, by a race condition we called a malicious upgraded canister while thinking it's yet a previous version.
+
+-------------------------
+
+NathanosDev | 2024-07-03 09:02:32 UTC | #6
+
+2. How do you determine that the update is malicious in this case? When does your canister start trusting the new module hash?
+3. That race condition exists if the module hash checking is implemented in your canister, but not if it's implemented in the 3rd party canister. Implementing it in the 3rd party canister is subject to point number 2 though.
+
+Thanks for the additional context, I think this could be an interesting feature to have on the protocol level.
+
+-------------------------
+
+peterparker | 2024-07-03 09:38:41 UTC | #7
+
+I'm not convinced that what is suggested here actually solves the original concern that was shared.
+
+OP mentions:
+
+> "It is especially useful in context of Seb’s project of “owned canisters”, because the user may update his canister at any moment and external (not user owned) canisters may rely on it.".
+
+If interfaces are changing, Candid is changing as well and therefore a call with an outdated payload would already fail no? So to some extension, getting an issue because of invalid payload or because a invalid hash, at the end of the day, it's kind of same same.
+
+-------------------------
+
+qwertytrewq | 2024-07-03 14:45:25 UTC | #8
+
+[quote="peterparker, post:7, topic:32631"]
+If interfaces are changing, Candid is changing
+[/quote]
+
+We need to protect also against the case when the interface remains unchanged but what the function does has changed.
+
+It could be a typical hacker's attack to change the doings of a function without changing its interface.
+
+-------------------------
+
+qwertytrewq | 2024-07-03 14:50:55 UTC | #9
+
+[quote="NathanosDev, post:6, topic:32631"]
+2. How do you determine that the update is malicious in this case? When does your canister start trusting the new module hash?
+3. That race condition exists if the module hash checking is implemented in your canister, but not if it’s implemented in the 3rd party canister. Implementing it in the 3rd party canister is subject to point number 2 though.
+[/quote]
+
+2. We would hold a list of checked non-malicious hashes, to ensure that a malicious code isn't called. It starts trusting new hash after a code review and our DAO deciding to trust it.
+3. Implementing in 3rd party canister probably really avoids the race condition, I didn't notice this. But also note that using a third-party canister changes the principal to which the checked canister needs to trust, what is undesirable, (and also is probably rather slow).
+
+-------------------------
+
+peterparker | 2024-07-03 14:57:11 UTC | #10
+
+I see, that's a good point. How would you generate a hash just for the code of that function that changed though? You can generate the hash for the entire WASM, but is it possible to do that just for a function and what's used within that function? If not automatic, if the developer has to provide the hash manually, I'm not convinced it should be part of the protocol I would say sponaneously.
+
+-------------------------
+
+qwertytrewq | 2024-07-03 18:55:43 UTC | #11
+
+[quote="peterparker, post:10, topic:32631"]
+You can generate the hash for the entire WASM
+[/quote]
+
+Of course, we generate hash for the entire WASM of a canister. It is already done in `dfx deploy` to decide whether to deploy or deployment is skipped because the same WASM is already deployed.
+
+-------------------------
+
+peterparker | 2024-07-03 19:11:15 UTC | #12
+
+I don't follow. If your idea is to use the hash of the entire WASM, how do you differentiate one particular function that has an unchanged interface but changed its logic from another function that remains the same? Or is your idea to prevent access to any functions, even if they did not change, if the provided hash is not the current hash?
+
+-------------------------
+
+qwertytrewq | 2024-07-04 08:17:57 UTC | #13
+
+My idea is to use the hash of the entire WASM. I don't differentiate one particular function that has an unchanged interface but changed its logic from another function that remains the same. My idea is prevent access to any functions, even if they did not change, if the provided hash is not the current hash.
+
+It works on module level, not function level.
+
+-------------------------
+
+NathanosDev | 2024-07-04 08:26:52 UTC | #14
+
+[quote="qwertytrewq, post:9, topic:32631"]
+We would hold a list of checked non-malicious hashes, to ensure that a malicious code isn’t called. It starts trusting new hash after a code review and our DAO deciding to trust it.
+[/quote]
+
+This would mean that the canister is broken until the new hash of the 3rd party canister is approved. I think there might be better ways to handle this.
+
+If we're talking about user owned canisters, then maybe we need to look at some kind of compatibility matrix. So if a user owns canisters A and B, A relies on B. If B has a new update, the user is not able to update A until there is an update to A that gives it compatibility with B.
+
+For other scenarios, I think immutable smart contracts can handle this in a nice way. Deploy a canister and then black hole it. When there's a new version, create a new canister and then black hole that one two. When dependendant canisters are ready to move from a previous to a new version, then can switch from the previous canister to the new canister.
+
+-------------------------
+
+qwertytrewq | 2024-07-04 08:37:52 UTC | #15
+
+[quote="NathanosDev, post:14, topic:32631"]
+If we’re talking about user owned canisters, then maybe we need to look at some kind of compatibility matrix. So if a user owns canisters A and B, A relies on B. If B has a new update, the user is not able to update A until there is an update to A that gives it compatibility with B.
+[/quote]
+
+It's OK: A stores the part of compatibility matrix pertaining to A.
+
+-------------------------
+
+peterparker | 2024-07-04 10:07:49 UTC | #16
+
+[quote="qwertytrewq, post:13, topic:32631"]
+My idea is to use the hash of the entire WASM.
+[/quote]
+
+Thank you for the explanation and answer.
+
+Well then, in that case, I believe this feature might not be suited to be implemented at the protocol level, or at least it is not something I would use I think. In my humble opinion, while it is true that APIs can be fully deprecated, such as moving from API v1 to v2, there are typically several iterations between major versions. These iterations usually occur at the function level rather than the global level.
+
+For instance, in Juno, I often deprecate specific functions and rarely change their behavior significantly. When I do make changes, they are always at the function level, not for the entire canister - i.e. I definitely do not want to prevent a global access to an entire canister. I'm more approaching development with the most backwards compatibility as possible. Similarly, in then open, I would also not want to restrict access based on the overall version of a contract but, I guess that's probably personal opinion.
+
+In summary, this seems to be a particular requirement that I do not share, therefore thinking it might be better to solve it particularly and not on a protocol level. Of course, this is just my two cents. If the majority find it beneficial, I am for sure not against to it as long as it remains an optional feature.
+
+-------------------------
+
+qwertytrewq | 2024-07-04 10:48:34 UTC | #17
+
+@peterparker I don't see the logic: As I understood you, you critique other variants (such as Juno's one) of doing this and then reject my variant. Why? It is also fully backward compatible.
+
+-------------------------
+
+peterparker | 2024-07-04 11:17:38 UTC | #18
+
+That's not what I said.
+
+In other words maybe: that's not an approach I use or want to use. Therefore, I'm not convinced of its necessity at a global level, and I don't think it should be available at a protocol level. Instead, I believe it's something that should be developed by individual projects. However, if most people see the need for it, I am certainly not against it.
+
+-------------------------
+
+qwertytrewq | 2024-07-04 11:05:40 UTC | #19
+
+This is to protect against security vulnerabilities that may be worse that simply an outage. For this reason, my proposal temporarily disables access to the canister.
+
+We can improve my proposal to avoid outages, passing several hashes and succeeding the call if one of them matches the current WASM hash. This allows to prepare for a new hash in advance.
+
+-------------------------
+
+peterparker | 2024-07-04 11:10:08 UTC | #20
+
+[quote="qwertytrewq, post:19, topic:32631"]
+This is to protect against security vulnerabilities that may be worse that simply an outage. For this reason, my proposal temporarily disables access to the canister.
+[/quote]
+
+I don't see how that would work or protect anything related to security if a client passes the hash as an argument.
+
+Anyway, I think this proposal does not really concern me, so I'm going to stop adding noise to the topic.
+
+-------------------------
+

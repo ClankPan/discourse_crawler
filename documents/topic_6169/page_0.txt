@@ -1,0 +1,819 @@
+GLdev | 2021-07-28 12:46:12 UTC | #1
+
+So I've been trying to run queries from node.js, and wanted to document the process, if anyone is interested. I'm also hoping some of the workarounds that I found can be properly patched so we can use services like heroku without having to jump trough hoops.
+
+```
+:~/work/dfinity/node_test_2$ node -v
+v10.19.0
+
+:~/work/dfinity/node_test_2$ npm -v
+6.14.4
+
+:~/work/dfinity/node_test_2$ npm init
+```
+Following the readme from [here](https://github.com/dfinity/agent-js/tree/main/packages/agent), I installed the agent package.
+
+```
+npm i --save @dfinity/agent
+```
+
+I created a file app.js, with a simple import, and ran it with 
+**node app.js**
+
+```
+const actor = require("@dfinity/agent");
+```
+
+First series of errors seem to stem from the fact that npm doesn't import other packages. I had to add them manually.
+
+```
+Error: Cannot find module '@dfinity/principal'
+#fix:
+npm i --save @dfinity/principal
+
+Error: Cannot find module '@dfinity/candid'
+#fix:
+npm i --save @dfinity/candid
+
+#will need later:
+npm i --save node-fetch
+```
+
+With all importing errors fixed, I ran **node app.js** again, and got the following error:
+
+```
+ReferenceError: TextEncoder is not defined
+    at Object.<anonymous> (~/work/dfinity/node_test_2/node_modules/@dfinity/agent/lib/cjs/auth.js:19:50)
+```
+
+This can be fixed by patching the *auth.js* file, adding the following line after *use strict*:
+
+```
+global.TextEncoder = require("util").TextEncoder;
+```
+
+With the file patched, we can now import the agent without any errors. Now let's build an actor for a local deployment, and make a call to a local canister:
+
+app.js:
+
+```
+const Actor = require("@dfinity/agent").Actor;
+const HttpAgent = require("@dfinity/agent").HttpAgent;
+
+//a mix of greet, and whoami capsules, with another greetq (as query) added
+const idlFactory = ({ IDL }) => {
+    return IDL.Service({
+        'greet': IDL.Func([IDL.Text], [IDL.Text], []),
+        'greetq': IDL.Func([IDL.Text], [IDL.Text], ['query']),
+        'whoami': IDL.Func([], [IDL.Principal], ['query']),
+    });
+};
+
+//replace with any canister id
+const canisterId = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+
+const agent = new HttpAgent({
+    host: "http://localhost:8000",
+});
+//needed for update calls on local dev env, shouldn't be used in production!
+agent.fetchRootKey();
+
+const actor = Actor.createActor(idlFactory, {
+    agent,
+    canisterId,
+});
+
+
+let callCanister = async (message) => {
+    res = await actor.greet(message).catch(e => { return "Error" + e });
+    return res;
+}
+
+callCanister("TEST").then(res => { console.log(res) });
+``` 
+
+Running that code gives another error:
+```
+TypeError: Cannot read property 'bind' of undefined
+    at getDefaultFetch (~/work/dfinity/node_test_2/node_modules/@dfinity/agent/lib/cjs/agent/http/index.js:57:28)
+```
+
+We can again fix this by patching the *index.js* file, adding the following line after *use strict*:
+
+```
+global.fetch = require("node-fetch");
+```
+
+And finally, after all this we get the call to work:
+
+```
+~/work/dfinity/node_test_2$ node app.js 
+Hello, TEST!
+```
+
+**Awesome!**
+
+Now, the question is, was I doing something wrong, or are there better ways of calling canisters from node.js? My eventual goal would be to run this on a service like heroku, so it would be great if this can get patched at source. (and of course someone should check if those hacks affect other areas of code)
+
+-------------------------
+
+kpeacock | 2021-07-28 15:17:34 UTC | #2
+
+Excellent writeup! You're right - node.js workflows are underdocumented, and I'll add it to my list.
+
+At a cursory reading, you're not doing anything wrong - we would expect most devs to do the same sort of TextEncoder and fetch setup. I think it can be easier with how to manage the canister ID, but generally you're doing things right
+
+-------------------------
+
+skilesare | 2021-07-28 17:29:51 UTC | #3
+
+You are a scholar and a gentleman.  Thanks for the write-up!
+
+-------------------------
+
+mbeekman | 2021-08-01 23:03:40 UTC | #4
+
+wicked!
+
+Thanks for this ... got me over a hurdle ... and its working in my local ... 
+
+I can't seem to find where the "production" host would point to. 
+i.e.
+if "host: "http://localhost:8000" for the HttpAgent in dev environment, what address do I put in for a canister on the actual IC?  ... 
+I looked but could not find easily, and tried a few but cannot get it to work ... 
+Thoughts/input?
+
+Much thanks
+
+-------------------------
+
+GLdev | 2021-08-02 05:20:41 UTC | #5
+
+I haven't tried it myself yet, but in the example provided [here](https://github.com/dfinity/internet-identity/tree/main/demos/sample-javascript/src) it's:
+
+```
+<input type="text" id="hostUrl" value="https://boundary.ic0.app/" />
+
+[...]
+
+const actor = Actor.createActor(idlFactory, {
+    agent: new HttpAgent({
+      host: hostUrlEl.value,
+      identity,
+    }),
+    canisterId,
+  });
+```
+
+Also, I *think* that not passing any hosturl is defaulting to the public url as well. In the template created with **dfx new** the declarations .js file seems to work like this:
+
+```
+export const createActor = (canisterId, options) => {
+  const agent = new HttpAgent({ ...options?.agentOptions });
+ 
+[...] 
+ 
+  // Creates an actor with using the candid interface and the HttpAgent
+  return Actor.createActor(idlFactory, {
+    agent,
+    canisterId,
+    ...options?.actorOptions,
+  });
+};
+
+ export const test_assets = createActor(canisterId);
+```
+
+I'd try it first without a hosturl, and see if it goes to the public one.
+
+-------------------------
+
+mbeekman | 2021-08-02 14:56:57 UTC | #6
+
+double wicked! it works with the boundary address ...
+
+good looking out on the pointer to the example ... I should have found that :) ...
+
+I had tried no host which errored ...  so I chased in the agent lib and the HttpAgent requires it with no reference to what is the production host ...
+
+Anyway it works ... currently from command line, going to get it into a service now ... 
+
+THANK YOU, 
+-M
+
+-------------------------
+
+skilesare | 2021-10-02 14:46:29 UTC | #7
+
+[quote="GLdev, post:1, topic:6169"]
+```
+const agent = new HttpAgent({
+    host: "http://localhost:8000",
+});
+```
+[/quote]
+
+Did you ever get this working with an identity?  How do you load in your local dfx identity into an identity?
+
+-------------------------
+
+wole | 2021-10-02 18:46:35 UTC | #8
+
+I think you'll get an answer in this thread https://forum.dfinity.org/t/problems-with-cross-referencing-principals/5926
+
+-------------------------
+
+GLdev | 2021-10-03 06:09:27 UTC | #9
+
+I never tried that in JS, but yeah you can do that in rust. You can use your dfx identity .pem file to issue calls programmatically. Let me know if you need it now, otherwise I'll make a post about it sometime next week. I want to write a longer thing about my experience in the hackathon, and will hopefully have some rust code that interacts with canisters. Just need to clean it up a bit.
+
+-------------------------
+
+anthonymq | 2021-11-12 14:34:58 UTC | #10
+
+Hi everyone, 
+Have you managed to authenticate your calls while using node.js ? Is there a way to set the httpAgent identity with a .pem file ?
+I want to run my script as the canister administrator.
+
+-------------------------
+
+GLdev | 2021-11-12 14:45:10 UTC | #11
+
+Not in node, but I did that in rust if it helps. You can import your .pem file from the dfx identity and call canisters with that. Let me know if that works for you and I'll look for the code.
+
+-------------------------
+
+anthonymq | 2021-11-13 10:03:01 UTC | #12
+
+It's okay. I'll write a bash script using the dfx cli. Thanks !
+
+-------------------------
+
+kpeacock | 2021-11-13 15:37:57 UTC | #13
+
+Y'all need to start following me on GitHub.
+
+https://github.com/krpeacock/node-identity-pem
+
+-------------------------
+
+ashuyadav09 | 2021-11-13 19:27:00 UTC | #14
+
+hey sir,
+I have a question 
+Can I move my internet identity (on phone) to the laptop without yubikey and where I can see my seed phrase on phone?
+
+-------------------------
+
+jzxchiang | 2021-11-14 19:25:04 UTC | #15
+
+This worked beautifully for me.
+
+Since I'm on node v14, I didn't need to set `TextEncoder` on the global object since it's already set by default.
+
+Also, you don't have to patch `node_modules/@dfinity/agent/lib/cjs/agent/http/index.js`.
+
+Instead, you can set `fetch` on the global object in your own module provided you set it *before* importing `@dfinity/agent`.
+
+-------------------------
+
+jzxchiang | 2021-11-14 19:27:31 UTC | #16
+
+Can you describe an easier way to manage the canister ID?
+
+Right now, I import it from the dfx generated files:
+
+```
+import _SERVICE, {
+  // @ts-ignore idlFactory is in service.js
+  idlFactory as service_idl,
+  // @ts-ignore canisterId is in service.js
+  canisterId as service_id,
+} from '../../../.dfx/local/canisters/service/service';
+```
+
+The `../../..` is not pretty, and TypeScript doesn't know about `idlFactory` and `canisterId` since it's exported in `service.js` and not `service.d.ts`.
+
+FYI I'm still on dfx v0.7.1... not sure if this is an instance where upgrading dfx would make this more ergonomic.
+
+-------------------------
+
+kpeacock | 2021-11-14 19:36:08 UTC | #17
+
+At the end of the day, I'm managing it using environment variables and naming conventions, and having the bundler handle figuring it out from the canister_ids.json file.
+
+There are plenty of other valid ways to manage it, but the design challenges I'm trying to manage are:
+
+* During development, the app should use the local canister id for canisters in the same project
+* When I specify the network, the frontend should point should automatically point to the canister IDs from that network
+* No code should need to be manually changed when deploying to those different targets.
+* Dfx should be involved as little as possible, and the implementation should stick to JavaScript patterns and conventions
+
+-------------------------
+
+kpeacock | 2021-11-14 19:39:42 UTC | #18
+
+Here's the new Webpack config that will be coming with dfx 0.8.4 - I made the setup simpler and now it maps all the canisters dynamically, instead of requiring you to add them to the EnvironmentPlugin manually
+
+https://github.com/dfinity/sdk/blob/e8a1c7a59ba35d636a21b9f02f6980e703f1ccd0/src/dfx/assets/new_project_node_files/webpack.config.js
+
+-------------------------
+
+anthonymq | 2021-11-16 21:07:43 UTC | #19
+
+You won a follower :rofl:
+
+-------------------------
+
+anthonymq | 2021-11-22 14:51:16 UTC | #20
+
+I hope it will be the last question :slight_smile: , is it normal that i don't have the same Principal when using the CLI and when i'm using your script with my "~/.config/dfx/identity/default/identity.pem" file ?
+I need the script to impersonate the "canister deployer"
+
+-------------------------
+
+GLdev | 2021-11-22 17:33:26 UTC | #21
+
+@anthonymq: How do you check for your "CLI" principal? IIRC you have to pass --no-wallet so that the call goes to the canister directly and not via your "wallet" canister.
+
+-------------------------
+
+kpeacock | 2021-11-22 17:32:02 UTC | #22
+
+`dfx identity --network ic get-principal`
+
+-------------------------
+
+anthonymq | 2021-11-23 16:28:24 UTC | #23
+
+yep that's what I did :frowning:
+
+-------------------------
+
+peterparker | 2021-11-23 16:51:04 UTC | #24
+
+Alright so I was about to post details and everything but [cannot](https://forum.dfinity.org/t/i-cant-reply-some-topics-somtimes/4082/21?u=peterparker) therefore I just gonna say that I face the exact same issue.
+
+When I compare a `caller` principal in a query called from a NodeJS script, in which I used my private key, with the self `fromActor` principal, I get an error respectively both principals are not the same.
+
+-------------------------
+
+peterparker | 2021-11-23 18:24:56 UTC | #26
+
+```
+const initIdentity = () => {
+  const buffer = readFileSync('/Users/daviddalbusco/.config/dfx/identity/default/identity.pem');
+  const key = buffer.toString('utf-8');
+
+  const privateKey = crypto.createHash('sha256').update(key).digest('base64');
+
+  return Secp256k1KeyIdentity.fromSecretKey(Buffer.from(privateKey, 'base64'));
+};
+```
+
+-------------------------
+
+peterparker | 2021-11-23 18:27:10 UTC | #27
+
+[quote="kpeacock, post:22, topic:6169"]
+dfx identity --network ic get-principal
+[/quote]
+
+`dfx identity --network ic get-principal` leads to `w2bwq-cyvg6...`
+
+in nodejs
+
+```
+const identity = initIdentity();
+
+console.log(identity.getPrincipal().toText());
+```
+
+I get another value -> `cd5mb-c6i5a....`
+
+-------------------------
+
+dpdp | 2021-11-23 18:37:20 UTC | #28
+
+Are you sure your `pem` file is corresponding to a Secp256k1 key? and not Ed25519?
+
+-------------------------
+
+peterparker | 2021-11-23 18:41:34 UTC | #29
+
+I would say probably or yes because if I use the `Ed25519KeyIdentity` provider of agent-js instead of the `Secp256k1KeyIdentity` with the exact same code I get `Error: bad secret key size`
+
+-------------------------
+
+anthonymq | 2021-11-26 10:24:46 UTC | #30
+
+Yep same error for me.
+
+-------------------------
+
+coin_master | 2021-12-08 20:25:25 UTC | #31
+
+Same here too
+20chars
+
+-------------------------
+
+kpeacock | 2021-12-08 20:31:29 UTC | #32
+
+I've added reproductible identities across dfx and agent-js as an issue for SDK to resolve. It ought to work, and either a defect or lack of documentation is barring that functionality
+
+-------------------------
+
+coin_master | 2021-12-09 06:02:54 UTC | #33
+
+Do you have a link to the issue?
+
+-------------------------
+
+kpeacock | 2021-12-13 17:27:54 UTC | #34
+
+We've shifted to Jira for our board to work with other teams at the foundation more easily, but I could also create an issue in agent-js to track it publicly
+
+-------------------------
+
+ayazgv | 2022-01-26 14:07:17 UTC | #35
+
+Hello dears, is there any update about [reply #29](https://forum.dfinity.org/t/using-dfinity-agent-in-node-js/6169/29) ?
+
+-------------------------
+
+peterparker | 2022-01-26 15:14:21 UTC | #36
+
+Not that I know, I did not try again neither.
+
+-------------------------
+
+kpeacock | 2022-01-26 17:34:25 UTC | #37
+
+Yeah, that's on me. I haven't had the time to figure out what's going on there
+
+-------------------------
+
+atomikm | 2022-02-17 15:46:43 UTC | #38
+
+I'm also running into this issue as well
+
+-------------------------
+
+kpeacock | 2022-02-18 17:21:33 UTC | #39
+
+We've been investigating on and off for a while and haven't been able to find a simple way to reproduce identities from `dfx` in `agent-js`. I think it's going to require re-implementing the full logic of the Rust library that `dfx` uses as a new `npm` package.
+
+It's something we want to do, but it's below a few other more critical features we want to get through first
+
+-------------------------
+
+neeboo | 2022-02-22 14:12:47 UTC | #40
+
+It might be happening on `tweetnacl`, better using try catch and loop the keypair function
+
+-------------------------
+
+kpeacock | 2022-02-25 22:06:01 UTC | #41
+
+Update - @ericswanson helped me unblock this:
+
+**seed.txt**
+```
+early cinnamon crucial teach mobile just toast real rebel around card priority spike aerobic result account marble hero action intact inside elbow wrestle oval
+```
+
+`$ keysmith principal`  yields 
+`bh66w-ffyze-maien-ejjje-wzhqi-crrjo-rcgs7-twjrh-kf2km-hbtia-eae`
+
+**seed.js**
+```javascript
+const Identity = require("@dfinity/identity");
+const hdkey = require("hdkey");
+const fs = require("fs");
+
+const { Secp256k1KeyIdentity } = Identity;
+
+const bip39 = require("bip39");
+
+const phrase = fs.readFileSync("seed.txt").toString().trim();
+
+export const identityFromSeed = async (phrase) => {
+  const seed = await bip39.mnemonicToSeed(phrase);
+  const root = hdkey.fromMasterSeed(seed);
+  const addrnode = root.derive("m/44'/223'/0'/0/0");
+
+  return Secp256k1KeyIdentity.fromSecretKey(addrnode.privateKey);
+};
+
+identityFromSeed(phrase).then((identity) => {
+  console.log(identity.getPrincipal().toString());
+});
+```
+`$ node seed.js` yields 
+`bh66w-ffyze-maien-ejjje-wzhqi-crrjo-rcgs7-twjrh-kf2km-hbtia-eae`
+
+We still have to hunt down the implementation used by https://github.com/sfackler/rust-openssl/blob/master/openssl/src/pkey.rs#L518, but this should open up the possibility to use a single identity across JS and `dfx`, from a shared seed phrase!
+
+Of course, this comes with some security caveats - 
+* Do not ever commit a seed phrase to your souce code. 
+* THIS PATTERN SHOULD NEVER BE USED IN A FRONTEND APPLICATION
+* Use a different identity for each project to mitigate risk
+* Dfinity does not officially endorse doing this
+
+-------------------------
+
+coin_master | 2022-02-26 04:39:04 UTC | #42
+
+This looks promising :partying_face:, would that also work for the pem file? since our dfx identity is created using a pem file, or is there a way to get the seed phrase from a pem file?
+
+-------------------------
+
+atomikm | 2022-03-10 19:26:23 UTC | #43
+
+also wondering this^
+
+-------------------------
+
+skilesare | 2022-04-18 21:30:36 UTC | #44
+
+What am I missing here?  I used this pattern in my node.js script, and the identity actually works fine.  The problem is that when I try to include my actor from /src/declaration/project_name/project_name.js or /src/declaration/project_name/index.js I get the dreaded: SyntaxError: Unexpected token 'export' or Cannot use import statement outside a module.  I can get around this by copying the export const idlFacotry....line from the file into my script and getting rid of the export.  But this is really annoying to do every time.  Perhaps I've missed some updates to the js world in the last couple of years, but I've tried a number of things and I either get that something isn't compatible with commonjs or visa versa.  Does the IDL get dumped somewhere that I can reference with a require('x') statement?
+
+-------------------------
+
+peterparker | 2022-04-19 05:16:54 UTC | #45
+
+[quote="skilesare, post:44, topic:6169"]
+But this is really annoying to do every time.
+[/quote]
+
+If you are using NodeJS LTS or more recent versions you can use script module files `.mjs`.
+
+What I do is adding a postbuild script in `package.json` that automatically copy the `.did.js` files to `.did.mjs` files. Then in `myscript.mjs` script I can import the `idlFactory` as following (modules script support `import`)
+
+```
+import {idlFactory} from '..dfx/local/canisters/manager/manager.did.mjs';
+```
+
+Got a couple of scripts there https://github.com/papyrs/ic
+
+-------------------------
+
+jzxchiang | 2022-04-19 05:39:00 UTC | #46
+
+Just to confirm... I want to use my default dfx identity to authenticate with my canister using the `@dfinity/agent` library in node...
+
+Ideally using the PEM file in `~/.config/dfx/identity/default/identity.pem`. I'm guessing from this thread that this is not possible right now? (I need to create a new identity / principal using `keysmith` and use that instead. Does that sound right?)
+
+-------------------------
+
+skilesare | 2022-04-19 13:00:06 UTC | #47
+
+I think you can use Key Smith to produce a back up phrase for your default identity. Just run the help for key Smith and you’ll see a number of options.
+
+-------------------------
+
+skilesare | 2022-04-19 13:03:10 UTC | #48
+
+If I do this I have to convert all of my other require statements to import statements correct? I feel like I tried this but one of my existing packages demanded that I use require or something like that. I’ll give this a try and report back.
+
+-------------------------
+
+peterparker | 2022-04-19 13:47:40 UTC | #49
+
+[quote="skilesare, post:48, topic:6169"]
+If I do this I have to convert all of my other require statements to import statements correct?
+[/quote]
+
+Yes probably, a bit a pity but at least a one time change. Let me know if it works out 🤞
+
+-------------------------
+
+icme | 2022-05-29 07:49:20 UTC | #50
+
+Thanks to everyone above for the great commentary, really was nice to follow as I started troubleshooting not being able to load in my existing dfx principal via agent-js (I received the same different dfx and node principals as everyone else).
+
+Since it did take me a bit of time to get through it all, hopefully these steps make it easier for those of you running into a similar issue (as of the time of this post).
+
+### Steps
+
+1) Navigate to my .dfx identities ->  `~/.config/.dfx/identity`
+2) Create a new identity -> `mkdir local-testing; cd local-testing`
+3) Download [quill](https://github.com/dfinity/quill) since keysmith is now deprecated.
+4) Test that quill is installed correctly -> `quill`  
+5) Look up how to generate a key -> `quill generate --help`
+6) Generate a key and seed file -> `quill generate --pem-file identity.pem --seed-file seed.txt`
+7) Now implement Kyle's code snippet below (copied from comment this post is replying to)
+
+[quote="kpeacock, post:41, topic:6169"]
+```
+const Identity = require("@dfinity/identity");
+const hdkey = require("hdkey");
+const fs = require("fs");
+
+const { Secp256k1KeyIdentity } = Identity;
+
+const bip39 = require("bip39");
+
+const phrase = fs.readFileSync("seed.txt").toString().trim();
+
+export const identityFromSeed = async (phrase) => {
+  const seed = await bip39.mnemonicToSeed(phrase);
+  const root = hdkey.fromMasterSeed(seed);
+  const addrnode = root.derive("m/44'/223'/0'/0/0");
+
+  return Secp256k1KeyIdentity.fromSecretKey(addrnode.privateKey);
+};
+
+identityFromSeed(phrase).then((identity) => {
+  console.log(identity.getPrincipal().toString());
+});
+```
+[/quote]
+
+8) If you run this an have NodeJS version 17+, you will receive the following error coming from the hdkey library import -> `Error: error:0308010C:digital envelope routines::unsupported`. The possible solutions for getting around this are [here](https://stackoverflow.com/questions/69692842/error-message-error0308010cdigital-envelope-routinesunsupported), the easiest of which is downgrading to node 16. (@kpeacock/sdk team can you provide a node 17+ solution? :slightly_smiling_face: )
+9) Now running the above node script and `dfx identity get-principal` should return the same identity! Yay!
+
+-------------------------
+
+lastmjs | 2022-07-22 19:58:59 UTC | #51
+
+So there's no way to just pass in a path to a PEM file and get an identity that can be used in `@dfinity/agent`? It used to be the case that I could just pass in JSON object and all of this worked, that was last Summer. What happened?
+
+-------------------------
+
+kpeacock | 2022-07-22 20:45:48 UTC | #52
+
+a JSON object has always worked and still does work. The complicated flow is specifically for deriving an identical principal across `dfx`, `quill`, and `agent-js`
+
+-------------------------
+
+lastmjs | 2022-07-22 20:50:38 UTC | #53
+
+Do you know where the documentation is on what the JSON object should look like? I keep getting errors with it
+
+-------------------------
+
+kpeacock | 2022-07-22 20:53:29 UTC | #54
+
+https://github.com/dfinity/agent-js/blob/05e12ec/packages/identity/src/identity/secp256k1.ts#L12
+
+-------------------------
+
+ZenVoich | 2022-07-29 06:52:56 UTC | #55
+
+[quote="lastmjs, post:51, topic:6169"]
+So there’s no way to just pass in a path to a PEM file and get an identity that can be used in `@dfinity/agent`?
+[/quote]
+
+
+Here is working code:
+https://github.com/ZenVoich/mops/blob/4bf6487deb7e4d3b83eabcd2c7323d9eb231e5a5/cli/pem.js
+
+-------------------------
+
+lastmjs | 2022-08-01 21:31:59 UTC | #56
+
+It does work! Thank you!
+
+-------------------------
+
+hilljh82 | 2022-09-13 01:37:51 UTC | #57
+
+For all those who are interested on this thread, I have created a dfinity module in BlueprintJS called blueprint-dfinity. The goal of this module is to make it easier to write NodeJS clients for the Internet Computer.
+
+https://github.com/onehilltech/blueprint/tree/master/packages/blueprint-dfinity
+
+Some of the key features of this BlueprintJS module are:
+
+* Declarative approach for defining actors
+* Ability to bind actors and their source canisters to properties
+* Codifies bootstrapping code
+
+The current version of trunk uses the original property definition approach to defining actors, and binding them to object properties. The newest version of the blueprint-dfinity, which is to be released with v5, uses decorators to define the actors and bindings to properties on ES6 classes.
+
+  https://github.com/onehilltech/blueprint/tree/v5/packages/blueprint-dfinity
+
+Please have a look and provide feedback.
+
+Disclaimer. I am the creator of BlueprintJS.
+
+-------------------------
+
+icme | 2022-12-29 19:48:00 UTC | #58
+
+Heads up to anyone who's still viewing this thread:
+
+In September the sdk (DFX) changed from generating Ed25519 identities to Secp256k1 identities.
+
+https://github.com/dfinity/sdk/commit/4f10e12ccd32613751f6ef878ba45bb0c5a53751, which was included in [0.12.0-beta.2](https://github.com/dfinity/sdk/releases/tag/0.12.0-beta.2), and then eventually released with [0.12.0](https://github.com/dfinity/sdk/releases/tag/0.12.0), (see the documentation site [release notes](https://internetcomputer.org/docs/current/developer-docs/updates/release-notes/#feat-generate-secp256k1-keys-by-default))
+
+For example, if I go back to DFX < 0.12.0, generate an identity with `dfx identity new <alias>`, [this solution will work](https://forum.dfinity.org/t/using-dfinity-agent-in-node-js/6169/55?u=icme), but if one uses any newer versions of dfx that uses different key generation, it will break.
+
+@AdamS @kpeacock  Are there any node based solutions in agent-js or elsewhere for pulling in the new Secp256k1 identities from a dfx >=0.12.0 generated pem file?
+
+Also I tried playing with the [blueprint solution](https://github.com/onehilltech/blueprint/blob/master/packages/blueprint-dfinity/lib/identity/key.js) provided by the post directly above this one :point_up: , but upon testing it with identities generated by dfx >= 0.12.0 I've found @hilljh82's solution now produces a different identity (maybe it worked previously but there were a few changes made?).
+
+-------------------------
+
+paulyoung | 2022-12-29 23:16:50 UTC | #59
+
+In case this helps, when I was trying to verify public keys they had to be converted to DER format first.
+
+https://github.com/dfinity/agent-rs/issues/395
+
+-------------------------
+
+ZenVoich | 2022-12-30 07:30:34 UTC | #60
+
+Here is the code with both Ed25519 and Secp256k1 identities support https://github.com/ZenVoich/mops/blob/master/cli/pem.js (the previous link was to an old commit)
+
+-------------------------
+
+kpeacock | 2023-01-04 17:38:55 UTC | #61
+
+This is my current recommendation - use a seed phrase in node.js and dfx. https://internetcomputer.org/docs/current/developer-docs/build/agents/javascript/nodejs#identity-from-a-seed-phrase
+
+You can drop the seed phrase in `seed.txt` (which should always be gitignored), and the import it with `dfx identity import --seed-file ./seed.txt`
+
+-------------------------
+
+icme | 2023-01-04 17:56:24 UTC | #62
+
+@kpeacock 
+
+Is there an issue with the Ed25519 and/or Secp256k1 solutions provided by [ZenVoich](https://github.com/ZenVoich/mops/blob/master/cli/pem.js)?
+
+Several developers I’ve spoken with prefer for the solution that imports the dfx generated pem file instead of the quill generated seed.txt (which they’ve professed the seed.txt derived identity import feels like a “hacky”, “roundabout”, or “unstable” solution).
+
+It’s also about consistency, mostly because then developers are using two different tools to manage identity/canisters.
+
+-------------------------
+
+kpeacock | 2023-01-04 18:12:07 UTC | #63
+
+there's nothing wrong with using the PEM files - we just haven't added official support or documentation for it yet.
+
+> instead of the quill generated seed.txt (which they’ve professed the seed.txt derived identity import feels like a “hacky”, “roundabout”, or “unstable” solution).
+
+Quill is unnecessary, unless you're trying to use an existing PEM file in a seed phrase context. I simply suggest using a freshly generated seed phrase from your tool of choice, which will work nicely in CI contexts
+
+-------------------------
+
+peterparker | 2023-02-05 13:13:58 UTC | #64
+
+Nice script @ZenVoich 👍. Do you know how to request a pwd and decode the pem file when encrypted?
+
+-------------------------
+
+Severin | 2023-02-06 08:43:28 UTC | #65
+
+@peterparker do you mean how to decrypt the dfx-encrypted PEM? You can see the process [here](https://github.com/dfinity/sdk/blob/master/src/dfx-core/src/identity/pem_safekeeping.rs#L205-L225). You will also need the nonce from your identity's config, which is located at `.config/dfx/identity/<identity name>/identity.json`
+
+-------------------------
+
+peterparker | 2023-02-06 09:49:46 UTC | #66
+
+I meant decrypt the encrypted PEM file in NodeJS.
+
+Above [script](https://github.com/ZenVoich/mops/blob/master/cli/pem.js) of @ZenVoich works like a charm to replicate dfx identity in NodeJS when the PEM is not encrypted.
+
+-------------------------
+
+jorgenbuilder | 2023-06-12 20:53:21 UTC | #67
+
+Also attempting to use an encrypted dfx identity in node. It looks like @ZenVoich's script is attempting to perform the decryption, but I didn’t get it working in practice when I tried it just now.
+
+Anyone else had luck with this yet? I believe performing a decryption and using the identity in memory is the preferable solution for running privileged actions in node locally.
+
+-------------------------
+
+kpeacock | 2023-06-15 18:32:24 UTC | #68
+
+you could probably use spawn a process to run `dfx identity export` if you have the right permissions
+
+-------------------------
+
+cryptoschindler | 2024-02-15 15:49:45 UTC | #69
+
+to support the latest agent release `0.21.3` that uses `noble` it seems like you only need to pass in the secret key, therefore adapt `decode` in @ZenVoich script to the following
+```
+function decode(rawKey: string) {
+	const buf: Buffer = pemfile.decode(rawKey);
+	if (rawKey.includes('EC PRIVATE KEY')) {
+		if (buf.length != 118) {
+			throw 'expecting byte length 118 but got ' + buf.length;
+		}
+		return Secp256k1KeyIdentity.fromSecretKey(buf.subarray(7, 39));
+	}
+	if (buf.length != 85) {
+		throw 'expecting byte length 85 but got ' + buf.length;
+	}
+	return Ed25519KeyIdentity.fromSecretKey(buf.subarray(16, 48));
+}
+```
+
+i didnt test the secp256k1 identities, so not sure if any changes are required there
+
+-------------------------
+

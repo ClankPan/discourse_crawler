@@ -1,0 +1,200 @@
+ildefons | 2023-11-15 12:39:11 UTC | #1
+
+I'm developing a machine learning (ML) method that can take up to 10s of minutes to complete. However, canister calls can only run for few seconds due to limitations of the consensus algorithm. To overcome this limit I want to develop 2 methods: 1) `start_process`, 2) `continue_process`. The first method `start_process` starts the execution of the ML method and returns and `id`. The second method would be used to request the excution of the ML method for an existing `id` already started, it would run this process for a few seconds and return true or false to let know the client (another canister or js/ts client) if the ML process ended.
+I have some questions about this approach:
+1) Do you think this is a good apporach to overcome the time limitation imposed by the consensus algorithm? Are there better ways to do that?
+2) How can I programmatically know (in the canister side) that I am approaching the limit time before the consensus round starts so the canister call can save the work and return?
+
+-------------------------
+
+zohaib29 | 2023-11-15 13:37:02 UTC | #2
+
+For point 2.
+The instruction limit for an update call is up to 20B, see the [docs](https://internetcomputer.org/docs/current/developer-docs/production/resource-limits#:~:text=Instruction%20limit%2C%20instructions%20per%20update%20call/heartbeat/timer)
+To know the instruction limit inside a canister call, maybe this [API](https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.instruction_counter.html) can help
+
+-------------------------
+
+ildefons | 2023-11-15 13:52:33 UTC | #3
+
+How can I access this API in Motoko?
+
+-------------------------
+
+Severin | 2023-11-15 13:53:37 UTC | #4
+
+If you have a for loop or something similar that covers most of the work you can maybe pull the work inside the loop into its own async function and then you can loop over the self-await. This should then start fresh messages for every iteration, resetting the execution counter every time
+
+-------------------------
+
+skilesare | 2023-11-15 14:35:34 UTC | #5
+
+Pipelinify.mo has a framework for stepwise processing:  
+
+https://github.com/skilesare/pipelinify.mo
+
+It provides function hooks to handle steps along the way and manages workspaces internally so that data remains available to your process across rounds:
+
+```
+    //pipeline types
+    public type PipelinifyIntitialization = {
+        onDataWillBeLoaded: ?((Hash, ?ProcessRequest) -> PipelineEventResponse);
+        onDataReady: ?((Hash, Workspace, ?ProcessRequest) -> PipelineEventResponse);
+        onPreProcess: ?((Hash, Workspace, ?ProcessRequest, ?Nat) -> PipelineEventResponse);
+        onProcess: ?((Hash, Workspace, ?ProcessRequest, ?Nat) -> PipelineEventResponse);
+        onPostProcess: ?((Hash, Workspace, ?ProcessRequest, ?Nat) -> PipelineEventResponse);
+        onDataWillBeReturned: ?((Hash, Workspace,?ProcessRequest) -> PipelineEventResponse);
+        onDataReturned: ?((Hash, ?ProcessRequest, ?ProcessResponse) -> PipelineEventResponse);
+        getProcessType: ?((Hash, Workspace, ?ProcessRequest) -> ProcessType);
+        getLocalWorkspace: ?((Hash, Nat, ?ProcessRequest) -> Candy.Workspace);
+        putLocalWorkspace: ?((Hash, Nat, Candy.Workspace, ?ProcessRequest) -> Candy.Workspace);
+
+    };
+```
+
+I haven't added timers to auto-advance, but it is definitely on the todo list. It should not be hard to add.
+
+-------------------------
+
+ildefons | 2023-11-16 11:07:45 UTC | #6
+
+This could be it but I don't quiet understand the sentence:
+
+[quote="Severin, post:4, topic:24712"]
+loop over the self-await
+[/quote]
+
+Could you please give an example?
+
+-------------------------
+
+ildefons | 2023-11-16 11:16:23 UTC | #7
+
+I am not sure this is what I need. Is there some simple examples documentation I can use to learn when and how to use this package?
+
+-------------------------
+
+Severin | 2023-11-16 11:58:58 UTC | #8
+
+Say one message is long enough to produce one output token of an LLM, but you want to produce a longer response. Factor out producing one token into a separate `async` function:
+
+```
+async fn one_token() -> Token {
+  model.do_something()
+}
+```
+Because it's `async`, every call of this function will run in a separate message. Then you can produce a long response like this:
+
+```
+async fn long_answer() -> LongOutput {
+  let output = empty()
+  while not_fully_responded() {
+    output <- output + one_token().await
+  }
+  return output
+}
+```
+
+-------------------------
+
+ildefons | 2023-11-16 12:32:52 UTC | #9
+
+Ok, I understand this far. Now let's add a new "requirement": I want methods one_token() and long_answer() to be inside a package/module so it can be reused. Module methods cannot be declared async and await cannot be used either. Is there a way a pattern were I could still write one_token and long_answer as module functions?
+
+-------------------------
+
+Severin | 2023-11-16 12:51:40 UTC | #10
+
+I don't know of a way how to split up functions you can't modify from the outside except for writing an entire runtime system, which is a little bit extreme
+
+-------------------------
+
+ildefons | 2023-11-16 13:07:37 UTC | #11
+
+I was thinking a possible way is to dynamically create a canister called long_answer" with 1 call method containing the main loop. This main loop could call module functions like one token. So now my machine learning library would consist of modules that contain code that can be safely executed monlitically and canister code that can be instantiated to perform long computations. 
+Do you think this makes sense?
+
+-------------------------
+
+skilesare | 2023-11-16 15:48:33 UTC | #12
+
+Use a class...it can certainly have an await*.  I actually think a module can as well.
+
+-------------------------
+
+ildefons | 2023-11-17 12:42:28 UTC | #13
+
+I think I am not explaining well and/or not understabding well your suggestions. Maybe the following code helps:
+Let's assume I have this module, where f1() can be safely executed within 1 consensus round and f2() that calls f1 many times and generate a vector. f2() needs much more time than the consensus round:
+
+```
+module {
+    public func f1(i_:Nat) : async (Nat) {  
+      return i_;
+    };
+
+    public func f2() : async ([Nat]) {  
+      let ret = Buffer.Buffer<Nat>(10);
+      for (i in Iter.range(0, 10)) { 
+        let f1_async_nat: async Nat = f1(i);
+        let f1_nat : Nat = await f1_async_nat;
+        ret.add(f1_nat);
+      };
+      return Buffer.toArray(ret);
+    };
+};
+```
+
+Now I have also a canister with one call method compute() that calls f2() and store the result in a canister variable:
+
+
+```
+actor {
+  var mydata: [Nat] = [0];
+  public func compute() : async () {
+    mydata := mymodule.f2();
+  };
+};
+```
+
+My problem is that compute will return before f2() ends. How can I make this work? That is why I suggested initially to develop 2 canister methods: 1) `start_process` , 2) `continue_process` .
+
+-------------------------
+
+Severin | 2023-11-17 12:45:05 UTC | #14
+
+[quote="ildefons, post:13, topic:24712"]
+`mydata := mymodule.f2();`
+[/quote]
+Doesn't this just create a future that you then store in the vec? AFAIU you're supposed to await the future so that you get the result, just like you're doing it in f2
+
+-------------------------
+
+ildefons | 2023-11-17 13:01:17 UTC | #15
+
+Should I do instead:
+
+`mydata := await mymodule.f2();`
+
+Would that be enough even if canister `compute()` method returns before f2 is over? Does it make sense my question?
+
+-------------------------
+
+Severin | 2023-11-17 13:07:58 UTC | #16
+
+This would make `compute()` wait until `f2()` is done and will collect the result. It will take a while because `f2()` performs multiple calls to `f1()`, which in turn may take quite a while
+
+-------------------------
+
+ildefons | 2023-11-17 13:13:09 UTC | #17
+
+Is it possible to call other canister methods while canister compute method is still running?
+
+-------------------------
+
+Severin | 2023-11-17 13:31:06 UTC | #18
+
+From the outside yes, and message execution order can be anything. From the inside, AFAIK the Rust CDK does not support multiple concurrent `await`s
+
+-------------------------
+

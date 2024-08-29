@@ -1,0 +1,184 @@
+icme | 2022-06-21 23:15:30 UTC | #1
+
+I've been starting to look into load scaling solutions on the IC, and came across the **updates per second** metric mentioned [here](https://wiki.internetcomputer.org/wiki/Internet_Computer_performance_%26_power_consumption#Measurements), as well as the **transactions per second** (TX/s) metric which one can find on the internet computer dashboard [here](https://dashboard.internetcomputer.org/).
+
+So my question is, in context of the two sources mentioned above - what is the difference between updates per second and transactions per second?
+
+-------------------------
+
+jzxchiang | 2022-06-22 00:46:05 UTC | #2
+
+I think they are one and the same. I really hope they are not including queries as part of transactions.
+
+-------------------------
+
+Dylan | 2022-06-22 01:03:32 UTC | #3
+
+The IC dashboard Transactions chart you linked to shows both types of calls described in the wiki page you linked, update calls per second and query calls per second. Hover over a chart line to see a tooltip (or on mobile, click a chart line). The number at the upper-right of the Transactions chart is update calls + query calls per second.
+
+-------------------------
+
+icme | 2022-06-22 04:43:58 UTC | #4
+
+@Dylan 
+
+Do multiple state updates within a single update call count as "update transactions" (say if I'm batching a bunch of data into a single update message), or is it simply the number of individual update call messages/requests which are processed that are counted?
+
+In one example, let's say I make one update call that makes 500 new updates to the canister state (say I add 500 items that were in my request body to a stable data structure on the canister heap).
+
+In the other example, let's say I make 500 unique update call requests with a single item, that makes one update to the canister state for each of these update calls.
+
+-------------------------
+
+yvonneanne | 2022-06-22 05:58:00 UTC | #5
+
+[quote="icme, post:4, topic:13965"]
+Do multiple state updates within a single update call count as “update transactions” (say if I’m batching a bunch of data into a single update message), or is it simply the number of individual update call messages/requests which are processed that are counted?
+[/quote]
+
+On the dashboard the number of processed individual update calls is counted, regardless of how many changes they cause in your canister heap.
+
+The performance measurements discussed in the wiki were carried out with a counter canister, where one update call increases a counter variable by one.
+
+-------------------------
+
+icme | 2022-06-22 06:53:32 UTC | #6
+
+@yvonneanne, this is the reason why I ask this question.
+
+I ran some back-filling of data onto the main network this past week in preparation for Supernova.
+
+I was able to sustain 1.2-1.3k transactions per second into my demo application for Supernova ([here it is if you're interested](https://devpost.com/software/candb)) on a single subnet for > 8hrs, amounting to ~2X the average described here https://wiki.internetcomputer.org/wiki/Internet_Computer_performance_%26_power_consumption#Measurements
+
+![Screen Shot 2022-06-20 at 08.23.47|690x447](upload://5tYlAhxBMNIP0aJX0XlySrW4YAg.png)
+
+<br/>
+
+You can also see that this was 1/3rd of the overall transactions on the IC at the time
+
+![Screen Shot 2022-06-20 at 08.24.17|690x178](upload://tksZ0TCk9O78ArjGlKTXmgDYZNr.png)
+
+
+I went back this past evening and took a screenshot of the 7 day view of my subnet. Each of the peaks you see over the past week were triggered by me testing out my backfill job (I know this because they started peaking at the exact same time as the job I was running and declined back to 30-100 after my job finished timed exactly to the minute. After initial backfill testing, I ran the final backfill in two batches, one on 6-19 and the other on 6-20 (SF Bay Area PDT time). As you can see, the dashboard peaked showing  1,341.13 update transactions happening per second as a result of my backfill job.
+
+![Screen Shot 2022-06-21 at 21.38.12|690x232](upload://3RUVahh3aAUPwCk8aensV1ToYSf.png)
+
+However, I know for a fact that I was not making anywhere near 1,341 update calls to the back-end at this time. Instead, I was making 4 update calls at a time and [awaiting for each call's result before uploading the next chunk](https://github.com/canscale/supernova-candb-demo/blob/96f8127d73128e6d2a21d84c56c5a24d4ad3eccb/backfill/src/load/index.ts#L60), with each update call containing 30-80KB chunks, and taking roughly 5 seconds to process each chunk depending on the size of the chunk and the network bandwidth.
+
+Each chunk contained ~500 records that were inserted into a red-black tree on the backend, with each record inserted into 3 different database indices to support flexible queries. So for each update call (1 update call), 1500 new entities were inserted. So essentially running this process in parallel with 4 different processes results in
+
+4 parallel processes * 1 job, where
+
+1 job = 1 message * 500 items/message * 3 indices/record * (1 message / 5 sec)
+
+We get 4 * 1 * 500 * 3 * (1/5) = 1200 -> oddly close to the update transaction count shown in the dashboard.
+
+Otherwise, I was only making (4 update calls / 5 sec) = 0.8 update calls/sec
+
+
+So unless I'm totally off in how I wrote my code to call the IC or my understanding of how the @dfinity/agent code (JavaScript/TypeScript) makes individual update calls (ingress update calls) to the IC using the generated actor classes, there's something that doesn't seem accurate in how the update transaction count is being displayed on the dashboard.
+
+One other piece that raises my suspicion is the measurements shown in this wiki https://wiki.internetcomputer.org/wiki/Internet_Computer_performance_%26_power_consumption#Measurements, which states that their testing found:
+> "The Internet Computer sustained more than **20'841 updates/second** calls to application canisters for a period of four minutes (averaging **672 updates/second** per subnet). The update calls measured here are triggered from ingress messages sent from outside the IC."
+
+I ran my backfill job for at least 8 hours each day (something like 10+ hours on 6-19), from which the dashboard chart shows that my subnet sustained > 1000 updates/sec for the entire 8 hour period.
+
+Can you provide an explanation for what might be happening here and why these interactions showed such a high update transaction count?
+
+-------------------------
+
+icme | 2022-06-22 06:57:14 UTC | #7
+
+Did you attempt this same experiment where the counter variable is incremented by one 500 times each call? I'm curious if it would return the same result.
+
+-------------------------
+
+free | 2022-06-22 07:13:07 UTC | #8
+
+An update /  transaction, as counted by the IC corresponds to one message execution (whether it increments one counter or rewrites the whole heap or makes no changes whatsoever to the state).
+
+Do note that in the case of an application consisting of multiple canisters every canister message counts as a transaction, as per the above. So if you call canister A (transaction 1); which calls canister B (transaction 2); which returns a response to canister A (transaction 3); that is 3 transactions.
+
+Happy to look into the metrics for your subnet if you can show me the subnet ID. (Although we don't have per-canister metrics, so I won't be able to tell you which canisters or how many of them were involved. But I should be able to tell you how many of those transactions were ingress messages; vs canister requests; vs canister responses.)
+
+-------------------------
+
+icme | 2022-06-22 07:27:07 UTC | #9
+
+[quote="free, post:8, topic:13965"]
+Happy to look into the metrics for your subnet if you can show me the subnet ID.
+[/quote]
+
+Here's the subnet - https://dashboard.internetcomputer.org/subnet/cv73p-6v7zi-u67oy-7jc3h-qspsz-g5lrj-4fn7k-xrax3-thek2-sl46v-jae (As of this message on June 22nd ~12:27am PDT, you can see roughly the same transactions chart as the 3rd image I posted above in [this message](https://forum.dfinity.org/t/what-is-the-difference-between-updates-per-second-and-transactions-per-second/13965/6?u=icme)).
+
+-------------------------
+
+yvonneanne | 2022-06-22 07:33:12 UTC | #10
+
+> Blockquote An update / transaction, as counted by the IC corresponds to one message execution (whether it increments one counter or rewrites the whole heap or makes no changes whatsoever to the state).
+
+Thanks for the clarification, I didn't know the dashboard also counts the calls between canisters!
+
+-------------------------
+
+free | 2022-06-22 07:54:33 UTC | #11
+
+Here's a screenshot of a Grafana dashboard for subnet `cv73p` between 2022-06-19 22:00:00 UTC and 2022-06-20 10:00:00 UTC (corresponding to the biggest bump in your screenshots).
+
+![Screenshot from 2022-06-22 09-31-16|690x288](upload://7vSRATQvTckSFwH7LlkOuiFT0lo.png)
+
+The panel right under the tooltip says "Message Induction Rate" and it basically shows a flat rate of ingress messages (~36/s) before, throughout and after your backfill. This is most likely traffic to other canisters, with your .8 updates/s not really registering as a trend. There is also some minuscule amount (<.5/s total) of canister requests and responses being inducted (taken from blocks and enqueued into canister input queues).
+
+The panel with the tooltip shows just over 600 updates (ingress plus canister requests) being executed per second (with 200 completing with no response and 439 completing successfully with a response); and about the same amount of "reply callbacks" (handling of canister responses) split (200/403 between no response and success with response). Everything else can be ignored.
+
+My reading of that is that something (other than your backfill) was handling 35-40 ingress messages per second. And your backfill triggered almost exactly 600 requests per second, all of them handled successfully, 200 without a response and 400 with a response, For a total of 1200 transactions per second (remember that there's a canister response for every canister request, so that's 2 transactions per request).
+
+Luckily (for my analysis) there was very little XNet (cross-subnet) traffic at the time, just the constant ingress traffic and your backfill (triggering a significant amount of subnet-local canister requests).
+
+All the while the subnet was at about 60% load on the critical path (there's a single thread handling induction, scheduling, message routing, etc. in order to ensure deterministic behavior across replicas), so it could have likely handled up to 1000 transactions/s more (unless it would have run into some other bottleneck).
+
+I guess the difference between the benchmark and your backfill is that the benchmark used ingress messages to trigger transactions. And ingress messages are rate limited (to a few hundred per block, don't remember the exact number) in order to limit the size of the ingress history (every ingress response is kept around for 5 minutes after completion, so combined with the rate limit this gives an upper bound to the ingress history size). Canister messages are not rate limited, particularly subnet-local ones, so you could achieve a lot higher throughput this way.
+
+I guess using canister messages instead of ingress messages for benchmarking might have been deemed as cheating (after all we care about user-triggered transactions rather than artificially generated traffic) so the benchmark was run with ingress messages.
+
+-------------------------
+
+free | 2022-06-22 08:03:12 UTC | #12
+
+So I guess to answer your question more directly, every one of your batch ingress messages triggered 3 canister requests for each of the 500 records. Had those 500 inserts been batched together (i.e. one batch insert of 500 entries per index instead of 500 inserts per index) you would have seen 500x fewer transactions.
+
+And both ingress messages and canister messages (requests and responses) are counted as transactions. By the point a canister handles them there is no fundamental difference between messages: each of them is an atomic work unit and may succeed (and commit) or fail (and roll back) independently. I.e. it's a transaction.
+
+-------------------------
+
+CatPirate | 2022-06-22 08:03:21 UTC | #13
+
+
+
+
+[quote="free, post:11, topic:13965"]
+Canister messages are not rate limited, particularly subnet-local ones, so you could achieve a lot higher throughput this way
+[/quote]
+
+So Canister can ddos other canister? I read about something like this on InfinitySwap's blog - when they were talking about their IS20 token standard
+
+-------------------------
+
+free | 2022-06-22 08:11:30 UTC | #14
+
+[quote="CatPirate, post:13, topic:13965"]
+So Canister can ddos other canister?
+[/quote]
+
+Yes and no. We iterate over input sources when inducting and routing messages (i.e. we take one ingress message, if present; then one subnet-local message, if available; then one cross-subnet message; and for canister messages we go round-robin over the source canisters). So it's fairer in this sense than e.g. your run-of-the-mill web server. And one could take this even further (e.g. keep a weight per source canister and prefer sources with lower weights).
+
+But it's still possible that someone may install 1000 local canisters and 1000 remote canisters and have them all message a given canister; plus send tons of ingress messages to it. Which would mean that a large proportion (but not 100%) of requests would be spam. And they may pick an endpoint that requires a lot of processing, further slowing down the rate of message execution.
+
+-------------------------
+
+free | 2022-06-22 08:27:31 UTC | #15
+
+Only just realized that you never said "3 different database canisters", just "3 different database indices". In case it's the latter and the indices are actually maintained by the same canister, it could be that you were simply invoking the respective `insert()` calls as canister calls (i.e. as if invoking some other canister's method), followed by an `await`; as opposed to using plain function calls that would have been executed as part of the same transaction.
+
+-------------------------
+

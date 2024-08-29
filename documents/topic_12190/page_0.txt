@@ -1,0 +1,351 @@
+ildefons | 2022-04-16 06:36:52 UTC | #1
+
+I am trying to generate random numbers with a canister implemented with rust but when I try to import (use rand::Rng) I get an error (subject). How can I import/use a non IC rust library within a rust canister? 
+
+
+------  sample code below
+
+use rand::Rng;
+
+#[ic_cdk_macros::query]
+fn getRandom() -> String {
+    let n1: u8 = rng.gen();
+    format!("{}", n1)
+}
+
+I get the following error:
+
+error[E0432]: unresolved import `rand`
+ --> src/rust_hello/src/lib.rs:1:5
+  |
+  | use rand::Rng;
+  |     ^^^^ use of undeclared crate or module `rand`
+
+-------------------------
+
+ildefons | 2022-04-16 06:51:07 UTC | #2
+
+I partially solved it by adding the corresponding dependency in the cargo file, but now I get an error when compiling [getrandom v0.2.6] saying that this is not supported (Error: the wasm32-unknown-unknown target is not supported by default). So it looks like I cannot use this library. So, this raises two questions:
+
+1) Is it correct that I cannot use the rand library?
+2) If (1) is correct, how can I know what libraries can/not I use?
+
+-------------------------
+
+GLdev | 2022-04-16 07:07:42 UTC | #3
+
+```toml
+getrandom = { version = "0.2.3", features = ["js"]}
+rand = "0.7.3"
+```
+
+Try these two out, they work as of yesterday. Some later versions error out from what I tried, but I haven't spent the time to track down exactly what's causing this.
+
+-------------------------
+
+ildefons | 2022-04-16 07:33:29 UTC | #4
+
+It compiles now but when I call the canister query with the random generator it outputs a n execution error (getrandom: this target is not supported).I am using dfx version 0.9.3. Should I use some other version?
+
+ildefons@ildefons-VirtualBox:~/rstest/rust_hello$ dfx canister call rust_hello greet world
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Panicked at 'could not initialize thread_rng: getrandom: this target is not supported', /home/ildefons/.cargo/registry/src/github.com-1ecc6299db9ec823/rand-0.7.3/src/rngs/thread.rs:65:17
+Error: The Replica returned an error: code 5, message: "IC0503: Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped explicitly: Panicked at 'could not initialize thread_rng: getrandom: this target is not supported', /home/ildefons/.cargo/registry/src/github.com-1ecc6299db9ec823/rand-0.7.3/src/rngs/thread.rs:65:17"
+
+-------------------------
+
+GLdev | 2022-04-16 08:51:22 UTC | #5
+
+Try using it like they do in [this demo app](https://github.com/hpeebles/rust-canister-demo/blob/master/todo/src/env.rs). It works great for me.
+
+-------------------------
+
+ildefons | 2022-04-16 14:45:01 UTC | #6
+
+It works. Thank you very much @GLdev.
+
+I narrowed down the problem as follows:
+
+THIS WORKS-->let mut rng = StdRng::from_seed(myseed);
+THIS DOES NOT WORK-->let mut rng = rand::thread_rng();
+
+Do you know why "thread_rng" is not supported? this could be relevant to anticipate other external libraries that could give execution errors.
+
+-------------------------
+
+paulyoung | 2022-04-16 16:48:42 UTC | #7
+
+I think the only way to get secure unpredictable randomness is to do this:
+
+https://github.com/dfinity/bigmap-poc/blob/3f13b36574a390025bd78ec8bfff150d94005ac7/src/canister_management.rs#L82-L93
+
+-------------------------
+
+ildefons | 2022-04-17 08:30:08 UTC | #8
+
+@paulyoung I tried your method but I get a compilation error. It says (below) that could not find `CanisterId` in `ic_cdk'. I declared as a query (below), is this ok?
+
+
+
+-------Method
+#[ic_cdk_macros::query]
+pub async fn subnet_raw_rand() -> Result<Vec<u8>, String> {
+    let management_canister = ic_cdk::CanisterId::from(Vec::new());
+    let rnd_buffer: Vec<u8> = match ic_cdk::call(management_canister, "raw_rand", Some(())).await {
+        Ok(result) => result,
+        Err(err) => {
+            ic_cdk::println!("Error invoking raw_rand: {:?} {}", err.0, err.1);
+            return Err(err.1);
+        }
+    };
+
+            
+    Ok(rnd_buffer.to_vec())
+}
+
+------
+ildefons@ildefons-VirtualBox:~/rstest/rust_hello$ dfx deploy
+Deploying all canisters.
+All canisters have already been created.
+Building canisters...
+Executing: cargo build --target wasm32-unknown-unknown --release -p rust_hello
+   Compiling rust_hello v0.1.0 (/home/ildefons/rstest/rust_hello/src/rust_hello)
+error[E0433]: failed to resolve: could not find `CanisterId` in `ic_cdk`
+  --> src/rust_hello/src/lib.rs:55:39
+   |
+55 |     let management_canister = ic_cdk::CanisterId::from(Vec::new());
+   |                                       ^^^^^^^^^^ could not find `CanisterId` in `ic_cdk`
+
+-------------------------
+
+paulyoung | 2022-04-17 08:42:14 UTC | #9
+
+It only works with an update call.
+
+https://github.com/dfinity/cdk-rs/issues/173
+
+-------------------------
+
+ildefons | 2022-04-17 08:59:26 UTC | #10
+
+I changed to 'update' but I get the same error (below)
+
+Compiling rust_hello v0.1.0 (/home/ildefons/rstest/rust_hello/src/rust_hello)
+error[E0433]: failed to resolve: could not find `CanisterId` in `ic_cdk`
+--> src/rust_hello/src/lib.rs:55:39
+|
+55 | let management_canister = ic_cdk::CanisterId::from(Vec::new());
+| ^^^^^^^^^^ could not find `CanisterId` in `ic_cdk`
+
+-------------------------
+
+ildefons | 2022-04-17 10:43:02 UTC | #11
+
+I solved the previous error but I get a new one. Specifically, the call "ic_cdk::call" says that 
+
+"the trait `for<'a> ArgumentDecoder<'a>` is not implemented for `std::vec::Vec<u8>`"
+
+Any idea what I can be doing wrong?
+```
+#[ic_cdk_macros::update]
+pub async fn subnet_raw_rand() -> Result<Vec<u8>, String> {
+    let management_canister = ic_cdk::export::Principal::management_canister();
+    let rnd_buffer: Vec<u8> = match ic_cdk::call(management_canister, "raw_rand", ()).await {
+        Ok(result) => result,
+        Err(err) => {
+            ic_cdk::println!("Error invoking raw_rand: {:?} {}", err.0, err.1);
+            return Err(err.1);
+        }
+    };
+
+    Ok(rnd_buffer.to_vec())
+}
+```
+
+-------------------------
+
+levi | 2022-04-17 10:48:47 UTC | #12
+
+[quote="ildefons, post:11, topic:12190"]
+`let rnd_buffer: Vec<u8> = match ic_cdk::call(management_canister, "raw_rand", ()).await {`
+[/quote]
+
+`let (rnd_buffer,): (Vec<u8>,) = match ic_cdk::call(management_canister, "raw_rand", ()).await {`
+
+-------------------------
+
+ildefons | 2022-04-17 11:57:29 UTC | #13
+
+It fixes the error
+
+But now I get the following candid syntax error:
+```
+"subnet_raw_rand": () -> (Result<Vec<u8>, String>);
+                                                    ^ Unknown token <
+```
+The " ^" symbol is below the first "<" symbol
+
+How should I declare a candid interface for this update method? is there a guide I can follow?
+
+-------------------------
+
+paulyoung | 2022-04-17 17:59:38 UTC | #14
+
+Something like:
+
+```
+service {
+  subnet_raw_rand : () -> (opt variant { ok : vec nat8; error : text });
+}
+```
+
+[quote="ildefons, post:13, topic:12190"]
+is there a guide I can follow?
+[/quote]
+
+See https://sdk.dfinity.org/docs/candid-guide/candid-concepts.html and https://smartcontracts.org/docs/candid-guide/candid-types.html
+
+-------------------------
+
+ildefons | 2022-04-18 13:43:57 UTC | #15
+
+It now compiles and deploys correctly, but I get a "FIX ME!" execution error (below). Could it be related to the candid interface? Maybe should I call the update method in a different way?
+
+--------Execution error:
+ildefons@ildefons-VirtualBox:~/rstest/rust_hello$ dfx canister call rust_hello subnet_raw_rand
+FIX ME! variant { 17_724 : table1; 3_456_837 : text } <: opt variant { ok : vec nat8; error : text } via special opt rule.
+This means the sender and receiver type has diverged, and can cause data loss.
+(null)
+
+-------------------------
+
+paulyoung | 2022-04-18 15:43:48 UTC | #16
+
+Maybe @chenyan knows but it might be due to a type mismatch.
+
+-------------------------
+
+paulyoung | 2022-04-18 15:45:36 UTC | #17
+
+It looks like there are 2 threads going about the same issue.
+
+https://forum.dfinity.org/t/rust-wasm-getrandom-custom/6351/9?u=paulyoung
+
+-------------------------
+
+chenyan | 2022-04-18 18:14:54 UTC | #18
+
+Rust result type uses capitalized tags, so the candid interface is
+```
+service : {
+  subnet_raw_rand : () -> (opt variant { Ok : vec nat8; Err : text });
+}
+```
+
+-------------------------
+
+ildefons | 2022-04-19 13:36:21 UTC | #19
+
+[quote="chenyan, post:18, topic:12190"]
+```
+}
+```
+[/quote]
+
+It works now. Thank you everyone for your help!
+
+-------------------------
+
+2bonahill | 2023-02-01 14:47:46 UTC | #20
+
+Hey there. I am doing all of the above, but I am still getting an error:
+
+Error: The Replica returned an error: code 5, message: "IC0504: Canister xxxx violated contract: "ic0_call_new" cannot be executed in non replicated query mode".
+
+Any clue?
+
+Code looks like this:
+
+```
+...
+let management_canister = ic_cdk::export::Principal::management_canister();
+let random_bytes: Vec<u8> = match ic_cdk::call(management_canister, "raw_rand", ()).await {
+    Ok((res,)) => res,
+    Err((_, err)) => ic_cdk::trap(&format!("Failed to get random seed: {}", err)),
+};
+...
+```
+
+And yes, i do include the 
+
+```
+#[ic_cdk_macros::update]
+```
+
+macro.
+
+-------------------------
+
+AdamS | 2023-02-01 16:26:58 UTC | #21
+
+Are you calling this function from a different function marked `#[query]`?
+
+-------------------------
+
+2bonahill | 2023-02-02 19:49:58 UTC | #22
+
+Yes. Maybe it has to do with the fact that i deploy locally?
+
+-------------------------
+
+Severin | 2023-02-03 08:10:55 UTC | #23
+
+It is not possible to call other canisters in queries (at least for now). There are [composite queries](https://forum.dfinity.org/t/proposal-composite-queries/15979) in the works, which will allow you to call other canisters, but for now you shouldn't write calls to other canisters in your queries
+
+-------------------------
+
+2bonahill | 2023-02-03 08:31:28 UTC | #24
+
+Okay, got it, thanks.
+
+But how then can I get some randomness? The only potential solution I have found so far is to call the "raw_rand" method on the management canister (as described in my code snippet). Is there a better way?
+
+-------------------------
+
+GLdev | 2023-02-03 09:01:30 UTC | #25
+
+Have you tried this way: https://forum.dfinity.org/t/issue-about-generate-random-string-panicked-at-could-not-initialize-thread-rng-getrandom-this-target-is-not-supported/15198/8 ?
+
+-------------------------
+
+2bonahill | 2023-02-03 15:28:11 UTC | #26
+
+Yes, does not help, because it still relies on calling another canister in queries. Thanks anyway.
+
+-------------------------
+
+AdamS | 2023-02-10 01:57:29 UTC | #27
+
+No, it relies on calling another canister in the initializer. 
+
+However, no matter what, you cannot get (unique) randomness, or anything else that would update state, in a query call. The closest you could get would be if you concatenated randomness with `time()` and hashed the result, but that wouldn't be very secure. Perhaps if you described what you were trying to do with it, it'd be easier to provide a solution.
+
+-------------------------
+
+2bonahill | 2023-02-10 12:58:32 UTC | #28
+
+Hi Adam
+
+Thanks for your reply. I recently just figured a work-around, which is as simple as it gets: i just tagged the function to be an "update" call. And it worked immediately. Probably not a really good way, but i still feel more comfortable than using time and hashing. 
+
+basically for now i only need the randomness to derive uuids. 
+
+all works for the time being. thank you very much!
+
+-------------------------
+
+lastmjs | 2023-02-11 07:07:31 UTC | #29
+
+We create an rng that is stored globally and hooked up to a custom randomness implementation for the rand crate. In our init and post_upgrade functions we set a timer with delay 0 that retrieves randomness with raw_rand and sets the global rng. This is working so far.
+
+-------------------------
+

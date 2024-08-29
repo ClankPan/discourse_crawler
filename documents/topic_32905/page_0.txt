@@ -1,0 +1,1382 @@
+peterparker | 2024-07-08 16:47:36 UTC | #1
+
+For fields that represent duration values, what are the numbers of seconds used to convert months and years provided in the SNS.yaml file?
+
+According documentation of the [SNS.yaml](https://github.com/dfinity/sns-testing/blob/main/example_sns_init.yaml) example it's
+
+```
+- months, month, M -- defined as 30.44 days
+- years, year, y -- defined as 365.25 days
+```
+
+However when I use `2630016`, i.e. 30.44 days, for months and try to propose the WaterNeuron SNS yaml I get an issue that the `dissolve_delay_seconds` exceeds the limit of `94_672_800` because for 36 months I get `94_680_576`.
+
+So you should be using something else than 30.44 days unless 30.44 days is not 2630016 seconds.
+
+-------------------------
+
+peterparker | 2024-07-08 17:52:32 UTC | #2
+
+I found this [piece](https://github.com/dfinity/ic-dre-testing/blob/74ea7d5708c8421715a9b12d8b093140e99918ae/rs/nns/governance/src/governance.rs#L112) of code in a foundation repo:
+
+```
+// A few helper constants for durations.
+pub const ONE_DAY_SECONDS: u64 = 24 * 60 * 60;
+pub const ONE_YEAR_SECONDS: u64 = (4 * 365 + 1) * ONE_DAY_SECONDS / 4;
+pub const ONE_MONTH_SECONDS: u64 = ONE_YEAR_SECONDS / 12;
+```
+
+So it seems that `2629800` is used for a month in second and `31557600` for a year.
+
+While it resolve most differences, but I still got issues with the dissolve delays.
+
+```
+Voting:
+    minimum_dissolve_delay: 3 months
+
+    VestingSchedule:
+        interval: 6 months
+```
+
+However for such a distribution I got the correct amount of seconds:
+
+```
+          principal: g...
+          stake: 1_500_000 tokens
+          memo: 2
+          dissolve_delay: 12 months
+          vesting_period: 6 months
+```
+
+Is there somehow two different number of seconds for month and year used by the NNS governance?
+
+-------------------------
+
+Andre-Popovitch | 2024-07-08 23:57:30 UTC | #3
+
+Excellent question! The CLI uses the humantime crate for duration parsing. The result of this is the period of time parsed to a rust `Duration` object. Then we convert it to seconds using `Duration::as_secs()`, but at this point the number of seconds corresponding to a month is already determined by humantime (rust durations are simply a number of seconds and a number of nanoseconds). 
+
+We can see the number of seconds that correspond to various humantime-understood units in the humantime source code [here](https://github.com/tailhook/humantime/blob/master/src/duration.rs#L136). Particularly, it seems like a month is 2_630_016 seconds, a year is 31_557_600 seconds, a day is 86_400 seconds and a week is seven times that. 
+
+So it seems that there are two different number of seconds for month and year used by the NNS governance. In particular the definition of a month is slightly different. The documentation seems correct to me however.
+
+I think you already know, but here is an explanation of the error for others who are curious. The maximal dissolve delay for a neuron an SNS participant receives is: the vesting schedule specified in the CreateServiceNervousSystem times the number of neurons each SNS participant receives. This is because, with a dissolve delay of 1 month and each participant receiving 8 neurons, they would get one neuron with a dissolve delay of one month, a second neuron with a dissolve delay of two months, and so on up to the eighth neuron having a dissolve delay of 8 months. Now if you imagine that the SNS's maximum dissolve delay is configured to be 5 months, this would create a problem as the sixth, seventh and eighth neuron could not be constructed. This check is implemented [here](https://github.com/dfinity/ic/blob/60f1411f1d06b6cfae09a2e4b99043fdca559c8f/rs/sns/init/src/lib.rs#L1508), although it is written in terms of the SnsInitPayload rather than the CreateServiceNervousSystem proposal for historical reasons.
+
+Let me know if this doesn't completely answer your question.
+
+-------------------------
+
+peterparker | 2024-07-09 18:18:06 UTC | #4
+
+Thanks for the explanation; however, I have to say that something is definitely off, in my opinion. I doubt that `humantime` is used out of the box to submit the proposal.
+
+I have tested the WaterNeuron YAML file many times and compared the outcome with the proposal submitted on mainnet. There is no valid scenario in which 2_630_016 seconds is used. Assuming the dissolve delay is a particular case, the only scenario in which I can reproduce the value submitted on mainnet is using 2_629_800 seconds for a human-readable month provided in the YAML file.
+
+Therefore, I see two scenarios:
+
+- Either the YAML file provided in the WaterNeuron repo is not exactly using the values used to submit the duration of the proposal
+
+or
+
+- There is an additional conversion in the foundation's code or a bug
+
+Either way, I'm becoming absolutely mental about those seconds, so I would love to be pointed to the exact piece of code used by the foundation to read the YAML data and generate the NNS proposal.
+
+-------------------------
+
+Andre-Popovitch | 2024-07-10 01:15:01 UTC | #5
+
+The code for duration parsing is [here]( https://github.com/dfinity/ic/blob/1ec57bd3ac00a716eb6e58ba2f49cf4e9c3e6b03/rs/nervous_system/humanize/src/lib.rs#L58).
+
+Most of the rest of the code for generating the CreateServiceNervousSystem is [here](https://github.com/dfinity/ic/blob/1ec57bd3ac00a716eb6e58ba2f49cf4e9c3e6b03/rs/sns/cli/src/init_config_file/friendly.rs#L375).
+
+My guess is that the YAML file provided in the WaterNeuron repo is not exactly the one that was used to submit the proposal. I believe there was another case of this mentioned in another forum post recently. If you link me to the waterneuron repo's YAML file, I can share the exact CreateServiceNervousSystem proposal it would generate and we could compare it against that.
+
+-------------------------
+
+peterparker | 2024-07-10 14:32:36 UTC | #6
+
+Thanks for the details. It appears that NNS and SNS are using different references in terms of seconds for months and years.
+
+For months, NNS seems to use `2_629_800` seconds, but SNS uses a human-readable crate value of `2_630_016` seconds.
+
+I assume that in both cases, I can multiply by 12 to get the value for a year.
+
+However, I do not know which fields of the `SNS.yaml` file should be calculated with the first value and which should be calculated with the second value.
+
+Can you provide such information?
+
+-------------------------
+
+peterparker | 2024-07-10 14:50:39 UTC | #7
+
+As far as I tested by comparing solely the proposal generated locally and on mainnet for CYCLES-TRANSFER-STATION, the following SNS.yaml fields require to be calculated with SNS seconds:
+
+- `Distribution.Neurons.dissolve_delay`
+- `Distribution.Neurons.vesting_period`
+- `Voting.minimum_dissolve_delay`
+
+And by SNS seconds I mean using the humanreadble create values, i.e.
+
+```
+const snsUnitsToSeconds: Record<string, number> = {
+	months: 2_630_016, // 30.44d = 2_630_016
+	years: 31_557_600, // 365.25d = 31_557_600
+};
+```
+
+Every other duration fields of the SNS.yaml file seem to have to be calculated with NNS seconds, i.e.
+
+```
+const ONE_DAY_SECONDS = 24 * 60 * 60;
+const ONE_YEAR_SECONDS = ((4 * 365 + 1) * ONE_DAY_SECONDS) / 4;
+const ONE_MONTH_SECONDS = ONE_YEAR_SECONDS / 12;
+
+const nnsUnitsToSeconds: Record<string, number> = {
+	months: ONE_MONTH_SECONDS, // 2629800
+	years: ONE_YEAR_SECONDS, // 2629800 * 12
+};
+```
+
+Can you please confirm or let me know which other fields require "SNS seconds"?
+
+-------------------------
+
+aterga | 2024-07-11 12:45:36 UTC | #8
+
+> My guess is that the YAML file provided in the WaterNeuron repo is not exactly the one that was used to submit the proposal.
+
++1
+
+> I believe there was another case of this mentioned in another forum post recently. If you link me to the waterneuron repo’s YAML file, I can share the exact CreateServiceNervousSystem proposal it would generate and we could compare it against that.
+
+See here https://forum.dfinity.org/t/sns-yaml-start-time-format-space/32797/2?u=aterga
+
+-------------------------
+
+aterga | 2024-07-11 12:56:43 UTC | #9
+
+> Thanks for the details. It appears that NNS and SNS are using different references in terms of seconds for months and years.
+
+This is correct. We discussed this issue at some point with the NNS team, but I don't remember the reasoning behind our decision to keep this unchanged. Maybe @daniel-wong remembers the outcome of that discussion?
+
+-------------------------
+
+peterparker | 2024-07-11 13:11:27 UTC | #10
+
+I don't mind about it being unchanged, on the other side, as I shared in my previous [question](https://forum.dfinity.org/t/sns-yaml-month-and-year-conversion-to-seconds/32905/7?u=peterparker), I would like to know which fields use which types of seconds.
+
+Otherwise I cannot really implement a feature that aim to submit SNS proposal as calculation of the temporality won't be accurate.
+
+-------------------------
+
+daniel-wong | 2024-07-12 14:47:50 UTC | #11
+
+@peterparker
+
+As best as I can recall (i.e. without re-reading the code right now)...
+
+Yes, different parts of the system use different definitions for the length of a "month". It would not surprise me if there are also different definitions of "year". This is a bug that we've known about for a while. It is not ideal, but we haven't fixed it yet, because the difference(s) are small, and they do not seem "very harmful".
+
+When interpreting an sns.yaml file, the same definition of month and year are used consistently throughout. However, it sounds like you are experiencing otherwise. Not sure what discrepancy you are seeing. Can you share an sns.yaml file where 1 month in one field is equal to X seconds, but 1 month in another field equals Y seconds (where Y ≠ X)?
+
+-------------------------
+
+peterparker | 2024-07-16 17:50:09 UTC | #12
+
+Well, important or not, it is still a bug, and my original question is still not answered. This leads my tooling to generate divergences compared to what's generated with tools built by the foundation.
+
+So, can the foundation answer my original question and provide the list of fields of the SNS.yaml file that should be calculated with the NNS number of seconds for months and those which should be calculated with the SNS number of seconds, given that this is documented nowhere?
+
+-------------------------
+
+daniel-wong | 2024-07-16 18:12:27 UTC | #13
+
+> can the foundation answer my original question
+
+Yes, I am trying to do that. I am asking for your help with that, specifically,
+
+> Not sure what discrepancy you are seeing. Can you share an sns.yaml file where 1 month in one field is equal to X seconds, but 1 month in another field equals Y seconds (where Y ≠ X)?
+
+-------------------------
+
+peterparker | 2024-07-16 19:14:04 UTC | #14
+
+[quote="daniel-wong, post:13, topic:32905"]
+Can you share an sns.yaml file where 1 month in one field is equal to X seconds
+[/quote]
+
+Any SNS.yaml file. IC Footprint, CTS, WaterNeuron etc. tried all recent projects.
+
+You can find a collection of all SNS.yaml file here, I collected them manually: https://github.com/peterpeterparker/sns
+
+There are various fields in the SNS.yaml that represent duration values. It would be helpful to know how each field converts to seconds for months, and which fields convert to other values in seconds for months, until the issue known by the team is resolved.
+
+-------------------------
+
+peterparker | 2024-07-16 20:04:44 UTC | #15
+
+After facing a corrupted local replica, a dfx that won't stop, numerous processes running that forced me to restart my laptop, and having to clear the state and redeploy everything from scratch as if I had nothing better to do in my life again, I managed to compare the three most recent SNS proposals.
+
+* **CTS**: I get the same results.
+
+* **WaterNeuron**: I'm not even able to submit a proposal as the `dissolve_delay_seconds` is greater than `max_dissolve_delay_seconds (94672800)`.
+
+* **IC Footprint**: The calculated `governanceParameters.neuronMaximumAgeForAgeBonus` and `governanceParameters.votingRewardParameters.rewardRateTransitionDuration` are different.
+
+This is how I map the YAML file content to a SNS proposal
+
+```
+import { type NeuronSchema, type SnsYaml } from '$lib/types/sns';
+import { formatToken } from '$lib/utils/token.utils';
+import type { CreateServiceNervousSystem, Tokens } from '@dfinity/nns';
+import type {
+	Duration,
+	GlobalTimeOfDay,
+	NeuronDistribution,
+	Percentage
+} from '@dfinity/nns/dist/types/types/governance_converters';
+import { convertStringToE8s, isNullish, nonNullish, TokenAmountV2 } from '@dfinity/utils';
+
+interface UnitsToSeconds {
+	seconds: number;
+	second: number;
+	sec: number;
+	s: number;
+	minutes: number;
+	minute: number;
+	min: number;
+	m: number;
+	hours: number;
+	hour: number;
+	hr: number;
+	h: number;
+	days: number;
+	day: number;
+	d: number;
+	weeks: number;
+	week: number;
+	w: number;
+	months: number;
+	month: number;
+	M: number;
+	years: number;
+	year: number;
+	y: number;
+}
+
+type GovernanceUnitsToSeconds = Pick<
+	UnitsToSeconds,
+	'months' | 'month' | 'M' | 'years' | 'year' | 'y'
+>;
+
+// NNS and SNS seconds are different. See https://forum.dfinity.org/t/sns-yaml-month-and-year-conversion-to-seconds/32905.
+const ONE_DAY_SECONDS = 24 * 60 * 60;
+const ONE_YEAR_SECONDS = ((4 * 365 + 1) * ONE_DAY_SECONDS) / 4;
+const ONE_MONTH_SECONDS = ONE_YEAR_SECONDS / 12;
+
+const nnsUnitsToSeconds: GovernanceUnitsToSeconds = {
+	months: ONE_MONTH_SECONDS, // 2629800
+	month: ONE_MONTH_SECONDS,
+	M: ONE_MONTH_SECONDS,
+	years: ONE_YEAR_SECONDS, // 2629800 * 12
+	year: ONE_YEAR_SECONDS,
+	y: ONE_YEAR_SECONDS
+};
+
+const snsUnitsToSeconds: GovernanceUnitsToSeconds = {
+	months: 2_630_016, // 30.44d = 2_630_016
+	month: 2_630_016,
+	M: 2_630_016,
+	years: 31_557_600, // 365.25d = 31_557_600
+	year: 31_557_600,
+	y: 31_557_600
+};
+
+const mapE8s = (value: string): Tokens => ({
+	e8s: BigInt(value.toLowerCase().replace(/\s+/g, '').replace('e8s', '').replaceAll('_', '').trim())
+});
+
+const mapTokens = (value: string): Tokens => {
+	const e8s = convertStringToE8s(
+		value
+			.toLowerCase()
+			.replace(/\s+/g, '')
+			.replace('e8s', '')
+			.replace('tokens', '')
+			.replace('token', '')
+			.replaceAll('_', '')
+			.trim()
+	);
+
+	if (typeof e8s === 'bigint') {
+		return { e8s };
+	}
+
+	throw new Error(`Invalid ${value} to convert to tokens.`);
+};
+
+const mapE8sOrTokens = (input: string): Tokens => {
+	const text = input.toLowerCase();
+
+	if (text.includes('e8s')) {
+		return mapE8s(text);
+	}
+
+	return mapTokens(text);
+};
+
+const mapPercentage = (percentage: string): Percentage => ({
+	basisPoints: BigInt(Number(percentage.toLowerCase().replace('%', '').trim()) * 100)
+});
+
+const mapDuration = ({
+	duration,
+	governanceUnitsToSeconds
+}: {
+	duration: string;
+	governanceUnitsToSeconds: GovernanceUnitsToSeconds;
+}): Duration => {
+	const unitsToSeconds: UnitsToSeconds = {
+		seconds: 1,
+		second: 1,
+		sec: 1,
+		s: 1,
+		minutes: 60,
+		minute: 60,
+		min: 60,
+		m: 60,
+		hours: 3600,
+		hour: 3600,
+		hr: 3600,
+		h: 3600,
+		days: 86400,
+		day: 86400,
+		d: 86400,
+		weeks: 604800,
+		week: 604800,
+		w: 604800,
+		...governanceUnitsToSeconds
+	};
+
+	const durationParts = duration.match(
+		/\d+\s*(seconds?|sec|s|minutes?|min|m(?![o|O]|onths?)|hours?|hr|h|days?|d|weeks?|w|months?|M|years?|y)/g
+	);
+
+	if (isNullish(durationParts)) {
+		throw new Error(`Invalid duration string: ${duration}`);
+	}
+
+	let totalSeconds = 0;
+
+	durationParts.forEach((part) => {
+		const matches = part.match(/\d+|\D+/g);
+
+		if (isNullish(matches) || matches.length !== 2) {
+			throw new Error(`Invalid duration part: ${duration} - ${part}`);
+		}
+
+		const [value, unit] = matches;
+		totalSeconds +=
+			parseInt(value) * (unitsToSeconds[unit.trim().toLowerCase() as keyof UnitsToSeconds] ?? 0);
+	});
+
+	return {
+		seconds: BigInt(totalSeconds)
+	};
+};
+
+const mapTimeOfDay = (timeOfDay: string): GlobalTimeOfDay => {
+	const [hours, minutes] = timeOfDay.split(' ')[0].split(':').map(Number);
+
+	return {
+		secondsAfterUtcMidnight: BigInt(hours * 3600 + minutes * 60)
+	};
+};
+
+const mapNeuron = ({
+	principal,
+	memo,
+	stake,
+	dissolve_delay,
+	vesting_period
+}: NeuronSchema): NeuronDistribution => ({
+	controller: principal,
+	memo: BigInt(memo),
+	stake: mapE8sOrTokens(stake),
+	dissolveDelay: mapDuration({
+		duration: dissolve_delay,
+		governanceUnitsToSeconds: snsUnitsToSeconds
+	}),
+	vestingPeriod: mapDuration({
+		duration: vesting_period,
+		governanceUnitsToSeconds: snsUnitsToSeconds
+	})
+});
+
+// Map source: https://github.com/dfinity/ic/blob/17df8febdb922c3981475035d830f09d9b990a5a/rs/registry/admin/src/main.rs#L2592
+export const mapSnsYamlToCreateServiceNervousSystem = ({
+	yaml: {
+		name,
+		description,
+		url,
+		Token,
+		Voting,
+		Proposals,
+		Neurons,
+		fallback_controller_principals: fallbackControllerPrincipalIds,
+		dapp_canisters: dappCanisters,
+		Swap,
+		Distribution
+	},
+	logo
+}: {
+	yaml: SnsYaml;
+	logo: string;
+}): CreateServiceNervousSystem => ({
+	name,
+	url,
+	description,
+	logo: {
+		base64Encoding: logo
+	},
+	ledgerParameters: {
+		transactionFee: mapE8sOrTokens(Token.transaction_fee),
+		tokenSymbol: Token.symbol,
+		tokenLogo: {
+			base64Encoding: logo
+		},
+		tokenName: Token.name
+	},
+	governanceParameters: {
+		neuronMaximumDissolveDelayBonus: mapPercentage(
+			Voting.MaximumVotingPowerBonuses.DissolveDelay.bonus
+		),
+		neuronMaximumAgeForAgeBonus: mapDuration({
+			duration: Voting.MaximumVotingPowerBonuses.Age.duration,
+			governanceUnitsToSeconds: nnsUnitsToSeconds
+		}),
+		neuronMaximumDissolveDelay: mapDuration({
+			duration: Voting.MaximumVotingPowerBonuses.DissolveDelay.duration,
+			governanceUnitsToSeconds: nnsUnitsToSeconds
+		}),
+		neuronMinimumDissolveDelayToVote: mapDuration({
+			duration: Voting.minimum_dissolve_delay,
+			governanceUnitsToSeconds: snsUnitsToSeconds
+		}),
+		neuronMaximumAgeBonus: mapPercentage(Voting.MaximumVotingPowerBonuses.Age.bonus),
+		neuronMinimumStake: mapE8sOrTokens(Neurons.minimum_creation_stake),
+		proposalWaitForQuietDeadlineIncrease: mapDuration({
+			duration: Proposals.maximum_wait_for_quiet_deadline_extension,
+			governanceUnitsToSeconds: nnsUnitsToSeconds
+		}),
+		proposalInitialVotingPeriod: mapDuration({
+			duration: Proposals.initial_voting_period,
+			governanceUnitsToSeconds: nnsUnitsToSeconds
+		}),
+		proposalRejectionFee: mapE8sOrTokens(Proposals.rejection_fee),
+		votingRewardParameters: {
+			rewardRateTransitionDuration: mapDuration({
+				duration: Voting.RewardRate.transition_duration,
+				governanceUnitsToSeconds: nnsUnitsToSeconds
+			}),
+			initialRewardRate: mapPercentage(Voting.RewardRate.initial),
+			finalRewardRate: mapPercentage(Voting.RewardRate.final)
+		}
+	},
+	fallbackControllerPrincipalIds,
+	dappCanisters,
+	swapParameters: {
+		minimumParticipants: BigInt(Swap.minimum_participants),
+		duration: mapDuration({
+			duration: Swap.duration,
+			governanceUnitsToSeconds: nnsUnitsToSeconds
+		}),
+		neuronBasketConstructionParameters: {
+			count: BigInt(Swap.VestingSchedule.events),
+			dissolveDelayInterval: mapDuration({
+				duration: Swap.VestingSchedule.interval,
+				governanceUnitsToSeconds: nnsUnitsToSeconds
+			})
+		},
+		confirmationText: Swap.confirmation_text,
+		maximumParticipantIcp: mapE8sOrTokens(Swap.maximum_participant_icp),
+		neuronsFundInvestmentIcp: undefined,
+		minimumIcp: undefined,
+		minimumParticipantIcp: mapE8sOrTokens(Swap.minimum_participant_icp),
+		startTime: nonNullish(Swap.start_time) ? mapTimeOfDay(Swap.start_time) : undefined,
+		maximumIcp: undefined,
+		restrictedCountries: nonNullish(Swap.restricted_countries)
+			? {
+					isoCodes: Swap.restricted_countries
+				}
+			: undefined,
+		maxDirectParticipationIcp: mapE8sOrTokens(Swap.maximum_direct_participation_icp),
+		minDirectParticipationIcp: mapE8sOrTokens(Swap.minimum_direct_participation_icp),
+		neuronsFundParticipation: Swap.neurons_fund_participation
+	},
+	initialTokenDistribution: {
+		swapDistribution: {
+			total: mapE8sOrTokens(Distribution.InitialBalances.swap)
+		},
+		treasuryDistribution: {
+			total: mapE8sOrTokens(Distribution.InitialBalances.governance)
+		},
+		developerDistribution: {
+			developerNeurons: Distribution.Neurons.map(mapNeuron)
+		}
+	}
+});
+
+export const mapSnsYamlForContent = (
+	yaml: SnsYaml
+): {
+	minimumParticipantIcp: string;
+	maximumParticipantIcp: string;
+	minDirectParticipationIcp: string;
+	maxDirectParticipationIcp: string;
+	swapDistribution: string;
+	treasuryDistribution: string;
+	developersDistribution: string;
+} => {
+	const { swapParameters, initialTokenDistribution } = mapSnsYamlToCreateServiceNervousSystem({
+		yaml,
+		logo: ''
+	});
+
+	const snsToken = {
+		symbol: yaml.Token.symbol,
+		name: yaml.Token.name,
+		decimals: 8
+	};
+
+	const ICPToken = {
+		symbol: 'ICP',
+		name: 'Internet Computer',
+		decimals: 8
+	};
+
+	const BLANK = '__________________';
+
+	const minimumParticipantIcp = nonNullish(swapParameters?.minimumParticipantIcp?.e8s)
+		? formatToken(
+				TokenAmountV2.fromUlps({
+					amount: swapParameters.minimumParticipantIcp.e8s,
+					token: ICPToken
+				})
+			)
+		: BLANK;
+	const maximumParticipantIcp = nonNullish(swapParameters?.maximumParticipantIcp?.e8s)
+		? formatToken(
+				TokenAmountV2.fromUlps({
+					amount: swapParameters.maximumParticipantIcp.e8s,
+					token: ICPToken
+				})
+			)
+		: BLANK;
+
+	const minDirectParticipationIcp = nonNullish(swapParameters?.minDirectParticipationIcp?.e8s)
+		? formatToken(
+				TokenAmountV2.fromUlps({
+					amount: swapParameters.minDirectParticipationIcp.e8s,
+					token: ICPToken
+				})
+			)
+		: BLANK;
+	const maxDirectParticipationIcp = nonNullish(swapParameters?.maxDirectParticipationIcp?.e8s)
+		? formatToken(
+				TokenAmountV2.fromUlps({
+					amount: swapParameters.maxDirectParticipationIcp.e8s,
+					token: ICPToken
+				})
+			)
+		: BLANK;
+
+	const swapDistribution = initialTokenDistribution?.swapDistribution?.total?.e8s;
+	const treasuryDistribution = initialTokenDistribution?.treasuryDistribution?.total?.e8s;
+	const developersDistribution = initialTokenDistribution?.developerDistribution?.developerNeurons
+		.map((neuron) => neuron.stake?.e8s)
+		.filter(nonNullish)
+		.reduce((acc, e8s) => acc + e8s, 0n);
+
+	return {
+		minimumParticipantIcp,
+		maximumParticipantIcp,
+		minDirectParticipationIcp,
+		maxDirectParticipationIcp,
+		swapDistribution: nonNullish(swapDistribution)
+			? formatToken(
+					TokenAmountV2.fromUlps({
+						amount: swapDistribution,
+						token: snsToken
+					})
+				)
+			: BLANK,
+		treasuryDistribution: nonNullish(treasuryDistribution)
+			? formatToken(
+					TokenAmountV2.fromUlps({
+						amount: treasuryDistribution,
+						token: snsToken
+					})
+				)
+			: BLANK,
+		developersDistribution: nonNullish(developersDistribution)
+			? formatToken(
+					TokenAmountV2.fromUlps({
+						amount: developersDistribution,
+						token: snsToken
+					})
+				)
+			: BLANK
+	};
+};
+```
+
+As already mentionned the YML file are there: [https://github.com/peterpeterparker/sns](https://github.com/peterpeterparker/sns)
+
+-------------------------
+
+daniel-wong | 2024-07-17 14:08:17 UTC | #17
+
+[quote="peterparker, post:14, topic:32905"]
+You can find a collection of all SNS.yaml file here, I collected them manually: [GitHub - peterpeterparker/sns: A collection of SNS.yaml files](https://github.com/peterpeterparker/sns)
+[/quote]
+
+Thank you.
+
+I looked at what happens when ICFootprint.yaml is used to create a CreateServiceNervousSystem proposal, and I did not find any two fields where month is defined differently. In all cases, month = 30.44 days. This includes where it says (12|24|36) months.
+
+You would think that 12 months = 1 year, but 1 year is defined as 365.25 days, so there is a slight difference: 12 months = 365.28 days (where 1 day = 86_400 s).
+
+Let me do some more mangling of sns_init.yaml to see if I can provoke different fields to show that they have a different definition of month. Currently, I'm not able to generate any apparent discrepancies.
+
+# How I translated ICFootprint.yaml into a CreateServiceNervousSystem proposal:
+
+1. I downloaded ICFootprint.yaml, and copied it to my current working directory on a Linux VM (this will not work locally on an Apple ARM system, like the one I'm using).
+2. I did steps 1,2,3,5 (NOT 4!) of [sns-testing](https://github.com/dfinity/sns-testing#sns-lifecycle).
+3. Within the bash shell launched by step 5 of sns-testing:
+    1. cp /dapp/ICFootprint.yaml sns_init.yaml
+    2. manually run the first few commands within run_basic_scenario:
+        1. ./set-icp-xdr-rate.sh 10000
+        2. ./deploy_test_canister.sh # Note the canister ID that this prints out.
+    3. Edit sns_init.yaml:
+        1. Changed dapp_canisters to list just one thing: the id printed out by deploy_test_canister.sh.
+        2. This probably does not matter, but I also changed fallback_controller_principals to just the principal ID printed out by `dfx identity get-principal` (at the time, the default identity was selected).
+4. Do the next couple of steps in run_basic_scenario:
+    1. ./let_nns_control_dapp.sh
+    2. ./propose_sns.sh # Note the proposal ID printed out here.
+5. Ask NNS governance what it thinks the values are: dfx canister call nns-governance get_proposal_info "$PROPOSAL_ID".
+
+
+Here is a summary of all the duration fields that I looked at, what was in sns_init.yaml, and the values that ended up in SNS governance:
+
+```
+Proposals:
+  maximum_wait_for_quiet_deadline_extension: 1 day -> 86_400 s
+  initial_voting_period: 4 days -> 345_600 s (note that this is exactly 4 * 86_400 s)
+
+Voting:
+  minimum_dissolve_delay: 1 month -> 2_630_016 s (30.44 days, where 1 day = 86_400 s)
+  MaximumVotingPowerBonuses:
+    DissolveDelay:
+      duration: 2 years -> 63_115_200 s (730.5 days)
+    Age:
+      duration: 6 months -> 15_780_096 s (182.64 days; note that 182.64 / 30.44 = 6)
+  RewardRate:
+    transition_duration: 30 months -> 78_900_480 s (913.2 days; note that 913.2 / 30.44 = 30)
+
+Distribution:
+  Neurons:
+    - dissolve_delay: 1 month -> 2_630_016 s (30.44 days)
+      vesting_period: 1 month -> 2_630_016 s (30.44 days)
+    - vesting_period: 12 months -> 31_560_192 s (365.28 days; note that 365.28 / 30.44 = 12)
+    - vesting_period: 24 months -> 63_120_384 s (730.56 days; note that 730.56 / 30.44 = 24)
+    - vesting_period: 36 months -> 94_680_576 s (1095.84 days; note that 1095.84 / 30.44 = 36)
+
+Swap:
+  duration: 14 days -> 1_209_600 s (14 days)
+  VestingSchedule:
+    interval: 6 months -> 15_780_096 s (182.64 days; note that 182.64 / 30.44 = 6)
+```
+
+-------------------------
+
+daniel-wong | 2024-07-17 14:56:20 UTC | #18
+
+[quote="daniel-wong, post:17, topic:32905"]
+Let me do some more mangling of sns_init.yaml to see if I can provoke different fields to show that they have a different definition of month.
+[/quote]
+
+I set as many of the duration fields to either 1 month or 10 months, and I got consistent results: all of them consider 1 month to be 2_630_016 s.
+
+**Update**: See the end of this post for the exact sns_init.yaml that I used.
+
+The only fields that I struggled to set to 1 or 10 months were under the Proposals section (namely, initial_voting_period, and maximum_wait_for_quiet_deadline_extension). The largest allowed value in those fields is 30 days.
+
+David, if you could provide more precise instructions for how I can reproduce the discrepancies you are seeing, that would help me to help you.
+
+```
+# You should make a copy of this file, name it sns_init.yaml, and edit it to
+# suit your needs.
+#
+# All principal IDs should almost certainly be changed.
+#
+# In this file, 1 year is nominally defined to be 365.25 days.
+#
+# This gets passed to `sns propose`. See propose_sns.sh.
+#
+# This follows the second configuration file format developed for the `sns`
+# CLI. The first format will be supported for a time, but this format will
+# eventually become the standard format.
+# ------------------------------------------------------------------------------
+# UNITS
+#
+# This SNS configuration file version allows specifying the various
+# fields with units that make configuration easier. For instance,
+# in the previous version, all fields relating to token values
+# had to be specified in e8s (fractions of 10E-8 of a governance token).
+# In this version, similar fields can be specified in whole tokens,
+# tokens with decimals, or e8s. Below is more information on the type
+# of units that can be used.
+#
+# For fields that represent token values (such as `transaction_fee`
+# or `rejection_fee`), devs can specify decimal strings ending in
+# "tokens" (plural), decimal strings ending in "token" (singular),
+# or integer strings (base 10) ending in "e8s". In the case of
+# "tokens" strings, the maximum number of digits after the (optional)
+# decimal point is 8. The "_" character may be sprinkled throughout.
+# Whitespace around number is insignificant. E.g. " 42 tokens" is
+# equivalent to "42tokens".
+#
+# For fields that represent duration values (such as `initial_voting_period`
+# or `minimum_dissolve_delay`), devs can specify durations as a concatenation
+# of time spans. Where each time span is an integer number and a suffix.
+# Supported suffixes:
+#  - seconds, second, sec, s
+#  - minutes, minute, min, m
+#  - hours, hour, hr, h
+#  - days, day, d
+#  - weeks, week, w
+#  - months, month, M -- defined as 30.44 days
+#  - years, year, y -- defined as 365.25 days
+#
+# For example, "1w 2d 3h" gets parsed as
+#
+# 1 week + 2 days + 3 hours
+#    =
+# (1 * (7 * 24 * 60 * 60) + 2 * 24 * 60 * 60 + 3 * (60 * 60)) seconds
+#
+# For fields that represent percentage values (such as `bonus`), devs specify
+# the value as an integer with a trailing percent sign ('%'). For example,
+# `10%`.
+#
+# For fields that represent time of day (such as `start_time`), devs specify
+# the value as a string in form "hh::mm UTC". Where hh is hour, and mm is minute.
+# Only the UTC timezone is currently supported.
+# ------------------------------------------------------------------------------
+
+# Name of the SNS project. This may differ from the name of the associated
+# token. Must be a string of max length = 255.
+name: IC Footprint
+
+# Description of the SNS project.
+# Must be a string of max length = 2,000.
+description: >
+  A native energy management and sustainability protocol on the Internet Computer
+
+# This is currently a placeholder field and must be left empty for now.
+Principals: []
+
+# Path to the SNS Project logo on the local filesystem. The path is relative
+# to the configuration file's location, unless an absolute path is given.
+# Must have less than 341,334 bytes. The only supported format is PNG.
+logo: logo.png
+
+# URL to the dapp controlled by the SNS project.
+# Must be a string from 10 to 512 bytes.
+url: https://owqnd-biaaa-aaaak-qidaq-cai.icp0.io/
+
+# Metadata for the NNS proposal required to create the SNS. This data will be
+# shown only in the NNS proposal.
+NnsProposal:
+  # The title of the NNS proposal. Must be a string of 4 to 256 bytes.
+  title: "NNS Proposal to create an SNS named 'IC Footprint'"
+
+  # The HTTPS address of additional content required to evaluate the NNS
+  # proposal.
+  url: "https://forum.dfinity.org/t/PLACEHOLDER"
+
+  # The description of the proposal. Must be a string of 10 to 2,000 bytes.
+  summary: >
+    ## I. Token Distribution
+      - Total Token Supply - 100,000,000
+      - Allocated to Treasury - 57,000,000
+      - Allocated to Decentralisation Sale - 25,000,000
+      - Allocated to Developer Neurons - 18,000,000
+        - Founding Team - 15,500,000
+        - Advisors - 2,500,000
+      - Ledger Transaction Fee - 0.001 FOOTPRINT
+
+    ## II. Decentralisation Sale
+      - Min Participation - 1 ICP
+      - Max Participation - 50,000 ICP
+      - Min Participants - 50
+      - Min to be Raised (not including NF) - 50,000 ICP
+      - Max to be Raised (not including NF) - 250,000 ICP
+      - Min Request from NF - 49,955 ICP
+      - Max Request from NF - 94,937 ICP
+      - Duration - 14 days
+
+    ## III. IC Footprint SNS
+      - Proposal Rejection Fee - 1000 FOOTPRINT
+      - Initial Voting Period - 4 days
+      - Wait for Quiet - 1 day
+      - Minimum Neuron - 5 FOOTPRINT
+      - Minimum Dissolve Delay - 1 month
+      - Maximum Dissolve Delay - 2 years
+      - Maximum Dissolve Delay Bonus - 100%
+      - Maximum Age for Age Bonus - 6 months
+      - Maximum Age Bonus - 0%
+      - Reward Rate - 2.5%
+
+    ## IV. The DApp
+      - Frontend : owqnd-biaaa-aaaak-qidaq-cai
+      - ESG Wallet : o7tg7-xaaaa-aaaak-qidba-cai
+      - Node Management : jhfj2-iqaaa-aaaak-qddxq-cai
+      - Cycles Assessment : z52ja-sqaaa-aaaak-aktda-cai
+
+    Following a successful SNS, a snapshot of all IC Footprint NFT holder will be taken and a proposal will be made to send 5,000,000 FOOTPRINT (5% of the total supply) tokens to ICP swap where user will be able to claim their allocation.
+
+# If the SNS launch attempt fails, control over the dapp canister(s) is given to
+# these principals. In most use cases, this is chosen to be the original set of
+# controller(s) of the dapp. Must be a list of PrincipalIds.
+fallback_controller_principals:
+  # For the actual SNS launch, you should replace this with one or more
+  # principals of your intended fallback controllers.
+  - wbays-nc4c6-qjbqz-7tw3q-xqiju-zbqdn-dp63o-jb2dx-47ghu-phymf-iae
+
+# The list of dapp canister(s) that will be decentralized if the
+# decentralization swap succeeds. These are defined in the form of canister IDs,
+# for example, `bnz7o-iuaaa-aaaaa-qaaaa-cai`.  For a successful SNS launch,
+# these dapp canister(s) must be co-controlled by the NNS Root canister
+# (`r7inp-6aaaa-aaaaa-aaabq-cai`) at latest at the time when the NNS proposal to
+# create an SNS is adopted (usually this is required even earlier, e.g., to
+# convince NNS neurons to vote in favor of your proposal).
+dapp_canisters:
+  # For the actual SNS launch, you should replace this with one or more
+  # IDs of the canisters comprising your to-be-decentralized dapp.
+  #
+  # For testing, propose_sns.sh will fill this in automatically.
+  - bkyz2-fmaaa-aaaaa-qaaaq-cai
+
+# Configuration of SNS tokens in the SNS Ledger canister deployed as part
+# of the SNS.
+Token:
+  # The name of the token issued by the SNS ledger.
+  # Must be a string of 4 to 255 bytes without leading or trailing spaces.
+  name: Footprint Token
+
+  # The symbol of the token issued by the SNS Ledger.
+  # Must be a string of 3 to 10 bytes without leading or trailing spaces.
+  symbol: FOOTPRINT
+
+  # SNS ledger transaction fee.
+  transaction_fee: 10_000 e8s
+
+  # Path to the SNS token logo on your local filesystem. The path is relative
+  # to the configuration file location, unless an absolute path is given.
+  # Must have less than 341,334 bytes. The only supported format is PNG.
+  logo: logo.png
+
+# Configures SNS proposal-related fields. These fields define the initial values
+# for some of the nervous system parameters related to SNS proposals. This will
+# not affect all SNS proposals submitted to the newly created SNS.
+Proposals:
+  # The cost of making an SNS proposal that is rejected by the SNS neuron
+  # holders. This field is specified as a token. For example: "1 token".
+  rejection_fee: 1000 tokens
+
+  # The initial voting period of an SNS proposal. A proposal's voting period
+  # may be increased during its lifecycle due to the wait-for-quiet algorithm
+  # (see details below). This field is specified as a duration. For example
+  # "4 days".
+  initial_voting_period: 1 day
+
+  # The wait-for-quiet algorithm extends the voting period of a proposal when
+  # there is a flip in the majority vote during the proposal's voting period.
+  #
+  # Without this, there could be an incentive to vote right at the end of a
+  # proposal's voting period, in order to reduce the chance that people will
+  # see and have time to react to that.
+  #
+  # If this value is set to 1 day, then a change in the majority vote at the
+  # end of a proposal's original voting period results in an extension of the
+  # voting period by an additional day. Another change at the end of the
+  # extended period will cause the voting period to be extended by another
+  # half-day, etc.
+  #
+  # The total extension to the voting period will never be more than twice
+  # this value.
+  #
+  # For more information, please refer to
+  # https://wiki.internetcomputer.org/wiki/Network_Nervous_System#Proposal_decision_and_wait-for-quiet
+  #
+  # This field is specified as a duration. For example: "1 day".
+  maximum_wait_for_quiet_deadline_extension: 1 hr
+
+# Configuration of SNS voting.
+Neurons:
+  # The minimum amount of SNS tokens to stake a neuron. This field is specified
+  # as a token. For instance, "1 token".
+  minimum_creation_stake: 5 tokens
+
+# Configuration of SNS voting.
+Voting:
+  # The minimum dissolve delay a neuron must have to be able to cast votes on
+  # proposals.
+  #
+  # Dissolve delay incentivizes neurons to vote in the long-term interest of
+  # an SNS, as they are rewarded for longer-term commitment to that SNS.
+  #
+  # Users cannot access the SNS tokens used to stake neurons (until the neuron
+  # is dissolved). This field is specified as a duration. For example: "6 months".
+  minimum_dissolve_delay: 1 month
+
+  # Configuration of voting power bonuses that are applied to neurons to
+  # incentivize alignment with the best interest of the DAO. Note, these
+  # bonuses multiply each other, so the increase in voting power due to
+  # the dissolve delay bonus is used in the equation to increase voting
+  # power for the age bonus.
+  MaximumVotingPowerBonuses:
+    # Users with a higher dissolve delay are incentivized to take the
+    # long-term interests of the SNS into consideration when voting. To
+    # reward this long-term commitment, this bonus can be set to a
+    # percentage greater than zero, which will result in neurons having
+    # their voting power increased in proportion to their dissolve delay.
+    #
+    # For example, if the user has a dissolve delay of 6 months, and
+    # the maximum dissolve delay duration (defined below as `duration`)
+    # for the dissolve delay bonus is 12 months, and the maximum bonus
+    # (defined as `bonus` below) is set to 10%, then that user’s voting
+    # power will be 105% of their normal voting power based on staked
+    # tokens (i.e. they will have a bonus of 5%). If the user increased
+    # their dissolve delay to 9 months, they would get 107.5% of the normal
+    # voting power of their tokens. And if they increased to 12 months, they
+    # would get 110%. If they increase further, they get no additional bonus.
+    #
+    # If you do not want this bonus to be applied for neurons with higher
+    # dissolve delay, set `bonus` to `0%` and those neurons will not receive
+    # higher voting power.
+    DissolveDelay:
+      # This parameter sets the maximum dissolve delay a neuron can have.
+      # When reached, the maximum dissolve delay bonus will be applied.
+      # This field is specified as a duration. For example: "8 years".
+      duration: 10 months
+      # If a neuron's dissolve delay is `duration`, its voting power will
+      # be increased by the dissolve delay `bonus` amount.
+      # This field is specified as a percentage. For instance,
+      # a value of "100%" means that the voting power will be doubled
+      # (multiplied by 2).
+      bonus: 100%
+
+    # Users with neurons staked in the non-dissolving state for a long
+    # period of time are incentivized to take the long-term interests of
+    # the SNS into consideration when voting. To reward this long-term
+    # commitment, this bonus can be set to a percentage (greater than zero),
+    # which will result in neurons having their voting power increased in
+    # proportion to their age.
+    #
+    # For example, if the neuron has an age of 6 months, and the maximum age
+    # duration (defined below as `duration`) for the age bonus is 12 months,
+    # and the maximum bonus (defined as `bonus` below) is set to 10%, then
+    # that neuron’s voting power will be 105% of their normal voting power
+    # based on staked tokens plus dissolve delay bonus (i.e. they will have a
+    # bonus of 5%). If neuron aged another 3 months to have an age of 9 months,
+    # the neuron would get 107.5% of the normal voting power. And if the neuron
+    # aged another 3 months to 12 months, the neuron would get 110%. If the neuron
+    # ages further, it get no additional bonus.
+    #
+    # If this bonus should not be applied for older neurons, set the bonus
+    # to `0%` and older neurons will not receive higher voting power.
+    Age:
+      # This parameter sets the duration of time the neuron must be staked
+      # in the non-dissolving state, in other words its `age`, to reach
+      # the maximum age bonus. Once this age is reached, the neuron will
+      # continue to age, but no more bonus will be applied. This field
+      # is specified as a duration. For example: "2 years".
+      duration: 10 months
+      # If a neuron's age is `duration` or older, its voting power will be
+      # increased by this age`bonus` amount.
+      # This field is specified as a percentage. For instance,
+      # a value of "25%" means that the voting power will increase by a quarter
+      # (multiplied by 1.25).
+      bonus: 25%
+
+  # Configuration of SNS voting reward parameters.
+  #
+  # The voting reward rate controls how quickly the supply of the SNS token
+  # increases. For example, setting `initial` to `2%` will cause the supply to
+  # increase by at most `2%` per year. A higher voting reward rate
+  # incentivizes users to participate in governance, but also results in
+  # higher inflation.
+  #
+  # The initial and final reward rates can be set to have a higher reward rate
+  # at the launch of the SNS and a lower rate further into the SNS’s lifetime.
+  # The reward rate falls quadratically from the `initial` rate to the `final`
+  # rate over the course of `transition_duration`.
+  #
+  # Setting both `initial` and `final` to `0%` will result in the system not
+  # distributing voting rewards at all.
+  #
+  # More details on SNS tokenomics can be found in the developer documentation:
+  # https://internetcomputer.org/docs/current/developer-docs/integrations/sns/tokenomics/rewards/#voting-rewards
+  RewardRate:
+    # The initial reward rate at which the SNS voting rewards will increase
+    # per year. This field is specified as a percentage. For example: "15%".
+    initial: 3%
+
+    # The final reward rate at which the SNS voting rewards will increase
+    # per year. This rate is reached after `transition_duration` and remains
+    # at this level unless changed by an SNS proposal. This field is
+    # specified as a percentage. For example: "5%".
+    final: 2.5%
+
+    # The voting reward rate falls quadratically from `initial` to `final`
+    # over the time period defined by `transition_duration`.
+    #
+    # Values of 0 result in the reward rate always being `final`.
+    #
+    # This field is specified as a duration. For example: "8 years".
+    transition_duration: 1 month
+
+# Configuration of the initial token distribution of the SNS. You can configure
+# how SNS tokens are distributed in each of the three groups:
+# (1) tokens that are given to the original developers of the dapp,
+# (2) treasury tokens that are owned by the SNS governance canister, and
+# (3) tokens which are distributed to the decentralization swap participants.
+#
+# The initial token distribution must satisfy the following preconditions to be
+# valid:
+#    - The sum of all developer tokens in E8s must be less than `u64::MAX`.
+#    - The Swap's initial balance (see group (3) above) must be greater than 0.
+#    - The Swap's initial balance (see group (3) above) must be greater than or
+#      equal to the sum of all developer tokens.
+Distribution:
+  # The initial neurons created when the SNS Governance canister is installed.
+  # Each element in this list specifies one such neuron, including its stake,
+  # controlling principal, memo identifying this neuron (every neuron that
+  # a user has must be identified by a unique memo), dissolve delay, and a
+  # vesting period. Even though these neurons are distributed at genesis,
+  # they are locked in a (restricted) pre-initialization mode until the
+  # decentralization swap is completed. Note that `vesting_period` starts
+  # right after the SNS creation and thus includes the pre-initialization mode
+  # period.
+  #
+  Neurons:
+    # For the actual SNS launch, you should replace this with one or more
+    # principals of your intended genesis neurons.
+    #
+
+    - principal: 5tzzh-kqopl-zychr-jjyoi-cpvu5-y2ai7-ggf3n-icajy-bszp6-2qenk-lae
+      stake: 3_000_000 tokens
+      memo: 0
+      dissolve_delay: 1 month
+      vesting_period: 1 month
+
+  # The initial SNS token balances of the various canisters of the SNS.
+  InitialBalances:
+    # The initial SNS token balance of the SNS Governance canister is known
+    # as the treasury. This is initialized in a special sub-account, as the
+    # main account of Governance is the minting account of the SNS Ledger.
+    # This field is specified as a token. For instance, "1 token".
+    governance: 57_000_000 tokens
+
+    # The initial SNS token balance of the Swap canister is what will be
+    # available for the decentralization swap. These tokens will be swapped
+    # for ICP. This field is specified as a token. For instance, "1 token".
+    swap: 25_000_000 tokens
+
+  # Checksum of the total number of tokens distributed in this section.
+  # This field is specified as a token. For instance, "1 token".
+  #          1_000    (neuron) developers
+  #      2 million    (governance) treasury
+  # + 500 thousand    (swap)
+  # --------------
+  total: 85_000_000 tokens
+
+# Configuration of the decentralization swap parameters. Choose these parameters
+# carefully, if a decentralization swap fails, the SNS will restore the dapp
+# canister(s) to the fallback controllers (defined in
+# `fallback_controller_principals`) and you will need to start over.
+Swap:
+  # The minimum number of direct participants that must participate for the
+  # decentralization swap to succeed. If a decentralization swap finishes due
+  # to the deadline or the maximum target being reached, and if there are less
+  # than `minimum_participants` (here, only direct participants are counted),
+  # the swap will be committed.
+  minimum_participants: 50
+
+  # Minimum amount of ICP from direct participants. This amount is required for
+  # the swap to succeed. If this amount is not achieved, the swap will be
+  # aborted (instead of committed) when the due date/time occurs.
+  # Must be smaller than or equal than `maximum_direct_participation_icp`.
+  minimum_direct_participation_icp: 50000 tokens
+
+  # Maximum amount of ICP from direct participants. If this amount is achieved,
+  # the swap will finalize immediately, without waiting for the due date/time;
+  # in this case, the swap would be committed if and only if the number of
+  # direct participants (`minimum_participants`) is reached (otherwise, it
+  # would be aborted).
+  # Must be at least `min_participants * minimum_direct_participation_icp`.
+  maximum_direct_participation_icp: 250000 tokens
+
+  # The minimum amount of ICP that each participant must contribute
+  # to participate. This field is specified as a token. For instance,
+  # "1 token".
+  minimum_participant_icp: 1 tokens
+
+  # The maximum amount of ICP that each participant may contribute
+  # to participate. This field is specified as a token. For instance,
+  # "1 token".
+  maximum_participant_icp: 50000 tokens
+
+  # The text that swap participants must confirm before they may participate
+  # in the swap.
+  #
+  # This field is optional. If set, must be within 1 to 1,000 characters and
+  # at most 8,000 bytes.
+  # confirmation_text: >
+  #     I confirm my understanding of the responsibilities and risks
+  #     associated with participating in this token swap.
+
+  # A list of countries from which swap participation should not be allowed.
+  #
+  # This field is optional. By default, participants from all countries
+  # are allowed.
+  #
+  # Each list element must be an ISO 3166-1 alpha-2 country code.
+  restricted_countries:
+    - AF # Afghanistan
+    - BY # Belarus
+    - BA # Bosnia and Herzegovina
+    - BI # Burundi
+    - CF # Central African Republic
+    - KP # North Korea
+    - CD # Democratic Republic of the Congo
+    - IR # Iran
+    - IQ # Iraq
+    - LB # Lebanon
+    - LY # Libya
+    - ML # Mali
+    - ME # Montenegro
+    - MM # Myanmar
+    - NI # Nicaragua
+    - RU # Russia
+    - RS # Serbia
+    - SO # Somalia
+    - SD # Sudan
+    - SY # Syria
+    - UA # Ukraine
+    - VE # Venezuela
+    - YE # Yemen
+    - ZW # Zimbabwe
+    - US # United States
+    - UM # United States Minor Outlying Islands
+    - CU # Cuba
+
+  # Configuration of the vesting schedule of the neuron basket, i.e., the SNS
+  # neurons that a participants will receive from a successful
+  # decentralization swap.
+  VestingSchedule:
+    # The number of events in the vesting schedule. This translates to how
+    # many neurons will be in each participant's neuron basket. Note that
+    # the first neuron in each neuron basket will have zero dissolve delay.
+    # This value should thus be greater than or equal to `2`.
+    events: 4
+
+    # The interval at which the schedule will be increased per event. The
+    # first neuron in the basket will be unlocked with zero dissolve delay.
+    # Each other neuron in the schedule will have its dissolve delay
+    # increased by `interval` compared to the previous one. For example,
+    # if `events` is set to `3` and `interval` is `1 month`, then each
+    # participant's neuron basket will have three neurons (with equal stake)
+    # with dissolve delays zero, 1 month, and 2 months. Note that the notion
+    # of `Distribution.neurons.vesting_period` applies only to developer
+    # neurons. While neuron basket neurons do not use `vesting_period`, they
+    # have a vesting schedule. This field is specified as a duration. For
+    # example: "1 month".
+    interval: 1 months
+
+  # Absolute time of day when the decentralization swap is supposed to start.
+  #
+  # An algorithm will be applied to allow at least 24 hours between the time
+  # of execution of the CreateServiceNervousSystem proposal and swap start.
+  # For example, if start_time is 23:30 UTC and the proposal is adopted and
+  # executed at 23:20 UTC, then the swap start will be at 23:30 UTC the next
+  # day (i.e., in 24 hours and 10 min from the proposal execution time).
+  #
+  # WARNING: Swap start_time works differently on mainnet and in testing.
+  #
+  # On mainnet:
+  # - Setting start_time to some value (e.g., 23:30 UTC) will allow the swap
+  #   participants to be prepared for the swap in advance, e.g.,
+  #   by obtaining ICPs that they would like to participate with.
+  # - If start_time is not specified, the actual start time of the swap will
+  #   be chosen at random (allowing at least 24 hours and less than 48 hours,
+  #   as described above).
+  #
+  # In testing:
+  # - Setting start_time to some value works the same as explained above.
+  # - If start_time is not specified, the swap will begin immediately after
+  #   the CreateServiceNervousSystem proposal is executed. This facilitates
+  #   testing in an accelerated manner.
+  #
+  # start_time: 23:30 UTC  # Intentionally commented out for testing.
+
+  # The duration of the decentralization swap. When `start_time` is calculated
+  # during CreateServiceNervousSystem proposal execution, this `duration` will
+  # be added to that absolute time and set as the swap's deadline.
+  duration: 1 month
+
+  # Whether Neurons' Fund participation is requested.
+  neurons_fund_participation: true
+```
+
+-------------------------
+
+peterparker | 2024-07-17 16:19:37 UTC | #19
+
+Thanks a lot for investing time and helping debugging this issue.
+
+[quote="daniel-wong, post:18, topic:32905"]
+I got consistent results
+[/quote]
+
+I have absolutely no doubt that the results are consistent.
+
+[quote="daniel-wong, post:17, topic:32905"]
+CreateServiceNervousSystem proposal, and I did not find any two fields where month is defined differently
+[/quote]
+
+Actually there is one diffence in the results you shared.
+
+```
+Voting:
+   MaximumVotingPowerBonuses:
+    DissolveDelay:
+      duration: 2 years -> 63_115_200 s (730.5 days)
+
+Distribution:
+  Neurons:
+     - vesting_period: 24 months -> 63_120_384 s (730.56 days; note that 730.56 / 30.44 = 24)
+```
+
+`63_115_200` vs `63_120_384` or `730.5 days` vs `730.56 days`.
+
+Your experiment confirms that some fields are using a certain amount of seconds for "1 month" or "1 year" while other fields use another amount of seconds.
+
+Tomorrow, I'll debug and try to execute the SNS file you shared and try to land on the same results, one field after the other. I just hope I won't have to clean state and redeploy everything a zillion times.
+
+I'll let you know what I find and thanks again!
+
+-------------------------
+
+peterparker | 2024-07-18 06:09:56 UTC | #20
+
+And the replica ends being corrupted again after few submitting proposals locally. I'm just tired...
+
+> 2024-07-18T06:08:29.986820Z  WARN icx_proxy_dev::proxy::agent: Other error: The replica returned an HTTP Error: Http Error: status 503 Service Unavailable, content type "text/plain; charset=utf-8", content: Replica is unhealthy: CertifiedStateBehind. Check the /api/v2/status for more information.
+2024-07-18T06:08:29.987151Z ERROR icx_proxy_dev::proxy: Internal Error during request:
+The replica returned an HTTP Error: Http Error: status 503 Service Unavailable, content type "text/plain; charset=utf-8", content: Replica is unhealthy: CertifiedStateBehind. Check the /api/v2/status for more information.
+2024-07-18T06:08:29.987285Z ERROR tower_http::trace::on_failure: response failed classification=Status code: 500 Internal Server Error latency=8 ms
+2024-07-18 06:06:27.030096 UTC: [Canister sgymv-uiaaa-aaaaa-aaaia-cai] Getting SNS index 1... get_metadata
+2024-07-18T06:08:30.016388Z ERROR tower_http::trace::on_failure: response failed classification=Status code: 503 Service Unavailable latency=0 ms
+2024-07-18T06:08:30.019989Z  WARN icx_proxy_dev::proxy::agent: Other error: The replica returned an HTTP Error: Http Error: status 503 Service Unavailable, content type "text/plain; charset=utf-8", content: Replica is unhealthy: CertifiedStateBehind. Check the /api/v2/status for more information.
+2024-07-18T06:08:30.020012Z ERROR icx_proxy_dev::proxy: Internal Error during request:
+The replica returned an HTTP Error: Http Error: status 503 Service Unavailable, content type "text/plain; charset=utf-8", content: Replica is unhealthy: CertifiedStateBehind. Check the /api/v2/status for more information.
+2024-07-18T06:08:30.020077Z ERROR tower_http::trace::on_failure: response failed classification=Status code: 500 Internal Server Error latency=0 ms
+
+-------------------------
+
+peterparker | 2024-07-18 07:13:12 UTC | #21
+
+Alright, I think we should come to a conclusion.
+
+After redeploying a new state, I proposed various SNSes locally and compared the proposals generated with what was effectively proposed on mainnet.
+
+I used a wider sample and, as a result, it turned out that the most accurate way to generate the "seconds per month" was to use the same strategy for any fields.
+
+i.e., always use these fixed values:
+
+```
+const snsUnitsToSeconds: GovernanceUnitsToSeconds = {
+	months: 2_630_016, // 30.44 days
+	years: 31_557_600, // 365.25 days
+};
+```
+
+Unlike what I said many times in this thread, using those values, I could replicate the proposals of the following projects:
+
+* CTS
+* ICPanda
+* ICPSwap
+
+When I generated the proposal for ICFootprint, I found one difference in `swapParameters.duration.seconds`, but I assume it's not related. I assume the team modified the value when they created their proposal and did not commit the change in their repo. This is probably a correct assumption given that I also found different values in the `minimumParticipantIcp`.
+
+I also tried to generate a proposal for ICPCC, but the shared YAML file contains too many fields that were not set, so I couldn't really process it.
+
+Regarding WaterNeurons, I'm still unable to submit the proposal due to a validation issue because the `dissolve_delay_seconds` is greater than `max_dissolve_delay_seconds`. Given that all four other projects seem accurate, I'm going to assume that the SNS.yaml shared by the team is invalid and was corrected afterward without being committed in their repo as well.
+
+Long story short, it seems okay, and therefore I'll stop debugging for now.
+
+As I'm preparing an SNS proposal for Juno, I suggest that as a final validation step, once I make the data public, if you agree to help, I send you my SNS.yaml file. That way we can compare our outcomes, and if both results match, we can then assume that the issue is finally resolved.
+
+Thanks @Andre-Popovitch @aterga and @daniel-wong.
+
+-------------------------
+
+daniel-wong | 2024-07-18 16:48:51 UTC | #22
+
+[quote="peterparker, post:21, topic:32905"]
+```
+const snsUnitsToSeconds: GovernanceUnitsToSeconds = {
+	months: 2_630_016, // 30.44 days
+	years: 31_557_600, // 365.25 days
+};
+```
+[/quote]
+
+:+1:
+
+[quote="peterparker, post:21, topic:32905"]
+I could replicate the proposals
+[/quote]
+
+:tada:
+
+[quote="peterparker, post:21, topic:32905"]
+I assume the team modified the value when they created their proposal and did not commit the change in their repo.
+[/quote]
+
+I concur that this is probably what happened.
+
+[quote="peterparker, post:19, topic:32905"]
+`63_115_200` vs `63_120_384` or `730.5 days` vs `730.56 days`.
+[/quote]
+
+Yes, I mentioned this earlier:
+
+[quote="daniel-wong, post:17, topic:32905"]
+You would think that 12 months = 1 year, but 1 year is defined as 365.25 days, so there is a slight difference: 12 months = 365.28 days (where 1 day = 86_400 s).
+[/quote]
+
+My main claim is that all fields define month the same. I could not find any evidence to the contrary.
+
+-------------------------
+
+peterparker | 2024-08-01 07:00:23 UTC | #23
+
+For the track record, I get the same duration when I simulate submitting the SNS.yaml of DOGMI and ICVC with proposals.network locally as what was proposed on the mainnet. Sounds good.
+
+-------------------------
+

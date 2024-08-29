@@ -1,0 +1,133 @@
+Jesse | 2022-02-03 17:09:36 UTC | #1
+
+I'm trying to transfer ICP but am getting the following error:
+```
+Reject text: IC0503: Canister b4q7m-7iaaa-aaaaa-aaerq-cai trapped explicitly: IDL error: unexpected IDL type when parsing Nat
+```
+
+below is the relevant code snippet. Does anyone see any apparent reason for the error? 
+
+```
+ public shared(msg) func transferICP(amount: Nat, canisterAccountId: Account.AccountIdentifier) : async Result.Result<(), Error> {
+
+        let callerId = msg.caller;
+
+        let userProfile = Trie.find(
+            profiles,
+            key(callerId), //Key
+            Principal.equal 
+        );
+
+        switch(userProfile) {
+            case null{
+                #err(#NotFound)
+            }; 
+            case (? profile){
+                let userJournal = profile.journal;
+
+                let status = await userJournal.transferICP(Nat64.fromNat(amount), canisterAccountId);
+                if(status == true){
+                    #ok(());
+                } else {
+                    #err(#TxFailed)
+                }
+
+            };
+        };
+    };
+```
+
+
+
+
+the `userJournal.transferICP()` function that is used in the above code snippet is defined below 👇🏾
+
+
+
+
+```
+public func transferICP(amount: Nat64, recipientAccountId: Account.AccountIdentifier) : async Bool {
+
+        let res = await Ledger.transfer({
+          memo = Nat64.fromNat(10);
+          from_subaccount = null;
+          to = recipientAccountId;
+          amount = { e8s = amount };
+          fee = { e8s = 10_000 };
+          created_at_time = ?{ timestamp_nanos = Nat64.fromNat(Int.abs(Time.now())) };
+        });
+
+        switch (res) {
+          case (#Ok(blockIndex)) {
+            Debug.print("Paid reward to " # debug_show principal # " in block " # debug_show blockIndex);
+            return true;
+          };
+          case (#Err(#InsufficientFunds { balance })) {
+            throw Error.reject("Top me up! The balance is only " # debug_show balance # " e8s");
+            return false;
+          };
+          case (#Err(other)) {
+            throw Error.reject("Unexpected error: " # debug_show other);
+            return false;
+          };
+        };
+    };
+```
+
+edit: I think it may be something wrong with the way I'm sending the recipientAccountId to the backend, but I'm not quite sure what exactly the issue is. below is the front end code when I convert the address from a text to a byte array then send the request to the backend:
+
+```
+const onSendConfirm = async () => {
+        console.log(fromHexString(recipientAddress));
+        const status = await actor.transferICP(parseInt(amountToSend), fromHexString(recipientAddress));
+        console.log(status);
+    };
+```
+
+here is the definition of the `fromHexString()` function:
+
+```
+export const fromHexString = (hex) => {
+    if (hex.substr(0,2) === "0x") hex = hex.substr(2);
+    for (var bytes = [], c = 0; c < hex.length; c += 2)
+    bytes.push(parseInt(hex.substr(c, 2), 16));
+    return bytes;
+};
+```
+
+-------------------------
+
+GLdev | 2022-02-02 18:41:04 UTC | #2
+
+I don't know motoko, but are Nat and Nat64 interchangeable? You seem to be using both, and the error hints at expecting Nat and receiving something else.
+
+-------------------------
+
+Jesse | 2022-02-02 18:44:16 UTC | #3
+
+Nat and Nat64 are distinct and cannot be used interchangeably. On the line where i define `status` I convert the `Nat` To a `Nat64`, which is the data type that the `Ledger.transfer()` function is ultimately expecting.
+
+-------------------------
+
+Jesse | 2022-02-04 15:28:26 UTC | #4
+
+I ended up having to stop and restart my local replicas and redeploy my app and after that, the error disappeared and it working. So, for anyone reading this in the future, trying restarting your local replica and redeploying you app and see where that gets you.
+
+-------------------------
+
+mymikemiller | 2022-06-18 06:05:58 UTC | #5
+
+I spent half the day today trying to figure out what was at the root of my `unexpected IDL type when parsing...` issue. Deleting .dfx/ and restarting with `dfx start --clean` didn't help me.
+
+For me, the problem was a mismatch between a local canister's Actor's function's return type and the type I specified for it when I imported it using its cid as described here:
+
+[quote="Ori, post:2, topic:6473"]
+`let cowsay = actor(“7igbu-3qaaa-aaaaa-qaapq-cai”): actor { cowsay: (Text) -> async Text };`
+[/quote]
+
+The actual function from the imported canister returned something other than Text, which is why the error complained about `unexpected IDL type when parsing Text`. I wish the error pointed me to the import line where the erroneous type was specified, or caused the trap to happen somewhere other than "in the promise". That one took a while to track down.
+
+I had to import the actor this way, which requires you to specify the interface you expect the Actor to have, because the actor was in a different canister than the one I was importing it into and `import myCanister "canister:myCanister"` was giving me a `canister alias "myCanister" not defined` even though it was defined in dfx.json and located in the same project. Seems like you can only import actors this way if they are defined in the same canister as the one they're being imported into. I understand why mainnet IC canisters need to be imported so explicity but it would be nice if there was an easier way to import local canisters defined in separate canisters (but the same project) by name (not cid) and without needing to specify the expected interface since the .did file is available in the project. If it is possible to import without having to specify the cid or interface type, someone please let me know so I can avoid this problem in the future!
+
+-------------------------
+

@@ -1,0 +1,223 @@
+paulyoung | 2022-09-01 18:59:32 UTC | #1
+
+I recently integrated a few third-party services and I think the story around doing that as it relates to Candid could be improved.
+
+The current process seems to be to copy and paste from `README`s and `.did` files to your own `.did` file.
+
+I think introducing a module system to Candid could provide a solution to ever-growing and unwieldy Candid files, as well as provide a better experience when integrating with third-party services.
+
+@chenyan, I'm curious to know what you think.
+
+## Proposal
+
+Introduce an `import` keyword to Candid. Everything in a `.did` file would be implicitly exported.
+
+e.g.
+
+```
+import canistergeek from "./canistergeek.did";
+
+...
+
+// Access types like canistergeek.LogMessagesData here if necessary
+
+...
+
+service : {
+  ...
+  collectCanisterMetrics: canistergeek.service.collectCanisterMetrics;
+  getCanisterLog: canistergeek.service.getCanisterLog;
+  getCanisterMetrics: canistergeek.service.getCanisterMetrics;
+}
+```
+
+This would be backwards-compatible with how things work today.
+
+## Alternatives Considered
+
+To approximate the above proposal, service providers could follow a convention of separating the `service` declaration into a separate file from the rest, and then concatenating the files together using a custom build step.
+
+Consumers would then add third-party `.did` files to the list of files they include in their own custom build step.
+
+e.g. for service-providers:
+* `methods.did` <> `service.did` = `canister.did`
+* `types.did` <> `methods.did` <> `service.did` = `canister.did`
+* `create.did` <> `read.did` <> `service.did` = `canister.did`
+* ...
+
+e.g for consumers:
+* `methods.did` <> `third-party-methods.did` <> `service.did` = `canister.did`
+
+_Pros_
+* Requires no changes to Candid; works today.
+
+_Cons_
+* Requires people to follow conventions; not be enforced by tooling.
+* Requires a separate custom build step per-project.
+* Still requires consumers to redeclare methods in their own `service` declaration.
+
+-------------------------
+
+chenyan | 2022-09-01 19:11:40 UTC | #2
+
+We actually have `import`: https://github.com/dfinity/candid/blob/master/spec/Candid.md#imports, but it's not scoped. All the type definitions are imported to the current scope.
+
+-------------------------
+
+paulyoung | 2022-09-01 19:15:50 UTC | #3
+
+@chenyan thanks, I didn't know that!
+
+It sounds like `import` works a bit like the alternative approach I described, except it also includes `service`.
+
+How does that work? Are all of the `service` definitions (including that of the consumer) merged? Are multiple imports/services supported?
+
+-------------------------
+
+chenyan | 2022-09-01 19:22:16 UTC | #4
+
+It only imports the type definitions, the main service is ignored. Multiple imports are supported.
+
+If you want to import each main service in the did file, you have to change the did file to make the main service a type definition as well:
+```
+service : { ... }   =>    let my_service = service { ... }; 
+                          service : my_service;
+```
+
+-------------------------
+
+paulyoung | 2022-09-01 20:36:37 UTC | #5
+
+It sounds like this supports the example I gave in my proposal.
+
+I’ll give it a try and then try to socialize the approach and/or make PRs.
+
+Thanks @chenyan!
+
+-------------------------
+
+rossberg | 2022-09-02 08:04:05 UTC | #6
+
+[quote="chenyan, post:4, topic:15234"]
+It only imports the type definitions, the main service is ignored.
+[/quote]
+
+Interesting, I wasn't aware of that – sounds a bit fishy :). An alternative would be to make trying to import something that has a service declaration an error. Of course, then people would have to split up their Candid sources into "libraries" and main files where reuse is intended, but that may be a good thing.
+
+-------------------------
+
+chenyan | 2022-09-02 15:36:53 UTC | #7
+
+Or we can introduce scoping as Paul suggested and import the main service as well. There is an open issue in the spec about whether we want to have qualified names for imports.
+
+OTOH, `import` can only appear in local development. When we attach the did file as canister metadata, `import` cannot appear there, because there is no notion of file system. We can only dump the typing environment when exporting did file.
+
+-------------------------
+
+paulyoung | 2023-01-11 02:48:57 UTC | #8
+
+@chenyan I only just got around to trying this and I'm not sure I can do what I was hoping to do.
+
+Is there a way to do something like this?
+
+```
+// canistergeek.did
+...
+type Canistergeek = service {
+  collectCanisterMetrics: () -> ();
+  getCanisterLog: (opt CanisterLogRequest) -> (opt CanisterLogResponse) query;
+  getCanisterMetrics: (GetMetricsParameters) -> (opt CanisterMetrics) query;
+};
+```
+
+```
+// codebase.did
+import "canistergeek.did";
+...
+service : () -> {
+  ...
+  collectCanisterMetrics: Canistergeek.collectCanisterMetrics;
+  getCanisterLog: Canistergeek.getCanisterLog;
+  getCanisterMetrics: Canistergeek.getCanisterMetrics;
+}
+```
+
+or, even better would be:
+
+```
+// codebase.did
+import "canistergeek.did";
+...
+service : () -> canistergeek && {
+  ...
+}
+```
+
+-------------------------
+
+chenyan | 2023-01-11 03:33:09 UTC | #9
+
+You can do the last one but without the `&&` part: `service : () -> canistergeek`. We don't have a way to project or extend the fields. 
+
+If you can refactor `canistergeek.did` to separate function types, then you can do the second one.
+
+-------------------------
+
+skilesare | 2023-01-11 04:36:02 UTC | #10
+
+{canistergeek with ....} syntax won't work?
+
+-------------------------
+
+paulyoung | 2023-01-11 04:37:56 UTC | #11
+
+That's not valid Candid syntax AFAIK.
+
+-------------------------
+
+chenyan | 2023-01-11 04:43:58 UTC | #12
+
+`with` is a Motoko syntax, not Candid.
+
+-------------------------
+
+paulyoung | 2023-01-11 05:09:08 UTC | #13
+
+[quote="chenyan, post:9, topic:15234"]
+If you can refactor `canistergeek.did` to separate function types, then you can do the second one.
+[/quote]
+
+I did this for now:
+
+```
+type collectCanisterMetrics = func () -> ();
+type getCanisterLog = func (opt CanisterLogRequest) -> (opt CanisterLogResponse) query;
+type getCanisterMetrics = func (GetMetricsParameters) -> (opt CanisterMetrics) query;
+```
+
+The above works, but is it supported in `ic-repl`?
+
+I have tests that do `import codebase = "<canister id>" as "candid/codebase.did";` that are now failing with `Error: Unbound type identifier collectCanisterMetrics`
+
+-------------------------
+
+chenyan | 2023-01-11 05:13:59 UTC | #14
+
+ic-repl assumes that the did file comes from the canister, so it ignores the import. But this is a good use case, I will fix it tomorrow.
+
+-------------------------
+
+paulyoung | 2023-01-11 21:53:58 UTC | #15
+
+I created an issue for tracking purposes.
+
+https://github.com/chenyan2002/ic-repl/issues/49
+
+-------------------------
+
+chenyan | 2023-01-11 23:48:25 UTC | #16
+
+Released: https://github.com/chenyan2002/ic-repl/releases/tag/0.3.11 :)
+
+-------------------------
+

@@ -1,0 +1,381 @@
+kristofer | 2023-12-06 12:46:20 UTC | #1
+
+Hey! I wanted to share what I am working on and open up for ideas and early feedback. 
+
+I have been awarded a grant by the Dfinity Foundation to develop support libraries and template applications to simplify the process for Ethereum developers to extend their apps onto IC. Now with ckETH being fully launched we should expect an explosion of cross chain applications using the strengths of the ETH/IC chains combined! 
+
+Most Ethereum wallets are now compatible with the [EIP-4361: Sign-In With Ethereum (SIWE) standard](https://docs.login.xyz/general-information/siwe-overview/eip-4361), to allow Ethereum accounts to authenticate with off-chain services. SIWE works by having accounts sign a standard message that includes scope, session details, and security features such as a nonce.
+
+### Project Goals
+
+The main goal of this project is to enable Ethereum applications to securely establish sessions with IC canisters using SIWE. Here are some key aspects of this implementation:
+
+1. **Secure SIWE verification**: The verification of SIWE signatures should take place securely at the canister level, not in the browser.
+2. **Unique and ephemeral SIWE messages**: Each SIWE message is made unique by including a nonce. The signature based on that message can only be used one time.
+3. **Session Identity Uniqueness**: Session identities must be unique to each app's context. A session identity generated in canister A cannot be used to access canister B. Malicious app B should not be able to generate an identity to fool the user to access canister A.
+4. **Consistent Principal Generation**: Logging in with an Ethereum wallet should consistently generate the same Principal, irrespective of the client used.
+5. **Direct Ethereum Address to Principal Mapping**: There should be a one-to-one correspondence between an Ethereum address and Principal within the scope of the current application. In other words, logging in with a specific Ethereum address in this application should always yield the same Principal.
+6. **Timebound Sessions**: Sessions expire after an amount of time set by the canister developer.
+
+### Deliverables
+
+- **Rust and Motoko Support Libraries**: Development of two support libraries to integrate SIWE with Rust and Motoko based canisters.
+- **Template Applications**: Creation of two React starter template applications, demonstrating the Ethereum login process and interaction with canisters on the Internet Computer.
+- **JavaScript NPM Package**: An NPM package to simplify the creation of delegate identities and streamline the login process.
+### Implementation
+
+The SIWE support library uses standard ECDSA signature verification and address recovery on the SIWE message. 
+
+Once the SIWE message has been verified, the library creates a signature delegation from the canister. This delegation is then used by the frontend to create a delegation identity for subsequent authenticated calls. This part is heavily inspired by/borrowed from the Internet Identity project.
+
+![image|621x499](upload://6nJldQep0FmrLTrpbuyeXUAhQvo.png)
+
+### Status
+
+I have been working part time on the project for a month now. Currently, the flow works from end to end with a Vite/React based frontend and the Rust version of the library.
+
+Next up: Heavy refactoring, cleaning up and documentation before hopefully publishing a beta version of the Rust version before Christmas.
+
+January: Finish up Rust version after code review and feedback, then start migrating the library to Motoko.
+### RFC
+
+Let me hear your thoughts! Could this useful be to you and/or your project? Do you miss some functionality?
+
+Thanks for the great support so far @domwoe @frederikrothenberger
+
+-------------------------
+
+CodeCork | 2023-12-06 20:32:49 UTC | #2
+
+Hi, great project. SIWE is getting momentum in Eth world. 
+
+I have a question.
+
+Will the person that logs with SIWE get their own principal?
+
+-------------------------
+
+kristofer | 2023-12-06 20:44:38 UTC | #3
+
+Yes, every ETH address that logs in will get a separate principal.
+
+-------------------------
+
+LiveDuo | 2023-12-11 14:43:55 UTC | #4
+
+Awesome work @kristofer. Looking forward see the implementation in Rust and understand the details of the library.
+
+I've gone through the implementation design in the image above and have a few comment / questions:
+1. There's one project design goal aiming for the consistent principals and I'm wondering how it's achieved. In the Internet Identity spec the `prepare_delegation` [method](https://github.com/dfinity/internet-identity/blob/main/src/internet_identity/internet_identity.did#L472) get's `UserNumber`, `FrontendHostname`, `SessionKey` and `maxTimeToLive` params and since the `session_key` should be generated from the `session_identity` I thought the generated principals would be different.
+2. What does the `canister_pubkey` variable represent? Is it the canister principal?
+
+3. When we built our own Ethereum login, our threat model for the nonce was a malicious IC node replaying the `login` canister call. Since the canister knows if that particular `session_identity` has been used or not, we don't have an equivalent to the first call ie. `prepare_login`. Does this approach make sense to you? If not, what's the threat model you considered for implementing the nonce?
+
+-------------------------
+
+kristofer | 2023-12-12 11:04:47 UTC | #5
+
+[quote="LiveDuo, post:4, topic:25306"]
+There’s one project design goal aiming for the consistent principals and I’m wondering how it’s achieved. In the Internet Identity spec the `prepare_delegation` [method](https://github.com/dfinity/internet-identity/blob/main/src/internet_identity/internet_identity.did#L472) get’s `UserNumber`, `FrontendHostname`, `SessionKey` and `maxTimeToLive` params and since the `session_key` should be generated from the `session_identity` I thought the generated principals would be different.
+[/quote]
+
+As long as the seed for the delegate identity stays the same, the identity stays the same. In my case, instead of the `UserNumber`, I use `EthAddress`. `SessionKey` and  `maxTimeToLive` are not part of the seed and does not affect the identity. 
+
+[quote="LiveDuo, post:4, topic:25306"]
+What does the `canister_pubkey` variable represent? Is it the canister principal?
+[/quote]
+
+It is the canister pubkey with added details, in DER format. The seed is part of this key, allowing the canister to sign on behalf of the user represented by the seed. This `userCanisterPubKey` determines the generated identity principal.
+
+See this image for some more details:
+
+![Screenshot 2023-12-04 at 16.05.42|690x369](upload://tg64gibtbuMZ09Qig7SmvOWnVPU.jpeg)
+
+[quote="LiveDuo, post:4, topic:25306"]
+When we built our own Ethereum login, our threat model for the nonce was a malicious IC node replaying the `login` canister call. Since the canister knows if that particular `session_identity` has been used or not, we don’t have an equivalent to the first call ie. `prepare_login`. Does this approach make sense to you? If not, what’s the threat model you considered for implementing the nonce?
+[/quote]
+
+The SIWE enabled canister in my case uses the SIWE message only once, then it is discarded. The message includes a nonce, and the message itself acts as sort of a nonce. I don't know enough about the low level details of IC to tell if what you are describing would be a risk. One additional layer of security is, even if a malicious node would intercept the login call and get access to the delegation details, it still does not have access to the `session_identity` private key required to use the delegation.
+
+-------------------------
+
+kristofer | 2023-12-14 09:14:51 UTC | #6
+
+![image|690x490](upload://1wx9w9vIyRAwXvzRVqwrEuawe5W.jpeg)
+
+I have opened up access to the repositories I have worked on and would like to share to progress so far of the ic-siwe library and the companion React demo application / template.
+
+## Deployed demo
+
+Try out the login flow here, let me know what you think!
+
+[https://shtr2-2iaaa-aaaal-qckva-cai.icp0.io](https://shtr2-2iaaa-aaaal-qckva-cai.icp0.io/)
+
+## ic-siwe-rust
+
+https://github.com/kristoferlund/ic-siwe-rust
+
+This is the Rust based library that you use in your canister to enable Ethereum based identities. I have tried to make the integration as compact as possible, here is an example on how to add the three needed endpoints.
+
+```Rust
+// Prepare the login by generating a challenge (the SIWE message) and returning it to the caller.
+#[update]
+fn prepare_login(address: String) -> Result<String, String> {
+    ic_siwe::prepare_login(&address).map(|m| m.into())
+}
+
+// Login the user by verifying the signature of the SIWE message. If the signature is valid, the
+// public key is returned. In this step, the delegation is also prepared to be fetched in the next
+// step.
+#[update]
+fn login(signature: String, address: String, session_key: ByteBuf) -> Result<ByteBuf, String> {
+    ic_siwe::login(&signature, &address, session_key)
+}
+
+// Once logged in, the user can fetch the delegation to be used for authentication.
+#[query]
+fn get_delegation(
+    address: String,
+    session_key: ByteBuf,
+) -> Result<ic_siwe::SignedDelegation, String> {
+    ic_siwe::get_delegation(&address, session_key)
+}
+```
+
+## ic-siwe-react-demo-rust
+
+https://github.com/kristoferlund/ic-siwe-react-demo-rust
+
+A demo and a template application to get started using the library. 
+
+## RFC
+
+I would like to get feedback on the current approach. The ic-siwe library is using certified variables internally to facilitate the delegate identity creation. The library borrows a lot of code from the internet identity codebase here. This all works well, but, it makes it harder if the canister developer wants to use certified variables as that will collide with the certified variable set by the library. This could be mitigated of course. But perhaps the approach is wrong, building this as a library? Perhaps ic-siwe shoud be a canister instead? Not a centralised service such as the Internet Identity but a small drop in, pre-compiled canister that you add to your `dfx.json` and configure to support your setup. In web2 development, often the authentication runs as a separate microservice. This would be very similar. If ic-siwe ran as a separate canister it could also be configured to allow the session to be valid on more than one canister, simplifying for developers who want to create multi canister applications.
+
+Canister composability rather than canister bloat?! 😂
+
+Eager to hear your thoughts on this @domwoe @frederikrothenberger @cryptoschindler and all others.
+
+-------------------------
+
+frederikrothenberger | 2023-12-14 09:31:47 UTC | #7
+
+Hi @kristofer 
+
+It's great to see progress on this project! :smiley: 
+
+> This all works well, but, it makes it harder if the canister developer wants to use certified variables as that will collide with the certified variable set by the library.
+
+Your library should not take control of the whole `certified_variable` but rather just contribute part of the hash_tree. I.e. allow canister developers to have other subtrees (e.g. the ones for HTTP asset certification) in addition to the `sigs` tree.
+
+Moreover, I think the library should also make it possible to add canister signatures for other things. So you should not even take control over all of the `sigs` subtree. Or at least expose access to it so items can be added and removed.
+
+> Perhaps ic-siwe should be a canister instead?
+
+I think having that as an option would be great. I would still keep the library approach, but offer another artifact that is the minimal canister using the library (similar to your example above). Of course this canister would probably need some configuration as well...
+
+But only offering a canister is very annoying in case you need it as a library (for whatever reason).
+
+-------------------------
+
+kristofer | 2023-12-14 10:09:48 UTC | #8
+
+Yes, offering both and is definitely one way to go.
+
+
+[quote="frederikrothenberger, post:7, topic:25306"]
+Your library should not take control of the whole `certified_variable` but rather just contribute part of the hash_tree.
+[/quote]
+
+Sure, I will look into sharing the `certified_variable` with the integrating canister. It will make the canister integration slightly more complex but there is no way around it.
+
+-------------------------
+
+domwoe | 2023-12-14 10:37:38 UTC | #9
+
+Great work @kristofer!
+
+I agree with Frederik's feedback, and it's awesome to see more projects using the canister signature delegation pattern used in Internet Identity.
+
+-------------------------
+
+Yasharsaljoughi | 2023-12-15 00:34:32 UTC | #10
+
+Nice job :heart_eyes:
+I love it
+
+-------------------------
+
+jennifertran | 2023-12-26 16:59:37 UTC | #11
+
+This looks great and I have a few use cases for this.
+
+A few questions on my end:
+
+1. It looks like you are assigning an II to an Ethereum wallet in your canister. Could you have used [II attributes](https://github.com/dfinity/wg-identity-authentication/blob/main/topics/attribute-sharing.md)? 
+
+2. Let's say that I already have an II and separate Ethereum wallet. Do you have any plans for users who want to attribute their Ethereum wallet to a specific II?
+
+-------------------------
+
+LiveDuo | 2023-12-28 14:46:41 UTC | #12
+
+Hey @kristofer,
+
+Got the chance to look at the repo more closely. Great work on the design and using good Rust practises in the meantime.
+
+Some things to point out:
+
+1. I look at the `nonce` implementation and became more convinced that it does not provide any additional security benefits. At the same time it requires setting up [a timer](https://github.com/kristoferlund/ic-siwe-rust/blob/main/packages/ic_siwe/src/init.rs#L16) that many developers may not want to do in their canisters. Maybe it could go behind a feature flag if the `nonce` variable has to stay in the library.
+
+2. Agree with @frederikrothenberger about not taking control over the canister hash certified variables. We had a somewhat similar problem with [Communities](https://github.com/LiveDuo/communities) and [ic_certified_assets](https://docs.rs/ic-certified-assets/latest/ic_certified_assets/) where we ended up having a [local fork](https://github.com/LiveDuo/communities/tree/master/src/_meta/assets) of the library as we couldn't just changed some of the behaviour.
+
+-------------------------
+
+jennifertran | 2023-12-29 06:52:18 UTC | #13
+
+Hello @kristofer, I have forked the crate and React demo site and am getting the following error when I attempt to sign:
+
+```
+index-l4GFnWdI.js:214 Uncaught (in promise) Error: Call failed:
+  Canister: ajuq4-ruaaa-aaaaa-qaaga-cai
+  Method: get_delegation (query)
+  "Status": "rejected"
+  "Code": "CanisterError"
+  "Message": "IC0503: Canister ajuq4-ruaaa-aaaaa-qaaga-cai trapped explicitly: Signature not found."
+    at r (index-l4GFnWdI.js:214:3357)
+    at async he (index-l4GFnWdI.js:1436:6182)
+    at async index-l4GFnWdI.js:1436:6577
+```
+It looks like the Signature not found message returns when the `handle_witness` function in the `ic-siwe` crate fails which is used in the `getSignature` function and the `get_delegation` function. 
+
+Therefore, the delegation could not happen. It will fail at this point in the `IdentityProvider.tsx`:
+
+```
+const signedDelegation = await callGetDelegation(
+        address,
+        sessionPublicKey,
+        expiration
+      );
+```
+Do you know why the backend could not find the signature? 
+
+The only thing that I can infer is that I am passing the wrong expiration date. It looks like the new crate does pass in an `expiration` of u64 type into `get_delegation`. However, it is not reflected in the React demo app. I am attempting to pass in an expiration date in this repo here: https://github.com/jennifertrin/SepholiaCards
+
+-------------------------
+
+kristofer | 2023-12-29 17:24:31 UTC | #14
+
+[quote="LiveDuo, post:12, topic:25306"]
+I look at the `nonce` implementation and became more convinced that it does not provide any additional security benefits. At the same time it requires setting up [a timer](https://github.com/kristoferlund/ic-siwe-rust/blob/main/packages/ic_siwe/src/init.rs#L16) that many developers may not want to do in their canisters. Maybe it could go behind a feature flag if the `nonce` variable has to stay in the library.
+[/quote]
+
+You are right, the nonce does not add significantly to the security of the flow. It might do in other SIWE setups. But in the ic-siwe case:
+- SIWE messages are unique for each login since `Issued At` changes on each login. Guessing the exact `Issued At` is "hard" for an attacker. 
+- The whole message is used as a "nonce", it can only be used for login once.
+
+It is there in the SIWE spec though. So, removing it completely is not the way to go. But as you suggest, hiding it behind a feature flag sounds like a great compromise. Default would be off / not used.
+
+[quote="LiveDuo, post:12, topic:25306"]
+Agree with @frederikrothenberger about not taking control over the canister hash certified variables. We had a somewhat similar problem with [Communities](https://github.com/LiveDuo/communities) and [ic_certified_assets](https://docs.rs/ic-certified-assets/latest/ic_certified_assets/) where we ended up having a [local fork](https://github.com/LiveDuo/communities/tree/master/src/_meta/assets) of the library as we couldn’t just changed some of the behaviour.
+[/quote]
+
+I will make sure canister dev can retain control over the certified variables.
+
+Thanks for great feeback!
+
+-------------------------
+
+kristofer | 2023-12-29 17:29:15 UTC | #15
+
+Hey! The React demo repo is out of sync with the main repo. I'll give you a ping when all cogwheels connect again. 
+
+I am currently working on issues mentioned above in this thread:
+- Give canister dev control back over certified variables
+- Support delegation targets
+- Integration testing using PocketIc
+- .. plus refactoring etc
+
+-------------------------
+
+kristofer | 2023-12-30 22:41:02 UTC | #16
+
+Demo repo should be back to a working state, now using the prebuilt `ic_siwe_provider` canister for easier setup. You should be good to go just like this:
+
+```bash
+dfx start --clean --background
+make deploy-backend
+make deploy-frontend
+```
+
+To see the full integration of the `ic-siwe` library, have a look at the code of the `ic_siwe_provider`:
+
+https://github.com/kristoferlund/ic-siwe/tree/main/packages/ic_siwe_provider
+
+Nb: Very much a work in progress still, the issue with exposing certified variable handling etc not implemented yet.
+
+-------------------------
+
+kristofer | 2024-01-04 11:27:51 UTC | #17
+
+I have pushed a few updates to the `ic_siwe` library and `ic_siwe_provider` canister.
+
+## Certified data
+
+Certified data is now handled outside of the library, allowing the integrating canister to also certify other data. Some utility functions are provided to simplify integration as much as possible. Love to hear your feedback @domwoe, @frederikrothenberger @LiveDuo, is the setup reasonable? 
+
+```rust
+#[query]
+fn get_delegation(
+    address: String,
+    session_key: ByteBuf,
+    expiration: u64,
+) -> Result<SignedDelegation, String> {
+    let certificate = data_certificate().expect("get_delegation must be called using a query call");
+
+    STATE.with(|s| {
+        let signature_map = s.signature_map.borrow_mut();
+        
+        let seed = generate_seed(&address);
+        let delegation = create_delegation(session_key, expiration);
+        let delegation_hash = create_delegation_hash(&delegation);
+        let signature_witness = witness(&signature_map, seed, delegation_hash)?;
+
+        // Create a forked version of the state tree with the signature witness and the pruned asset hashes.
+        let tree = fork(
+            HashTree::Pruned(labeled_hash(
+                LABEL_ASSETS,
+                &s.asset_hashes.borrow().root_hash(),
+            )),
+            ic_certified_map::labeled(LABEL_SIG, signature_witness),
+        );
+
+        // The canister certifies that the delegation is valid.
+        let signature = create_certified_signature(certificate, tree)?;
+
+        Ok(SignedDelegation {
+            delegation,
+            signature: ByteBuf::from(signature),
+        })
+    })
+}
+```
+
+## `nonce` feature flag
+
+By default, the library now don't generate unique nonce values for each generated SIWE message. The nonces don't add significantly to security. With feature disabled library requires a few less dependencies (`ic-cdk-timers`, `rand_chacha`) and does not have to call management canister to initiate the RNG.
+
+## PocketIc integration tests
+
+Run `make test` in the `packages/ic_siwe_provider` folder to test. Not all features are yet tested though as PocketIc don't yet support delegate identities.
+
+-------------------------
+
+LiveDuo | 2024-01-07 14:16:52 UTC | #18
+
+Great work, yeah it seems better now.
+
+Minor thing I notice is that the `getrandom` crate is not [used anywhere](https://github.com/search?q=repo%3Akristoferlund%2Fic-siwe+getrandom&type=code). If that's the case maybe it could be removed. If it's used, it could also be marked as `optional` and go behind the `nonce` feature flag.
+
+-------------------------
+

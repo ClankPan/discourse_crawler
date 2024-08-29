@@ -1,0 +1,923 @@
+icme | 2022-10-19 00:15:52 UTC | #1
+
+This is a two-part question on **1)** Canister Output Message Queue Limits, and **2)** IC Management Canister Throttling Limits
+
+First, some context.
+
+I recently ran into the  ["Canister trapped explicitly: could not perform self call"](https://forum.dfinity.org/t/error-the-replica-returned-an-error-code-5-message-canister-trapped-explicitly-could-not-perform-self-call/11604) issue when trying to asynchronously and concurrently query the canister status of over 500 canisters at a single time.
+
+I understand this is due to limitations of the the [canister output queue](https://internetcomputer.org/docs/current/developer-docs/glossary#o). 
+
+**1\)** 
+
+What is the canister output queue, where are its limits/parameters defined in the code, and is there any way I can push this limit or navigate around these limits (if I need to constantly contact potentially thousands of canisters from a single canister)? Is one shot execution preferred?
+
+**2\)**
+
+Additionally, given that from a canister on the IC (not an ingress HTTP call) I am calling the IC Management Canister's `canister_status` method for thousands of canisters, I am assuming there a point at which the management canister will throttle my canister's requests? If so, what is this throttle limit? How does the IC Management "Canister" manage load?
+
+<br/>
+
+Finally, a "nice to have" feature would be if instead of making many individual requests to the `canister_status` method of the Management Canister, a canister could just make one requests to the Management Canister with a list of canister ids in order to then have it then retrieve and return a list of each canister id's status.
+
+-------------------------
+
+paulyoung | 2022-10-19 04:34:25 UTC | #2
+
+For #1, a quick [search](https://github.com/dfinity/ic/search?q=canister+output+queue&type=) revealed this:
+
+https://github.com/dfinity/ic/blob/a52bb83dd6fc99072db070ccc905478f5ce4bee4/rs/replicated_state/src/canister_state/queues.rs#L30-L30
+
+I also spotted this, which seems like it could further limit the number of messages:
+
+https://github.com/dfinity/ic/blob/a52bb83dd6fc99072db070ccc905478f5ce4bee4/rs/replicated_state/src/canister_state/queues.rs#L1325-L1330
+
+-------------------------
+
+roman-kashitsyn | 2022-10-19 07:44:10 UTC | #3
+
+[quote="icme, post:1, topic:15972"]
+[“Canister trapped explicitly: could not perform self call”](https://forum.dfinity.org/t/error-the-replica-returned-an-error-code-5-message-canister-trapped-explicitly-could-not-perform-self-call/11604)
+[/quote]
+
+Is that the exact error message that you get? If so, it tells you that the canister sent too many messages to _itself_.
+
+The system keeps track of _queues_ between pairs of canisters. When your canister sends messages to thousands of canisters, the system creates a separate queue for each destination. Each canister also has a queue for messages it sends to itself.
+
+The `DEFAULT_QUEUE_CAPACITY` constant that @paulyoung dug up applies to a single queue.
+
+If you see `could not perform self call`, your canister might perform nested self calls exhausting the message queue limit. You might be able to fix the issue by restructuring the code. Is the code public?
+
+[quote="icme, post:1, topic:15972"]
+I need to constantly contact potentially thousands of canisters from a single canister
+[/quote]
+
+Your canister can interact with as many canisters as it wants simultaneously. There is no limit on the number of queues, only the size of each queue and the total memory consumption.
+
+-------------------------
+
+dsarlis | 2022-10-19 08:05:03 UTC | #4
+
+Roman's answer is accurate, I wanted to provide some extra clarification for the management canister question.
+
+Based on the general limit on the queue to a canister as already mentioned by the others, you can have up to `DEFAULT_QUEUE_CAPACITY` messages from a single canister to the management canister. So, if you want to get the status of thousands of canisters in the same message execution, I expect that you'll hit that limit. But as long as you space them out you should be fine.
+
+> Finally, a “nice to have” feature would be if instead of making many individual requests to the `canister_status` method of the Management Canister, a canister could just make one requests to the Management Canister with a list of canister ids in order to then have it then retrieve and return a list of each canister id’s status.
+
+Nice idea but it might be harder to implement than you might initially think if we want to allow for an arbitrarily long list of ids. A response is limited to 2MiB so if we need to return thousands of canister statuses in a single one we might be close to hitting that limit and then we'd need to support some form of pagination for the response (arguably you can still fit a few thousand canister statuses before you actually hit the response limit but it needs to be taken into account if we want a general solution).
+
+-------------------------
+
+bogwar | 2022-10-19 09:41:10 UTC | #5
+
+Further to @dsarlis 's point regarding  `canister_status`: these calls are passed to the subnetwork hosting the canister so batching `canister_status` would not work w/o a lot of abstraction breaking and low level machinery and bookkeeping (i.e. parsing the message, constructing messages for the different subnetworks and then reconstructing the reply from the replies we would get)
+
+-------------------------
+
+cryptoschindler | 2022-10-19 18:17:08 UTC | #6
+
+[quote="roman-kashitsyn, post:3, topic:15972"]
+Is that the exact error message that you get? If so, it tells you that the canister sent too many messages to *itself*.
+[/quote]
+
+Maybe this is a good time to bring up the thread mentioned above again. I'm wondering where in this repl there is a self call 🧐
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3936417316
+
+I'm also not able to grasp how the platform behaves in the case of the repl if we imagine that I awaited the calls instead of ignoring them. 
+
+To my understanding ignoring them is like fire and forget. I fill up the queue until the canister traps with the "could not perform self call" error, and all the messages that have been in the queue until this point still get executed but I don't know which ones those were because everything gets rolled back after the trap. Is this correct?
+
+If I await them, the queue can't fill up because I only issue a new call after the old one returned. What I don't understand here is how this works under the hood. Imagine I have 100 inter canister calls each of them taking more than 2 seconds to return. Does that mean the IC can't process new blocks/messages for the next 200+ seconds (let's assume the cycles limit isn't reached for the message)? I thought spanning multiple rounds of execution is something that DTS would enable 🧐
+
+I'm probably mixing some things up here and there but I hope it's clear enough :smiley:
+
+-------------------------
+
+icme | 2022-10-20 05:43:32 UTC | #7
+
+[quote="roman-kashitsyn, post:3, topic:15972"]
+Is that the exact error message that you get? If so, it tells you that the canister sent too many messages to *itself*.
+[/quote]
+
+I am not sending calls to myself. I'm executing code similar to that mentioned in this post, where I send off a bunch of async calls in parallel, and then after all the async calls are in flight, I collect the awaited results. 
+
+https://forum.dfinity.org/t/motoko-sharable-generics/9021/3
+
+[quote="roman-kashitsyn, post:3, topic:15972"]
+The system keeps track of *queues* between pairs of canisters. When your canister sends messages to thousands of canisters, the system creates a separate queue for each destination. Each canister also has a queue for messages it sends to itself.
+[/quote]
+
+In my specific case, all of these asynchronous calls are hitting the IC Management canister, so then according to your description there is a single queue between my canister and the IC managment canister and that queue is filling up (hitting the 500 limit).
+
+[quote="roman-kashitsyn, post:3, topic:15972"]
+If you see `could not perform self call`, your canister might perform nested self calls exhausting the message queue limit. You might be able to fix the issue by restructuring the code. Is the code public?
+[/quote]
+
+I'm currently able to get around the 500 limit by batching the calls (batches of ~300 or so) at a time, but wonder what might happen if I now want to do this same batching but now with a second, third, or nth canister, where canister A is batching calls to both canister B, C .... all the way to canister N? At some point, would the message queue to canister A hit a cap due to all of the incoming asynchronous messages from canister B to N?
+
+-------------------------
+
+icme | 2022-10-20 06:59:30 UTC | #8
+
+[quote="cryptoschindler, post:6, topic:15972"]
+Maybe this is a good time to bring up the thread mentioned above again. I’m wondering where in this repl there is a self call :face_with_monocle:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3936417316
+[/quote]
+
+Yep, this essentially a much simpler example of the same issue I was hitting. Maybe the error message can be updated to something like "Canister output queue limit exceeded"?
+
+-------------------------
+
+icme | 2022-10-20 07:05:53 UTC | #9
+
+[quote="dsarlis, post:4, topic:15972"]
+Based on the general limit on the queue to a canister as already mentioned by the others, you can have up to `DEFAULT_QUEUE_CAPACITY` messages from a single canister to the management canister. So, if you want to get the status of thousands of canisters in the same message execution, I expect that you’ll hit that limit. But as long as you space them out you should be fine.
+[/quote]
+
+This makes sense, thanks @dsarlis and @bogwar for the additional context and explanation!
+
+Instead of calls coming from a single canister, what if I had 500 canisters that are all batching calls (300 at a time) to the IC Management canister. What if this number of canisters making batch calls was raised to 10,000 canisters?
+
+I guess what I'm trying to get at is, does the IC Management canister have any load limitations? I've heard that technically the IC Management canister is not a "canister", so I'm curious about how it balances or queues up load.
+
+-------------------------
+
+dsarlis | 2022-10-20 07:48:01 UTC | #10
+
+@icme It's not that different than if you wanted to hit some other canister with this load. The queues are between pairs of canisters as already mentioned earlier in the thread. This means that if you have N canisters trying to hit the management canister then you'll have N queues on the management canister each to hold the incoming messages from each of the N canisters. We do not have a limit on N, but as we've said each queue has a default capacity of 500 messages. The next limit you might hit then is the [subnet message memory capacity](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/config/src/execution_environment.rs?L32:7).
+
+Now, there are some more technicalities if you want to go deeper (I'm unclear how much of this is theoretical or you have actual use cases in mind). E.g. if your target canisters are on different subnets, then hitting the management canister means that eventually the messages are routed to each subnet hosting the target canister, so you get some more capacity because of that (basically you take up the queue for the management canister on different subnets). Also, if you are doing `install_code` messages, we apply an extra rate limit on them if they've consumed too many instructions.
+
+-------------------------
+
+cryptoschindler | 2022-10-21 15:19:44 UTC | #11
+
+[quote="roman-kashitsyn, post:3, topic:15972"]
+If you see `could not perform self call`, your canister might perform nested self calls exhausting the message queue limit. You might be able to fix the issue by restructuring the code. Is the code public?
+[/quote]
+
+@roman-kashitsyn 
+
+with the REPL I linked here I can't even get close to 500 messages. Can you explain why that is (and maybe answer my other questions :angel: )?
+
+[quote="cryptoschindler, post:6, topic:15972"]
+Maybe this is a good time to bring up the thread mentioned above again. I’m wondering where in this repl there is a self call :face_with_monocle:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=3936417316
+
+I’m also not able to grasp how the platform behaves in the case of the repl if we imagine that I awaited the calls instead of ignoring them.
+[/quote]
+
+-------------------------
+
+cryptoschindler | 2022-10-21 15:36:41 UTC | #12
+
+And when running this [REPL](https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1894631334) with `200` as an argument, the following error appears.
+
+```
+Server returned an error:
+Code: 400 ()
+Body: Specified ingress_expiry not within expected range:
+Minimum allowed expiry: 2022-10-21 15:32:10.019462710 UTC
+Maximum allowed expiry: 2022-10-21 15:37:40.019462710 UTC
+Provided expiry: 2022-10-21 15:32:08.119 UTC
+Local replica time: 2022-10-21 15:32:10.019464171 UTC
+```
+
+How do I interpret that?
+
+-------------------------
+
+nomeata | 2022-10-24 08:25:09 UTC | #13
+
+It looks as if the agent signs the signature request for the state read (i.e. for polling the response) when it makes the call, and when the call takes a while (e.g. a loop around `await`) does not extend the expiry in the read request, and after a while it expires.
+
+TL;DR: possibly a bug in the agent
+
+-------------------------
+
+cryptoschindler | 2022-10-24 09:31:44 UTC | #14
+
+Thanks Joachim! I can confirm that calling it from `dfx` indeed works. Tagging @kpeacock because I think he's the owner of the agent.
+
+-------------------------
+
+kpeacock | 2022-10-24 16:11:54 UTC | #15
+
+Oh, that's an interesting theory - I'll see if I can reproduce this with a new test
+
+-------------------------
+
+bitbruce | 2022-11-07 14:33:52 UTC | #16
+
+When developing complex projects, a number of internal asynchronous functions may be refactored to achieve functional reusability. For example
+```
+private func fun1() : async Nat{
+    await ledger.transfer(..)          //cross-canister call
+   //...
+};
+private func fun2() : async Nat{
+    // ...
+    await fun1();
+};
+private func fun3() : async Nat{
+    // ...
+    await fun2();
+};
+private func fun4() : async Nat{
+    // ...
+    await fun3();
+};
+private func fun5() : async Nat{
+    // ...
+    await fun4();
+};
+public shared func run() : async Nat{
+    ignore fun5();
+    //...
+};
+```
+The problem is that when 100 users call the canister at the same time, the number of Output Message Queues may exceed the limit of 500, and some await calls may be trapped.
+
+My views:
+
+1. The await call is classified as outcall and innercall, and the innercall should not be so restrictive.
+2. Optimise the await role of private function calls. As in the above example, it is sufficient to make await ledger.transfer(..) act asynchronously, ignore other await. 
+**An effect like this.**
+```
+private func fun1() : Nat{
+    await ledger.transfer(..)           //cross-canister call
+   //...
+};
+private func fun2() : Nat{
+    // ...
+   fun1();
+};
+private func fun3() : Nat{
+    // ...
+   fun2();
+};
+private func fun4() : Nat{
+    // ...
+    fun3();
+};
+private func fun5() : Nat{
+    // ...
+    fun4();
+};
+public shared func run() : async Nat{
+    fun5();
+    // ....
+};
+```
+**OR,**
+```
+private func fun1() : inner async Nat{
+    await ledger.transfer(..)        //cross-canister call
+    //...
+};
+private func fun2() : inner async Nat{
+    // ...
+    inner await fun1();
+};
+private func fun3() : inner async Nat{
+    // ...
+    inner await fun2();
+};
+private func fun4() : inner async Nat{
+    // ...
+    inner await fun3();
+};
+private func fun5() : inner async Nat{
+    // ...
+    inner await fun4();
+};
+public shared func run() : async Nat{
+    ignore fun5();
+    //....
+};
+```
+3. Allows futures to be returned in a synchronous function and saved in a global variable. For example:
+```
+private var f : ?Future<Nat> = null;
+private func fun() : Nat{
+    // ...
+    f :=  ?ledger.transfer(..);          // no await
+    //...
+};
+```
+
+-------------------------
+
+bitbruce | 2022-11-07 01:41:27 UTC | #17
+
+There is a new solution: add the countAwaitingCalls() method inside the ExperimentalInternetComputer Module so that Canister can limit the entry of new requests.
+
+-------------------------
+
+PaulLiu | 2022-11-08 14:37:36 UTC | #18
+
+[quote="bitbruce, post:16, topic:15972"]
+The problem is that when 100 users call the canister at the same time, the number of Output Message Queues may exceed the limit of 500, and some await calls may be trapped.
+[/quote]
+
+In your original example, each call uses `await`, which means it will schedule an outgoing self call message, and end the current call. So the total number of outstanding messages do not increase.
+
+It is only when you use `ignore fun2()` for example, it will schedule more than one outgoing calls.
+
+----
+
+Edit: I should add that calls like `await fun2()` will also reserve resources (e.g. place in the input queue) to make sure when `fun2()` returns a value, it will be processed. So nested await calls do consume more resources than a single one.
+
+-------------------------
+
+bitbruce | 2022-11-07 09:29:02 UTC | #19
+
+[quote="PaulLiu, post:18, topic:15972"]
+In your original example, each call uses `await`, which means it will schedule an outgoing self call message, and end the current call. So the total number of outstanding messages do not increase.
+[/quote]
+Yes, Output messages are accumulated whenever an ignore funN() is present in the call chain. This becomes uncontrollable when many users access it at the same time.
+
+-------------------------
+
+derlerd-dfinity1 | 2022-11-07 13:57:17 UTC | #20
+
+Hello everyone,
+
+I talked to some people today to collect some recommendations on how to handle issues with too many outstanding messages filling up queues. Two general recommendations to be followed when aiming for scalable dapps that call other canisters came up quite consistently:
+
+* Make sure that the dapp maintains a counter or something similar on how many outstanding requests it has, and explicitly handle the situation where too many calls would be in flight at the same time. @roman-kashitsyn agreed to follow up with details how this is (plannded to be) done for the ckBTC canister.
+* If the design of the dapp allows to batch together some of the calls to external canisters, aim to batch them together. For example, if there are multiple calls to the ledger involving the same account, it might be possible to batch them together and only do one transfer.
+
+There are also certain things that the IC protocol could do differently. The things identified here seem to be in line with the suggestions already brought up earlier in this thread. However, I want to stress that these measures will not really help with scalability as these would only bump limits by an order of magnitude or even less, but limits would still be easily hit as soon as, say, 1000 instead of 100 users try to do something. These things are:
+
+* Investigate whether it can be made easier to make nested function calls in Motoko without accumulating reservations, or whether there is an alternative pattern one could use. @PaulLiu already provided some pointers above, and @claudio agreed to follow up on details on this and what could be done.
+* Calls to self are currently treated in the same way as calls to other canisters. This means that there is a reservation for the response made in the input queue and in the output queue, which means that for calls to self effectively only have half the queue capacity available. This item is already in our list of backlog tasks and we will look into whether this can be picked up soon.
+
+-------------------------
+
+bitbruce | 2022-11-07 14:54:48 UTC | #21
+
+[quote="derlerd-dfinity1, post:20, topic:15972"]
+This means that there is a reservation for the response made in the input queue and in the output queue, which means that for calls to self effectively only have half the queue capacity available. This item is already in our list of backlog tasks and we will look into whether this can be picked up soon.
+[/quote]
+
+I think successive nested SELF calls can be optimised into one call.
+```
+call:fun5() -> call:fun4() -> call:fun3() -> call:fun2() -> call:fun1() -> out-call: ledger.transfer() ... 
+return:fun5() <- return:fun4() <- return:fun3() <- return:fun2() <- return:fun1() <- out-return: ledger.transfer() <-
+```
+It can be optimised as below in the queue.
+```
+call:funs() -> out-call: ledger.transfer() ... 
+return:funs() <- out-return: ledger.transfer() <-
+```
+In fact, the above 5 functions could be written as one function. But when coding, there is a need for code refactoring and reuse.
+
+-------------------------
+
+derlerd-dfinity1 | 2022-11-07 14:50:02 UTC | #22
+
+[quote="bitbruce, post:21, topic:15972"]
+In fact, the above 5 functions could be written as one function. But when coding, there is a need for code refactoring and reuse.
+[/quote]
+
+Yes, this point is what @claudio will provide more details on. This is what I aimed to describe in the bullet point "Investigate whether ....". 
+
+What I meant to describe with the bullet point on reservations for responses in the snippet you are citing in your previous message is something that could be improved on the protocol level thats unrelated to how these things are handled in Motoko: roughly speaking, the protocol currently only allows `DEFAULT_QUEUE_CAPACITY/2` requests in flight to `self` while there can be `DEFAULT_QUEUE_CAPACITY` requests in flight to other canisters. This is because the protocol doesn't distinguish between local and remote canisters; distinguishing between them could provide 2x more space for messages to self.
+
+-------------------------
+
+claudio | 2022-11-07 16:50:14 UTC | #23
+
+I will write a longer response when I get a chance, but, for now, to avoid the overhead of async/await associated with local functions that need to send messages, you need to remove those functions and inline them into their call sites.
+
+I agree this is not good and have even proposed and implemented solutions to this problem in the past but they were felt to be too risky, blurring the distinction between await and state commit points.
+
+I'll elaborate on this in another reply, but fully agree that the current situation is not good enough for code-reuse and abstraction.
+
+I'm happy to revisit addressing this, but there is no quick fix beyond inlining the calls to avoid the redundant async/await.
+
+-------------------------
+
+bitbruce | 2022-11-08 05:43:25 UTC | #24
+
+[quote="claudio, post:23, topic:15972"]
+I agree this is not good and have even proposed and implemented solutions to this problem in the past but they were felt to be too risky, blurring the distinction between await and state commit points.
+[/quote]
+
+This is important. motoko is not a toy, not just for writing demos. motoko needs to meet the needs of engineering.
+Its risks can be improved by good programming habits, good IDE tools.
+
+Calls to functions of smart contracts in EVM are also divided into internal and external calls.
+
+-------------------------
+
+claudio | 2022-11-08 08:56:18 UTC | #25
+
+
+[quote="bitbruce, post:24, topic:15972, full:true"]
+[quote="claudio, post:23, topic:15972"]
+I agree this is not good and have even proposed and implemented solutions to this problem in the past but they were felt to be too risky, blurring the distinction between await and state commit points.
+[/quote]
+
+This is important. motoko is not a toy, not just for writing demos. motoko needs to meet the needs of engineering.
+Its risks can be improved by good programming habits, good IDE tools.
+[/quote]
+
+FTR, https://github.com/dfinity/motoko/issues/1482 is the original issue that discussed this along with links to the PR's that fixed it that were then deemed to risky.
+
+-------------------------
+
+bitbruce | 2022-11-08 12:56:15 UTC | #26
+
+Yes
+The introduction of new semantic expressions is a good solution. For example `inner await`, `inner async`.
+`inner await` is not a data commit point, but it may have an `await` data commit point inside it.
+
+-------------------------
+
+abc | 2022-11-09 23:51:36 UTC | #27
+
+Indeed, FTX Storms, the centralization is facing more and more challenges in the foreseeable future and we need to be prepared for these users who are moving to decentralization!
+Looking forward to detailed reports and what preparations and changes we need to make(as soon as possible!) to support tens of millions(even more,yes even more) of users!
+
+-------------------------
+
+bitbruce | 2022-11-10 14:13:55 UTC | #28
+
+“Canister trapped explicitly: could not perform self call" error caused by input/output message queue limitation cannot be caught by `try-catch` now.
+
+This can break data consistency.
+
+For example
+```
+private stable var n: Nat = 0;
+private func fun() : async (){
+  try{
+      n += 1;  // Here it has been executed
+      let res = await fun1(); // trapped by input/output message queue limitation
+      // ...  // Here the code will not be executed
+  }catch(e){
+      n -= 1;     // Here the code will not be executed
+  };
+};
+```
+
+-------------------------
+
+icme | 2022-11-10 18:13:58 UTC | #29
+
+[quote="bitbruce, post:28, topic:15972"]
+“Canister trapped explicitly: could not perform self call" error caused by input/output message queue limitation cannot be caught by `try-catch` now.
+[/quote]
+
+This is expected behavior - if the error comes at runtime from the canister itself then (in this case the canister is overflowing it’s own output queue), then the error can’t be caught and traps. Until nested async function calls are optimized or the canister output queue limit is raised, I would recommend putting in guardrails in your code to protect you from these runtime trap situations.
+
+If the error comes as the awaited response from an async call, then this can be caught. Likewise, errors explicitly thrown by your code in a canister can be caught.
+
+-------------------------
+
+claudio | 2022-11-10 23:22:18 UTC | #30
+
+We discussed the async abstraction issue in our team meeting today and will prioritize finding a solution for this soon. 
+
+But it won't be overnight, I'm afraid, so you'll need a workaround for now. 
+
+One is to avoid using asynchronous local functions by inlining their bodies into the call-sites, without the awaits. 
+
+If you don't like inlinng, another solution that might work is to write non-async functions  returning a value describing the call you want to make (a tuple of shared function and arguments), and getting the outermost function to perform the actual call with a single await, by applying the function from the tuple  to the argument in the tuple and awaiting that.
+
+-------------------------
+
+bitbruce | 2022-11-10 23:38:59 UTC | #31
+
+Now our temporary solution is to actively control the number of input/output messages. This control is not very reliable because it is difficult to get the exact size of the message queue.
+
+-------------------------
+
+derlerd-dfinity1 | 2022-11-13 09:34:37 UTC | #32
+
+[quote="bitbruce, post:31, topic:15972"]
+it is difficult to get the exact size of the message queue.
+[/quote]
+
+For each queue to another canister there are 500 slots available, whereas there are (currently) 250 slots for the queue of a canister to itself. So if you can somehow make sure that a call only happens if there is still enough space w.r.t. these limits and currently outstanding calls things should work reliably, no? 
+
+To provide some background: pushing a message onto an output queue will make a reservation on the respective input queue. This reservation will only be "cleared" as soon as the reply arrives. So once the reply arrived one can be sure that the message is no longer "in flight". So the counter of outstanding messages could be checked and incremented if there is still space before making a call, and decremented again once the reply arrives.
+
+Sidenote 1: I'm not an expert in Motoko, so maybe @claudio can comment whether there are any concrete limitations in Motoko that would prevent realizing such a reliable counter of outstanding calls, or with recommendations how something like this can be implemented?
+
+Sidenote 2: As described above, resolving the limitation that queues to self can only handle half of the messages compared to queues to other canisters is something we will prioritize. Note that it will also take some time to implement, though.
+
+-------------------------
+
+bitbruce | 2022-11-15 03:29:48 UTC | #33
+
+We are writing a counter and testing it
+
+```
+private func aaa() : async (){
+  try{
+     counter += 1;
+     await bbb();
+     counter -= 1;
+  }catch(e){ counter -= 1; };
+};
+
+```
+It works fine at low TPS, the counter counts normally during execution and returns to 0 when there is no access.
+
+However, when a 10TPS stress test was performed, there was congestion when there were about 200+ accesses, and new accesses could be blocked as judged by the counter. But the internal execution seems to stop and the counter value stays at 486.  With no new accesses, it has been more than 1 hour and still no longer changes.
+
+-------------------------
+
+claudio | 2022-11-19 01:31:00 UTC | #34
+
+@derlerd-dfinity1 asked me to look at your code and suggested the problem is that bbb() will trap when the queue is full (edited) and never decrement the counter.
+
+He suggested something along the lines of: 
+
+```
+private func aaa() : async (){
+    if (count >= limit) throw Error.reject("full"); 
+    try {
+      count += 1;
+      await bbb();
+      count -= 1;
+    } catch (e) { 
+      count -= 1; 
+      throw e;
+    };
+  };
+```
+
+Notice that this tests for capacity before issuing the call, avoiding the trap.
+
+I've played around a bit with testing this but I have to admit that counting calls is extremely error prone  and (ideally) not something we should be expecting our users to do.
+
+See here for what its worth:
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1485135786
+
+Unfortunately, I think the arbitrary queue limits are a leaky abstraction that makes programming very hard.
+
+-------------------------
+
+PaulLiu | 2022-11-18 13:25:39 UTC | #35
+
+[quote="claudio, post:34, topic:15972"]
+suggested the problem is that bbb() will trap when the queue is empty and never decrement the counter.
+[/quote]
+
+I suppose you mean "when queue is full"?
+
+However, I think when `await bbb()` traps, since it is treated as a synchronous error, the execution of function `aaa()` will roll back and counter shouldn't be incremented. 
+
+So what @bitbruce wrote above looks correct code to me. No?
+
+-------------------------
+
+claudio | 2022-11-19 01:32:20 UTC | #36
+
+Right on both counts but he still needs to test counter to avoid the trap in the first place.
+
+-------------------------
+
+Iceypee | 2022-11-29 04:55:07 UTC | #38
+
+So is the main issue being discussed if you chain more than 100 some ignore's() of any asynchronous call to another canister? I'm trying to understand whats the issue from a motoko only perspective, if you will.
+
+Now I also noticed you mentioned https://forum.dfinity.org/c/developers/languages/21 this post where you describe some kind of parallel execution which I havent fully wrapped my head around tbh. But essentially I do see that the stable buffer add is calling an async a bunch of times without having to await anything. Is under the hood, this function just ignoring instead of awaiting each f(as[i]), and at the end of the day and its the same problem? Or is this something completely different? Or is this not even where the error is in that code sample?
+
+-------------------------
+
+timo | 2022-11-29 15:24:24 UTC | #39
+
+[quote="PaulLiu, post:35, topic:15972"]
+However, I think when `await bbb()` traps, since it is treated as a synchronous error, the execution of function `aaa()` will roll back and counter shouldn’t be incremented.
+[/quote]
+
+I think @claudio meant the code inside `bbb()` traps. Shouldn't then `await bbb()` cause an error with reject code 5, that get caught and inside the catch branch the counter gets decremented again? So we don't roll back. The counter value is correct, just for a different reason. So the code from @bitbruce still looks correct to me. If it does not work then I would like to understand why it doesn't work.
+
+-------------------------
+
+Iceypee | 2022-11-29 19:03:09 UTC | #40
+
+Actually, wait when @PaulLiu says
+[quote="PaulLiu, post:35, topic:15972"]
+However, I think when `await bbb()` traps, since it is treated as a synchronous error, the execution of function `aaa()` will roll back and counter shouldn’t be incremented.
+[/quote]
+
+Does he mean 
+
+[quote="bitbruce, post:33, topic:15972"]
+```
+private func aaa() : async (){
+  try{
+     counter += 1; //step 1 goes through //step 3 reverts this since looks at await bbb() as syncrhonous
+     await bbb(); //step 2 fails
+     counter -= 1;
+  }catch(e){ counter -= 1; };
+};
+//step 4 never hits the catch(e) and finsihes
+```
+[/quote]
+
+
+
+or is he saying 
+
+[quote]
+```
+private func aaa() : async (){
+  try{
+     counter += 1; //step 1 goes through //step 3 revert since  await bbb() looked at synchronously
+     await bbb(); //step 2 fails
+     counter -= 1;
+  }catch(e){ counter -= 1; //step4 goes here };
+};
+//negatively icnrements
+```
+[/quote]
+
+Meanwhile youre saying
+[quote="bitbruce, post:33, topic:15972"]
+```
+private func aaa() : async (){
+  try{
+     counter += 1; // goes through and is recorded
+     await bbb(); //some failure 
+     counter -= 1; //skip this line
+  }catch(e){ counter -= 1;  //this goes through};
+};
+```
+[/quote]
+
+I think the last one is correct though.
+
+-------------------------
+
+claudio | 2022-11-30 00:02:03 UTC | #41
+
+No I actually meant that the call to `bbb()` traps in `aaa()`before ever entering `bbb()` (because the queue between the actor and the destination of bbb is full). Then `aaa()` traps and all its effects, including the increment of `counter`, are rolled back.
+
+We could make the trap (before entering bbb()) produce a local exception in aaa(), transferring control to the catch clause, but the current implementation does not do that. 
+
+I'm about to investigate changing that.
+
+-------------------------
+
+timo | 2022-11-30 08:43:09 UTC | #42
+
+[quote="claudio, post:41, topic:15972"]
+No I actually meant that the call to `bbb()` traps in `aaa()`before ever entering `bbb()`
+[/quote]
+
+Ok, but in that case Paul’s reasoning applies, the increment will be rolled back, and the code is correct. I still don’t understand how the code can break as observed in the stress test.
+
+-------------------------
+
+icme | 2022-12-02 04:25:36 UTC | #43
+
+@roman-kashitsyn @dsarlis 
+
+A few follow ups that just came to mind.
+
+[quote="dsarlis, post:4, topic:15972"]
+Nice idea but it might be harder to implement than you might initially think if we want to allow for an arbitrarily long list of ids.
+[/quote]
+
+What about adding this API with a limit to the # of principals passed (say 1000 canister principals)? That’s ~33KB.
+
+It’s a huge improvement from a cycles cost perspective, since then only one inter-canister call is required.
+
+[quote="dsarlis, post:4, topic:15972"]
+you can have up to `DEFAULT_QUEUE_CAPACITY` messages from a single canister to the management canister.
+[/quote]
+
+Is there a particular reason why this queue capacity limit is currently 500 and not higher (i.e. performance degradation or DDOS prevention?)?
+
+-------------------------
+
+dsarlis | 2022-12-02 09:17:59 UTC | #44
+
+> What about adding this API with a limit to the # of principals passed (say 1000 canister principals)? That’s ~33KB.
+
+This would alleviate the issue of the result potentially being too large. But I think we would still need to handle what @bogwar mentioned 
+
+> Further to @dsarlis 's point regarding `canister_status` : these calls are passed to the subnetwork hosting the canister so batching `canister_status` would not work w/o a lot of abstraction breaking and low level machinery and bookkeeping (i.e. parsing the message, constructing messages for the different subnetworks and then reconstructing the reply from the replies we would get)
+
+Making this work is non-trivial. We could also say that we can limit this api to only canisters on the same subnet but at this point I'd be questioning whether that API would be really useful.
+
+> Is there a particular reason why this queue capacity limit is currently 500 and not higher (i.e. performance degradation or DDOS prevention?)?
+
+I believe the main reason is to ensure that no single queue can potentially take all space, so more like DDOS prevention as you mentioned. A limit has to be there imo, we cannot have unbounded queues. Whether the 500 value is too low or not, I'm not sure I can answer off the top of my head. We'd likely need to experiment with higher values and see if it would be viable from a subnet health pov. Is there a specific value that would be more preferable? 2x? 3x?
+
+-------------------------
+
+icme | 2022-12-02 10:01:51 UTC | #45
+
+[quote="dsarlis, post:44, topic:15972"]
+these calls are passed to the subnetwork hosting the canister so batching `canister_status` would not work w/o a lot of abstraction breaking and low level machinery and bookkeeping (i.e. parsing the message, constructing messages for the different subnetworks and then reconstructing the reply from the replies we would get)
+[/quote]
+
+I see how this would break the existing endpoint interface and require a new endpoint or type definition, but I’m not sure I quite understand the heavy lifting involved in sending out multiple parallel asynchronous requests from the subnet and then collecting the response - isn’t the subnet good at handling this type of stuff when dealing with cross-subnet calls?
+
+
+[quote="dsarlis, post:44, topic:15972"]
+Is there a specific value that would be more preferable? 2x? 3x?
+[/quote]
+
+In order of preference, being able to batch principals to canister status would be preferred as that would allow me to drastically reduce the canister output queue between my status checking canister and the IC management canister while simultaneously reducing cycle costs.
+
+If this isn’t possible 2X would be a good start for the output queue being raised, but I’d just be throwing more parallel requests at the management canister.
+
+I probably don’t fully understand the plumbing involved in what @bogwar and you are referring to, but it feels like having a batch canister status method would actually reduce load on the management canister, as fewer status calls would be necessary.
+
+The same goes for many canister management methods.
+
+-------------------------
+
+dsarlis | 2022-12-02 10:49:09 UTC | #46
+
+> in sending out multiple parallel asynchronous requests from the subnet and then collecting the response - isn’t the subnet good at handling this type of stuff when dealing with cross-subnet calls?
+
+What you're asking is an endpoint which when you call it, it would fan out to multiple messages and then collect the results. This would likely require keeping some call context on the management canister for these requests as well as some logic to be able to know which messages for other subnets we need to send (based on target principals). It's not that we can't do it but it would require quite some work. Also, where things get a bit hairy is that normally routing messages to other subnets happens on the message routing layer but in this case the management canister would probably need to do some of it (hence Bogdan's comment on abstraction breaking).
+
+As I said earlier in the thread, it's a nice idea but implementing it might be trickier than you initially think. I can bring it up with some folks internally and see if we can sketch out something to gauge the effort level more concretely.
+
+-------------------------
+
+bitbruce | 2022-12-03 06:32:34 UTC | #47
+
+[quote="dsarlis, post:46, topic:15972"]
+As I said earlier in the thread, it’s a nice idea but implementing it might be trickier than you initially think. I can bring it up with some folks internally and see if we can sketch out something to gauge the effort level more concretely.
+[/quote]
+
+Caution is indeed needed if the solution to the issue is too costly.
+A more conservative approach would be to
+1. raise the queue limit to 1000, 500 is really too low.
+2, provide a system method that allows canister to query the current queue's available size, so that developers can control the call without touching the limit.
+
+-------------------------
+
+icme | 2022-12-05 07:30:27 UTC | #48
+
+Was further looking into queues, and found `DEFAULT_OUTPUT_REQUEST_LIFETIME`
+
+https://github.com/dfinity/ic/blob/a52bb83dd6fc99072db070ccc905478f5ce4bee4/rs/replicated_state/src/canister_state/queues.rs#L34
+
+There's also reference to a deadline and requests "timing out"
+https://github.com/dfinity/ic/blob/a52bb83dd6fc99072db070ccc905478f5ce4bee4/rs/replicated_state/src/canister_state/queues/queue.rs#L547
+
+Is there a certain point at which inter-canister messages could be dropped (timed out) if the deadline has passed? Let's say I have a canister or subnet that's completely overloaded with messages and has a bunch of these messages in my canister's output queue. What happens to these messages if the 300 second deadline has passed?
+
+-------------------------
+
+derlerd-dfinity1 | 2022-12-08 08:26:25 UTC | #49
+
+[quote="icme, post:48, topic:15972"]
+Is there a certain point at which inter-canister messages could be dropped (timed out) if the deadline has passed? Let’s say I have a canister or subnet that’s completely overloaded with messages and has a bunch of these messages in my canister’s output queue. What happens to these messages if the 300 second deadline has passed?
+[/quote]
+
+Note that the protocol guarantees that each request will receive a response. So requests are never dropped. Instead the system produces synthetic reject responses whenever a request can not be delivered/processed.
+
+More precisely, for for timeouts this means that all requests that don't make it into the subnet-to-subnet stream before the deadline has passed (and therefore were not visible to anybody except the sending canister), the system will produce a synthetic reject response in the same way as it would produce a synthetic reject response when, e.g., the receiver's input queue is full, the receiving canister/subnet is at memory limits, the receiver is stopped/freezed/traps while processing, and potentially other cases I might be missing now. So everything can be handled in the same way as in these cases and canisters shouldn't be required to explicitly handle these timeout cases -- _that is, assuming they handle the other cases correctly, they already implicitly handle timeouts, as a timeout is also just an asynchronous reject with reject code "transient"_. Requests in streams currently don't time out as this would require more work to implement in a way that messaging guarantees given by the IC are not broken (essentially once messages are in streams we don't know whether the message has been seen/picked up by other subnets/canisters and therefore no longer have an easy way to time them out). Finally, for responses, the protocol guarantees delivery and so these won't time out at all, irrespective of whether they are in streams or in queues.
+
+-------------------------
+
+derlerd-dfinity1 | 2023-01-12 09:13:35 UTC | #50
+
+[quote="derlerd-dfinity1, post:20, topic:15972"]
+Calls to self are currently treated in the same way as calls to other canisters. This means that there is a reservation for the response made in the input queue and in the output queue, which means that for calls to self effectively only have half the queue capacity available. This item is already in our list of backlog tasks and we will look into whether this can be picked up soon.
+[/quote]
+
+Hi @bitbruce, the changes that were necessary to also allow calls to self to go to the full queue capacity have meanwhile been made and are part of [the release](https://dashboard.internetcomputer.org/proposal/100821) elected to be rolled out this week. Hope this helps to make things smoother for you and other devs.
+
+-------------------------
+
+bitbruce | 2023-01-12 09:22:24 UTC | #51
+
+Great work!
+We will be working on the canister code upgrade.
+
+-------------------------
+
+icme | 2023-01-18 18:37:46 UTC | #52
+
+For those following this topic thread, 
+
+Tomorrow @dsarlis will be giving a talk tomorrow in the Scalability & Performance working group on "*Canister queues (ingress, input and output) overview and “case studies of handling large message volumes*" - https://forum.dfinity.org/t/technical-working-group-scalability-performance/14265/33
+
+-------------------------
+
+claudio | 2023-02-04 12:25:22 UTC | #53
+
+Motoko [0.8.1](https://github.com/dfinity/motoko/releases/tag/0.8.1) is out now. The previous release, [0.8.0](https://github.com/dfinity/motoko/releases/tag/0.8.0), introduced the following (breaking) change to let users detect and handle message send failures using `try ... catch` expressions. These releases are not yet included in dfx to allow time for users to provide feedback.
+
+  * BREAKING CHANGE 
+  
+     Failure to send a message no longer traps but, instead, throws a catchable `Error` with new error code `#call_error` (#3630). 
+  
+     On the IC, the act of making a call to a canister function can fail, so that the call cannot (and will not be) performed. 
+     This can happen due to a lack of canister resources, typically because the local message queue for the destination canister is full, 
+     or because performing the call would reduce the current cycle balance of the calling canister to a level below its freezing threshold. 
+     Such call failures are now reported by throwing an `Error` with new `ErrorCode` `#call_error { err_code = n }`, 
+     where `n` is the non-zero `err_code` value returned by the IC. 
+     Like other errors, call errors can be caught and handled using `try ... catch ...` expressions, if desired. 
+  
+     The constructs that now throw call errors, instead of trapping as with previous version of Motoko are: 
+     * calls to `shared` functions (including oneway functions that return `()`). 
+       These involve sending a message to another canister, and can fail when the queue for the destination canister is full. 
+     * calls to local functions with return type `async`. These involve sending a message to self, and can fail when the local queue for sends to self is full. 
+     * `async` expressions. These involve sending a message to self, and can fail when the local queue for sends to self is full. 
+     * `await` expressions. These can fail on awaiting an already completed future, which requires sending a message to self to suspend and commit state. 
+  
+     (On the other hand, `async*` (being delayed) cannot throw, and evaluating `await*` will at most propagate an error from its argument but not, in itself, throw.) 
+  
+     Note that exiting a function call via an uncaught throw, rather than a trap, will commit any state changes and currently queued messages. 
+     The previous behaviour of trapping would, instead, discard, such changes. 
+  
+     To appreciate the change in semantics, consider the following example: 
+  
+     ``` motoko 
+     actor { 
+       var count = 0; 
+       public func inc() : async () { 
+         count += 1; 
+       }; 
+       public func repeat() : async () { 
+         loop { 
+           ignore inc(); 
+         } 
+       }; 
+       public func repeatUntil() : async () { 
+         try { 
+           loop { 
+            ignore inc(); 
+           } 
+         } catch (e) { 
+         } 
+       }; 
+     } 
+     ``` 
+  
+     In previous releases of Motoko, calling `repeat()` and `repeatUntil()` would trap, leaving `count` at `0`, because 
+     each infinite loop would eventually exhaust the message queue and issue a trap, rolling back the effects of each call. 
+     With this release of Motoko, calling `repeat()` will enqueue several `inc()` messages (around 500), then `throw` an `Error` 
+     and exit with the error result, incrementing the `count` several times (asynchronously). 
+     Calling `repeatUntil()` will also enqueue several `inc()` messages (around 500) but the error is caught so the call returns, 
+     still incrementing `count` several times (asynchronously). 
+  
+     The previous semantics of trapping on call errors can be enabled with compiler option `--trap-on-call-error`, if desired, 
+     or selectively emulated by forcing a trap (e.g. `assert false`) when an error is caught. 
+  
+     For example, 
+  
+     ``` motoko 
+       public func allOrNothing() : async () { 
+         try { 
+           loop { 
+            ignore inc(); 
+           } 
+         } catch (e) { 
+           assert false; // trap! 
+         } 
+       }; 
+     ``` 
+  
+     Calling `allOrNothing()` will not send any messages: the loop exits with an error on queue full, 
+     the error is caught, but `assert false` traps so all queued `inc()` messages are aborted.
+
+-------------------------
+
+icme | 2023-02-04 16:49:56 UTC | #54
+
+[quote="claudio, post:53, topic:15972"]
+The constructs that now throw call errors, instead of trapping as with previous version of Motoko are:
+
+* calls to `shared` functions (including oneway functions that return `()`).
+These involve sending a message to another canister, and can fail when the queue for the destination canister is full.
+* calls to local functions with return type `async`. These involve sending a message to self, and can fail when the local queue for sends to self is full.
+* `async` expressions. These involve sending a message to self, and can fail when the local queue for sends to self is full.
+* `await` expressions. These can fail on awaiting an already completed future, which requires sending a message to self to suspend and commit state.
+[/quote]
+
+Hey Claudio, to clarify - this breaking change is only changing how output queue overflow errors will be handled, correct? (They need to be caught and explicitly trapped if the developer wishes to discard the intermediate state and not have it committed).
+
+My understanding is that other inter-canister or non-output queue async/await errors already demonstrate the intermediate state commit behavior. 
+
+...Or is this a complete overhaul of how all async errors are handled?
+
+-------------------------
+
+claudio | 2023-02-04 17:05:40 UTC | #55
+
+Correct.
+
+If a call itself returns an error (by rejecting the message or trapping) the caller's state will, by necessity,  already have been committed (otherwise the call would never have been issued).
+
+-------------------------
+

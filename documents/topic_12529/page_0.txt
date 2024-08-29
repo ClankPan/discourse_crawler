@@ -1,0 +1,74 @@
+ulan | 2022-04-29 16:17:28 UTC | #1
+
+# Summary
+
+A DFINITY engineer found a critical bug in the cycles bookkeeping code. In theory under specific circumstances, cycles transferred from one canister to another could be refunded while also being kept in the call context. Exploiting the bug would allow an attacker to repeatedly double their cycle balance. The bug has existed since Genesis.
+
+A new replica version proposed in proposal [57150](https://dashboard.internetcomputer.org/proposal/57150) contains a fix that ensures that call contexts do not have any cycles available after a refund.
+
+# Impact
+
+Based on analyzing metrics of cycles minted, cycles burned, and cycle balances of canisters, we believe that this bug has not been exploited and that it had no impact.
+
+# Timeline (UTC)
+
+2022-04-24: The DFINITY engineer discovers a mismatch between [The Internet Computer Interface Specification](https://smartcontracts.org/docs/interface-spec/index.html#rule-message-execution) and the implementation of cycles bookkeeping.
+
+2022-04-25: The DFINITY engineer manages to construct a proof of concept exploit and confirms doubling of the cycles balance on a testnet.
+
+2022-04-26: (All times in UTC)
+
+* 09:00: The team discusses the issue and starts preparing a hotfix.
+* 11:00: Quiet period starts: Mirroring to the public github repository is disabled according to the IC’s [security patch policy](https://dashboard.internetcomputer.org/proposal/48792) until the issue has been fixed.
+* 12:45: The hotfix is merged to the release branch.
+* 15:00: The hotfix passes the qualification tests, but there are issues with reproducibility of builds. The team starts investigating the reproducibility issues.
+
+2022-04-27: The team investigates the reproducibility issues throughout the day and merges five fixes in the build scripts.
+
+2022-04-28: (All times in UTC)
+
+* 06:25: The team confirms that the builds are reproducible.
+* 06:40: The hotfix rollout process starts.
+* 07:08: NNS proposal [57150](https://dashboard.internetcomputer.org/proposal/57150) to elect new replica binary revision.
+* 08:16: NNS proposals to upgrade subnets io67a, snjp4, shefu, w4asl, pjljw, qxesv.
+* 09:45: NNS proposals to upgrade subnets lspz2, pae4o, 5kdm2, csyj4, brlsh, cv73p, 4ecnw, lhg73, opn46.
+* 12:11: NNS proposals to upgrade subnets 3hhby, 6pbhf, e66qm, qdvhd, fuqsr, k44fs, yinp6, mpubz, o3ow2.
+* 13:33: NNS proposals to upgrade subnets w4rem, eq6en, jtdsg, nl6hn, x33ed, gmq5v, 4zbus, ejbmu.
+* 14:30: All subnets except for the system subnets are upgraded.
+* 16:50: Quiet period ends and the github source for the elected replica version with the fix is now publicly available on [github](https://github.com/dfinity/ic/tree/b3788091fbdb8bed7e527d2df4cc5e50312f476c).
+
+# What went wrong?
+
+* The [on_canister_result()](https://github.com/dfinity/ic/blob/rc--2022-04-11_18-31/rs/replicated_state/src/canister_state/system_state/call_context_manager.rs#L448) function had a bug where it diverged from the specification in some cases allowing the call context to keep the cycles after refunding.
+* The [invariant](https://smartcontracts.org/docs/interface-spec/index.html#_invariants) explicitly stated in the spec was not checked in the implementation.
+* Reproducibility issues with the build system caused delays of the fix rollout.
+
+# What went right?
+
+* The bug was found by a DFINITY engineer.
+* The rollout of the fix was smooth and swift after the reproducibility issues were fixed.
+
+# Action items
+
+* Increase test coverage for inter-canister calls with extra care on various cycles transfers scenarios.
+* Enhance invariant checks on cycles bookkeeping.
+* Security audit with the security team of all code related to cycle management.
+* Checks in place that monitor build reproducibility, and whenever there are issues, treat this with the highest priority.
+
+# Technical details
+
+The [on_canister_result()](https://github.com/dfinity/ic/blob/rc--2022-04-11_18-31/rs/replicated_state/src/canister_state/system_state/call_context_manager.rs#L448) function of the call context manager does not properly reset the `available_cycles` field of the call context in cases when the canister responds and there are outstanding calls. This breaks one of the main [invariants](https://smartcontracts.org/docs/interface-spec/index.html#_invariants) stated in the IC spec: “Responded call contexts have no available_cycles left”.
+
+Scenario that would trigger and exploit the bug:
+
+1. Canister A sends N cycles to canister B.
+2. Canister B replies without accepting the cycles and at the same time calls another canister C.
+3. Now the bug triggers because canister B has responded and it also has an outstanding call to C.
+4. The on_canister_result() function sends N cycles back to canister A as a refund. But N was not subtracted from `available_cycles` of the call context.
+5. Canister B handles the response from C and accepts N cycles from the call context.
+6. Now both canister A and canister B have N cycles.
+
+Note that the exploit works even if canisters A, B, and C are the same canister (calls become self-calls).
+
+-------------------------
+

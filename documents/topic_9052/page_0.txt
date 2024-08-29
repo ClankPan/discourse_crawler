@@ -1,0 +1,116 @@
+lastmjs | 2021-11-24 03:25:03 UTC | #1
+
+I'm trying to execute cross-canister calls from within a function that I cannot make async. I am using the `futures` crate to do this. `futures::executor::block_on` works just fine if I call my own `async` functions, but when I try to call `ic_cdk::api::call::call` I get this error:
+
+```bash
+[Canister rrkah-fqaaa-aaaaa-aaaaq-cai] Panicked at 'condvar wait not supported', library/std/src/sys/wasm/../unsupported/condvar.rs:23:9
+```
+
+Here's an example of the call I am trying to make (this is within a function that cannot be made async):
+
+```rust
+let string = futures::executor::block_on(async {
+    let call_result: Result<(String,), _> = ic_cdk::api::call::call(
+        ic_cdk::export::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+        "testString",
+        ()
+    ).await;
+
+    return call_result.unwrap().0;
+});
+```
+
+I've narrowed things down to...well, I really think there's an issue in the `ic-cdk` futures implementation somehow. I don't yet understand Rust futures super well, but my own async functions work just fine, so I assume there is an issue with the futures that `ic-cdk` functions are using.
+
+-------------------------
+
+mparikh | 2021-12-13 23:43:13 UTC | #2
+
+I am getting the same error.... "condvar wait not supported " on calling ic_cdk::call below; using tokio. Any pointers would be much appreciated. 
+
+```
+#[tokio::main(flavor="current_thread")]
+async fn get_raw_rand() -> i32 {
+    match call(ic_cdk::export::Principal::management_canister(),
+     "raw_rand", 
+     ()).await as  Result< (Vec<u8>, ), _> {
+         Ok(_) => return 42,
+         Err(_) => return 0
+     }
+}
+
+#[update]
+fn get() -> candid::Nat {
+    candid::Nat::from(get_raw_rand())
+}
+
+```
+
+-------------------------
+
+lastmjs | 2021-12-13 23:48:11 UTC | #3
+
+Yeah, I've just ruled out tokio for now. I think futures need a real overhaul to make them work with the Rust ecosystem at large.
+
+-------------------------
+
+mparikh | 2021-12-13 23:52:35 UTC | #4
+
+ok. But in the meantime, does it mean that all async functions exposed (i.e. call::call) are inaccessible in Rust?
+
+-------------------------
+
+lastmjs | 2021-12-13 23:57:26 UTC | #5
+
+No, if you remove tokio doesn't that code above work?
+
+-------------------------
+
+lastmjs | 2021-12-13 23:58:14 UTC | #6
+
+Well, it should look like this right?
+
+```rust
+async fn get_raw_rand() -> i32 {
+    match call(ic_cdk::export::Principal::management_canister(),
+     "raw_rand", 
+     ()).await as  Result< (Vec<u8>, ), _> {
+         Ok(_) => return 42,
+         Err(_) => return 0
+     }
+}
+
+#[update]
+async fn get() -> candid::Nat {
+    candid::Nat::from(get_raw_rand().await)
+}
+```
+
+-------------------------
+
+mparikh | 2021-12-14 00:07:14 UTC | #7
+
+Thanks ! That works.
+
+-------------------------
+
+roman-kashitsyn | 2022-01-10 13:57:08 UTC | #8
+
+> this is within a function that cannot be made async
+
+Sorry, there is really no way to block within a canister. If you need to make a call, you have to make the surrounding function async.
+
+> works just fine if I call my own `async` functions
+
+I guess that's because your async functions never block.
+
+-------------------------
+
+flyq | 2022-12-09 09:23:14 UTC | #9
+
+https://github.com/dfinity/cdk-rs/blob/bf054697a4/src/ic-cdk/src/futures.rs#L22
+
+`ic_cdk::spawn` has an effect similar to `futures::executor::block_on`, but why the `Output` here is `()`, if it can be a generic T, it is more convenient to use
+
+-------------------------
+

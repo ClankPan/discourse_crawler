@@ -1,0 +1,62 @@
+Iceypee | 2023-02-24 09:39:02 UTC | #1
+
+If I have in the timer function
+
+> Blockquote
+system func timer(set : Nat64 -> ()) : async () {
+  set(fromIntWrap(Time.now()) + 1_000_000_000); // ` seconds from now 
+  await Do_something_greater_than_1_second() 
+  };
+
+does the timer wait till the do_something_greater_than_1_second() to finish before running again or is it queued, or does it just keep calling the await every second?
+
+In abstract terms how does the timer wait to recall itself when its body might take longer than the time interval for set?
+
+Also, what would happen if it wasnt an asynchronous call in the body but a synchronoous call that might take longer than the timer interval (if thats even possible).
+
+-------------------------
+
+claudio | 2023-03-01 18:25:20 UTC | #2
+
+
+
+>does the timer wait till the do_something_greater_than_1_second() to finish before running again or is it queued, or does it just keep calling the await every second?
+
+I'm not entirely sure, but I  believe another timer invocation can occur before the await completes. 
+@berestovskyy might know better.
+
+> In abstract terms how does the timer wait to recall itself when its body might take longer than the time interval for set?
+
+Message are only run one at a time, including timer messages, so a long-running action, that doesn't await, should delay other message processing. I'm actually not sure what the platform guarantees about timers that are scheduled to run again before a message actually completes.
+They could either be delayed or skipped, but I don't know which is the case.
+
+> Also, what would happen if it wasnt an asynchronous call in the body but a synchronoous call that might take longer than the timer interval (if thats even possible).
+
+I think that is possible, especially once deterministic time slicing is supported for heartbeats, which is either coming soon or already available.
+
+In Motoko, the body of a  timer function is only scheduled to run when the timer triggers, it doesn't actually run when the timer fires (i.e. when the timer is activated, it sends a message to execute the next action, it doesn't execute the action directly). We might improve that in the future, but that's the situation at the moment.
+
+@ggreif might want to say more
+
+-------------------------
+
+berestovskyy | 2023-03-01 22:41:51 UTC | #3
+
+In short, “normal” async rules and same message priorities apply. All the update messages, including timers, get executed one by one. Another update execution _might_ start only in the `await` points in the code.
+
+If the `await Do_something_greater_than_1_second()` actually awaits for the function to complete, then any other execution _might_ happen at this point, including timers, heartbeats, inter-canister calls, ingress messages or reply/reject callbacks.
+
+If the function is synchronous, then, even if it takes a few rounds (i.e. a few seconds), the IC won't be scheduling any other execution in between.
+
+Hope this answers your questions.
+
+-------------------------
+
+ggreif | 2023-03-03 11:12:58 UTC | #4
+
+I think we (Motoko docs) have a warning that timers shouldn't be used with a similar granularity as the block rate. And yes, jobs triggered by the global timer expirations can overlap in execution, so all the `async` caveats apply. Ideally jobs also should check if the task at hand is still relevant before doing anything.
+
+The exact mechanism is that every global timer expiration checks for (currently max 10) expired timers and uses self-sends to schedule the executions of the respective jobs. We are pondering several improvements to this mechanism but there is nothing concrete in the works yet.
+
+-------------------------
+

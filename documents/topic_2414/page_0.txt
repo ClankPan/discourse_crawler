@@ -1,0 +1,365 @@
+skilesare | 2021-04-07 19:12:27 UTC | #1
+
+I'm looking at the Buckets and Map example at https://sdk.dfinity.org/docs/language-guide/actor-classes.html and I have some questions about what is happening under the covers.
+
+When I create an array of  Buckets in my map, are each of those buckets their own actor and thus their own canister?  Do they each get a 4GB limit? Or do they all live on one cannister?
+
+    let b = await Buckets.Bucket(n, i); // dynamically install a new Bucket
+
+If they are each their own canister, will they all have to be charged with cycles?  Is there a way to get a reference to them other than the memory slot that I've allocated them to?  Ideally, I'd like to have a reference to the canister Ids so that I can allocate cycles manually.
+
+If they aren't separate canisters, how would I go about doing that?  Do I need to create them all in my dfx json and manually point the map canister to the 8 buckets?  Can I reference them dynamically by doing something like Bucket('cannisterID')?
+
+-------------------------
+
+claudio | 2021-04-08 11:44:05 UTC | #2
+
+Each dynamically created bucket is indeed a separate canister. 
+
+That example actually predates the implementation of cycles and needs to be updated to additionally provision each constructed buckets with cycles by calling `ExperimentalCycles.add(cyles)` just before the constructor call (see below). 
+
+What isn't clear to me yet is what a good strategy for this would be. Provision `Map` with enough cycles for all buckets and transfer on demand or, indeed, let the user do this manually?
+
+To obtain the bucket (ids), you should be able to add a (query or update) method that given bucket index, uses library function `Principal.fromActor(...)` to return the `Principal` of an allocated  bucket or even just return an optional `Bucket` canister . Something like.
+
+    import Array "mo:base/Array";
+    import Principal "mo:base/Principal";
+    import Cycles "mo:base/ExperimentalCycles";
+    import Buckets "Buckets";
+
+    actor Map {
+
+      let n = 8; // number of buckets
+
+      type Key = Nat;
+      type Value = Text;
+
+      type Bucket = Buckets.Bucket;
+
+      let buckets : [var ?Bucket] = Array.init(n, null);
+
+      public func get(k : Key) : async ?Value {
+        switch (buckets[k % n]) {
+          case null null;
+          case (?bucket) await bucket.get(k);
+        };
+      };
+
+      public func put(k : Key, v : Value) : async () {
+        let i = k % n;
+        let bucket = switch (buckets[i]) {
+          case null {
+            Cycles.add(1_000_000_000_000); // add some cycles
+            let b = await Buckets.Bucket(n, i); // dynamically install a new Bucket
+            buckets[i] := ?b;
+            b;
+          };
+          case (?bucket) bucket;
+        };
+        await bucket.put(k, v);
+      };
+
+      public query func getPrincipalOfBucket(i : Nat) : async ?Principal {
+        switch (buckets[i]) {
+          case null null;
+          case (?bucket) ? Principal.fromActor(bucket);
+        };
+      };
+
+      public query func getBucket(i : Nat) : async ?Bucket {
+        switch (buckets[i]) {
+          case null null;
+          case (?bucket) ? bucket;
+        };
+      };
+
+    };
+
+(I've only typechecked but not run this code)
+
+Or you could add a `topUp` method that accepts and re-distributes cycles to the buckets.
+
+-------------------------
+
+skilesare | 2021-04-08 14:38:56 UTC | #3
+
+Awesome.  Thanks for the example and clear explanation.  How does Cycles.add know that those cycles should go to the next created bucket?  Does it get added to an underlying msg object or something?
+
+-------------------------
+
+claudio | 2021-04-08 16:00:48 UTC | #4
+
+Yes it adds the cycles to the next message send (which consumes them):
+
+https://sdk.dfinity.org/docs/language-guide/cycles.html
+
+In future, I expect we'll add dedicated syntax for this, instead of using a stateful library, hence the `Experimental` prefix on the library (and warnings in its documentation).
+
+-------------------------
+
+hackape | 2021-05-25 06:12:14 UTC | #5
+
+Question: do we have the counter part of `Principal.fromActor` that restores an actor instance from a principal? Something like `Principal.toActor = (address: Principal) -> Actor`?
+
+-------------------------
+
+claudio | 2021-05-25 06:57:32 UTC | #6
+
+Yes. You can find a partial example in base library 'Random.mo' , function 'blob', using a text value. 
+
+You'll need to convert the principal to text and then assert the interface of that text principal using an actor reference as in that 'blob' function. 
+
+Will send an example later (not at my desk now)
+
+-------------------------
+
+claudio | 2021-05-25 07:03:01 UTC | #7
+
+https://sdk.dfinity.org/docs/language-guide/language-manual.html#exp-actor
+
+-------------------------
+
+hackape | 2021-05-25 07:42:31 UTC | #8
+
+Thanks for the answer! A follow-up question: I can't seem to wrap the actor ref syntax into a generic function, is it intended? What am I missing?
+
+```
+func toActor<T <: actor {}>(id: Principal): T {
+    // ERROR: actor reference must have an actor type
+    return actor(Principal.toText(id)) : T;
+};
+```
+
+---
+
+I don't have problem using concrete actor type though. This works.
+
+```
+type FooActor = actor {
+    foo: () -> async (Text);
+};
+
+let fooActor = actor(Principal.toText(id)) : FooActor;
+```
+
+-------------------------
+
+claudio | 2021-05-25 10:46:50 UTC | #9
+
+Yes, that's intentional and a limitation of the fact that we compile polymorphism by erasure (not type passing). You'll need to know the actor type you want to ascribe statically.
+
+-------------------------
+
+skilesare | 2021-05-25 17:15:58 UTC | #10
+
+How does this work for subtyping?  Say I have a simple actor type and some more complicated actor types that share a function.
+
+    type TopUper = actor {
+     topUp(Nat) -> ()
+    }
+
+    type MixerWallet = actor {
+     topUp(Nat) -> ()
+     distribute(Nat) -> ()
+     balance(Principal) -> Nat
+    }
+
+    type CoolWallet = actor {
+     send(Nat, Principal) -> ()
+     topUp(Nat) -> ()
+     balance() -> Nat
+    }
+
+Is knowing TopUper enough for me to know about the the structur?  So I could do:
+
+    let fooWallet = actor(Principal.toText(id) : TopUper);
+    fooWallet.topUp(1000000000000); // send me 1T cycles
+
+And this would work for any other crazy wallet actors I might create as long as they have the topUp function?
+
+I'm sorry to be dense, but I think a few things clicked for me recently and I'm looking for some reinforcement.
+
+-------------------------
+
+claudio | 2021-05-25 18:13:22 UTC | #11
+
+Yes, although you should really only be using the actor reference syntax to cast an (untyped) principal to an actor type as a last resort. Any (strongly typed) actor of type `CoolWallet` (or `MixerWallet`) also has supertype `TopUper` (without any additional consersion) and it would be better to maintain types rather than ascribe them to raw principals as the above syntax does.
+
+-------------------------
+
+skilesare | 2021-05-25 21:06:52 UTC | #12
+
+Can you unpack a couple of things?
+
+First, I had a syntax error and meant:
+
+`let fooWallet = actor(Principal.toText(id)) : TopUper;`
+
+I'm not sure that changes what you said, but lets assume it doesn't.
+
+> Yes, although you should really only be using the actor reference syntax to cast an (untyped) principal to an actor type as a last resort
+
+Does this mean I should store the Principal as a principal?  Can I just wrap call TopUper(myPrincipal)? or maybe there is an alternate syntax to instantiate an actor from a principal?
+
+> it would be better to maintain types rather than ascribe them to raw principals as the above syntax does
+
+I don't understand this very well.  Are you saying that we really shouldn't be relying on supertypes or more general types?  It seemed like a cool language feature that might get me some leeway to write some general services that could be handed actors of a wide variety and do something common with them without having to know everything about them.  Say...a number of different kinds of wallets that want to easily uses a broad range of multi-sig patterns could implement the interface for an unlockable type.  And then a MultiSig Service could be granted the rights to call .unlock() on wallets.  The exact scheme of the multisig(m of n, threshold, whatever) doesn't need to be in the wallet, it can reside in the service.
+
+Maybe I'm missing what you are referring to as 'raw principals' I didn't know I ascribed them...and maybe I don't know what they are.  Thanks for the help.
+
+-------------------------
+
+claudio | 2021-05-25 22:23:37 UTC | #13
+
+No, relying on supertypes is perfectly fine and safe. 
+
+What I meant was don't be tempted to obtain the principal of a `MixerWallet` and cast that to an `ToUper` wallet using an actor reference. Just use subtyping to directly use the `MixerWallet` as a `TopUper`. It's both safer and more direct than going via a principal.
+
+When you use the actor reference expression, you are basically telling the compiler, "trust me, I know this principal has this interface" but the compiler has no way to check your claim is true. If it isn't,  sending a message to that actor can fail at a later time. 
+The compiler can, however, verify that one type is a subtype of another, e.g. check that your use of a `MixerWallet` as a `TopUper` wallet is perfectly safe (and complain at compile time if it isn't).
+
+-------------------------
+
+claudio | 2021-05-25 22:31:47 UTC | #14
+
+https://github.com/dfinity/examples/pull/95 is a buildable Map/Buckets example
+
+-------------------------
+
+hackape | 2021-05-26 00:54:48 UTC | #15
+
+[quote="claudio, post:11, topic:2414"]
+you should really only be using the actor reference syntax to cast an (untyped) principal to an actor type as a last resort
+[/quote]
+
+Why is it discouraged? Because potential runtime error?
+
+And what is the recommended way?
+
+-------------------------
+
+anthonymq | 2021-05-26 08:00:27 UTC | #16
+
+Hi @claudio sorry I haven't run your example but are the query calls fast with the Buckets ? I want to be able to split my data across bucket but speed is one of my main concern.
+Cheers
+
+-------------------------
+
+claudio | 2021-05-26 10:03:29 UTC | #17
+
+They are not declared as query calls so won't be fast. 
+
+You cannot just declare the Map `get` function as `query` because the platform (and Motoko) doesn't (fully) support nested queries yet and  `Map`'s `get` function would need to issue a query to some `Bucket`'s new query method (the nested query).
+
+As a workaround, one way to make them fast would be to add a `query` method to `Map` that returns the `Bucket` to query, and add an additional fast `query` method in class `Bucket`. Then the client (say the frontend) can retrieve an item using two queries, one to `Map`, followed by another to `Bucket`, which should still be much faster (but less trustworthy) than a single update call.
+
+If the platform gets full support for nested queries,  we will be in a better position to enable and exploit them in Motoko.
+
+-------------------------
+
+claudio | 2021-05-26 10:01:49 UTC | #18
+
+
+[quote="hackape, post:15, topic:2414, full:true"]
+Why is it discouraged? Because potential runtime error?
+[/quote]
+
+Yes.
+[quote="hackape, post:15, topic:2414, full:true"]
+And what is the recommended way?
+[/quote]
+
+If you have a strongly typed actor, just use subtyping to restrict to a more general interface (supertype).
+ 
+If all you have is a principal that you "know/trust" implements some interface, then use an actor literal to cast it to the desired interface.
+
+-------------------------
+
+hackape | 2021-05-26 10:09:44 UTC | #19
+
+Passing an actor reference to another actor, like:
+
+```
+import Types "Types"
+
+actor class Foo(bar: Type.BarActor) {
+}
+```
+
+versus
+```
+import Types "Types"
+
+actor class Foo(bar: Principal) {
+  let barActor: Type.BarActor = actor(bar);
+}
+```
+
+Is there any realistic difference between the two? Or it's just syntax difference but wasm level they're equivalent?
+
+-------------------------
+
+claudio | 2021-05-26 21:44:50 UTC | #20
+
+At the wasm level they are actually the same. At the candid level, they may be slightly different (I'd have to check).
+
+Really, it's a matter of **typing** difference. The Motoko and Candid interface of the first and second class `Foo` are different. The first one is much more restrictive in what it accepts as an argument, but more permissive about what you can directly do it with it (without resorting to an actor reference 'cast').
+
+-------------------------
+
+hackape | 2021-05-26 10:26:44 UTC | #21
+
+Got it! Really appreciate all the detailed explanations :100:
+
+-------------------------
+
+jzxchiang | 2021-10-30 05:45:48 UTC | #22
+
+Here's the code snippet:
+
+```
+let raw_rand = (actor "aaaaa-aa" : actor { raw_rand : () -> async Blob }).raw_rand;
+```
+
+One question: what happens if the Principal refers to a user and not a canister? What kind of error will be thrown when this code tries to call `raw_rand`?
+
+-------------------------
+
+nomeata | 2021-10-30 09:48:25 UTC | #23
+
+You mean if you make an inter-canister call (this is just one instance of that) to a principal that is not one of an existing canister?
+
+It _should_ behave the same as if you’d made a call to a principal that _could_ be a canister id, but no such principal exists, so you’ll get a `reject` response.
+
+-------------------------
+
+Ori | 2021-10-30 09:59:25 UTC | #24
+
+(Note that raw_rand is just a public method on the management canister aaaaa-aa).
+
+-------------------------
+
+jzxchiang | 2021-10-30 19:16:15 UTC | #25
+
+I guess the real question is: how can we check if a principal refers to a canister or a user (to avoid these kind of situations)?
+
+This thread seems to [suggest](https://forum.dfinity.org/t/possible-to-check-if-msg-caller-is-a-canister-as-opposed-to-a-user/2695/2?u=jzxchiang) that we can't.
+
+But this [code](https://github.com/Deland-Labs/dfinity-fungible-token-standard/blob/7ce5091d9bfde3e596e49f1a51834e79b717a032/motoko/dft/utils/PrincipalExt.mo#L53) by @witter seems to suggest that we can.
+
+:thinking:
+
+-------------------------
+
+nomeata | 2021-10-31 10:00:19 UTC | #26
+
+My advise is to just don’t worry. There is no reason to treat a principal that _could_ be the identifier for an existing canister, but actually isn't (because that canister does not exist) different from identifiers that (given knowledge about the _current_ IC implementation) _can’t_ be identifiers of such canisters. At least not in backend code – _maybe_ in human-facing UI forms, such checks are sensible. But once you are past that, focus on “exists vs. does not exist”, and don't worry about the “why” of “does not exist”.
+
+-------------------------
+
+bobbylingus | 2022-08-22 23:23:14 UTC | #27
+
+Is there more I can read about this topic?
+
+-------------------------
+

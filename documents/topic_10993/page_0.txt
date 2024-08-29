@@ -1,0 +1,161 @@
+bytesun | 2022-02-20 01:15:18 UTC | #1
+
+In the latest release, the "append" function of Array is deprecated, then what is the good way to "append" a new item?
+
+the notice is :
+> /main.mo:3017.20-3017.32: warning [M0154], field append is deprecated:
+> Array.append has critical performance flaws; use a Buffer, and Buffer.append, instead.
+
+but there is no filter/find functions for Buffer, which means I have to convert buffer to Array for filtering? or any other better ways?
+
+-------------------------
+
+icme | 2022-02-20 02:22:31 UTC | #2
+
+Believe it or not, but many of the array class methods convert the array to a `Buffer`, and then back to an `Array`.
+
+See the [`Array.filter` implementation in motoko-base](https://github.com/dfinity/motoko-base/blob/master/src/Array.mo#L120) - I would recommend just copying the `Buffer` filter logic/functionality from there. You can expand upon that to do the same for `.find()`.
+
+Buffer has `.get()` methods for retrieving indexes as well, so I would honestly only use an `Array` if you're sure that your index-able list isn't going to change in size - otherwise, `Buffer` all the way.
+
+-------------------------
+
+mbeekman | 2022-03-27 18:02:35 UTC | #4
+
+Hello, so just for clarification, converting the array to a buffer is straight forward enough, but unless I am missing something a Buffer is not a stable variable type … what would be the recommend path if you want to have a stable var outcome?
+
+Would you convert the array to a buffer and back again to maintain stability? or build it as a buffer with upgrade hooks to put them to arrays and back to buffers after? like one might for a hashmap? … just looking for a general consensus for lowest denominator on performance and best practices. … if you have an app based on stable arrays what would you do?
+
+-------------------------
+
+mbeekman | 2022-03-27 18:49:56 UTC | #6
+
+ie. if I have the following:
+
+```
+
+return Array.append<Project>(theProjectsNew, [newProject]);
+
+```
+
+which appends a new object “newProject” to an array called “theProjectsNew”
+
+and replace it with:
+
+```
+
+let theProjectsBuffer : Buffer.Buffer = Buffer.Buffer(theProjectsNew.size());
+
+for (x in theProjectsNew.vals()) {
+
+theProjectsBuffer.add(x);
+
+};
+
+theProjectsBuffer.add(newProject);
+
+return theProjectsBuffer.toArray();
+
+```
+
+the programatic results are the same … and the warning goes away … is this a valid way forward? and leave things otherwise as stable arrays?
+
+-------------------------
+
+icme | 2022-03-27 23:10:40 UTC | #7
+
+[quote="mbeekman, post:4, topic:10993"]
+Buffer is not a stable variable type
+[/quote]
+
+You are correct that `Buffer` is not a stable variable type, because the `Buffer` class is an object that containing local functions. According to the [documentation](https://smartcontracts.org/docs/language-guide/upgrades.html#_typing),
+> "Like shared types, stable types are restricted to first-order data, excluding local functions and structures built from local functions (such as objects)."
+
+Let's take a second to look at the `Buffer` class signature:
+
+```
+public class Buffer<X>(initCapacity : Nat) {
+    var count : Nat = 0;
+    var elems : [var X] = [var]; // initially empty; allocated upon first `add`
+
+    ...local functions
+}
+```
+
+Although the `Buffer` class is not stable, the `count` and `elems` local variables are stable, as long as the `X` type involved passed is stable. This means you can take the [`add` method directly from `Buffer.mo`](https://github.com/dfinity/motoko-base/blob/master/src/Buffer.mo#L29), rip it out of the class, and turn it's signature from:
+
+``` 
+public func add(elem : X) 
+```
+
+to
+
+```
+public func add<X>(elems: [X], count: Nat, elem : X)
+```
+
+I had been meaning to write a stable buffer module, so you're comment pushed me to do it here :slight_smile:  - [https://github.com/canscale/StableBuffer](https://github.com/canscale/StableBuffer). 
+
+Please feel free to use it, as well as any of the other stable-adapted modules I've written ([StableHashMap](https://github.com/canscale/StableHashMap), [StableRBTree](https://github.com/canscale/StableRBTree))
+
+-------------------------
+
+icme | 2022-03-27 23:21:59 UTC | #8
+
+You can do this conversion back and forth if you want to keep things stable, but it's pretty inefficient IMO. Better just to keep it as a buffer if you don't have a fixed bound on the size of the array. 
+
+You can keep doing this conversion (stable, but inefficient), or use a stable buffer like this library I mentioned in my other post [https://github.com/canscale/StableBuffer](https://github.com/canscale/StableBuffer). If you don't need direct lookups by index, [Lists](https://github.com/dfinity/motoko-base/blob/master/src/List.mo) are a great solution.
+
+[quote="mbeekman, post:6, topic:10993"]
+```
+for (x in theProjectsNew.vals()) {
+  theProjectsBuffer.add(x);
+};
+```
+[/quote]
+
+In the code above, you are adding all the elements in the array to the buffer.
+
+[quote="mbeekman, post:6, topic:10993"]
+`theProjectsBuffer.toArray()`
+[/quote]
+
+And in this code (directly above), you are essentially creating an array and adding all the elements from the buffer back to the array.
+
+See the `toArray()` implementation I've copied in below.
+
+```
+// https://github.com/dfinity/motoko-base/blob/master/src/Buffer.mo#L105
+public func toArray() : [X] =
+  // immutable clone of array
+  Prim.Array_tabulate<X>(
+    count,
+    func(x : Nat) : X { elems[x] }
+  );
+```
+
+-------------------------
+
+skilesare | 2022-03-27 23:55:27 UTC | #9
+
+Basically, always use buffer and convert it to an array preupgrade and back to a buffer in your init function(or post upgrade.).
+
+-------------------------
+
+mbeekman | 2022-03-29 19:03:49 UTC | #10
+
+@icme  -  Totally makes sense to me ... I will also take a look at that StableBuffer and StableHash map repos ... Thanks again for the detailed reply ... will work a refactored solution in our platform over the next week.... the amount of data in play at the moment is negligible so surviving the "deprecation" of Array.append was our priority :slight_smile: 
+
+@skilesare - thanks as well ... I was actually unaware of the pre/post upgrade options when I started our project a bunch of months ago, but will factor it as an option for this application for sure.
+
+-------------------------
+
+icme | 2023-01-31 03:53:48 UTC | #11
+
+Updating the solution to use this permalink 
+https://github.com/dfinity/motoko-base/blob/96487f4866060f46cdfe3de3280e6b6857eaac84/src/Array.mo#L335
+
+since the original solution has so many clicks and now points to the wrong line of code.
+
+-------------------------
+

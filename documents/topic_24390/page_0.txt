@@ -1,0 +1,122 @@
+zohaib29 | 2023-11-03 12:19:56 UTC | #1
+
+I deployed a canister on the IC that implements HTTP Outcalls. The method appeared to function correctly for several days, but today it returned an error when I executed it.
+ `opt "Rejection code 2, Canister http responses were different across replicas, and no consensus was reached";`
+
+Additionally, I encountered an error on the local replica today, despite all tests passing previously.
+`"Rejection code 1, Http body exceeds size limit of 785 bytes.";`
+I also tried to increase the `max_response_bytes` by `2000` but an error remains the same `"Rejection code 1, Http body exceeds size limit of 2785 bytes.";`
+
+-------------------------
+
+yotam | 2023-11-03 12:57:41 UTC | #2
+
+For the first error, it sounds like, as written, the response is not deterministic or not correctly transformed. The outcall is going out from multiple node machines. Each one then applies the transform function on the response it gets. The transformed response must be exactly the same on all nodes. So you must make sure it is the case.
+
+For the other error, it sounds like the responses are also too big. Do you know what size you actually expect there?
+
+-------------------------
+
+zohaib29 | 2023-11-03 13:10:59 UTC | #3
+
+The response size is less than 1,000 bytes.
+
+My main concern is that I have not made any changes to my code, and it is working correctly on both networks. All tests are also passing. However, today I received these errors:
+
+-------------------------
+
+yotam | 2023-11-06 07:29:36 UTC | #4
+
+Could you try to provide more information?
+With the existing information, it is very hard to tell what is going on...
+
+-------------------------
+
+lastmjs | 2023-11-07 18:01:13 UTC | #5
+
+For the second error, perhaps you didn't send enough cycles?
+
+-------------------------
+
+luckerninja | 2023-11-08 18:05:32 UTC | #6
+
+I'm experiencing the same issue with version 0.17.1, but with the message '"Rejection code 1, Http body exceeds size limit of 3094 bytes."' I've attempted to add more loops and increase the 'max_response_bytes', but the error persists. The file where this error occurs can be found here — https://github.com/relinkd/ICP-Wallet-Scorer/blob/main/src/params/poap.ts. Are there any limitations in Azle regarding the maximum response size? Does version 18 differ in this regard?
+
+-------------------------
+
+lastmjs | 2023-11-08 21:21:20 UTC | #7
+
+There shouldn't be any in Azle, and I don't think it should matter from 0.17.x to 0.18.x
+
+Rejection code 1 is a SysFatal error, there's something wrong at the "system" level it seems. I'm not sure what limit you're hitting, @ulan do you know who would know the low level details of http outcalls?
+
+-------------------------
+
+zohaib29 | 2023-11-09 09:37:15 UTC | #8
+
+I am making HTTP requests to the [API](https://deces.matchid.io/deces/api/v1/version). The response size is 139 bytes, and I'm sending 100M cycles for this call. It appears that this API is functioning correctly on both networks. However, a few days ago, it encountered an error.
+
+-------------------------
+
+zohaib29 | 2023-11-09 09:48:04 UTC | #9
+
+It has come to my attention that when I include a `User-Agent` header, the method works properly (although I haven't tested this on the mainnet yet, only locally). However, I'm uncertain whether adding this header is necessary, as it was functioning correctly without it a few days ago.
+
+-------------------------
+
+zohaib29 | 2023-11-13 08:46:29 UTC | #10
+
+This error persists on Mainnet
+@yotam @ulan
+
+-------------------------
+
+tim1 | 2023-11-13 19:54:51 UTC | #11
+
+I was able to reproduce the issue locally and on small testnet. It seems that without the `User-Agent` header the response has status 403 (forbidden) and a non-deterministic body. When I set the `User-Agent` header to, for example, `my-agent/1.0` it seems to work. 
+
+Do I understand correctly that in your case the issue persisted on mainnet when setting a valid `User-Agent` header?
+
+If yes can you give me the following details such that I can try to reproduce on mainnet:
+
+ - Subnet your canister is deployed to.
+ - `dfx` version used when deploying.
+ - Specific `User-Agent` used to do the requests.
+
+-------------------------
+
+zohaib29 | 2023-11-13 20:38:21 UTC | #12
+
+When I add the `User-Agent` Header the HTTP outcalls work locally, but on IC it fails
+So for Mainnet, I removed all headers while making a `GET` request.
+
+However, I'm encountering an issue where the result does not consistently persist with each call.
+
+1. Sometimes it works fine
+2. Sometimes it results `"Rejection code 2, Canister http request timed out"`
+3. Sometimes it results ` "Rejection code 2, Canister http responses were different across replicas, and no consensus was reached"`
+
+- Subnet the canister deployed to [4ecnw-byqwz-dtgss-ua2mh-pfvs7-c3lct-gtf4e-hnu75-j7eek-iifqm-sqe](https://dashboard.internetcomputer.org/subnet/4ecnw-byqwz-dtgss-ua2mh-pfvs7-c3lct-gtf4e-hnu75-j7eek-iifqm-sqe)
+- DFX Version: 0.15.1
+
+-------------------------
+
+tim1 | 2023-11-13 21:35:24 UTC | #13
+
+I think issue 3 is caused by the API returning a 429 error when too many requests are made, and in this case, the response is non-deterministic. You can see in the script below that the hash differs for status 429. To gracefully handle this you could prune the body in the transform function for status code 429.
+
+```
+for i in {1..100}; do curl -s -o response.txt -w "%{http_code}" https://deces.matchid.io/deces/api/v1/version; echo -n " "; sha256sum response.txt | awk '{print $1}'; done
+```
+
+
+Issue 2 seems to be a connectivity issue between the IC nodes and matchid.io. How often does this occur compared to issues 1 and 3? Both kinds of errors are common for public APIs that have stricter rate limits, so I would suggest ensuring that your calling logic limits in-flight requests and implements a backoff strategy for failed requests.
+
+-------------------------
+
+lastmjs | 2023-11-30 22:24:44 UTC | #14
+
+@luckerninja Does any of this solve your problems?
+
+-------------------------
+

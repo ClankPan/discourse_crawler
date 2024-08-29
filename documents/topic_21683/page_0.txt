@@ -1,0 +1,180 @@
+NnsDAO | 2023-07-25 09:40:21 UTC | #1
+
+Any idea how to integrate with Tauri, I've made some attempts but I can't authorize through the wallet, after clicking on the wallet authorization it doesn't bring up a new interface to authorize, I've tried II, Stoic, and Connect2ic.
+
+We have built a podcast based entirely on Canister, which is currently in its final stages, and anyone can use it directly, with full ownership of your data.
+
+It would be greatly appreciated if you could help me or give me some examples.
+
+Github: [https://github.com/NnsDao/podcast-fe](https://github.com/NnsDao/podcast-fe)
+
+alpha: [https://alpha.looncast.com/](https://alpha.looncast.com/)
+
+-------------------------
+
+Severin | 2023-07-31 11:01:32 UTC | #2
+
+Not sure if it's useful, but have you looked at the discussion here? https://forum.dfinity.org/t/integrate-internet-identity-within-iframe/7685/9
+
+-------------------------
+
+peterparker | 2023-07-31 11:06:55 UTC | #3
+
+I'm curious about the integration of II in Tauri as well. First time I checked, it felt like it was not possible yet because Tauri does not support out of the box in app browser like. However, I recently discovered that Tauri has a cross-platform webview library called [wry](https://github.com/tauri-apps/wry). I wonder if using this library would allow implementing the window communication based on "postMessage" with II. If you decide to explore this possibility and manage to make it work, please let me know.
+
+-------------------------
+
+sea-snake | 2023-07-31 23:48:30 UTC | #4
+
+You could in theory:
+1. Create an identity within Tauri, send it's public key in step 2 to the website
+2. Open a website with II in a new window/webview
+3. Authenticate II
+4. Create DelegationChain with identity from AuthClient for public key from step 1
+5. Send DelegationChain back to Tauri and create a DelegationIdentity from identity from step 1 + DelegationChain.
+
+This will require rs-agent in Tauri to support delegation identities, which was once implemented but closed before it was completed and merged to rs-agent: https://github.com/dfinity/agent-rs/pull/348
+
+Edit: Seems like you can also run agent-js within Tauri frontend and use same approach as above
+
+Here's some example code that uses Delegations and a website that authenticates with II. The website could in theory also authenticate with any wallet and use delegation towards the Tauri app. ECDSAKeyIdentity is used in this example, but any identity that can sign can be used.
+
+From within Tauri:
+```ts
+const delegationIdentity = await ECDSAKeyIdentity.generate({
+  extractable: false,
+  keyUsages: ['sign', 'verify'],
+});
+// Here we open a browser and continue on the website with next code snippet
+const delegationChain = await openBrowserWithII(delegationIdentity.getPublicKey());
+// Here we create an identity with the delegation chain we received from the website
+const internetIdentity = DelegationIdenttiy.fromDelegation(delegationIdentity, delegationChain);
+// You can now make calls with internetIdentity
+```
+
+From within website with II (Could be e.g. a website hosted in asset canister)
+```ts
+const publicKey= /* Get public key from e.g. url params */
+const delegationIdentity = await ECDSAKeyIdentity.generate({
+  extractable: false,
+  keyUsages: ['sign', 'verify'],
+});
+const delegationChain = await new Promise<DelegationChain>(async (resolve, reject) => {
+    const authClient = await AuthClient.create({
+      // Make Internet identity create a delegation chain for below identity
+      identity: delegationIdentity,
+      // Idle checks aren't needed
+      idleOptions: {
+        disableIdle: true,
+        disableDefaultIdleCallback: true,
+      },
+      // Storage isn't needed
+      storage: {
+        get: () => Promise.resolve(null),
+        set: () => Promise.resolve(),
+        remove: () => Promise.resolve(),
+      },
+    });
+    await authClient.login({
+      // Internet Identity should be valid for 30 days
+      maxTimeToLive: 30n * 24n * 60n * 60n * 1_000_000_000n,
+      onSuccess: () =>
+        resolve(
+          (authClient.getIdentity() as DelegationIdentity).getDelegation(),
+        ),
+      onError: reject,
+    });
+});
+
+// Create delegation chain from II delegation chain for public key
+const delegationChainForPublicKey = DelegationChain.create(delegationIdentity, publicKey, undefined, { previous: delegationChain });
+
+/* Send above delegationChainForPublicKey back to Tauri */
+```
+
+-------------------------
+
+peterparker | 2023-08-01 05:05:18 UTC | #5
+
+Sounds interesting 👍. Tauri noob here: do you happen to have an example of how to communicate back and forth between Tauri and the webview?
+
+-------------------------
+
+sea-snake | 2023-08-01 09:01:42 UTC | #6
+
+Personally I wouldn't use a WebView for auth, but open a browser instead, so users already have things like their II anchor set or are already logged in to their e.g. stoic wallet.
+
+```
+import { open } from '@tauri-apps/api/shell';
+import Buffer from 'buffer';
+
+const publicKey = Buffer.from(delegationIdentity.getPublicKey().toDer()).toString('hex');
+open(`https://canister-id-that-authenticates-with-ii.icp0.io?publicKey=${publicKey}`);
+```
+Then from the browser after getting the DelegationChain with above example:
+```
+const json = JSON.stringify(delegationChainForPublicKey.toJSON());
+window.open(`my-app://internetIdentityCallback?delegationChain=${encodeURIComponent(json)}`);
+```
+The Tauri app should now handle being opened by above url, as far as I can find Tauri doesn't seem to support deep linking yet but someone did make a plugin for it: https://github.com/FabianLars/tauri-plugin-deep-link
+
+After receiving the delegation chain from the deep link you can create an Identity instance:
+```
+// Get JSON from deep link query param
+const delegationChain = DelegationChain.fromJSON(json);
+// Use delegation chain created earlier before opening the browser
+const internetIdentity = DelegationIdenttiy.fromDelegation(delegationIdentity, delegationChain);
+```
+
+Alternatively you could also use the wry lib you mentioned above, you can use an IPC handler to communicate back and forth, found this in the examples:
+https://github.com/tauri-apps/wry/blob/dev/examples/eval_js.rs#L38
+
+Not sure if wry supports WebAuthn within the WebView, that would be something necessary for Internet Identity to work.
+
+-------------------------
+
+peterparker | 2023-08-01 09:39:35 UTC | #7
+
+That's the thing, I was under the impression that Tauri did not support `window.open`, making `postMessage` communication between Tauri and the opened native browser impossible. Hence, my question.
+
+Regarding your idea, I understand how to generate the identities, but the technical aspects of Tauri for data exchange remain unclear to me. I'll delve deeper into it when I find some time one of these days.
+
+Thanks a lot for the share!!!
+
+-------------------------
+
+sea-snake | 2023-08-01 09:47:22 UTC | #8
+
+That's why you use `open` from `@tauri-apps/api/shell` within the Tauri interface. The `window.open` is used within the browser to go back to the Tauri app again (`my-app://` is an example custom app deep link scheme). There's no usage of `postMessage` in this flow, all data that's sent back and forth is part of the URLs that are opened.
+
+In the embedded wry alternative, you can use ipc to communicate with the webview instead of postMessage as shown in the github link.
+
+Post message is mostly used between browser windows/tabs, it's not really used when communicating between browsers and native apps.
+
+For other frequent direct communication between the native app and a browser you can also look into maybe something like WebRTC. But for an auth flow, the url based flow probably makes the most sense.
+
+-------------------------
+
+peterparker | 2023-08-01 10:00:10 UTC | #9
+
+Ahhhhh, gotcha! I've had mixed experiences with custom app schemes. When I had to implement conventional mobile apps for clients, I found it easier to use tools like branch.io instead of setting up my own scheme for all devices. (which of course would not work in this case)
+
+WebRTC is also a cool idea, but one might need a small server to go through firewalls (if it's still the case, was few years ago) to establish the communication. I'm not sure about the security implications spontaneously, but it's definitely interesting.
+
+Thanks again!
+
+-------------------------
+
+sea-snake | 2023-08-01 10:00:45 UTC | #10
+
+[quote="peterparker, post:9, topic:21683"]
+case, was few years ago) to establish the communication. I’m not sure about the security implications
+[/quote]
+
+WebRTC on the same system doesn't need to go through firewalls if I remember correctly :D
+As for setting it up, you'd still need to use something like linking with deep links to instantiate the WebRTC connection. Regarding security, the connection itself is E2E encrypted with SRTP (part of the spec). 
+
+Also in the example of above delegation chains, those are not a security risk since someone would still need the identity that the delegation chain was signed for, without it, the chain cannot be used.
+
+-------------------------
+

@@ -1,0 +1,503 @@
+nomeata | 2021-12-30 11:51:33 UTC | #1
+
+You might have seen my previous posts discussion issues about [safe upgrades of canisters](https://forum.dfinity.org/t/canister-audit-advice/8469?u=nomeata) and [zero downtime upgrades](https://forum.dfinity.org/t/zero-downtime-canister-upgrades/9143?u=nomeata), and clearly, our platform isn’t particularly great for developers when it comes to persisting your data across safely and efficiently canister code upgrades. But it should be great!
+
+If we squint a bit, we’ll see that the problems we are facing here aren’t that unique: We have a system with a persistent storage (the _stable memory_) that is unstructured, flat and kinda slow. We need to store all relevant data in this storage. And we want to be able to make sense of this data even after changing the code of our canister, or possibly even changing the implementation language. This describes basically any computer out there with a disk attached to it! There, this is solved using file systems and/or databases, so maybe we can simply use the same?
+
+## TL;DR
+
+The [`sqlite` in-process database](https://sqlite.org/index.html) solves most if not all of the problems related to persistent storage, and can be backed by the IC’s stable memory.
+
+## The vision
+
+Something like this should work, and the developer shoudn't need to worry about much else:
+
+(TBD, avoiding 403 error)
+
+Behind the scenes this would use the canister’s stable memory like a raw block device. 
+
+## Why is this great?
+
+ * `sqlite` solves the problem of mapping structured data onto a flat disk, in a time-tested way.
+ * `sqlite` is well known to many developers, as it is the most commonly used data base out there. Even mobile phone apps tend to use sqlite for their data storage!
+ * The problem of schema migration, i.e. what to do if your new canister version stores its data differently, is well-known and has plenty of existing solutions to pick from.
+ * `sqlite` is used to work with a slow, block-based backend, so backing it with stable memory is sensible, and will likely make good use of the canister main memory as a cache.
+ * `sqlite` is designed to support large files (>4GB), so you can use large stable memory easily.
+ * `sqlite` guarantees backwards compatibility, so no worry about losing your data because your data serialization library has changes.
+ * The `sqlite` file format can be analyzed by dedicated tools, so if the IC (or your canister) provides read access to stable memory, this can be used for debugging, backup and archival.
+ * `sqlite` is available in many programming languages. By storing your data this way, you can in the future switch from one Canister implementation language to another without losing your data.
+ * By syncing at the end of each message, the data in stable memory is complete after each messages. This means you can upgrade your canister without running code in the `canister_preupgrade` hook, greatly reducing the risk of non-upgradeable canisters.
+ * The atomicity guarantees of the Internet Computer may allow you to use `sqlite` without locking and possibly without a journal, simplifying things. (But beware cross-message transactions are possible).
+ * Plenty of tools out there that build on top of sqlite, e.g. ORMs, that you could then use on the IC.
+
+
+## How to get there?
+
+@hassen.saidi has already demonstrated that [we can compile the `sqlite` library to Wasm](https://github.com/HassenSaidi/IC_sqlite) and use it on the Internet Computer; there backed by Main memory only (`memvfs`), and thus not persisted across upgrades.
+
+Luckily, `sqlite` is designed to be cross-platform and allows us to provide our own storage backend code, using the [VFS feature](https://www.sqlite.org/vfs.html). It even has [example VFS code](https://www.sqlite.org/src/doc/trunk/src/test_onefile.c), which quite nicely describes our use case:
+> This file implements a demonstration VFS named "fs" that shows how SQLite can be used on an embedded device that lacks a filesystem. Content is written directly to the underlying media. A VFS derived from this demonstration code could be used by a gadget with a limited amount of flash memory to make SQLite behave as the filesystem for the flash memory on the device.
+
+So we’d have to change this file to use [the `ic0.stable_*` system API calls](https://smartcontracts.org/docs/interface-spec/index.html#system-api-stable-memory) in `mediaRead()` and `mediaWrite()`, wrap it in a Rust crate, maybe add some initialization code, and we are ready to roll!
+
+## So, who wants this?
+
+I find the prospect of this pretty appealing, but I currently don’t have a project of my own that needs this, so I shied away from just doing this and instead came here to describe the idea. Maybe someone is now enthused and builds this?
+
+Or maybe [ICDevs](https://icdevs.org/) considers this a worthwhile bounty (ping @skilesare)?
+
+Or maybe the SDK team in the foundation will take this on?
+
+-------------------------
+
+nomeata | 2021-12-30 11:54:19 UTC | #2
+
+This is the code that was missing above (stupid [overly eager SQL injection protection](https://forum.dfinity.org/t/i-cant-reply-some-topics-somtimes/4082?u=nomeata) – can this please please be disabled?)
+
+```
+use rusqlite::{…};
+…
+  let conn = Connection::open(":stable-memory:", ).unwrap();
+  conn.execute("CREATE TABLE person (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL
+  )", NO_PARAMS).unwrap();
+
+  let name: String = "Steve Example".to_string();
+  let email: String = "steve@example.org".to_string();
+  conn.execute("INSERT INTO person (name, email) VALUES (?1, ?2)",
+    &[&name, &email]).unwrap();
+```
+
+-------------------------
+
+borovan | 2021-12-30 12:16:55 UTC | #3
+
+Yes please, this would be a game changer for our project.  I don't think I'm capable of coding something like this (nor would I want the future of data storage to hinge on my janky code).
+
+We would gladly contribute to any bounty though.
+
+I think I'd still use really low level stuff like arrays for smaller tables, but for player data this would be perfect.
+
+-------------------------
+
+nomeata | 2021-12-30 12:47:22 UTC | #4
+
+Well, in this vision, _all_ persisted memory would be put in the database somehow (like in a web service). You can of course keep the data in some other form in main memory for faster access (although I am not sure if this would really be needed).
+
+-------------------------
+
+nomeata | 2021-12-30 13:37:26 UTC | #5
+
+I found an example of a [sqlite VFS that is written in pure rust](https://github.com/epilys/vfsstat.rs/blob/main/src/vfs.rs ) (as well as [another one inspired by that](https://github.com/jalcine/sqlite-hypercore/)); so maybe no C writing would be necessary.
+
+-------------------------
+
+jzxchiang | 2021-12-30 21:16:51 UTC | #6
+
+Hopefully we can also have Motoko bindings for sqlite if OP's proposal really gets implemented...
+
+-------------------------
+
+jzxchiang | 2021-12-31 08:04:20 UTC | #7
+
+Now that I think about it, this problem is more widespread than I had thought.
+
+For example, I need full-text search functionality, so I was looking around on Rust and Motoko and found [tantivy](https://docs.rs/tantivy/latest/tantivy/index.html) on Rust. It just occurred to me that in order to persist tantivy data (e.g. search indexes) across upgrades, I'd have to implement some sort of IC VFS adapter, just like OP suggested for sqlite. Currently, tantivy doesn't [support](https://docs.rs/tantivy/latest/tantivy/directory/index.html) writing to stable memory using IC syscalls, obviously.
+
+So maybe writing canisters in Rust to take advantage of pre-existing libraries isn't as clear of a home run as I had thought. For libraries that don't interface with a file system, Rust definitely provides an advantage. For libraries that do, well... someone needs to write an adapter.
+
+This is one area where the Motoko stable variable abstraction is super convenient (although still limited to 4 GB until 64-bit support is in).
+
+-------------------------
+
+skilesare | 2022-01-03 14:43:16 UTC | #8
+
+This looks super interesting and we could certainly do an ICDevs bounty to get this up and running.  I'd love a couple of pieces of analysis from Rust/C Devs that can look at this code.  @lastmjs probably has some good experience to throw in here as well from his work on GraphQL.
+
+1. What processes are going to be an issue for long-running processes?  I'm particularly interested in processes that need to run out of band and build indexes/run table scan searches.
+2.  Does the architecture of SQLLite bend itself toward chunking these processes so that they might be optimized to fit inside of the cycle limit?
+
+-------------------------
+
+nomeata | 2022-01-03 16:16:27 UTC | #9
+
+You are spot on a possible weak point with that question The whole scheme only works well if sqlite does not have to long (i.e. linear with the file size) operations that can't be interrupted (migrations, indexing etc.). So yes, checking that (maybe simply by asking on their mailing list) is part of the job.
+
+-------------------------
+
+faraz.shaikh | 2022-01-03 16:59:46 UTC | #10
+
+I think we need journaling at a block level. This is simple to do, than
+-porting sql
+-figuring out the performance and other nooks of a database engine.
+
+There is nothing lite about sqllite in this context. 
+
+Why SQL ? Sql is justified, when data is large, structured and more importantly queries are adhoc. The relational algebra helps with the adhoc introspection of data. Using SQL to solve journaling/atomicity problem seems like a overkill, and ties the solution to unrelated usecase
+
+A block based journal is fairly easy to implement.
+ 
+
+1. Divide free memory into a linear block address space
+2. Reserve initial 32 or N blocks for journal. You can fit fixed sized txn here
+
+Journal api
+Txn_create
+Txn_add(block_no, new_data)
+Txn_add(…)
+Txn_commit(…)
+    - replay any transaction that exists in uncommitted state and valid state (crc32 matches)
+    - write out txn blocks to journal area, with a crc32 checksum over all blocks in txn
+    
+
+Eventually you can extend this to be an infinitely scalable lvm like journaled block Device, by linearly stitching canisters together
+
+-------------------------
+
+faraz.shaikh | 2022-01-03 17:02:27 UTC | #11
+
+If you are going down the sqllite path. Two things
+
+1. Storage sizing. If you report X as disk/canister size, the writes to disk for X bytes must always succeed
+
+2. Exclusive access to memory for every update. Imo ic model lends well here 
+
+
+
+And other things from here
+https://www.sqlite.org/howtocorrupt.html
+
+-------------------------
+
+nomeata | 2022-01-03 17:28:47 UTC | #12
+
+[quote="faraz.shaikh, post:10, topic:9998"]
+Using SQL to solve journaling/atomicity problem seems like a overkill
+[/quote]
+
+I am not sure why journaling plays a role here. The IC already guarantees atomicity, so data corruption isn’t an issue (with or without a SQL database). Maybe you are right with the above statement, but among many problems solved by sqlite, this is the one that we _don’t_ have on the IC.
+
+But the problems we are facing on the IC is:
+
+ * Coming up with a binary storage format for your application’s data
+ * That allows you to index into it (as reading all of stable data into main memory isn’t feasible)
+ * Where writes are reflected in the storage at the end of each message (to avoid `canister_preupgrade` and it's dangers)
+ * Is stable even across library versions (and hence canister versions)
+ * Schema changes are a well-understood problem.
+ * Does not tie your canister to a single programming language forever.
+ * Cleverly uses the (fast) main memory as a cache to the (slower) stable memory.
+ * Is designed to avoid dirtying too many pages of stable memory, to keep costs down, just like a system built on a SSD disk.
+
+Of course it’s possible and fun to build all that manually, but why not reach for an existing solution. 
+
+There might be other block-device-backed persistence solutions out there to consider, but sqlite seems to be [a go-to standard](https://www.sqlite.org/mostdeployed.html).
+
+-------------------------
+
+faraz | 2022-01-03 19:38:24 UTC | #13
+
+@nomeata  Yes, you are right in the "intra" canister calls case atomicity is guaranteed at a call level (barring the throw).  The atomicity/isolation pitfalls you described in your blog are for the multi-call transactions (inter/intra canister).
+So the block journaling approach I described is not applicable in the single canister call case. It might be useful in multi-canister transactions but will additional infrastructure for isolation, (some form of cross canister locking :(.
+
+
+So, back to SQLite/FS as a solution to the problems you mentioned. It's a great idea, the insight probably is that you cannot use data structures/lib that were not intended to host persistent data (viz rust hash tables) to compose systems that store data permanently (ie IC). These in-memory data-structures/lib (viz in-memory hash) have no obligation to keep their internal layout backward compatible, (unlike FS/databases).
+On that front, there are two logical solutions.
+
+1. Switch/port on-disk solution like leveldb,sqllite,initramfs,tinydb to work on IC. Canister memory then truly is dumb disk abstraction.
+2. Or version the in-memory data-structures libraries, such that incompatible code-changes don't interpret data the wrong way.
+
+
+
+Just be aware that  FS/DB doesn't magically solve the upgrade problem. Much of backward compatibility is at the cost of backing off on "features" that require incompatible data-structure changes :). Filesystems and databases are slow on innovation because they are tied to on-disk formats.
+
+-------------------------
+
+faraz | 2022-01-03 19:52:52 UTC | #14
+
+
+
+https://www.joachim-breitner.de/blog/788-How_to_audit_an_Internet_Computer_canister
+
+After reading this, looks like building any "serious" composable solution (all persistent storage is serious business) is a non-trivial task on IC. The promise of IC is composability and to compose anything trivial it seems the developer is expected to have an in-depth understanding of the implementation of ACID.
+
+Auditing is great, SQLLite is a great start. But I think it needs more thought on making it difficult for people to shoot themselves in the foot in the first place. In short, I believe we are presenting a raw disk abstraction to users to work with, and expecting the FS/DB details to be filled in by or careful programming/audits :)
+
+-------------------------
+
+gmsj0001 | 2022-01-05 01:19:05 UTC | #15
+
+I wondered someone can implement a filesystem but no one reply me.
+[Can stable memory used as a virtual filesystem - Developers - Internet Computer Developer Forum (dfinity.org)](https://forum.dfinity.org/t/can-stable-memory-used-as-a-virtual-filesystem/9268)
+I tried a little but OS develop is not such an easy project and it'is better done by dfinity offical rather than by community.
+
+-------------------------
+
+faraz | 2022-01-05 01:41:50 UTC | #16
+
+[quote="gmsj0001, post:15, topic:9998"]
+but OS develop is not such an easy project and it’is better done by dfinity offical rather than by community.
+[/quote]
+
+Wow ! great where are you stuck ? How can we help, but why do need OS programming for this. I might not have the entire picture here, but you don't have to deal with WASI when working with the IC canister abstraction.      Think of building a "model" canister library - that can aggregate stable memory across canister, scale when needed and provide a S3 like abstraction. Filesystem hierarchy can be built on top of it.    For just accessing local canister memory as a filesystem - I don't see the universal applicability. It may be just me.
+
+-------------------------
+
+Icdev2dev | 2022-01-05 02:12:24 UTC | #17
+
+I must admit that I never thought that I would actually build a file-system WITHIN a smart contract.
+
+I am working on  developing two different filesystems on stable memory... the first one is the s3-like abstraction ... i.e. an object store. This is a toy file system...just to get the nuances of working on mediaRead and mediaWrite just so. 
+
+The second is a more ambitious file-system that automatically does keyword based pathing for textual objects (not a general purpose fs). 
+
+Will publish this in my github soon.
+
+-------------------------
+
+faraz | 2022-01-05 02:18:54 UTC | #18
+
+very nice. Filesystem everywhere ! A request, let's keep this thread for the SQLite discussion that @nomeata started, we can use the old FS thread or make a new one for the filesystem discussion :)
+
+-------------------------
+
+faraz | 2022-01-05 09:18:29 UTC | #19
+
+Hello @nomeata my opinion
+
+SQLlite might not be a perfect match and maybe dogged with a long tail of corruption issues. Please read this https://www.sqlite.org/atomiccommit.html for more context on the response.
+ 
+
+
+Performance and cost:  DB  relies on the underlying FS and storage hardware features for performance.  One can present the DB with a featureless storage and  FS(stable memory). This would force the DB to take the most conservative and non-performant path to "ensure" crash consistency.  In a canister, this would translate to a single-byte update resulting in a exorbitantly large write amplification. 
+
+Also, SQLite documentation mentions support for configurable sector size (atomic unit of write to disk). In practice this is hardly configurable - only 2 sizes are guaranteed to be tested heavily and work 4K and 512bytes.   Every byte change would result in reading and rewriting of a sector chunk.  Roughly 2 read 2 write per byte change (of course there is coalescing but let's take the worst case). The sector size cannot be scaled down arbitrarily. 
+
+For correctness: To the very least we need SQLite crash consistency test  (.i.e. crash the OS at an inopportune time) to pass on the IC.  Don't quite know how to build a test harness for this. 
+
+So if it's a build vs re-use decision, it boils down to WRITE GOOD code OR Trust SQLlite is good code on new hardware.   SQLite is good code it needs to be qualified on new hardware aka stable memory.
+
+If someone wants to pursue this I would suggest getting the crash consistency tests running on IC. If the test fails this is what the debugging will involve http://www.sqlite.org/draft/hlr30000.html
+
+Some interesting scenarios to work out:
+1. A crash/trap leaves an uncommitted transaction on the disk. 
+2. An update query will involve having to clean/replay the transaction, which would involve a write. The write will be discarded. At least one problem is that every update will involve a read replay discard of the uncommitted journal.
+
+TL;DR
+If one is considering mission-critical (all production) data like ledger info I won't recommend SQL lite. Too much complexity in lieu of benefits.
+
+-------------------------
+
+nomeata | 2022-01-05 10:18:40 UTC | #20
+
+I think you are missing the fact that canisters never ever crash uncontrolled. If a canister method traps, the IC rolls back the changes! It will never happen that a canister stops in the middle of a sqlite operations and just leaves it's memory in that corrupted state. So none of the problems that sqlite needs to deal with exits on the IC.
+
+And the sector size setting is actually ideal as well: The IC will charge memory usage not per byte, but per read or dirtied Wasm page (64k). So if sqlite manages its storage in 64k sectors (or even 4k) then we benefit from the years of work that sqlite authors did to make that efficient, i.e. avoid reading and writing more sectors than needed, plus its logic for not hitting stable memory when the data is in main memory and combining reads at the end of the message (assuming that’s when you end your transaction and sync). 
+
+[quote="faraz, post:19, topic:9998"]
+If one is considering mission-critical (all production) data like ledger info I won’t recommend SQL lite. Too much complexity in lieu of benefits.
+[/quote]
+The complexity is not in sqlite per se, but inherent in the system (sans worry about corrupted state due to corruption). And the problems are not unique to the IC. So one has to deal with it in any case, and then it’s better to reach for a proven solution than to reinvent the wheel again.
+
+-------------------------
+
+anthonymq | 2022-01-05 14:24:20 UTC | #21
+
+Really interested by this. If we could manage schema migration in motoko this would greatly benefit the builders.
+
+-------------------------
+
+jzxchiang | 2022-01-06 00:05:25 UTC | #22
+
+Random thought: should we even try to port legacy database systems onto the IC?
+
+With orthogonal persistence, application developers no longer need to worry about disk block and file system requirements, and can instead write to and read from data structures in RAM (periodically and transparently snapshotted to disk).
+
+Maybe this is a good opportunity to "reinvent the wheel" and hopefully say goodbye to [impedance mismatch](https://en.wikipedia.org/wiki/Object%E2%80%93relational_impedance_mismatch)...? :man_shrugging:
+
+-------------------------
+
+nomeata | 2022-01-06 12:34:07 UTC | #23
+
+[quote="jzxchiang, post:22, topic:9998"]
+With orthogonal persistence, application developers no longer need to worry about disk block and file system requirements, and can instead write to and read from data structures in RAM (periodically and transparently snapshotted to disk).
+[/quote]
+
+Orthogonal persistence and upgrades don't mix. If you write an immutable canister (no upgrades ever), then OP is great. For anyone else, stable memory is your persistence, and all the “old” problems around persistence are still around (backward compat, schema changes, efficient access), and need to be solved. Yes, there are multiple ways of solving it (data bases, file systems, custom formats; maybe those writing software for [non-volatile RAM](https://en.wikipedia.org/wiki/Non-volatile_random-access_memory) have clever ideas). But unfortunately the IC does not magically make all these complexities disappear…
+
+-------------------------
+
+dsickles | 2022-01-08 05:55:16 UTC | #24
+
+Has anyone looked at FoundationDB? It looks like a good first persistence layer that you can build SQL-like or doc-db on the key value store. The C++ -> WASM story is good right?
+https://www.foundationdb.org/
+
+-------------------------
+
+senior.joinu | 2022-01-08 12:54:56 UTC | #25
+
+Hello everyone.
+I was working on the solution for stable memory in rust canisters for some time. 
+And I took a different approach. The core idea is, what if we somehow could allocate memory on stable storage. Yes, this won't work with native std's collections (since we want to allocate 64-bit pointers, but wasm is 32-bit), but if we also manage to build some collections on top of this allocator from scratch, this will do both:
+1. Save us from expensive pre-/post-upgrade procedures, since all of our data is already stored in a structured way.
+2. Respect the Orthogonal Persistence paradigm, since a user would store their data in a collections, not in a database.
+
+I've managed to build such a memory allocator. 
+https://github.com/seniorjoinu/ic-stable-memory-allocator
+
+I didn't tested it on a real canister yet, but I've abstracted the stable memory away with an interface and tested it on a raw `Vec`.
+
+Then I got promoted on my main work, and now I have no free time to implement the collections. I've tried to find a freelancer (I thought, for some CS student it could be a nice practice), but it seems like the amount of money I can afford to spend on this is not enough to motivate anybody.
+
+So, then I thought, maybe someone here, on this forum, would be interested in this thing?
+
+The main goal is to build two collections:
+1. A Java-like HashMap that would be able to efficiently manage at least 500GB of data.
+2. A Dynamic Array on top of that HashMap, that would use indexes instead of keys (so we could iterate).
+
+But for efficient HashMap of this size one would also need to implement classic Dynamic Array (to store the table) and some kind of self-balancing binary tree, like RBTree (for buckets). 
+
+So there is actually a lot of work.
+What do you think, guys? Is it worth trying?
+
+-------------------------
+
+senior.joinu | 2022-01-08 13:22:07 UTC | #26
+
+The memory allocator also supports 4 (this can be extended if needed) words of "global pointers".
+Such a pointer could point to some kind of "variable definition map" - a hashmap that stores named pointers to other collections.
+
+Such a definition map could be abstracted away with some handy functions so the end-user would get an interface like this:
+
+```rust
+static mut SOME_DATA_MAP: Option<StableMap<SomeData>> = None;
+static mut OTHER_DATA_VEC: Option<StableVec<OtherData>> = None;
+
+#[init]
+fn init() {
+  let alloc = StableMemoryAllocator::init();
+  let def_map = VariableDefinitionMap::init(alloc);
+
+  let some_data = StableMap::<SomeData>::init(def_map, "some_data_map");
+  let other_data = StableVec::<OtherData>::init(def_map, "other_data_vec");
+
+  unsafe {
+    SOME_DATA_MAP = Some(some_data);
+    OTHER_DATA_VEC = Some(other_data);
+  }
+}
+
+#[post_upgrade]
+fn post_upgrade() {
+  let alloc = StableMemoryAllocator::reinit();
+  let def_map = VariableDefinitionMap::reinit(alloc);
+
+  let some_data = StableMap::<SomeData>::reinit(def_map, "some_data_map");
+  let other_data = StableVec::<OtherData>::reinit(def_map, "other_data_vec");
+
+  unsafe {
+    SOME_DATA_MAP = Some(some_data);
+    OTHER_DATA_VEC = Some(other_data);
+  }
+}
+
+// update functions work with SOME_DATA_MAP and OTHER_DATA_VEC variables
+```
+
+-------------------------
+
+senior.joinu | 2022-01-08 13:28:04 UTC | #27
+
+What's also great with the approach of custom collections is that one could build a collection like `AutoCertifiedHashMap` which would automatically update a merkle-tree (or any other structure) and call `set_certified_data()` function. Such a collection could be used to store anything that needs to be verified somewhere else. 
+
+And with a great user experience.
+
+-------------------------
+
+senior.joinu | 2022-01-08 21:14:41 UTC | #28
+
+Another way to use such a big HashMap is to make canister stable memory work much like Ethereum memory does. Just a big kv storage to use.
+
+By the way, I don't know if motoko is written in Rust, but if it is, it could use this same allocator to make seamless stable variables, which could hold not only sized data, but also any other data.
+
+-------------------------
+
+jzxchiang | 2022-01-09 07:54:16 UTC | #29
+
+This is really interesting, thanks for sharing.
+
+Given that stable memory will always be limited by per-subnet hardware and software requirements (currently 8 GB but supposed to be 300 GB one day), I wonder if it's worth investing a bunch of effort down this route or whether it's better to invest in multi-canister approaches, most notably an upgrade-tolerant [BigMap](https://github.com/DFINITY-Education/data-structures/blob/main/vendor/motoko-bigmap/app/Main.mo).
+
+The example I linked doesn't show it, but theoretically you could have some index canister dynamically spin up a bunch of data bucket canisters (that clients can directly query), and have those data bucket canisters store their data in stable memory using high-level primitives like Motoko `stable` variables (not sure if there's an equivalent of that in Rust).
+
+That way, you're not limited by 300 GB. You're not even limited by a subnet so theoretically your BigMap could scale "infinitely" as the blockchain grows, and your data bucket canisters would be spun up on any subnet.
+
+But IMO the difficulty here is managing cycles for multiple canisters and doing multi-canister upgrades. If your BigMap schema changes, how would you upgrade the canisters atomically and in what order? The problem is avoided with the stable memory allocator you started building here.
+
+@diegop @akhilesh.singhania I wonder if you guys  know why a more mature BigMap solution was deprioritized on DFINITY's end? The stable memory increase does help but is only a stopgap. Does DFINITY expect the community to figure this out, or does the foundation have any plans to resume work on storage solutions that can scale infinitely? It seems pretty important. Thanks!
+
+-------------------------
+
+jzxchiang | 2022-01-09 07:59:59 UTC | #30
+
+I believe Motoko is implemented in OCaml, so I don't think it could use this same allocator unfortunately.
+
+BTW what's the difference between a "small stable vec" and "stable vec"? You mention per-message cycle limits, but I'm not sure I understand. Is the issue when a vector needs to be resized that the data needs to be copied over from the old memory to the new memory, and that copy operation is expensive?
+
+-------------------------
+
+senior.joinu | 2022-01-09 11:49:44 UTC | #31
+
+Small vec is what I called the classic dynamic array. These arrays work because of reallocation. But since we're limited by cycles for each message, large reallocations are not good for us. So these arrays could work, but only if they stay small.
+
+Stable vec is a dynamic array based on a big hash map, but uses indices instead of keys. So this array should be able to handle much more data, than it's small version.
+
+What about BigMap - yea, it was a dream that never came true, unfortunately.
+
+-------------------------
+
+lastmjs | 2022-03-17 13:52:29 UTC | #32
+
+I haven't read the whole thread yet, but based on my work on Sudograph https://github.com/sudograph/sudograph I believe SQLite would work pretty well within a canister.
+
+Even without any indexing yet (so really bad O(n) searches) GraphQL queries with Sudograph don't hit the query execution limit too easily. I don't have benchmarks yet, but my intuition tells me SQLite would be able to scale to storing and efficiently querying through many many records.
+
+Keep in mind that Sudograph is basically SQLite but using GraphQL as a query language. It uses an underlying simple relational database called Sudodb. IMO GraphQL provides a superior DX to traditional relational databases using SQL.
+
+But, we will probably be implementing many database architectures on the IC. I think a robust SQLite implementation would be useful (and Sudograph could swap out Sudodb for it possibly, though probably wouldn't).
+
+The biggest problem we need to solve with our databases on the IC is scaling beyond the single canister limit.
+
+-------------------------
+
+alejandrade | 2022-03-17 22:24:12 UTC | #33
+
+Whoever makes native database on the IC Is going to make bank.
+
+-------------------------
+
+domwoe | 2022-07-12 15:06:18 UTC | #34
+
+does Sudograph already leverage stable memory?
+
+-------------------------
+
+lastmjs | 2022-07-12 16:02:00 UTC | #35
+
+Not yet, that's the path we will probably pursue before any kind of multi-canister architecture.
+
+-------------------------
+
+lastmjs | 2022-07-12 16:02:45 UTC | #36
+
+Well, it leverages stable memory as in you can store the database in stable memory in a pre_upgrade and get it back in a post_upgrade, but it doesn't use stable memory as the main memory for the database.
+
+-------------------------
+
+domwoe | 2022-07-12 16:11:27 UTC | #37
+
+Thanks! yeah, I meant leveraging stable memory directly to be able to use more than 4GB and without expensive (de-) serialization on upgrades.
+
+-------------------------
+

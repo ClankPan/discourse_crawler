@@ -1,0 +1,181 @@
+qwertytrewq | 2023-09-28 05:01:24 UTC | #1
+
+I originally raised the issue in [that thread](https://forum.dfinity.org/t/how-in-client-side-typescript-code-convert-from-an-actor-type-to-principal/23341), but I start a new thread because here I consider a simplified example, to increase clarity:
+
+Motoko:
+```motoko
+actor class canvalue_backend() = this {
+  public query func test() : async canvalue_backend {
+    return this;
+  };
+};
+```
+
+TypeScript:
+```typescript
+const ac = await canvalue_backend.test();
+Actor.canisterIdOf(ac) // does not work
+```
+
+So, how to convert from `canvalue_backend` to `Principal` (in TypeScript)?
+
+-------------------------
+
+qwertytrewq | 2023-09-28 05:07:13 UTC | #2
+
+Wait. It does not work in the same way as my original example in [that thread](https://forum.dfinity.org/t/how-in-client-side-typescript-code-convert-from-an-actor-type-to-principal/23341).
+
+-------------------------
+
+qwertytrewq | 2023-09-28 05:10:14 UTC | #3
+
+Corrected code:
+
+Motoko:
+```
+actor class canvalue_backend() = this {
+  public type R = {
+    value: canvalue_backend;
+  };
+  public query func test() : async R {
+    return { value = this };
+  };
+};
+```
+
+TypeScript:
+```typescript
+import { Actor } from "@dfinity/agent";
+import { canvalue_backend } from "../../declarations/canvalue_backend";
+
+const ac = await canvalue_backend.test();
+Actor.canisterIdOf(ac.value)
+```
+
+Error:
+```text
+Argument of type 'canvalue_backend' is not assignable to parameter of type 'Actor'.
+  Property '[metadataSymbol]' is missing in type 'canvalue_backend' but required in type 'Actor'.
+```
+
+I will report a bug.
+
+-------------------------
+
+qwertytrewq | 2023-09-28 05:18:57 UTC | #4
+
+I've [reported a bug](https://github.com/dfinity/agent-js/issues/775).
+
+-------------------------
+
+RMCS | 2023-09-28 15:26:36 UTC | #5
+
+I would recommend checking out the dfinity packages https://www.npmjs.com/package/@dfinity/agent
+
+To my knowledge the bug you reported is not there. You are just doing it wrong.
+
+-------------------------
+
+kpeacock | 2023-09-28 15:37:37 UTC | #6
+
+`Actor.canisterIdOf` needs to point to an instance of an `Actor` class. in your example, you were passing the awaited result of a call to a canister from that actor.
+
+Your code should simply be `Actor.canisterIdOf(canvalue_backend)`
+
+See here: https://agent-js.icp.xyz/agent/classes/Actor.html#canisterIdOf
+
+-------------------------
+
+qwertytrewq | 2023-09-28 16:00:18 UTC | #7
+
+`Actor.canisterIdOf(canvalue_backend)` is possible in the simplified example (above) of a real situation, but not in my real situation with multiple canisters of an actor class.
+
+-------------------------
+
+kpeacock | 2023-09-28 16:20:35 UTC | #8
+
+Oh, I understand now. I'm not sure that this is hypothetically scalable to all cases, but you could conceivably infer that a reference to `self` as an actor could use the same principal.
+
+If we apply this to arbitrary canisters however, there isn't enough information present in the Candid to do what you want. From an example
+
+With a slightly more complex example returning a service type of `Foo`, such as this:
+```
+import Foo "Foo";
+
+actor class canvalue_backend() = this {
+  public func test() : async Foo.Foo {
+    return await Foo.Foo();
+  };
+};
+
+```
+
+Foo will have a different Principal, which is not communicated in the candid interface. We cannot instantiate full `Actor` instances or infer `Principal`s for returned values from calls without new tooling that doesn't exist today
+
+
+```
+type canvalue_backend = 
+ service {
+   test: () -> (Foo);
+ };
+type Foo = 
+ service {
+   foo: () -> (text);
+ };
+service : () -> canvalue_backend
+```
+
+-------------------------
+
+qwertytrewq | 2023-09-28 16:22:37 UTC | #9
+
+[quote="kpeacock, post:8, topic:23362"]
+We cannot instantiate full `Actor` instances or infer `Principal`s for returned values from calls without new tooling that doesn’t exist today
+[/quote]
+
+Are you sure? Won't the following work?
+
+```typescript
+(await canvalue_backend.test()) as unknown as Actor
+```
+
+-------------------------
+
+kpeacock | 2023-09-28 16:28:40 UTC | #10
+
+The information simply doesn't exist, even if you cast the type.
+
+I recommend modifying your return value to include the known principal along with the Actor reference. This would look something like this:
+
+```
+import Principal "mo:base/Principal";
+
+actor class canvalue_backend() = this {
+  public query func test() : async (Principal, canvalue_backend) {
+    return (Principal.fromActor(this), this);
+  };
+};
+```
+
+Then you'll need to pass the information in through `Actor.createActor`. There are also tools available for making calls to arbitrary canisters by fetching the candid interface directly from the principal, such as https://www.npmjs.com/package/ic0 or https://www.npmjs.com/package/@infu/icblast
+
+-------------------------
+
+qwertytrewq | 2023-09-28 17:32:40 UTC | #11
+
+[quote="kpeacock, post:10, topic:23362"]
+The information simply doesn’t exist, even if you cast the type.
+[/quote]
+
+So, using `agent-js` I cannot fetch actors from shared functions' return values.
+
+Can I reversely pass actors to shared functions?
+
+-------------------------
+
+kpeacock | 2023-09-28 20:48:47 UTC | #12
+
+The key concept here is that only the candid definition of an Actor can truly be passed among canisters or clients. The real Actor lives in the wasm module, and the JS client's interpretation of the actor can provide an interface to make calls to that canister, based on the methods and types that are exposed
+
+-------------------------
+

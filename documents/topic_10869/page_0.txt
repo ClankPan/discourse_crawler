@@ -1,0 +1,210 @@
+icme | 2022-02-14 06:48:37 UTC | #1
+
+I've recently been diving into the shared actor model, and still have a few questions about what's happening both directly and under the hood of the actor syntax in the following two examples.
+
+Thank you in advance for bearing with me through my lack of/incomplete understanding!
+<br/>
+
+**First example: (from various documentation examples)**
+```
+shared (install) actor class MyClass(someone : Principal) = this {
+    ...
+```
+```
+shared({ caller = initializer }) actor class MyClass() = this {
+  ...
+```
+
+```
+shared ({ caller = owner }) actor class MyClass() = this {
+  ...
+```
+1. What is happening under the hood with the `install` and deconstructed `{caller = initializer/owner}` bindings in these two shared actor examples? What does the whole `(install)` parameter object look like and how can I know all potential options for using it (what is it's type if deconstructed)?
+2. Would `install.caller` in the first example == `caller` in the second example?
+3. Is the difference between creating multiple actors via multiple plain actors (`actor MyActor`) vs. actor classes (`actor class MyActor()`) that the latter creates separate canisters for each actor, vs. the former creates multiple actors within the same canister?
+<br/>
+<br/>
+  
+
+**Second example**
+In [this part](https://github.com/gabrielnic/motoko-cdn/blob/main/src/backend/Container.mo#L37) of the mini-bigmap poc from the middle of last year by @Gabriel, a specific actor (the management canister) is defined within a shared actor class.
+```
+shared ({caller = owner}) actor class Container() = this {
+  ...
+  let IC = actor "aaaaa-aa" : actor {
+    ...
+  }
+}
+```
+In addition to the translated interface spec definitions, the author then defines an additional utility set of functions inside the `let IC =` bound actor, one of which is:
+```
+  // dynamically install a new Bucket
+  func newEmptyBucket(): async Bucket {
+    Cycles.add(cycleShare);
+    let b = await Buckets.Bucket();
+    let _ = await updateCanister(b); // update canister permissions and settings
+    let s = await b.getSize();
+    Debug.print("new canister principal is " # debug_show(Principal.toText(Principal.fromActor(b))) );
+    Debug.print("initial size is " # debug_show(s));
+    let _ = canisterMap.put(Principal.fromActor(b), threshold);
+    var v : CanisterState<Bucket, Nat> = {
+         bucket = b;
+         var size = s;
+    };
+    canisters[canisters.size() + 1 ] := ?v;
+  
+    b;
+  }
+```
+
+1. What is the affect of nesting actors like this? What if they were nested actor classes?
+2. It seems we're able to define the management canister like `actor "aaaaa-aa"`. What is the difference between: 
+  a. `actor "thisisastring123" { ... }`
+  b. `actor MyActor { ... }`
+3. The [management canister interface spec](https://smartcontracts.org/docs/interface-spec/index.html#ic-candid) looks to be fixed in the methods that can be called on it. How is the author able to create a `newEmptyBucket()` method within this management canister represented actor?
+4. What is the recommended way to call the management canister?
+  a. Create functions in a nested `"aaaaa-aa"` actor and then communicate with the management canister through these functions defined on the "aaaaa-aa" actor
+  b. Call the `create canister` method defined in the [interface spec](https://github.com/dfinity/interface-spec/blob/master/spec/ic.did#L20)
+  c. Another way? :slight_smile:
+
+-------------------------
+
+Gabriel | 2022-02-14 08:27:32 UTC | #2
+
+Hi there,
+
+`initializer/owner` is just the naming but they're exactly the same, a principal id. Again you can have it like this `shared(msg) actor ` and then have a stable variable where you store the principal that created the canister if you don't want `initializer/owner` part.  `caller/msg` is the principal calling your class so this way you can implement ACL, profiles, NFT owners etc. 
+
+`In addition to the translated interface spec definitions, the author then defines an additional utility set of functions inside the let IC = bound actor, one of which is:`
+
+Basically this way you can create canisters on the fly and then using the IC management tool you can adjust the parameters of that canister. Like you can increase memory or you can add another controller. You don't even need to use the actor class. The IC tool can do that as well. Check this example here: 
+
+https://github.com/dfinity/examples/blob/master/motoko/actor_reference/src/actor_reference/main.mo
+
+`let cid = await IC.create_canister({});` with this line you create a canister on the fly just like you can create one when you create a new instance of the actor class. 
+
+
+The IC management canister address is `aaaaa-aa` (i.e. the empty blob).
+
+https://smartcontracts.org/docs/interface-spec/index.html#ic-management-canister 
+
+Imagine the IC manangement canister as a superset that will give you the ability to create/change setting to a canister created with this if you need a way to create canisters on the fly and manage them. Sorry I don't really know how to explain this but will leave that to someone better than me. 
+
+Feel free to reach out on discord if you have more questions.
+
+-------------------------
+
+rossberg | 2022-02-14 10:40:57 UTC | #3
+
+In addition to @Gabriel's reply, let me answer some of your specific questions.
+
+[quote="icme, post:1, topic:10869, full:true"]
+1. What is happening under the hood with the `install` and deconstructed `{caller = initializer/owner}` bindings in these two shared actor examples?
+[/quote]
+
+The latter is just in place destructuring / pattern matching. No different from saying `shared(msg)` and later binding this with
+```
+let {caller = owner} = msg
+```
+which destructures `msg`.
+
+[quote]
+What does the whole `(install)` parameter object look like and how can I know all potential options for using it (what is it’s type if deconstructed)?
+[/quote]
+
+Currently, `caller` is the only field in this record, but it is very likely that additional ones will be added in future versions of Motoko (which you are free to ignore, of course).
+
+[quote]
+2. Would `install.caller` in the first example == `caller` in the second example?
+[/quote]
+
+No, `install.caller` is bound to the same value as `initializer` resp `owner` in the second and third example.
+
+Objects/record _patterns_ have the exact same structure as object/record _expressions_. That is, for each field, the field name is on the left, the nested pattern/expression on the right. Example:
+```
+let r = {a = 10; b = (2, 3, 4)};
+let {a = n; b = (x, y, z)} = r;
+```
+The second line binds the variables `n`, `x`, `y`, and `z` to the respective values.
+
+[quote]
+3. Is the difference between creating multiple actors via multiple plain actors ( `actor MyActor` ) vs. actor classes ( `actor class MyActor()` ) that the latter creates separate canisters for each actor, vs. the former creates multiple actors within the same canister?
+[/quote]
+
+It's the same difference as between a regular class and an object literal. A literal creates a singleton object, a class allows multiple different instantiations with varying constructor arguments.
+
+(In the case of a top-level actor/actor class expression in Motoko, though, a plain actor literal is just a short-hand for an actor class with no parameters.)
+
+[quote]
+1. What is the affect of nesting actors like this? What if they were nested actor classes?
+[/quote]
+
+A local actor literal has the same effect as locally instantiating an actor class: each time the definition is evaluated, a new actor, i.e., canister, is created.
+
+The form `actor "url"` is something different, though. It does not create a new actor, see next question.
+
+[quote]
+2. It seems we’re able to define the management canister like `actor "aaaaa-aa"` . What is the difference between:
+a. `actor "thisisastring123" { ... }`
+b. `actor MyActor { ... }`
+[/quote]
+
+The latter form is an actor literal. As said, it's evaluation creates a new canister, equivalent to instantiating an actor class of the same shape.
+
+The former is a special form that allows referring to an actor/canister that _already exists_ in the network, if you know its id. It just declares what the type of that actor is.
+
+[quote]
+3. The [management canister interface spec](https://smartcontracts.org/docs/interface-spec/index.html#ic-candid) looks to be fixed in the methods that can be called on it. How is the author able to create a `newEmptyBucket()` method within this management canister represented actor?
+[/quote]
+
+The call to `Buckets.Bucket` invokes the constructor of an actor class (`Bucket` is an actor class). So this creates a new canister, which is then bound to `b`, which is returned in the end.
+
+Hope this helps.
+
+-------------------------
+
+cryptoschindler | 2022-02-14 17:02:39 UTC | #4
+
+Regarding `3.`:
+
+I think the confusion comes from the fact that the `aaaaa-aa` actor reference ends in line `72`, but the closing bracket isn't indented correctly.
+
+So `newEmptyBucket` isn't "added" to the management canisters interface but to the `Container` actor class.
+
+-------------------------
+
+icme | 2022-02-15 19:16:34 UTC | #5
+
+@Gabriel - Thanks for the explanation and the link to that reference, this makes a lot of sense!
+
+What discord are you referring to?
+
+-------------------------
+
+icme | 2022-02-15 20:01:14 UTC | #6
+
+@rossberg Thanks for the thorough explanation.
+
+```
+let r = {a = 10; b = (2, 3, 4)};
+let {a = n; b = (x, y, z)} = r;
+```
+This destructuring example is great and really clears things up, half of my brain is still in JavaScript land, so the `=` assignment instead of `:` in records still throws me for a loop from time to time.
+
+> "The latter form is an actor literal. As said, it’s evaluation creates a new canister, equivalent to instantiating an actor class of the same shape. 
+The former is a special form that allows referring to an actor/canister that *already exists* in the network, if you know its id. It just declares what the type of that actor is."
+
+Really appreciate your explanation of all these subtleties with respect to actors - there was a bit about it in the [actor classes](https://smartcontracts.org/docs/language-guide/actor-classes.html) and [add access control](https://smartcontracts.org/docs/developers-guide/tutorials/access-control.html) sections of the documentation, but this explanation really answers my questions by comparing and contrasting actor behavior in different usage scenarios.
+
+If my debugging process at all helps, I first searched `actor` and `shared` in the developer docs, finding the [actor classes](https://smartcontracts.org/docs/language-guide/actor-classes.html) doc, the [sharing functions among actors](https://smartcontracts.org/docs/language-guide/sharing.html#_the_shared_keyword) doc, and various examples. This search, however, did not yield the [Principals and Caller Identification](https://smartcontracts.org/docs/language-guide/caller-id.html) example, which would have helped a lot in my understanding. I then looked at the grammar but stopped after trying to expand `'actor' <exp_plain>`. I then looked into the `motoko` repo greping for `actor` but am a bit limited in my OCaml/PL.
+
+I know you and the team are up to the ceiling in roadmap stuff, but it would be really nice to organize some of the docs for Motoko keywords so that I can find everything `actor` in a single place, just like is currently done with the [Motoko Base Library Docs](https://smartcontracts.org/docs/base-libraries/Array.html#sort). For the `actor` keyword this would including nesting, usage with shared, the special form, and any other potential special forms not mentioned :slight_smile: . The doc site already has so many great examples that the team has put together!
+
+-------------------------
+
+Gabriel | 2022-03-25 06:45:27 UTC | #7
+
+Sorry for the late reply. Go to https://dfinity.org/ scroll all the way down and you'll see a link with `Dev Discord` Press on that one and it's an invite to the dev discord.
+
+-------------------------
+

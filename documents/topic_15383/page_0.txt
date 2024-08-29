@@ -1,0 +1,274 @@
+saikatdas0790 | 2022-09-12 15:55:15 UTC | #1
+
+I have Rust code that dynamically creates canister by importing the wasm as a byte array and then creating canisters on demand. The import and creation code looks like this
+
+```rust
+const WASM: &[u8] = include_bytes!(
+    "../../../../target/wasm32-unknown-unknown/release/individual_user_template.wasm"
+);
+
+pub async fn create_users_canister(// caller: Principal,
+    // collection: Principal,
+) -> Principal {
+    let arg = management::CreateCanisterArgument {
+        // ...
+    };
+
+    let canister_id = management::CreateCanister::perform_with_payment(
+        // ...
+    )
+    .await
+    .unwrap()
+    .0
+    .canister_id;
+
+    management::InstallCode::perform(
+       // ...
+    )
+    .await
+    .unwrap();
+
+    canister_id
+}
+```
+
+For the canister wasm to be created I need to either call `dfx build` or `dfx deploy`. The problem is they require the `canister_id` to be provisioned beforehand otherwise I get an error that looks like this
+> Error: Failed to determine id for canister 'individual_user_template'.
+Caused by: Failed to determine id for canister 'individual_user_template'.
+  Cannot find canister id. Please issue 'dfx canister create individual_user_template'.
+
+Can `dfx build` be decoupled from the canister ID provision step and just build the resulting WASM without requiring an already present canister. Otherwise I will have to spend cycles and provision an unnecessary canister.
+
+Thoughts?
+
+-------------------------
+
+Severin | 2022-09-13 08:46:43 UTC | #2
+
+`cargo build -p hello_backend --target wasm32-unknown-unknown` produces wasm directly. Just note that if you want to compile canister IDs into the wasm somehow this will probably run into some problems.
+
+-------------------------
+
+saikatdas0790 | 2022-09-13 10:17:30 UTC | #3
+
+The problem with this approach is that dfx does some minification and gzipping that this won't do. The `type: "rust"` specified in the `dfx.json` is much more ergonomic and having to do all the build steps ourself is error prone and counter productive.
+
+It would be much more ergonomic to just be able to ask dfx to build without needing to get the canister_id  in valid cases such as this.
+
+For dynamically deployed canisters, does dfx need to know the canister IDs? It could just build the canister and call it a day, no? Are there drawbacks to this that I'm not seeing?
+
+-------------------------
+
+Severin | 2022-09-13 11:21:05 UTC | #4
+
+Ah, I see. We have a todo item that would expose the optimization through a dfx command, but it just hasn't been prioritized so far. For the moment it's still possible to use `ic-cdk-optimizer` to shrink your wasm. `cargo install ic-cdk-optimizer` will install it. It won't be around forever since it's been deprecated, but for now it still performs the exact same optimization dfx would do otherwise.
+
+[quote="saikatdas0790, post:3, topic:15383"]
+It would be much more ergonomic to just be able to ask dfx to build without needing to get the canister_id in valid cases such as this.
+
+For dynamically deployed canisters, does dfx need to know the canister IDs? It could just build the canister and call it a day, no?
+[/quote]
+Honestly, so far we haven't really considered dynamically deployed canisters. And you are right, the id is not necessary in quite a few cases, so I agree that restriction could probably be lifted. (But I'll double-check with those that know the build system in a bit more detail.)
+
+[quote="saikatdas0790, post:3, topic:15383"]
+Are there drawbacks to this that I’m not seeing?
+[/quote]
+The biggest drawback I can come up with (not claiming this is a show-stopping issue) is that in some cases compilation could run for a while until the error appears even though it could've been detected much earlier if no canister IDs are present. 
+
+Potential workaround for now: Create a script that does the following
+- `dfx start`
+- `dfx canister create <your dynamic canister>`
+- `dfx build <your dynamic canister>`
+- `cp .dfx/local/canisters/<your dynamic canister>/<your dynamic canister>.wasm path/to/dynamic.wasm`
+
+This way it will copy the optimized wasm for your dynamic wasm to `path/to/dynamic.wasm`, from where you can include it in the real canister.
+
+-------------------------
+
+saikatdas0790 | 2022-09-13 12:02:46 UTC | #5
+
+Thank  you for the response. 
+
+I remember reading earlier that dfx also gzips the canister after ic-cdk-optimizer has been run. Not sure how to do that step manually.
+
+Finally, the compiler output tells me that there's another toolchain called [`binaryen`](https://github.com/WebAssembly/binaryen) that's run on the resulting wasm which reduces size further. Again not sure how to do that manually
+
+These are what my optimization steps look like:
+![image|535x199](upload://dOjC0GZnlTqDWRHWyBiwvlYIfbb.png)
+
+---
+
+![image|535x184](upload://5OmD3dZrhj2W2SC6gp3l4oVEPVJ.png)
+
+I believe ic-cdk-optimizer alone wouldn't give me those results
+
+-------------------------
+
+Severin | 2022-09-13 12:11:56 UTC | #6
+
+[quote="saikatdas0790, post:5, topic:15383"]
+I remember reading earlier that dfx also gzips the canister after ic-cdk-optimizer has been run. Not sure how to do that step manually.
+[/quote]
+
+Looking through the code I don't think dfx already zips up the wasm, but I may be wrong. You can just `gzip canister.wasm` though and put the resulting `.gz` file either as your canister's wasm in dfx.json or manually upload it with `dfx canister install --wasm canister.wasm.gz` (May require the 0.12.0 beta).
+
+[quote="saikatdas0790, post:5, topic:15383"]
+Finally, the compiler output tells me that there’s another toolchain called [`binaryen`](https://github.com/WebAssembly/binaryen) that’s run on the resulting wasm which reduces size further
+[/quote]
+binaryen is run with both dfx (which uses the [ic-wasm](https://github.com/dfinity/ic-wasm) crate) and [ic-cdk-optimizer](https://github.com/dfinity/cdk-rs/tree/main/src/ic-cdk-optimizer) (just grep for `binaryen`), so you can use either to minimize your wasm (or to read the source if you want to do it yourself).
+
+-------------------------
+
+saikatdas0790 | 2022-09-13 13:17:44 UTC | #7
+
+Got it. I ended up using a hack for now. By setting the canister ID in the `canister_ids.json` to `aaaa-aa`. I remember reading that since that ID corresponds to the management canister, it's ignored by dfx but the build passes.
+
+I believe the drawback you suggested would mostly not be relevant for folks running dfx build, because most folks whose build expect the canister ID to be present would be using `dfx deploy` instead of `dfx build`. I believe `dfx build` should be decoupled for that reason.
+
+Consider this thread a feature request if you decide to add this to your roadmap :slight_smile:
+
+-------------------------
+
+Severin | 2022-09-16 10:07:01 UTC | #8
+
+So, I just learned that `ic-wasm` can be used as a CLI tool! You can install it with `cargo install ic-wasm`. This would mean that you can ditch `ic-cdk-optimizer` for good. See `ic-wasm -h` for the available commands, the one you're most likely looking for is `shrink`.
+
+-------------------------
+
+saikatdas0790 | 2022-09-16 12:52:44 UTC | #9
+
+Thanks for that info. Starred that repo. Will try. To be honest, if `dfx build` just worked without needing canister ID provisioning, that would be ideal.  But will bookmark `ic-wasm` in case I need to do manual canister creation/optimization in the future
+
+-------------------------
+
+saikatdas0790 | 2022-11-01 11:59:29 UTC | #10
+
+Hi @Severin 
+
+I was looking through the dfx source code to understand exactly what steps the `dfx build` runs through. Specifically, I am looking at [this file](https://github.com/dfinity/sdk/blob/master/src/dfx/src/commands/build.rs) but I don't quite understand what it does. 
+
+If I were to use the `ic-wasm` CLI to mimic what `dfx build` does, what would the steps look like for a Rust canister?
+
+-------------------------
+
+Severin | 2022-11-01 12:14:38 UTC | #11
+
+I'm happy to provide as many details as you want. I'll just start with a relatively high-level overview so I don't spend too much time on stuff you're not interested in. Let me know what you want to know more about.
+
+High level overview of build.rs:
+
+- [L32-L43](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/commands/build.rs#L32-L43): set up environment
+- [L45-L60](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/commands/build.rs#L45-L60): Figure out from CLI options and dfx.json settings which canisters are supposed to be built, plus figure out for which canisters' canister ID and candid interface have to be available for the build commands
+- [L62-L76](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/commands/build.rs#L62-L76): enforce that canisters have to be created before the canisters are built. I'd love to lift that entirely, but there's some issues with that. Not sure if you were involved in the last discussions around that...
+- [L80-L84](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/commands/build.rs#L80-L84): actually build canister(s)
+
+What you are probably most interested in is the Rust specialisation of the [CanisterBuilder](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/lib/builders/mod.rs#L50) trait: [RustBuilder](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/lib/builders/rust.rs). This contains all the Rust-specific compilation details. Build step [here](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/lib/builders/rust.rs#L67-L77), shrink step refers to [this method](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/lib/builders/mod.rs#L407-L416).
+
+-------------------------
+
+Severin | 2022-11-01 12:17:52 UTC | #12
+
+Turns out I forgot to answer your actual question...
+
+[quote="saikatdas0790, post:10, topic:15383"]
+If I were to use the `ic-wasm` CLI to mimic what `dfx build` does, what would the steps look like for a Rust canister?
+[/quote]
+
+It's `cargo build --target wasm32-unknown-unknown --release --locked -p <your canister name>` and then `ic-wasm <wasm file> shrink`
+
+-------------------------
+
+saikatdas0790 | 2022-11-01 12:29:11 UTC | #13
+
+Thank you. Where does the --network ic flag get passed here?
+
+When building with `dfx build`, I also specify the network for the environment variable `DFX_NETWORK` to get set to "ic"
+
+-------------------------
+
+GLdev | 2022-11-01 13:57:39 UTC | #14
+
+Hey, just wanted to mention that if you need to create a canister that can self spawn itself, the pattern of storing the wasm binary at build time can quickly get out of hand (self importing gets almost as weird as time traveling, once you re-build your project). I've found a better pattern to handle such cases, check it out and consider this as an alternative.
+
+Instead of importing the bytes directly, you define somewhere a wasm variable of type ```Vec<u8>```
+
+Then you load the wasm bytes like so:
+
+```rust
+#[update(name = "load_wasm")]
+fn load_wasm(wasm: Vec<u8>) -> bool {
+
+    RUNTIME_STATE.with(|state| state.borrow_mut().data.business_state.wasm_store = wasm);
+
+    true
+}
+```
+
+(check the [repo](https://github.com/GLicDEV/ic-quickstart-actor-model/blob/c3a105dea9b391978e149f80bcfb98f06acee900/src/ic_quickstart_actor_model/src/lib.rs#L583) for some sha256 hashing if you'd like to verify the upload as well).
+
+Then you can use a simple tool such as [this](https://github.com/GLicDEV/ic-quickstart-actor-model/blob/main/src/wasm_loader/src/main.rs) to load the wasm in a post-build script. (check the repo for an example post-build script).
+
+-------------------------
+
+saikatdas0790 | 2022-11-01 14:32:28 UTC | #15
+
+Thank you for the inputs. Not exactly self spawning.
+
+I just need to be able to get at the built WASM without having to provision a canister ID.
+
+-------------------------
+
+saikatdas0790 | 2022-11-01 15:55:43 UTC | #16
+
+Hi @Severin 
+
+Any thoughts on the `--network ic` flag as part of the `dfx build`? Does that affect the script you provided at all?
+
+-------------------------
+
+Severin | 2022-11-01 17:39:24 UTC | #17
+
+[quote="saikatdas0790, post:13, topic:15383"]
+Where does the --network ic flag get passed here?
+
+When building with `dfx build`, I also specify the network for the environment variable `DFX_NETWORK` to get set to “ic”
+[/quote]
+
+I _think_ that's doing the same twice. If DFX_NETWORK  is set and no --network is provided then it should act as if --network was set to DFX_NETWORK
+
+[quote="saikatdas0790, post:16, topic:15383"]
+Any thoughts on the `--network ic` flag as part of the `dfx build`? Does that affect the script you provided at all?
+[/quote]
+
+Yes, [these lines](https://github.com/dfinity/sdk/blob/780f79366afd136dd651d903f80b7ca05193be5f/src/dfx/src/lib/builders/rust.rs#L79-L86) set the envvars so that the right canister ids are available. The `pool` contains the right IDs for the network.  But I've never looked at that in detail, so I'd have to investigate the details too
+
+-------------------------
+
+saikatdas0790 | 2022-11-01 18:37:39 UTC | #18
+
+[quote="Severin, post:12, topic:15383"]
+`cargo build --target wasm32-unknown-unknown --release --locked -p <your canister name>` and then `ic-wasm <wasm file> shrink`
+[/quote]
+
+Thank you. Just to confirm, when running cargo build as shown above, I don't need to specify the DFX_NETWORK env var. It'll automatically get set to "ic"?
+
+-------------------------
+
+Severin | 2022-11-02 07:11:37 UTC | #19
+
+Assuming you run dfx with `--network ic` yes, in that case you don't have to manually set DFX_NETWORK. If you want to run everything on your own, then you'll have to set it manually.
+
+How I arrived at this (mostly future reference for myself):
+
+[This](https://internetcomputer.org/docs/current/references/cli-reference/dfx-envars) is our (apparently lacking) documentation for environment variables which doesn't mention DFX_NETWORK.
+
+BUT in the default webpack config taken from `dfx new` there is this line:
+```
+const network =
+    process.env.DFX_NETWORK ||
+    (process.env.NODE_ENV === "production" ? "ic" : "local");
+```
+So this can be taken as a guaranteed thing. We wouldn't want to break everybody's frontend
+
+-------------------------
+

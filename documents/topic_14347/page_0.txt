@@ -1,0 +1,119 @@
+senior.joinu | 2022-07-15 17:48:47 UTC | #1
+
+Hey there!
+
+I'm implementing a stable BTreeMap for [ic-stable-memory](https://github.com/seniorjoinu/ic-stable-memory) and there is a problem. ic-stable-memory allows developers to react to OutOfMemory exceptions programmatically. This is important, because it gives an opportunity to continue auto-scaling horizontally, once you're out of stable memory.
+
+This exception is designed in such a way, so when you catch it, you're sure that there were no side-effects - the change you was going to make is reverted completely and the stable collection you're working with is operable (yes, you can't insert more values, but you're able to delete and search).
+
+Up until now this feature was easy to implement, since I only worked with array-based collections (e.g. vec, hashmap, binaryheap). But BTreeMap is different - all of it's algorithms are recursive and I have no ability to go back down the stack and revert changes, once the OOM is encountered on my way back to the tree root. 
+
+I was thinking on a possible solution, but everything I can do on my side does not seem acceptable:
+* I could implement my own stack and use it in order to revert changes, but it looks too complicated, since I would have to implement some way of determining whether the change was made to a node during this updating session and what was this change exactly;
+* I could give up on side-effects for this collection, but that would mean that when such an exception occurs, the collection might broke which will lead to data loss (and memory leaks);
+* (my current solution) I could give up on programmatic error handling support for this collection and just `trap()` each time the canister can't `grow()` more stable memory; this would make the collection free of side-effects, but the user won't be able to execute any logic after such an exception - so no automatic horizontal scaling.
+
+_______________
+I understand, that for now I'm maybe the only one person who is bothered by this, but anyway.
+There are things the Foundation can do in order to help me with to resolve this issue:
+
+### Proposal #1 - `stable64_can_grow(u64) -> bool`
+This is a function that receives an amount of bytes as an argument and returns a boolean value indicating whether or not this canister can call `stable64_grow()` with the same argument and be sure that there will be no error returned.
+I could use this function in order to determine if it would be possible to allocate enough stable memory for the worst case scenario (all nodes of BTreeMap are already full - insertion will lead to an allocation of logN new nodes). And if it's not - I will just throw OOM as a preventive measure. 
+
+This is not ideal, but this will work.
+Yes, I can use current `stable64_grow(u64) -> Result<u64, OutOfMemory>` in order to make this check, but this way the canister will always have some unused (but paid) stable memory, which is not great.
+
+Also, having such a function may actually be a good thing, since there is no `stable_shrink()` function and sometimes you only want to check if you can have this memory, but to not necessary start paying for it immediately. 
+
+### Proposal #2 - `trap_handled(u64, &str)` function and `post_trap(u64)` canister hook
+Additionally to existing `trap(&str)` function I propose to add a new `trap_handled(u64, &str)` function that also receives a user-defined error code. When such a function is called, everything behaves the same as with the common `trap()`: the canister's state is reverted, the client-user (message sender) receives an error response; BUT a special canister hook  `post_trap(u64)` is invoked with the same error code as was passed to `trap_handled()`. 
+
+A developer can define some custom error handling logic in this hook: from logging the error to another canister, to scaling horizontally (like in my case). 
+
+This would solve my issue completely (and, I assume, this would solve any "revert all changes, but do something else instead" issue there is), but it looks much harder to implement. 
+
+_____________
+What do you think? Please, share your feedback. Not calling for any action, just a discussion.
+
+Linking only @domwoe, since it looks like a topic for you (because of the working group).
+
+-------------------------
+
+senior.joinu | 2022-07-15 20:13:45 UTC | #2
+
+A better alternative to the first proposal might be a `stable64_available() -> u64` function, that will return how many pages of stable memory more is available for the canister to `grow`. 
+
+I believe such a function would be useful not only for me, but also for any other memory monitoring task, unlike the one that I've proposed first.
+
+-------------------------
+
+roman-kashitsyn | 2022-07-18 08:30:59 UTC | #3
+
+I wouldn't say I like the idea of extending the System API for this use case. It is possible to implement transactional semantics with the current interface; all we need is a slightly more clever code.
+For example, we could:
+1. Simulate the insertion first without actually touching the nodes. Compute the number of node allocations we need on the first descent.
+2. Allocate the required number of nodes.
+3. If the allocation failed, bailout.
+4. Otherwise, run the insertion "for real" using the pool of pre-allocated nodes.
+
+-------------------------
+
+roman-kashitsyn | 2022-07-18 08:38:13 UTC | #4
+
+Another approach that does not require two passes but is more copy-intensive: use a [purely functional](https://en.wikipedia.org/wiki/Purely_functional_data_structure) implementation.
+1. Create new nodes as you descend the tree instead of modifying the existing nodes. You'll need to allocate log(N) nodes on the path from the root to the new leaf.
+2. Keep track of all the nodes you allocated and the nodes they replace as you descend.
+3. If any allocations fail, release the created nodes and bailout.
+4. Once you know that the insertion succeeded, replace the tree root with the newly allocated root and reclaim old nodes.
+
+-------------------------
+
+paulyoung | 2022-07-18 08:39:36 UTC | #5
+
+For proposal #1, does `core::arch::wasm32::memory_size` help at all?
+
+-------------------------
+
+abk | 2022-07-18 09:08:22 UTC | #6
+
+`stable64_grow` could fail because we're hitting the subnet memory limit or the canister's memory limit, so that wouldn't work reliably.
+
+-------------------------
+
+senior.joinu | 2022-07-18 12:52:48 UTC | #7
+
+Thanks for the reply. This simulation tactic gave me an idea of how I could try to implement it in a more general way.
+
+In ic-stable-memory I have this "testing environment" where I emulate stable memory with a simple vector. Maybe I could use that environment for the insertion simulation, in order to keep the code simpler.
+
+-------------------------
+
+senior.joinu | 2022-07-18 12:54:51 UTC | #8
+
+As far as I understand, `wasm32::memory_size` will return the heap size. Stable memory is a different kind of memory, I believe it shouldn't be accounted by this function.
+
+-------------------------
+
+senior.joinu | 2022-07-18 13:22:06 UTC | #9
+
+Could you please elaborate on that a little bit more? 
+
+I understand that there is a subnet-level limit of how much stable memory can a single canister allocate at most (looks like it is on 8GB now).
+
+But also, for me it seems that `stable64_grow()` can actually fail randomly. This is a pure speculation, but I'm just coming from a simple logic:
+* I assume the memory allocation for a canister happens on-demand - for both heap and stable memory (otherwise these 79k already deployed canisters, that [this page](https://dashboard.internetcomputer.org/canisters) shows, just wouldn't fit)
+* this means that a scenario, when I deploy a new canister to an already dense packed subnet, where there are only, for example, 6GB of free memory total left, is possible
+* (assuming that other canisters in my subnet won't grow at all during this time) I can only `stable64_grow()` 6GB of stable memory, instead of 8GB, because there is physically less memory than the limit says;
+* so `stable64_grow()` should fail for me after I would try to grow more than 6GBs, and there is no way for me to find out this number before I would actually grow the memory
+
+-------------------------
+
+abk | 2022-07-18 15:13:22 UTC | #10
+
+Yes this description of the total subnet capacity is correct. Although I wouldn't say `stable64_grow` can fail "randomly" - it fails in well-defined situations, but a canister just doesn't have the information to determine when it's in that situation without actually making the call.
+
+In addition to the subnet limit, each canister has a fixed total memory limit (12 GB by default if you don't have a reserved memory allocation) and the canister's total memory usage on the subnet (including not just wasm memory and stable memory, but also the wasm binary size and space used by enqueued messages) count against that. So it's also possible a `stable64_grow` call will fail when it pushes the canister over that limit even if the stable memory would still be below 8 GB.
+
+-------------------------
+

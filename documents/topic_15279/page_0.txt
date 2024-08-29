@@ -1,0 +1,139 @@
+icme | 2022-09-05 00:50:22 UTC | #1
+
+Regarding this thread -> https://forum.dfinity.org/t/increased-canister-smart-contract-memory/6148/118
+
+I'm curious if anyone has performance tested stable memory vs. heap memory storage?
+
+Assuming the same canister settings and underlying data structure (i.e. Array, BTree, etc.) is used, I'd like to use data to build some ballpark intuition for the differences between stable & heap memory with respect to the following metrics:
+
+* Cycles (and cost)
+* Lookup/access time
+* Space/memory utilized
+
+Additionally, ideally these tests would be performed on data sets from 50MB-2GB, to see what the performance comparison looks like as the size of the data increases.
+
+I'm additionally curious about the performance of stable memory in the 2-8GB range.
+
+@senior.joinu @lastmjs @ielashi @rckprtr Would love your input, and please feel free to tag others who have experience with the performance of stable memory.
+
+-------------------------
+
+lastmjs | 2022-09-06 15:38:10 UTC | #2
+
+I haven't done any benchmarking yet, sorry about that
+
+-------------------------
+
+C-B-Elite | 2022-09-07 02:24:44 UTC | #3
+
+Stable Memory Performance: https://mirror.xyz/0x1F89AfC31f531f77Fd7eeC072619A8b86353a0B6/Wpdvh4nahn0rIrsvXK70bnvOnZ2o7YPuXUa8xwOZWPE
+
+Heap memory vs Stable Memory（In Chinese）: 
+https://github.com/C-B-Elite/Internet-Computer-Research/blob/main/Storage/%E5%AD%98%E5%82%A8%E5%AE%9E%E9%AA%8C%E4%B8%8E%E7%BB%93%E6%9E%9C%E8%AF%B4%E6%98%8E.pdf
+
+-------------------------
+
+ielashi | 2022-09-07 18:56:05 UTC | #4
+
+I unfortunately don't have concrete numbers yet, but very soon we'll be testing syncing the Bitcoin testnet state on a Wasm canister, so that should give us some insights into what it's like to have a relatively large canister.
+
+Regarding cycles/cost, [this file](https://github.com/dfinity/ic/blob/master/rs/embedders/src/wasmtime_embedder/system_api_complexity.rs) has the costs of various instructions. AFAICT, the cost for `stable_write` for example has an overhead of 20 instructions + 100 instructions per byte written. (@berestovskyy did I read that correctly?)
+
+I am not sure what you're referring to by "space/memory utilized". Are you referring to how stable/heap memory uses internally in the replicas?
+
+-------------------------
+
+icme | 2022-09-08 01:35:46 UTC | #5
+
+[quote="ielashi, post:4, topic:15279"]
+I am not sure what you’re referring to by “space/memory utilized”. Are you referring to how stable/heap memory uses internally in the replicas?
+[/quote]
+
+I'm referring to if you take the same x amount of MB to GB of data, and then you:
+
+1. Use the standard [BTreeMap in collections](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html) to store that data in the heap
+2. Use either the [IC stable BTreeMap](https://github.com/dfinity/ic/blob/master/rs/stable-structures/src/btreemap.rs) or the [ic-stable-memory BTreeMap](https://github.com/seniorjoinu/ic-stable-memory/blob/master/src/collections/btree_map.rs) to store that data in stable memory
+
+What does the overall memory footprint taken up look like between the two (is the BTreeMap in collections used with the heap more compact, is the BTreeMap in stable memory more compact, or are they similar)? How do the heap and stable memory perform as you continue to insert the same data from say 50MB -> 4GB?
+
+<br/>
+
+It might also make sense to perform this same test on a simpler data structure from an implementation standpoint, such as an array or linked list to ensure that we're not testing the data structure implementation, and are solely focusing on heap memory vs. stable memory.
+
+The overall goal from this conversation is to gain intuitions for the tradeoffs that a developer will gain or lose from when they choose to use the canister heap or stable memory as storage.
+
+-------------------------
+
+berestovskyy | 2022-09-08 14:06:59 UTC | #6
+
+morgen guys,
+The latest system API benchmarks are over here:
+https://github.com/dfinity/ic/blob/master/rs/execution_environment/benches/SYSTEM_API.md
+
+The benchmarks are very synthetic, so they are really the best case scenario. But still, the numbers greatly depend on the memory block size we operate on, i.e.:
+
+> ic0_stable_write()/1B	297M IPS
+> ic0_stable_write()/8K	33.1G IPS
+
+while the baseline performance is:
+
+> baseline/empty loop	7.64G IPS
+
+So the actual performance of a data structure will greatly depend on the block size we read/write, and it varies from a few times slower to a few times faster for large blocks.
+
+It would be really nice to have a set of benchmarks with some load patterns close to reality...
+
+-------------------------
+
+icme | 2022-09-09 02:36:40 UTC | #7
+
+I'm assuming `IPS` is referring to "instructions per second", where an instruction is a web assembly instruction and is directly then related to cycles utilized.
+
+What are the `/1B` and `/8K` suffixes to `ic0_stable_write()`?
+
+From the benchmarks you provided above, looking at stable read for the same benchmarks:
+
+```
+update/ic0_stable_read()/1B 	85.1ms 	86.6ms 	+1%
+update/ic0_stable_read()/8K 	259ms 	167ms 	-36%
+```
+
+How should I think about both the instruction costs and the speed (round time/new time) if I'm trying to find an element and iterating through a List O(n), looking up an element in a HashMap O(1), or descending through a balanced tree and making comparisons along the way O(log(n))?
+
+Are they additive (for each read & comparison along the way), or is there just some initial overhead for instructions accessing stable memory and then all subsequent computations, say in a search with read/compare, these subsequent instructions don't have that same overhead?
+
+-------------------------
+
+berestovskyy | 2022-09-12 12:53:06 UTC | #8
+
+> What are the `/1B` and `/8K` suffixes to `ic0_stable_write()` ?
+
+Those are stable writes for a 1 byte and 8 kilobyte blocks respectively.
+
+> How should I think about both the instruction costs and the speed
+
+I'm not sure, does speed beyond number of executed WASM instructions has any value you think?
+
+> Are they additive (for each read & comparison along the way)
+
+There is no caching functionality built into the BTreeMaps, so they are pretty much additive.
+
+-------------------------
+
+ielashi | 2022-09-17 12:24:25 UTC | #9
+
+We unfortunately don't yet have benchmarks for stable structures (stable BTreeMap and others). For the past few weeks, our contributions to stable structures were around making them functional. Examples:
+
+* The [MemoryManager](https://github.com/dfinity/ic/blob/master/rs/stable-structures/src/memory_manager.rs), which simulates having multiple memories and is necessary to ergonomically use multiple stable structures in a canister.
+* The [Log](https://github.com/dfinity/ic/blob/master/rs/stable-structures/src/log.rs) data structure, which is useful for storing append-only data. 
+
+I think we've now reached a point where stable structures have enough functionality to be useful, and within a few days we'll move it into a separate repo, open it up for external contributions, and publish it as a rust crate on crates.io. Now I think would be the time we'll start looking into its performance and do some benchmarking. Community contributions here would be more than welcome :slight_smile:
+
+-------------------------
+
+Samer | 2023-12-20 16:17:16 UTC | #10
+
+Any benchmarks in the meantime?
+
+-------------------------
+

@@ -1,0 +1,236 @@
+saikatdas0790 | 2023-08-25 10:22:32 UTC | #1
+
+I have an external REST endpoint that I am calling using https outcalls. How can I extract the canister_id from the request and validate who the canister is?
+
+Basically, like how we have the `caller()` mechanism for inter-canister calls where we can trust the network provided canister principal, how do I get the canister principal for an HTTPS outcall received from a canister?
+
+-------------------------
+
+domwoe | 2023-08-25 11:30:24 UTC | #2
+
+Here's some discussion about this:
+
+https://forum.dfinity.org/t/long-term-r-d-integration-with-the-ethereum-network/9382/95?u=domwoe
+
+-------------------------
+
+saikatdas0790 | 2023-08-25 12:08:14 UTC | #3
+
+Went over my head. 
+
+My takeaway from the minimal understanding that I had was it's possible but currently not available for a canister developer to be able to do this without implementing the signature mechanism themselves?
+
+-------------------------
+
+sea-snake | 2023-08-25 15:05:20 UTC | #4
+
+Right now the only way I can think of to verify it would be following approach:
+1. Keep a private key within canister
+2. Sign data to be sent in http outcall with this key
+3. Send data and this signature in http outcall
+
+The http server receiving the call can then verify the data with the public key for the above private key.
+
+I would recommend to always include a nonce (random value) and a timestamp within the data so you can reject incoming data that has already been received within a given time window. This is basically how the http calls are made to the IC too (with ingress expiry and request id based on data).
+
+Avoid sending a secret in http outcalls, approaches like above with signatures and/or encryption are more secure given the design of http outcalls.
+
+Being able to somehow sign data as the canister itself, would avoid the need to store a private key within the canister but that's not possible as far as I'm aware at the moment.
+
+-------------------------
+
+sea-snake | 2023-08-25 15:08:15 UTC | #5
+
+In theory a canister could add the hash of the http outcall data in the certified data tree before making the outcall. The http server can then verify if the hash has been certified through the canister status. This approach seems like an option without the need for a private key. Though it's not ideal that the http server needs to make a call after receiving data compared to simply checking a signature.
+
+-------------------------
+
+domwoe | 2023-08-25 17:48:04 UTC | #6
+
+Instead of keeping a secret in the canister (which is in principle extractable by the node providers), you can use [threshold ECDSA](https://internetcomputer.org/docs/current/developer-docs/integrations/t-ecdsa/) to sign. However, this adds latency and cost.
+
+-------------------------
+
+saikatdas0790 | 2023-08-31 13:02:32 UTC | #7
+
+This would not be feasible is what I understand from some basic calculations. I'm making around a million requests a day. Signing using tECDSA costs around 3 cents for every signing request. The resulting costs wouldn't work
+
+How does the exchange rate canister authenticate with feed providers?
+
+P.S. I'm assuming that every outcall request would need to call `sign`. If that's not the case, please elaborate
+
+-------------------------
+
+domwoe | 2023-08-31 15:42:03 UTC | #8
+
+[quote="saikatdas0790, post:7, topic:22374"]
+This would not be feasible is what I understand from some basic calculations. I’m making around a million requests a day. Signing using tECDSA costs around 3 cents for every signing request. The resulting costs wouldn’t work
+[/quote]
+
+Yep, I agree.
+
+[quote="saikatdas0790, post:7, topic:22374"]
+How does the exchange rate canister authenticate with feed providers?
+[/quote]
+
+It doesn't (I think) cc @THLO 
+
+So, if you don't care about the security implications of rogue node providers, you could just use a shared secret, i.e. API key.
+
+-------------------------
+
+senior.joinu | 2023-08-31 19:59:36 UTC | #9
+
+As an alternative to ecdsa, you could add your requests to canisters certified state and then query this state with the certificate with your remote web server. This can be done in batches. Once the batch is queried, you could purge it from the certified state.
+
+-------------------------
+
+saikatdas0790 | 2023-09-01 04:49:44 UTC | #10
+
+[quote="senior.joinu, post:9, topic:22374"]
+query this state with the certificate with your remote web server
+[/quote]
+
+Unless I'm misunderstanding, this would require an additionaly query by the off-chain server using one of the agents (js/rust).
+
+I would like to avoid this as this defeats the purpose of the outcall.
+
+But I'd like to explore your suggestion. Do you have a minimal example/repo that I could refer to? Thank you for the inputs :slight_smile:
+
+-------------------------
+
+THLO | 2023-09-01 07:14:57 UTC | #11
+
+[quote="domwoe, post:8, topic:22374"]
+It doesn’t (I think) cc @THLO
+[/quote]
+
+That's correct. The exchange rate canister only uses open APIs.
+
+-------------------------
+
+free | 2023-09-01 09:00:29 UTC | #12
+
+I suppose you could combine the two (tECDSA and API keys) and (repeatedly) use tECDSA to generate tokens with expiration times. E.g. every 10 minutes you get a new token valid for 15 minutes and attach it to your requests. If someone intercepts such a token, they can only (ab)use it for up to 15 minutes.
+
+It's not foolproof, but it also doesn't require you to bake a private key into your canister and risk it being stolen. It's also tunable: depending on your risk profile and how much you're willing to pay for the additional security, you could create a new token once per day or once per second.
+
+-------------------------
+
+senior.joinu | 2023-09-01 09:19:09 UTC | #13
+
+By the way, you could also use ecdsa, but just sign multiple requests in batch. The idea is to have multiple requests, but to only sign them all once. The only question is to how to combine these requests to enable this flow. You could combine requests' hashes and sign only the combination. This can be done by using some kind of Merkle tree (if you need then to verify each individual request's signature) or you could simply sort all request hashes and combine them in a new total hash using this order - this is simpler, but will only allow you to verify the signature of all requests at once.
+
+[quote="saikatdas0790, post:10, topic:22374"]
+Unless I’m misunderstanding, this would require an additionaly query by the off-chain server using one of the agents (js/rust).
+
+I would like to avoid this as this defeats the purpose of the outcall.
+[/quote]
+
+Yes. But on the other hand, this is cheaper.
+
+[quote="saikatdas0790, post:10, topic:22374"]
+But I’d like to explore your suggestion. Do you have a minimal example/repo that I could refer to? Thank you for the inputs :slight_smile:
+[/quote]
+
+No I don't. But you could use sources of the asset canister for guidance and inspiration.
+
+-------------------------
+
+saikatdas0790 | 2023-09-01 09:30:35 UTC | #14
+
+Thank you for the suggestions @free and @senior.joinu 
+
+Our needs are primarily for canister monitoring and logging, so, the above are a bit of too high effort vs benefits received at this stage to implement owing to the fact that security here isn't mission critical.
+
+But we'll revisit this decision again once this scales further.
+
+Although, after thinking about this a bit, I'm leaning towards the periodic key generation. Let me explore a bit more
+
+-------------------------
+
+saikatdas0790 | 2023-09-01 09:32:37 UTC | #15
+
+Quick follow on question, how would the periodically (let's say daily) generated secret key be shared with the off-chain server?
+
+-------------------------
+
+domwoe | 2023-09-01 09:32:49 UTC | #16
+
+[quote="saikatdas0790, post:14, topic:22374"]
+Our needs are primarily for canister monitoring and logging, so, the above are a bit of too high effort vs benefits received at this stage to implement owing to the fact that security here isn’t mission critical.
+[/quote]
+
+The best practice for this is to provide a log/metric endpoint and periodically fetch the data instead of pushing it.
+
+-------------------------
+
+saikatdas0790 | 2023-09-01 09:36:49 UTC | #17
+
+That won't work if there's an ever growing list of endpoints(canisters) that need to be queried by the monitoring solution.
+
+1. It would need a separate service for discovery, i.e., to know which endpoints to query
+2. Serverless solutions would run into limits of how long they can process jobs at a time. Considering that they are woken up every hour to scrape an ever growing list of endpoints
+
+-------------------------
+
+free | 2023-09-01 10:32:39 UTC | #18
+
+[quote="saikatdas0790, post:15, topic:22374"]
+how would the periodically (let’s say daily) generated secret key be shared with the off-chain server?
+[/quote]
+
+You don't need to share it with the off-chain server. In the same way that you would use tECDSA to sign every request (to say "this request was sent by canister X") without having to share anything but the public key with the server; you would use it to sign a token saying "the holder of this token is canister X". So the contents of the token would be the same over time ("I am canister X"), only its validity time range would be different.
+
+[quote="saikatdas0790, post:17, topic:22374"]
+That won’t work if there’s an ever growing list of endpoints(canisters) that need to be queried by the monitoring solution.
+[/quote]
+
+This is exactly what [Prometheus](https://prometheus.io/docs/introduction/overview/) does. In fact, you could very much use Prometheus for metrics, it's what we use at DFINITY for the various NNS and SNS canister metrics (e.g. [here](https://rrkah-fqaaa-aaaaa-aaaaq-cai.raw.ic0.app/metrics) is the metrics endpoint of the NNS governance canister; and [here](https://github.com/dfinity/ic/blob/f29f22b8063ddec0055c8d13a61a663c7d964a55/rs/nns/governance/src/lib.rs#L194) is the code that generates them). You can use something like [HTTP service discovery](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#http_sd_config) to inform Prometheus of a changing list of canisters to scrape.
+
+I'm not sure the ~~push~~ pull model works for logs and I don't have any experience in that area. You can probably accumulate quite a few log messages in the canister though and only push them once an hour or something. For that, it may be reasonable to rely on tECDSA to sign the full payload.
+
+-------------------------
+
+saikatdas0790 | 2023-09-01 12:41:58 UTC | #19
+
+[quote="free, post:18, topic:22374"]
+You can use something like [HTTP service discovery](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#http_sd_config) to inform Prometheus of a changing list of canisters to scrape.
+[/quote]
+
+Yep, we evaluated Prometheus before landing on our current solution. However, Prometheus:
+- is limited in its scope of what's possible in that it's mostly meant for monitoring
+- needs an additional service for discovery which wouldn't solve the auth problem anyway
+- would require us to use the limited string manipulation based metric publishing mechanism which is limited in its capacity to communicate rich data types
+- would require us to learn a new stack/query language/semantics which is limited to monitoring/Prometheus
+- doesn't have lots of options in terms of managed hosting services that we can use
+- doesn't have much in the way of support for logs
+- isn't generic enough for other use cases such as analytics
+
+But yeah, it's something that we definitely considered. Probably a discussion relevant for another time :slight_smile:
+
+-------------------------
+
+infu | 2023-09-01 12:54:17 UTC | #20
+
+If there was a request header. Something like "From-Canister-Id: ....." 
+Then you could whitelist node IPs and if you get ~12 HTTP requests from whitelisted IPs then you can trust it. Maybe there is such a header already?
+
+-------------------------
+
+saikatdas0790 | 2023-09-01 12:57:29 UTC | #21
+
+We can already set headers from inside a canister. How would this be different?
+
+A rogue actor impersonating our canisters could add the "From-Canister-Id" header when sending requests to our service is what I understand. 
+
+Please elaborate if I'm missing something :slight_smile:
+
+-------------------------
+
+infu | 2023-09-01 12:59:23 UTC | #22
+
+Yeah, well the system making the request can disallow the canister from setting that particular header and overwrite it
+
+-------------------------
+

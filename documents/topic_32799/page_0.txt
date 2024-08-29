@@ -1,0 +1,73 @@
+KirillTroiak | 2024-07-06 10:00:00 UTC | #1
+
+Good day, I want to perform profiling on stable data structure libraries in Motoko Language for my research. I would like to ensure that the measurements are valid by asking for your clarification on a number of nuances.
+Sorry, this will be quite a mouthful 😁.
+
+### Measured parameters: 
+#### 1) Stable memory usage for different number of elements: I want to use [ExperimentalStableMemory.stableVarQuery as Claudio suggested](https://forum.dfinity.org/t/please-tell-me-everything-practical-about-stable-memory/19703/5?u=kirilltroiak) to measure stable memory used:
+a) When I run this on an empty canister (without any variables or funcs) - it always shows me value of 9 bytes, should I just subtract 9 from all the next measurements?
+
+b) I tried using it for measuring simple stable variables, when I make an array: "stable var t: [Nat64] = [1, 2, 3, 4];" and then call stableVarQuery, after subtraction of 9 I get 40, regardless of the size of the array (tried adding a lot more elements or initing an empty arr []). Should it not take 8 bytes per each element (are the measurements of stableVarQuery always accurate?). [Source Code](https://github.com/ktry1/Motoko_measurement_questions/blob/main/Stable_memory.mo)
+
+#### 2) Heap memory usage for different number of elements: I want to use [rts values, as alexeychirkov did](https://forum.dfinity.org/t/motoko-array-memory/5324?u=kirilltroiak) to measure heap memory used. I use '--force-gc' in compiler args as [mentioned here](https://forum.dfinity.org/t/garbage-collection-when-using-the-motoko-playground/12995/9?u=kirilltroiak) to make gc run at the end of message and ensure correct measurements:
+a) I tried using it to measure simple variables, like array: 'var t: [Nat64] = [1, 2, 3, 4];', but no matter the size of array, it always gives me 'rts_heap_size = 44' like in empty canister, should it not be 8 bytes per each element? [Source code](https://github.com/ktry1/Motoko_measurement_questions/blob/main/Heap_memory.mo)
+
+b) Is the cycle cost for storing memory on the canister calculated as '({Stable memory used} + {rts_heap_size}) * {cycle cost per byte}' or is it '{rts_memory_size} * {cycle cost per byte}' for all allocated memory [as mentioned by rossberg](https://forum.dfinity.org/t/motoko-array-memory/5324/18?u=kirilltroiak). Just want to clarify, because the answer was in 2022.
+    
+#### 3) Cycle cost for calling update functions: I want to use [ExperimentalInternetComputer.countInstructions](https://internetcomputer.org/docs/current/motoko/main/base/ExperimentalInternetComputer#function-countinstructions):
+a) It says that it does not not account for any deferred garbage collection costs incurred by the function that is measured. If еhe operations are performed on a stable variable, how can I measure the gc costs? I want to use incremental gc. Maybe we should use {rts_reclaimed}, but what do we multiply it by to obtain cycle cost?
+
+-------------------------
+
+claudio | 2024-07-09 21:19:22 UTC | #2
+
+> a) When I run this on an empty canister (without any variables or funcs) - it always shows me value of 9 bytes, should I just subtract 9 from all the next measurements?
+
+9 bytes should not really matter, so I wouldn't bother subtracting.
+
+> b) I tried using it for measuring simple stable variables,
+
+In the source code that you link, the variable is *not* declared `stable` (a typo?) so its contents won't be considered for the size computation.
+
+> a) I tried using it to measure simple variables, like array: ‘var t: [Nat64] = [1, 2, 3, 4];’...
+
+I think what is happening here is that the constant value `[1,2,3,4]` is statically allocated (i.e. preallocated) by the compiler so won't contribute to the dynamic heap size. Try to use a dynamically create array, something like `Array.tabulate<Nat64>(1000, fun i { i });` and see if that alters the `rts_heap_size` reading.
+
+> b) Is the cycle cost for storing memory...
+
+The cost should depend on both the actual wasm and stable memory size so some function of `rts_stable_memory_size` (in 64KiB pages) and `rts_memory_size` (in bytes). What the precise function is I'm not sure, but perhaps one can figure it out from here https://internetcomputer.org/docs/current/developer-docs/gas-cost#storage
+
+> a) It says that it does not not account for any deferred garbage collection costs incurred by the function that is measured...
+
+
+
+`countInstructions(f)` can only measure instructions used during the execution of the functional argument `f()`, but GC (which happens after a message) and other things like message argument deserialization and result serialization happen outside of that, so can't be measured with any `f()`.
+
+As a last resort, you can, however, use `rts_mutator_instructions` and `rts_collector_instructions` to retrieve the number of instructions used by the last completed message (not the current message). The former should include the cost of argument/result deserialization and serialization, and any user computation, while the latter should include the GC work, of the last completed message of the actor. Probably a bit tricky to use though.
+
+-------------------------
+
+KirillTroiak | 2024-07-10 07:57:33 UTC | #3
+
+Thank you greatly for your answer, Claudio! 
+
+I think I will be using `rts_mutator_instructions` and `rts_collector_instructions` to measure instructions used by functions. I've been experimenting with them a bit by calling query function after the update execution has ended with '--force-gc' flag and it seems that `rts_mutator_instructions` counts instructions for the last message, while `rts_collector_instructions` counts instructions for the whole time the canister was running, as it only increases. 
+
+Looking forward to using this for my measurements!
+
+-------------------------
+
+claudio | 2024-07-10 13:36:02 UTC | #4
+
+Queries never commit state changes, omit GC (because there is no point), and can't update the state needed to track mutator/collector instructions, so don't use a query for those.
+
+I think you can only use these two to measure the cost of an update method that does not itself make any further calls. Maybe try that first.
+
+-------------------------
+
+KirillTroiak | 2024-07-10 17:40:46 UTC | #5
+
+Thanks, will keep that in mind. 🙂
+
+-------------------------
+

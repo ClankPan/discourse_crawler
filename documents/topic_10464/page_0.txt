@@ -1,0 +1,183 @@
+kpeacock | 2022-01-24 19:41:12 UTC | #1
+
+The Dfinity security team has flagged the 24 hour default delegation in `@dfinity/auth-client` as too insecure of a default, so we will be releasing an update as an `0.11.x` minor version update.
+
+The new version will have some changes to `@dfinity/agent` as well as the auth-client:
+
+*  Set the default delegation timeout to **8 hours**
+* Add support for invalidating an identity to an `Actor` and `HttpAgent`
+* Add an `idle` tracker to the `auth-client` that will invalidate
+* Provide `onIdle` and `onIdleWarning` callbacks to the authClient to trigger warning dialogs and prompts to refresh the user's authentication
+* Default idle time will be **10 minutes**
+  * After `Idle`, the user's identity will be invalidated, and the delegation will be cleared from localStorage
+* Delegation timeout, idle time, and idle warning will all be configurable
+
+These features are designed to make IC dapps secure by default, and hopefully with enough configuration to suit a variety of use cases, while minimizing the impact to user experience that is provided by our default. 
+
+What do you think? Do you support these changes, and are the defaults sensible for your use cases?
+
+-------------------------
+
+Gabriel | 2022-01-24 19:50:42 UTC | #2
+
+Nice, I love this one: 
+
+``` Provide onIdle and onIdleWarning callbacks to the authClient to trigger warning dialogs and prompts to refresh the user’s authentication ``` 
+
+Question, that default idle time is the one you can set in `maxTimeToLive` ?
+
+-------------------------
+
+kpeacock | 2022-01-24 21:10:14 UTC | #3
+
+The current `maxTimeToLive` option represents the expiration of the delegation, which becomes invalid after that # of nanoseconds. In the new scheme, it will represent the amount of time before a `DelegationIdentity` becomes invalid, assuming you have either prevented your browser from going idle in that time, or if the application has set the idle time to equal the `maxTimeToLive`, because they are not interested in that behavior
+
+-------------------------
+
+infu | 2022-01-30 13:07:25 UTC | #4
+
+Sounds good. I would also like to check if delegation has expired and not rely on catching errors when calling actor functions. Is that included in the list? Maybe both - timeout and idle are triggering the onIdle callback?
+
+-------------------------
+
+kpeacock | 2022-01-31 17:40:37 UTC | #5
+
+We have a utility for that! `@dfinity/authentication/isDelegationValid`
+
+https://erxue-5aaaa-aaaab-qaagq-cai.raw.ic0.app/authentication/modules.html#isdelegationvalid
+
+-------------------------
+
+infu | 2022-02-01 11:44:48 UTC | #6
+
+Nice, however the only place I have seen it used is here https://github.com/dfinity/agent-js/blob/96c5fee3f8e8246960f6cd4031ca52eb4dc6bd85/packages/auth-client/src/index.ts#L186
+
+I thought there will be something like agent.isExpired(), because it seems that currently, we have to take a delegation from localStorage to use this function. If I hardcode the key "ic-delegation" things may break in the future.
+
+-------------------------
+
+kpeacock | 2022-02-01 16:24:29 UTC | #7
+
+I see what you mean - I'll make a note to add the ability to inspect the identity being used by an actor, as well as checking its expiration, during the invalidation refactor
+
+-------------------------
+
+Nakamotik | 2022-02-09 15:05:23 UTC | #8
+
+Is "idle time" the time when there are no requests to IC with user delegation?
+What does "refresh the user’s authentication" mean?
+
+-------------------------
+
+kpeacock | 2022-02-09 15:49:32 UTC | #9
+
+Idle time is when there is no cursor movement, scrolling, or keyboard events for a certain amount of time.
+
+Refreshing the authentication would require sending the user back to II to log in again, but it would allow you to replace the `Identity` inside of the `HttpAgent` without having to re-initialize the `Actor`
+
+-------------------------
+
+kpeacock | 2022-03-24 23:26:43 UTC | #10
+
+Getting close to the final shape of this API - here's a glimpse into what it will look like
+
+```
+const authClient = await AuthClient.create({
+  idleOptions: {
+    idleTimeout: 1000 * 60 * 30, // default is 30 minutes
+    onIdle: () => {
+      // invalidate identity in your actor
+      Actor.agentOf(actor).invalidateIdentity() 
+      // prompt user to refresh their authentication
+      refreshLogin();
+    },
+    disableIdle: false, // set to true to disable idle timeout
+  }
+});
+// ...authClient.login()
+const identity = await authClient.getIdentity();
+const actor = Actor.createActor(idlFactory, {
+  agent: new HttpAgent({
+    identity,
+  }),
+  canisterId,
+});
+
+refreshLogin() {
+  // prompt the user before refreshing their authentication
+  authClient.login({
+    onSuccess: async () => {
+      // authClient now has an identity
+      const identity = await authClient.getIdentity();
+      // set new identity in your actor without reloading the page
+      Actor.agentOf(actor).replaceIdentity(identity);
+    },
+  });
+}
+```
+
+-------------------------
+
+peterparker | 2022-03-25 06:39:48 UTC | #11
+
+Nice 👍
+
+- will `onIdle` callback accept promises too?
+
+- if the identity becomes idle and `Actor.agentOf(actor).invalidateIdentity()` would not be called - i.e. if a developer does not implement such call, what would or would not happen?
+
+-------------------------
+
+kpeacock | 2022-03-25 21:59:01 UTC | #12
+
+Okay, I have a better pattern now. The `authClient` can let you register Actors. Registered actors will automatically get their identity invalidated after idle, and can get refreshed after `login` success. 
+
+You can add additional callbacks with `authClient.idleManager?.registerCallback?.(cb)`
+ 
+```
+const authClient = await AuthClient.create({
+  idleOptions: {
+    idleTimeout: 1000 * 60 * 30, // default is 30 minutes
+    disableIdle: false, // set to true to disable idle timeout
+  }
+});
+// ...authClient.login()
+const identity = await authClient.getIdentity();
+const actor = Actor.createActor(idlFactory, {
+  agent: new HttpAgent({
+    identity,
+  }),
+  canisterId,
+});
+
+authClient.registerActor("ii", actor);
+
+refreshLogin() {
+  // prompt the user then refresh their authentication
+  authClient.login();
+}
+
+authClient.idleManager?.registerCallback?.(refreshLogin)
+```
+
+-------------------------
+
+saikatdas0790 | 2022-06-08 15:20:15 UTC | #13
+
+@kpeacock 
+
+Could we do away with the `onSuccess` callback inside the `authclient.login` and just resolve the promise with the relevant response (`Identity`?) instead of having to specify a callback.
+This is because the `login` is itself a Promise and it seems like a poorly designed API if we need to specify a callback inside it when everything's resolved.
+
+Thoughts?
+
+-------------------------
+
+kpeacock | 2022-06-28 21:31:34 UTC | #14
+
+The `login` being a promise is mainly to support `async / await` patterns inside of the `onSuccess` callback. A callback approach is appropriate here because it mirrors the actual browser API being used. Because we have to handle interruptions from the opened window, and we are relying on the `message` event listener, which are asynchronous and event-based.
+
+I get that trying to await the result of the operation is syntactically nice, but it can also lock up the user's interaction in the page that initiated the request, which is not ideal. You are free to do this by wrapping the `login` and having the `onSuccess` resolve that `Promise`, but it is not an ideal practice that I would encourage
+
+-------------------------
+

@@ -1,0 +1,140 @@
+frederico02 | 2024-06-21 09:49:38 UTC | #1
+
+Hi,
+
+I'm using pocket-ic ( v 4.0.0 ) to test a cron job I have. It runs every hour and when it does i check if the timestamp i create falls within a 2 hour window using the `time` crate
+
+```rust
+pub fn timestamp_millis() -> u64 {
+    timestamp_nanos() / 1_000_000
+}
+#[cfg(target_arch = "wasm32")]
+pub fn timestamp_nanos() -> u64 {
+    unsafe { ic0::time() as u64 }
+}
+```
+
+```rust
+
+
+// specifies a range that the reward interval can occur. e.g on a certain weekday and between a start hour and end hour
+#[derive(CandidType, Deserialize, Serialize, Clone)]
+pub struct RewardDistributionInterval {
+    /// weekday - e.g  Monday, Tuesday, Wednesday = 2, Thursday = 3, Friday = 4, Saturday = 5, Sunday = 6
+    weekday: String,
+    /// 24 hour clock - 0 = 00, 14 = 14:00
+    start_hour: u8,
+    /// 24 hour clock - 0 = 00, 14 = 14:00
+    end_hour: u8,
+}
+
+impl Default for RewardDistributionInterval {
+    fn default() -> Self {
+        Self {
+            weekday: "Wednesday".to_string(),
+            start_hour: 14, // 2pm
+            end_hour: 16, // 4pm
+        }
+    }
+}
+
+impl DistributionInterval {
+    pub fn is_within_interval(&self, timestamp_millis: TimestampMillis) -> bool {
+        let timestamp_secs = timestamp_millis / 1000; // Convert milliseconds to seconds
+
+        // Create a DateTime equivalent using time crate
+        let timestamp = match time::OffsetDateTime::from_unix_timestamp(timestamp_secs as i64) {
+            Ok(t) => t,
+            Err(_) => {
+                return false;
+            } // Invalid timestamp
+        };
+
+        // Convert weekday index to time crate's Weekday enum
+        let weekday = match Weekday::from_str(&self.weekday) {
+            Ok(w) => w,
+            Err(e) => {
+                debug!("Invalid Weekday set for distribution reward interval");
+                return false;
+            } // Invalid weekday index
+        };
+
+        // Check if the given timestamp is on the specified weekday
+        if timestamp.weekday() == weekday {
+            // Check if the given timestamp is within the specified hour range
+            let hour = timestamp.hour();
+            if hour >= self.start_hour && hour < self.end_hour {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+```
+the unit tests for this all seem to work correctly.
+
+```rust
+
+#[test]
+    fn test_reward_distribution_interval() {
+        let distribution_interval = RewardDistributionInterval {
+            weekday: "Wednesday".to_string(),
+            start_hour: 14,
+            end_hour: 16,
+        }; // wednesday between 14:00 and 16:00
+
+        let time_now = 1718809200855; // UTC - wednesday Jun 19, 2024, 3:00:00 PM
+        assert_eq!(distribution_interval.is_within_interval(time_now), true);
+
+        let time_now = 1718805600855; // UTC - wednesday Jun 19, 2024, 14:00:00 PM
+        assert_eq!(distribution_interval.is_within_interval(time_now), true);
+
+        let time_now = 1718812799855; // UTC - wednesday Jun 19, 2024, 15:59:59 PM
+        assert_eq!(distribution_interval.is_within_interval(time_now), true);
+
+        let time_now = 1718812800855; // UTC - wednesday Jun 19, 2024, 16:00:00 PM
+        assert_eq!(distribution_interval.is_within_interval(time_now), false);
+
+        let time_now = 1718805599855; // UTC - wednesday Jun 19, 2024, 13:59:59 PM
+        assert_eq!(distribution_interval.is_within_interval(time_now), false);
+
+        let time_now = 1718722800855; // UTC - Tuesday Jun 18, 2024, 15:00:00 PM
+        assert_eq!(distribution_interval.is_within_interval(time_now), false);
+    }
+
+```
+
+
+in my integration test I make sure to set the time and advance time like so
+
+```rust
+   pic.set_time(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1718814600));
+ /// ....
+  test_env.pic.advance_time(Duration::from_millis(DAY_IN_MS * 1));
+    tick_n_blocks(&test_env.pic, 100);
+    test_env.pic.advance_time(Duration::from_millis(DAY_IN_MS * 6));
+    tick_n_blocks(&test_env.pic, 100);
+    test_env.pic.advance_time(Duration::from_secs(180 * 60));
+    tick_n_blocks(&test_env.pic, 100);
+    println!("time is {:?}", test_env.pic.get_time());
+```
+
+the time i see in the println log does match what I expect. however my function is_within_interval always returns false. Any suggestions on what this might be?
+
+i do notice that in my pocket-ic logs, it doesn't seem to increase with what i would expect since I have advanced time by 7 days since June 21 I expect to see June 28th.
+```
+aa-aaaaa-aaaca-cai
+Jun 21 09:33:24.171 WARN s:/n:/ic_messaging/stream_builder No route to canister rkp4c-7iaaa-aaaaa-aaaca-cai
+Jun 21 09:33:24.187 WARN s:/n:/ic_messaging/stream_builder No route to canister rkp4c-7iaaa-aaaaa-aaaca-cai
+```
+
+-------------------------
+
+frederico02 | 2024-06-21 13:50:59 UTC | #2
+
+Ah i found the issue. I wasn't advancing time correctly. internal time of the canister whilst in pocket-ic won't update unless i advance time 1 hour in a loop
+
+-------------------------
+

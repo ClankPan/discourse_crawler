@@ -1,0 +1,182 @@
+senior.joinu | 2021-05-18 22:28:49 UTC | #1
+
+I want to check if a third party canister was updated since recently and maybe did broken some of its APIs. How can I achieve this?
+
+Is there any version info or latest update timestamp somewhere?
+
+-------------------------
+
+nomeata | 2021-05-19 07:59:28 UTC | #2
+
+We don’t have version info or latest update timestamp, but you can query the SHA256 of the installed module and compare to what you observed before. You can use `dfx` for that
+```
+~/dfinity/nns-ifaces $ dfx canister --no-wallet --network mercury info governance
+Controller: r7inp-6aaaa-aaaaa-aaabq-cai
+Module hash: 0x8e8303c87e9ed91cd367d65207215cdfe46401fd81e61410b6ae7384858bbc09
+```
+
+-------------------------
+
+senior.joinu | 2021-05-19 08:28:38 UTC | #3
+
+Thanks a lot!
+
+Any way to do this onchain?
+
+-------------------------
+
+wang | 2021-05-19 08:53:14 UTC | #4
+
+This works if you're querying a canister that is controlled by the current one:
+```
+type CanisterIdRecord = { canister_id : Principal };
+
+type CanisterStatusResult = {
+    controller : Principal;
+    status : { #stopped; #stopping; #running };
+    memory_size : Nat;
+    module_hash : ?Blob;
+    cycles : Nat;
+    balance : [(Blob, Nat)]
+};
+
+private let ic00 = actor "aaaaa-aa" : actor {
+    canister_status : CanisterIdRecord -> async CanisterStatusResult;
+};
+
+public func status(dst : Principal) : async CanisterStatusResult {
+    await ic00.canister_status({canister_id = dst})
+};
+```
+
+How do we do this for arbitrary canisters?
+
+-------------------------
+
+nomeata | 2021-05-19 09:23:14 UTC | #5
+
+This is currently not possible on-chain if you are not the controller (although it should be), sorry.
+
+-------------------------
+
+wang | 2021-05-19 09:13:32 UTC | #6
+
+How can we do this off-chain in order build a canister registry as described here?
+
+https://forum.dfinity.org/t/how-can-i-deploy-a-canister-that-is-verifiably-running-public-code/3811
+
+-------------------------
+
+nomeata | 2021-05-19 10:17:05 UTC | #7
+
+Off-chain? Using the `dfx` command I showed above (or the underlying `read_state` HTTP API function)
+
+-------------------------
+
+wang | 2021-05-19 10:33:43 UTC | #8
+
+Oh I see, this works:
+``` dfx canister --network ic --no-wallet info ryjl3-tyaaa-aaaaa-aaaba-cai```
+
+Can you point me to the equivalent in JS with `@dfinity/agent`?
+
+-------------------------
+
+dpdp | 2021-05-19 10:39:57 UTC | #9
+
+https://sdk.dfinity.org/docs/interface-spec/index.html#state-tree-canister-information
+
+I tried to call the endpoints directly; It did not seem to respond
+
+-------------------------
+
+nomeata | 2021-05-19 12:53:43 UTC | #10
+
+[quote="wang, post:8, topic:3987"]
+Can you point me to the equivalent in JS with `@dfinity/agent` ?
+[/quote]
+
+Not an expert on JS, but it seems that there is a method for [readState](https://erxue-5aaaa-aaaab-qaagq-cai.raw.ic0.app/agent/classes/httpagent.html#readstate). That returns a certificate which you can parse, validate and read from using [`Certificate`](https://erxue-5aaaa-aaaab-qaagq-cai.raw.ic0.app/agent/classes/certificate.html).
+
+[quote="dpdp, post:9, topic:3987"]
+I tried to call the endpoints directly; It did not seem to respond
+[/quote]
+
+I’d need more information about what you tried to do to help you here.
+
+-------------------------
+
+dpdp | 2021-05-19 13:23:05 UTC | #11
+
+I tried this
+
+https://h5aet-waaaa-aaaab-qaamq-cai.raw.ic0.app/api/v2/canister/h2bch-3yaaa-aaaab-qaama-cai/module_hash
+
+But it seems it's 404
+
+-------------------------
+
+nomeata | 2021-05-19 15:13:57 UTC | #12
+
+That’s not how it works, sorry :slight_smile: 
+
+You have to `POST` a suitable `read_state` request to `https://h5aet-waaaa-aaaab-qaamq-cai.raw.ic0.app/api/v2/canister/read_state`, and then decode the resulting certificate. Will take a while to implement from scratch, so I encourage using the agents. But if you want to learn more, maybe start reading from https://sdk.dfinity.org/docs/interface-spec/index.html#http-interface
+
+-------------------------
+
+dpdp | 2021-05-19 15:18:42 UTC | #13
+
+Ha i misunderstood the specs :slight_smile: 
+
+![Screen Shot 2021-05-19 at 6.17.15 PM|387x500](upload://rcsWmRrbbREI2NzehhbiTzFl9AR.png)
+
+Information is very close; I will use the agent;
+
+-------------------------
+
+wang | 2021-05-25 09:16:14 UTC | #14
+
+This works for me:
+
+```js
+import {
+  HttpAgent,
+  Principal,
+  Certificate,
+  blobFromText,
+} from "@dfinity/agent";
+
+const agent = new HttpAgent({ host: "https://ic0.app" });
+const canisterId = Principal.fromText("a4gq6-oaaaa-aaaab-qaa4q-cai");
+const path = [
+  blobFromText("canister"),
+  canisterId.toBlob(),
+  blobFromText("module_hash"),
+];
+const res = await agent.readState(canisterId, {
+  paths: [path],
+});
+const cert = new Certificate(res, agent);
+await cert.verify();
+const module_hash = cert.lookup(path);
+```
+
+-------------------------
+
+gajendraks | 2021-12-25 14:08:34 UTC | #15
+
+Sorry if am asking wrong question.
+
+Lets say a code is being deployed on canister which hosts some service to the public, and after somedays the canister owner has modified the code, how can the public know whether this is modified or not?
+So based on the canister version/changelog people/public can take call whether to use the service.
+
+If there is no way for public to know the version/modification on canister. Could anyone explain the intention behind that?
+
+-------------------------
+
+northman | 2022-01-15 12:18:18 UTC | #16
+
+Has any progress been made on being able to get the module hash for a canister for which you are not the controller on chain?
+
+-------------------------
+

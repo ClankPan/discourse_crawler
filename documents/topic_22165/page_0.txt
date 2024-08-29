@@ -1,0 +1,232 @@
+LightningLad91 | 2023-08-15 19:16:34 UTC | #1
+
+Hello. I am attempting to build a Motoko module that efficiently packs different primitive types into a fixed size byte array for stable storage and/or data transmission between canisters. I would like to avoid needlessly creating and recreating arrays and objects to do this.
+
+The types would look like this:
+
+```
+type Schema = [Field];
+
+type Record = [Value];
+
+type Field = {
+  #n: Nat // indicates a byte range of size <Nat> for storing a natural number
+  #i: Nat // indicates a byte range of size <Nat> for storing a signed integer
+  ... 
+};
+
+type Value = {
+  #n: Nat //stores a value of type Nat
+  #i: Int //stores a value of type Int
+  ...
+};
+
+type Struct = {
+  length: Nat; // Stores the size of the array for convenience
+  schema: Schema // Provides instruction for packing data into the array
+  var buffer: [var Nat8] // used to store byte values as they are packed 
+};
+```
+I'm planning for the following functions to be included:
+```
+func init(s: Schema): Struct {
+  let bytecount: Nat = countBytes(s);  //evaluates the total size of the struct based on the fields define in the Schema
+  return {
+    length = bytecount;
+    schema = s;
+    var buffer = Prim.Array_init<Nat8>(bytecount, 0);
+  }
+};
+
+func pack(s: Struct, r: Record): Blob {}; // pack an array of values into a blob
+
+func unpack(s: Struct, b: Blob): Record {}; // unpack a blob into an array of values
+```
+
+I understand that when I call `Struct.unpack(s, b)` I will have to initialize a new mutable array by calling `s.buffer := Blob.toArrayMut(b)`. I can then iterate over the buffer and extract the values according to the schema.
+
+But, when I call `Struct.pack(s, r)` i'm not sure if it would be cheaper to initialize a new array by calling `s.buffer := Array.init<Nat8>(s.length, 0)` or if i should create and use a function like `zeroize(s.buffer)` to just set all of the values in the buffer to 0 before I start writing new data.
+
+I imagine the size of the array probable has some impact on this decision. I also understand that I could probably do my own tests to figure this out. Honestly, I don't get a lot of time to work with Motoko so I was hoping someone in the community might have some experience looking into this sort of question.
+
+Thanks in advance.
+
+-------------------------
+
+skilesare | 2023-08-16 01:57:19 UTC | #2
+
+Following.
+
+As an aside...do you think you'll get better performance than to_candiding the thing and then zipping it?
+
+https://github.com/NatLabs/deflate.mo/tree/main
+
+-------------------------
+
+LightningLad91 | 2023-08-16 12:50:15 UTC | #3
+
+I don’t think I’ll get better performance than using to_candid but I would like to be able to produce a fixed size blob every time I pack a set of values under a given schema. I didn’t think candid offered that.
+
+That gzip lib looks cool but I’m not sure how it helps with this. Most of the records I’m looking to pack into a blob are going to be relatively small (<2mb).
+
+Edit: I made an incorrect statement about from_candid
+
+-------------------------
+
+skilesare | 2023-08-16 12:34:27 UTC | #4
+
+I don't think from_candid is async...it is just a system function.
+
+I was just making the(likely false assumption) that you were trying to compact the data somehow.
+
+If it is just that you need binary, you may find some good stuff in https://forum.dfinity.org/t/completed-icdevs-org-bounty-24-stablebtree-mokoko-up-to-10k/14867.  Also, check with @matthewhammer as he has an whole new stable region syntax ready for motoko.
+
+-------------------------
+
+LightningLad91 | 2023-08-16 12:47:23 UTC | #5
+
+I had to look back at my code from last year and you’re right from_candid isn’t async. My apologies. 
+
+Im actually looking forward to @matthewhammer stable regions work. I wanted to build something like that for my filesystem and was happy to learn DF was working on something.
+
+-------------------------
+
+LightningLad91 | 2023-08-16 14:22:01 UTC | #6
+
+I would still appreciate some feedback on whether it’s cheaper to zeroize a mutable array or initialize a new one in this scenario. I feel like that would be useful information regardless of how I plan to use this knowledge.
+
+-------------------------
+
+tomijaga | 2023-08-19 12:15:10 UTC | #7
+
+I think zeroing the existing array might be better because you avoid deallocating the old array and allocating memory for the new one.
+
+However, there is a third approach that might be more performant. Assuming the array isn't always filled you could add a variable (`count`) that keeps track of the items in the array. So instead of zeroing the array, you would update the `count` value to zero indicating that it is empty and when new data is added you can increment the variable.
+
+Also, you could skip allocating a new array in the `unpack()` fn by iterating over the blob directly and extracting its values to the buffer:
+
+```swift
+var i = 0;
+for (val in blob.vals()){
+    s.buffer[i] := val;
+    i+= 1;
+}
+
+count := i;
+```
+
+-------------------------
+
+LightningLad91 | 2023-08-19 19:00:33 UTC | #8
+
+Hey @tomijaga, thank you for taking the time to respond.
+
+[quote="tomijaga, post:7, topic:22165"]
+I think zeroing the existing array might be better because you avoid deallocating the old array and allocating memory for the new one.
+[/quote]
+
+That was my suspicion as well. I guess I was wondering if it’s possible to reach a point where making a bunch of individual changes to the values within an array can cost more than the allocation and deallocation of memory for the array itself. I may be overthinking this though.
+
+
+[quote="tomijaga, post:7, topic:22165"]
+However, there is a third approach that might be more performant. Assuming the array isn’t always filled you could add a variable (`count`) that keeps track of the items in the array. So instead of zeroing the array, you would update the `count` value to zero indicating that it is empty and when new data is added you can increment the variable.
+[/quote]
+
+In this case I’m writing it with the expectation that the `Record` being passed to `pack()` has the same size and order of values as the `Schema` that was stored in the struct when I called `Struct.init()`. So the entire buffer will be populated and there can be a series of empty (0) bytes at different offsets depending on the values being packed into it.
+
+[quote="tomijaga, post:7, topic:22165"]
+Also, you could skip allocating a new array in the `unpack()` fn by iterating over the blob directly and extracting its values to the buffer:
+[/quote]
+
+Doesn’t blob.vals() have to allocate memory for the array that is stored in the iterator?
+
+-------------------------
+
+icme | 2023-08-20 05:17:34 UTC | #9
+
+Without understanding too much about the efficiency of `Blob.fromArrayMut()`, my intuition would be to use [Array.tabulateVar()](https://github.com/dfinity/motoko-base/blob/085468f72379236b4a6346ceda4eb0101cd0ec7d/src/Array.mo#L57C3-L57C26) to initialize the mutable array, and then use `Blob.fromArrayMut(<mut_array>)` to get to the blob.
+
+@kentosugama did a heroic rewrite of the Buffer class earlier this year, so I'm guessing he might have a better idea of the optimal route.
+
+-------------------------
+
+timo | 2023-08-20 15:41:18 UTC | #10
+
+I can recommend to do some experiments with [countInstructions](https://internetcomputer.org/docs/current/motoko/main/base/ExperimentalInternetComputer/#function-countinstructions). You can do it in the playground it is very easy and it will tell you exactly what you want to know.
+
+I can also recommend to look at the implementation of the functions in motoko-base. Here is the [Array module](https://github.com/dfinity/motoko-base/blob/master/src/Array.mo). You can see `init` (for mutable array) and `tabulate` (for immutable array) are implemented directly in the runtime and therefore fast, while `tabulateVar` is implemented in Motoko and therefore slow compared to tabulate. The reason is that each array access in Motoko for each individual index comes with an out-of-bounds check which the runtime can avoid. So my guess is that your two options, allocating a new mutable array or overwriting an existing one, are too close to each other to be worth worrying about. Only if you can use an immutable array _and_ create it with `tabulate` then you could see an advantage.
+
+There is a comment in `tabulateVar` saying that it may also be moved to the runtime in the future. Once that happens then in your question it would indeed be more efficient to create a new array instead of overwriting an existing one _if_ you can create the new array with `tabulateVar` (not with `init` plus looping yourself over it).
+
+-------------------------
+
+LightningLad91 | 2023-08-21 03:57:37 UTC | #11
+
+Hi @timo, thank you for sharing this. I knew we had tools for estimating costs but I didn’t realize it was that simple to count the number of instructions.
+
+I ran a quick test on the playground earlier today and it looks like initializing a new array with `init` and assigning it to an existing variable required a little more than half the number of instructions required to change all of the values in the existing array to zero.
+
+I would share the playground link but i flubbed up and refreshed the screen as I was wrapping up. Will try again tomorrow. Thank you again.
+
+-------------------------
+
+LightningLad91 | 2023-09-10 19:41:32 UTC | #12
+
+@skilesare @Tim @Gekctek @tomijaga @icme 
+
+I just pushed my "Struct" repository to [github](https://github.com/TFC-Motley/Struct). This was inspired by Python library of the same name. 
+
+I'm still writing tests but would appreciate any feedback y'all might have.
+
+Thanks!
+
+-------------------------
+
+icme | 2023-09-10 22:58:50 UTC | #13
+
+From a DX perspective, I might prefer spelling out the type of the variant (i.e. `#nat` instead of `#n`). I don't think it makes a different space wise either since you're packing the data as a blob anyways, right?
+
+Also, it might be nice if `Struct.unwrapNat()` takes in the type argument of the schema to make sure the developer isn't accidentally pulling the wrong type. You could event then potentially simplify it to `Struct.unwrap<MySchemaType>(reg, 0)` and then the type returned would be inferred based off of the schema. I'm not sure how easy this would be to do on the Motoko side of things, but it would be a nice DX.
+
+-------------------------
+
+LightningLad91 | 2023-09-10 23:41:27 UTC | #14
+
+[quote="icme, post:13, topic:22165"]
+From a DX perspective, I might prefer spelling out the type of the variant (i.e. `#nat` instead of `#n`). I don’t think it makes a different space wise either since you’re packing the data as a blob anyways, right?
+[/quote]
+
+Yeah the variant doesn’t impact the size. I was trying to figure out if spelling it out was better or not. Nothing against it and I can make that change easy enough.
+
+
+[quote="icme, post:13, topic:22165"]
+Also, it might be nice if `Struct.unwrapNat()` takes in the type argument of the schema to make sure the developer isn’t accidentally pulling the wrong type.
+[/quote]
+
+I was approaching it with the mindset that if you successfully unpacked a blob then it implies that your schema is valid and you can safely assume the type of data at that index of the register. 
+
+
+[quote="icme, post:13, topic:22165"]
+`Struct.unwrap<MySchemaType>(reg, 0)` and then the type returned would be inferred based off of the schema. I’m not sure how easy this would be to do on the Motoko side of things, but it would be a nice DX.
+[/quote]
+
+I’m not sure I can make that work in Motoko without declaring a generic and then there’s no way to know if that generic matches the primitive type stored in the variant.
+
+-------------------------
+
+matthewhammer | 2023-09-12 15:08:59 UTC | #15
+
+[quote="LightningLad91, post:5, topic:22165"]
+Im actually looking forward to @matthewhammer stable regions work. I wanted to build something like that for my filesystem and was happy to learn DF was working on something.
+[/quote]
+
+Update: [The new region system in the latest release of Motoko](https://github.com/dfinity/motoko/releases), thanks to lots of help from @claudio!
+
+-------------------------
+
+LightningLad91 | 2023-09-12 16:08:27 UTC | #16
+
+This is really great and I think it’s going to make the next step of my project a lot easier to implement. Thank you and the rest of the team for your efforts.
+
+-------------------------
+

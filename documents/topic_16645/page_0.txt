@@ -1,0 +1,205 @@
+Safik | 2022-11-17 13:19:27 UTC | #1
+
+Hi!
+After all, not all issues have been resolved by me.
+Error exchanging ICP for cycles. The transaction is stuck. I must say right away I tried to solve the problem myself for a long time.Below in details.
+Coinage code:
+
+```
+    public shared({caller}) func minting_cycles_this_canister(
+            icp_amount: Nat) : async (TransferResult, NotifyTopUpResult){
+                return await mctc(caller, icp_amount);
+    };
+    public shared({caller}) func mctc(
+            user_caller: Principal,
+            icp_amount: Nat) : async (TransferResult, NotifyTopUpResult){
+        var amount = Nat64.fromNat(icp_amount);
+        assert(amount > (Const.transfer_icp_fee + 100_000));
+        var transfer_res: TransferResult = #Err(#TxCreatedInFuture);
+        var transform_notify_res: NotifyTopUpResult = #Err(#InvalidTransaction(""));
+        let time = { timestamp_nanos = Nat64.fromNat(Int.abs(Time.now())) };
+        let amount_res = { e8s = amount - (Const.transfer_icp_fee + 100_000)};
+        let coinage: Principal = Principal.fromText(Const.canister_nns_cycles_minting);
+        let subaccount: SubAccount = Tools.principalToAccount(caller, null);
+        let to_cycles = Tools.accountIdentifier(coinage, subaccount);
+        try{
+             transfer_res := await public_ledger.transfer({
+                to = to_cycles;
+                fee = { e8s = Const.transfer_icp_fee; };
+                memo = 0;
+                from_subaccount = null;
+                // from_subaccount = ?subaccount;
+                created_at_time = ?time;
+                amount = amount_res;
+            });
+            switch(transfer_res){
+                case(#Err(e)){
+                    return (transfer_res, transform_notify_res);
+                };
+                case(#Ok(height)){
+
+                    transform_notify_res := await public_ccn.notify_top_up({
+                                block_index = height;
+                                canister_id = caller;
+                            });
+                    return (transfer_res, transform_notify_res);
+                };
+            };
+        }
+        catch(e){ 
+            return (transfer_res, transform_notify_res);
+        };
+    };
+```
+
+Error:
+
+```
+(
+  variant { Ok = 4_878_415 : nat64 },
+  variant {
+    Err = variant {
+      InvalidTransaction = "Destination account in the block (c46e6da5d5aab2239fe94051c759104885d80243c1f685f61e4089bf48b94a2b) different than in the notification (b00c86416e82dd18993ed926eaeee00a94de9aceb02d37ca9c4823076a7aef83)"
+    }
+  },
+)
+```
+That is, the transaction with ICP passes, but they get stuck and do not return the exchanged cycles.
+
+All trial transactions are stuck on https://icscan.io/account/c46e6da5d5aab2239fe94051c759104885d80243c1f685f61e4089bf48b94a2b
+
+-Can you tell me what's wrong again?
+
+-Maybe it is necessary to create a canister using an actor (rkp4c-7iaaa-aaaaa-aaaca-com) .notify_create_canister and only then will the coinage cycles work for the created canister?
+
+-------------------------
+
+roman-kashitsyn | 2022-11-17 16:30:28 UTC | #2
+
+> let subaccount: SubAccount = Tools.principalToAccount(caller, null);
+
+Can I look at the `principalToAccount` function?
+[That's how](https://github.com/dfinity/sdk/blob/3d91c1be7f1a508f9506e10f666584634a2f85a3/src/dfx/src/lib/nns_types/account_identifier.rs#L177-L185) DFX computes the subaccount for a principal:
+```
+    fn from(principal_id: &Principal) -> Self {
+        let mut subaccount = [0; std::mem::size_of::<Subaccount>()];
+        let principal_id = principal_id.as_slice();
+        subaccount[0] = principal_id.len().try_into().unwrap();
+        subaccount[1..1 + principal_id.len()].copy_from_slice(principal_id);
+        Subaccount(subaccount)
+    }
+```
+
+-------------------------
+
+bogwar | 2022-11-17 16:41:34 UTC | #3
+
+I think there are two issues with the code. 
+
+First, the subaccount the ICP transfer goes to needs to be an encoding of the canister id where the cycles will go to. The encoding is what Roman shared above.  I think `principalToAccount` returns the default account of the principal.  
+
+The second issue is that transfers that are intended for topping up canisters need to have a specific memo field, namely  `0x50555054`   (there's also a specific memo if you want to use the converted cycles to create a canister). You can see the definitions of the memos used [here](https://sourcegraph.com/github.com/dfinity/ic@05aec87/-/blob/rs/nns/cmc/src/lib.rs?L104).
+
+-------------------------
+
+Safik | 2022-11-17 17:09:56 UTC | #4
+
+Yes, of course. I immediately say there are two implementations of them, they work the same way. I had to experiment because of errors
+
+variant 1
+
+```
+ public func principalToAccount(p : Principal, sa : ?[Nat8]) : [Nat8] {
+        return principalBlobToAccount(Principal.toBlob(p), sa);
+    };
+    public func principalBlobToAccount(b : Blob, sa : ?[Nat8]) : [Nat8] { //Blob & [Nat8]
+        return generate(Blob.toArray(b), sa);
+    };
+    private func generate(data : [Nat8], sa : ?[Nat8]) : [Nat8] {
+        var _sa : [Nat8] = sa_zero;
+        if (Option.isSome(sa)) {
+            _sa := Option.get(sa, _sa);
+            while (_sa.size() < 32){
+                _sa := Array.append([0:Nat8], _sa);
+            };
+        };
+        var hash : [Nat8] = SHA224.sha224(Array.append(Array.append(ads, data), _sa));
+        var crc : [Nat8] = CRC32.crc32(hash);
+        return Array.append(crc, hash);                     
+    };
+```
+variant 2
+(where:  subaccount -> defaultSubaccount())
+```
+ public func defaultSubaccount() : Subaccount {
+        Array.freeze<Nat8>(Array.init(32, 0 : Nat8)); 
+    };
+
+    public func accountIdentifier(principal: Principal, subaccount: Subaccount) : AccountIdentifier {
+        let hash = SHA224.Digest();
+        hash.write([0x0A]);
+        hash.write(Blob.toArray(Text.encodeUtf8("account-id")));
+        hash.write(Blob.toArray(Principal.toBlob(principal)));
+        hash.write(subaccount);
+        let hashSum = hash.sum();
+        let crc32Bytes = beBytes(CRC32.ofArray(hashSum));
+        let arr: [Nat8] = Array.append(crc32Bytes, hashSum);
+        return arr ;
+    };
+```
+
+-------------------------
+
+Safik | 2022-11-17 17:14:47 UTC | #5
+
+[quote="bogwar, post:3, topic:16645"]
+The second issue is that transfers that are intended for topping up canisters need to have a specific memo field, namely `0x50555054` (there’s also a specific memo if you want to use the converted cycles to create a canister)
+[/quote]
+
+Ок, thanks you. I think this is the key to the solution.
+
+[quote="bogwar, post:3, topic:16645"]
+I think `principalToAccount` returns the default account of the principal.
+[/quote]
+Yes it is
+
+-------------------------
+
+bogwar | 2022-11-17 17:57:08 UTC | #6
+
+The error you are hitting is not because you don't use the correct memo, but because the transfer does not go to the correct subaccount. Basically, you need a function which takes a canister_id and returns a subaccount; this is the function that Roman in his answer. 
+The two functions you provided take a canister_id and a subaccount and return an account (which is not what you want).
+
+-------------------------
+
+Safik | 2022-11-17 18:46:19 UTC | #7
+
+This is excellent. Your help has yielded results! I'll give you the code, maybe it will help someone else. Function for subaccount:
+```
+ public func principalToSubAccount(id: Principal) : [Nat8] {
+        let p = Blob.toArray(Principal.toBlob(id));
+        Array.tabulate(32, func(i : Nat) : Nat8 {
+            if (i >= p.size() + 1) 0
+            else if (i == 0) (Nat8.fromNat(p.size()))
+            else (p[i - 1])
+        })
+    };
+```
+
+but then there was a mistake
+```
+variant { Ok = 4_880_838 : nat64 },
+  variant {
+    Err = variant {
+      InvalidTransaction = "Intent in the block (0 == unrecognized) different than in the notification (1347768404 == TopUp)"
+    }
+  },
+
+```
+And a clear indication
+let coinage_cycles_memo = 0x50555054 : Nat64;
+
+Fixed the problem
+
+-------------------------
+

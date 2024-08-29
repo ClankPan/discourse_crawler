@@ -1,0 +1,80 @@
+jzxchiang | 2021-06-16 22:36:53 UTC | #1
+
+Well big surprise, I'm running into a bunch of issues using the @dfinity/agent JS library in my RN app. For context, I'm using the library in iOS to call a canister running locally.
+
+I've resolved a bunch of issues already—namely around polyfills for libraries not supported out-of-the-box in the RN JS engine—but I'm running into an issue I can't easily resolve...
+
+Basically, the `read_state` HTTP endpoint is returning 200 but the body contains the text string `undefined` instead of the Certificate. Code is [here](https://github.com/dfinity/agent-js/blob/90b073dc735bfae9f3b1c7fc537bd97347c5cc68/packages/agent/src/agent/http/index.ts#L316).
+
+-----
+
+Here is what gets printed out when I console.log the Response object from the fetch() call:
+
+`
+{"type":"default","status":200,"ok":true,"statusText":"","headers":{"map":{"date":"Wed, 16 Jun 2021 22:24:48 GMT","access-control-allow-headers":"Accept, Authorization, Content-Type","content-length":"182","content-type":"application/cbor","access-control-allow-methods":"POST, GET","access-control-allow-origin":"*"}},"url":"http://localhost:8000/api/v2/canister/rrkah-fqaaa-aaaaa-aaaaq-cai/read_state","bodyUsed":false,"_bodyInit":{"_data":{"size":182,"offset":0,"blobId":"CB831679-886B-4AD7-A7A3-8735D070398F","type":"application/cbor","name":"read_state","__collector":{}}},"_bodyBlob":{"_data":{"size":182,"offset":0,"blobId":"CB831679-886B-4AD7-A7A3-8735D070398F","type":"application/cbor","name":"read_state","__collector":{}}}}`
+
+-----
+
+Does anyone know what's going on? I've verified that the local canister I'm calling is running via `dfx canister call ...`, which works fine. Maybe the @dfinity/agent JS library is making certain assumptions about the Fetch API that aren't true in a mobile env?
+
+-------------------------
+
+kpeacock | 2021-06-16 23:03:15 UTC | #2
+
+When you initialize your HttpAgent, are you passing in a custom `fetch` option? If so, which library are you using? Here's the interface for the constructor: https://erxue-5aaaa-aaaab-qaagq-cai.raw.ic0.app/agent/interfaces/httpagentoptions.html
+
+-------------------------
+
+jzxchiang | 2021-06-16 23:03:59 UTC | #3
+
+Nope I'm just using the default `fetch`, which I guess is some global thing that RN implements.
+
+```
+const agent = new HttpAgent({host: 'http://localhost:8000'})
+```
+
+-----
+
+I just saw [this](https://stackoverflow.com/a/62663317) so maybe it might explain it?
+
+-------------------------
+
+kpeacock | 2021-06-16 23:05:56 UTC | #4
+
+I hope that solves it! If you do get a working set of polyfills and such, please let me know so I can document it in the package readme and save other people the hassle
+
+-------------------------
+
+jzxchiang | 2021-06-17 07:21:27 UTC | #5
+
+Okay so I tried using the `rn-fetch-blob` library with `@dfinity/agent` like such:
+
+```
+const Fetch = RNFetchBlob.polyfill.Fetch;
+const agent = new HttpAgent({host: 'http://localhost:8000', fetch: new Fetch({auto: false}).build()});
+```
+
+So far it's erroring out when trying to send the CBOR-encoded body of the initial /call request. 
+
+(There are two separate HTTP requests made in the course of a single Candid call to a canister: /call to asynchronously submit the request, and /read_state to poll for the response.)
+
+Basically, the library doesn't seem to [like](https://github.com/joltup/rn-fetch-blob/blob/dcbde6f7e12b666b9fe1c8c4a8e2cb04e0048326/polyfill/Fetch.js#L51) a request body that's a Buffer (which is [how](https://github.com/dfinity/agent-js/blob/90b073dc735bfae9f3b1c7fc537bd97347c5cc68/packages/agent/src/agent/http/index.ts#L199) the agent lib represents the CBOR-encoded body). Since typeof Buffer === 'object' and not 'string', that if statement executes and converts the Buffer to a string... 
+
+When I got rid of that if statement and forced it to pass the body as a Buffer, I got this cryptic error:
+
+```
+Error: Exception in HostFunction: Malformed calls from JS: field sizes are different.
+```
+
+-----
+
+Stepping back, the default fetch used by the agent actually successfully calls the /call endpoint (and passes the CBOR-encoded request body), but it fails only when trying to decode the CBOR-encoded response body. In other words, RN seems to handle binary encoded *request* bodies just fine but struggles only when dealing with binary encoded *response* bodies.
+
+-------------------------
+
+jzxchiang | 2021-06-17 07:22:40 UTC | #6
+
+I wonder what fetch you've tried when using the agent lib with RN?
+
+-------------------------
+

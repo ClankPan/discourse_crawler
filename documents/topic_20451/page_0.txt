@@ -1,0 +1,77 @@
+timo | 2023-06-05 06:08:22 UTC | #1
+
+The primary application of this library is to track user names or user principals inside a service canister and to assign permanent numerical user ids to them.
+
+`Enumeration` is an add-only set which keeps track of the order in which elements were added. Efficient lookups are provided in both ways, from an element to its order number and from an order number to the element.
+
+For example, when user principals sign up for a service then they get a numerical user id in the order in which they signed up. We want to resolve a principal to a user id and vice versa. This is what Enumeration allows - a two-way lookup. The assumption is that user ids and principals are stored forever, never deleted.
+
+The underlying implementation is an array plus a red-black tree. The two are interwoven to optimize for memory efficiency. We benchmarked the library against other comparable maps such as [btree](https://mops.one/stableheapbtreemap), RBTree from base and [map (v7 and v8)](https://mops.one/map). It performs well in comparison even though it provides more functionality by being a two-way map instead of a one-way map. The benchmarking results can be found in the [README](https://github.com/research-ag/enumeration). 
+
+Memory-wise Enumeration is close to the leader btree (it uses 3 bytes more than btree per entry). For example, storing 32-byte blobs (what principals need) in Enumeration requires 68 bytes per entry. 
+
+Time-wise Enumeration is slightly slower than RBTree from base, which is the result of a trade-off made for higher memory efficiency. However, it should be noted that in practice the use of Enumeration should result in saving time. The idea is to write the service canister entirely around numerical ids as user identifiers. This saves time and memory compared to using principals as user identifiers by storing user data in simple arrays. The only place where principals occur is in Enumeration, i.e. the use of principals is confined to one place. The lookup from principal -> user id happens once at the beginning of a call and never again during the same call because all subsequent data access is based on user id. It is cheaper to do one lookup with Enumeration than doing multiple lookups with any of the other map data structures.
+
+Enumeration can be used for any data type, not only Principals. It is published on [Mops](https://mops.one/enumeration) and [GitHub](https://github.com/research-ag/enumeration).
+
+-------------------------
+
+ArielRobotti | 2023-06-05 23:03:47 UTC | #2
+
+Hello bro, excellent work. I was thinking of doing something similar but using two hashMaps in such a way that access to both values ​​from keys and access to keys from values ​​is constant O(c) (I don't remember if it is represented like this). What advantages does your solution have in terms of storage space and access speed compared to the use of two hashMaps, be they as the hashMaps implemented in the base/ library, or some custom implementation?
+
+-------------------------
+
+timo | 2023-06-13 14:17:54 UTC | #3
+
+[quote="ArielRobotti, post:2, topic:20451"]
+What advantages does your solution have in terms of storage space and access speed compared to the use of two hashMaps, be they as the hashMaps implemented in the base/ library, or some custom implementation?
+[/quote]
+
+The advantage in terms of storage space is large. You can say roughly that storage for a key-value map, per entry, is the size of the key + size of the value + overhead of the tree. With two independent maps you double that:
+```
+2 * (key-size + value-size + overhead)
+```
+With Enumeration, since both maps are integrated into one data structure, you have only
+```
+key-size + value-size + overhead
+```
+To be fair, the overhead in the first equation should be slightly lower than in the second equation, because it is a one-directional map vs a two-directional one, assuming both are equally optimized. But the difference will be small an won't compensate for doubling the key-value storage. In summary you will get approximately twice the storage for two maps vs Enumeration.
+
+As a practical example, if the keys are 29-byte long Principals and the values are Nats 0,1,2,.. then for Enumeration the calculation becomes
+```
+40 + 4 + 24 = 68
+```
+bytes per entry. 40 bytes is the size of a 32 byte Blob on the heap (for Principal), 4 bytes is a small Nat, and 24 bytes is the overhead that can be seen in this table from the [README](https://github.com/research-ag/enumeration):
+
+|btree|enumeration|rb_tree|map v7|map v8|
+|---|---|---|---|---|
+|20.9|24|48|36|52|
+
+For two btrees you will get `2 * (40 + 4 + 20.9) = 129.8`.
+
+*To be precise the table for the maps is accurate for maps of type `X -> Nat` (with small Nat values). So in our example the btree calculation will be accurate for the map direction `Principal -> Nat`. For the direction `Nat -> Principal` the result may actually be 8 bytes larger than 129.8 because of heap boxing of the Principal values vs the Nat values. But I have not measured that to confirm. The table has been confirmed for multiple types X, with and without boxing, but only for the direction `X -> Nat`.
+
+To be fair, of course you can do more things with two independent maps than you can with Enumeration. For example, the Nats don't have to be consecutive (0,1,2,...) and you can delete entries. In Enumeration they have to be consecutive and you cannot delete.
+
+For access speed comparison, Enumeration will be slower for the direction `K -> Nat`. The access times are here, measured in wasm instructions (maps filled with 4,096 entries):
+```
+|btree|enumeration|rb_tree|map v7|map v8|
+|---|---|---|---|---|---|
+|hits|5107|3241|2889|2226|2111|
+|misses|5107|2704|2310|2226|2111|
+```
+
+In the other direction though, `Nat -> K`, the access time for Enumeration will be instant but non-trivial for the other maps.
+
+_UPDATE_ With `moc 0.9.2` and another improvement of Enumeration for Blobs the table now looks like this:
+```
+|method|enumeration|red-black tree|b-tree|zhus v8|zhus v7|
+|---|---|---|---|---|---|
+|hits  |2519|2483|4972|2060|1934|
+|misses|2026|1983|4972|2060|1934|
+```
+For misses the rb-tree based data structures are as fast as the hashmap based ones. For hits there is the additional cost for the final long, matching comparison.
+
+-------------------------
+

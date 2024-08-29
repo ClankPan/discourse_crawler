@@ -1,0 +1,178 @@
+mymikemiller | 2022-09-14 09:31:59 UTC | #1
+
+I understand that [subtyping](https://sdk.dfinity.org/docs/language-guide/local-objects-classes.html#_object_subtyping) works a little differently in Motoko than most languages I'm used to, being based on [structrural subtyping](https://sdk.dfinity.org/docs/language-guide/local-objects-classes.html#_structural_subtyping) as opposed to nominal subtyping. So I understand that the following will work just fine, and that Document's `root` member has no problem being either an ElementNode or a TextNode, even though neither of those declared that their "supertype" is Node, they just happen to share `Node`'s more general structure:
+
+```
+public class Document(prolog0: Text, root0: Node) {
+    var prolog: Text = prolog0;
+    var root: Node = root0;
+};
+
+public class Node(tag0: Text) {
+    var tag: Text = tag0;
+};
+
+public class ElementNode(tag0: Text, children0: [Node]) {
+    var tag: Text = tag0;
+    var children: [Node] = children0;
+};
+
+public class TextNode(tag0: Text, text0: Text) {
+    var tag: Text = tag0;
+    var text: Text = text0;
+};
+```
+
+But that's a lot of repeated code. I'd rather declare the `tag` member in only one place, and call into that constructor from the `subclass` constructors. Is there a way in Motoko to specify that ElementNode and TextNode should inherit the structure of the `Node` class so I don't need to redeclare that variable?
+
+For example, I'd like to do something like this:
+
+```
+public class Node(tag0: Text) {
+    var tag: Text = tag0;
+};
+
+public class ElementNode(tag0: Text, children0: [Node]) : Node(tag0) {
+    var children: [Node] = children0;
+};
+
+public class TextNode(tag0: Text, text0: Text) : Node(tag0) {
+    var text: Text = text0;
+};
+```
+
+That results in a syntax error, likely because it conflicts with the [type annotation syntax](https://sdk.dfinity.org/docs/language-guide/local-objects-classes.html#_type_annotation) used to specify the constructor's return type. 
+
+Is superclass initialization possible in Motoko? Does that question even make sense with the way Motoko does things? What's the best way to keep code like this DRY in Motoko?
+
+-------------------------
+
+chenyan | 2020-12-26 21:11:29 UTC | #2
+
+Class inheritance is most likely not useful when you have full variant type in the language. In your case, you can define the type directly:
+```
+type Node = {
+  #element: [Node];
+  #text: Text;
+};
+type Document = { prolog: Text; root: Node };
+```
+
+-------------------------
+
+mymikemiller | 2020-12-30 23:13:18 UTC | #3
+
+@chenyan I'm honestly a little confused by that syntax. What's the `#` there for? In the [docs](https://sdk.dfinity.org/docs/language-guide/style.html#_spacing), I see some examples using that symbol to declare enums but not variables:
+
+```
+type Vec3D = { x : Float; y : Float; y : Float };
+type Order = { #less; #equal; #more };
+```
+
+What does adding the `#` do before a variable definition? What would happen if I was to add before to `x`, `y`, and `y` above? (that last one should probably be `z`, not `y`...)
+
+Why would you write your example as you did instead of:
+
+```
+type Node = {
+  element: [Node];
+  text: Text;
+};
+```
+
+I think it has something to do with [variant type fields](https://sdk.dfinity.org/docs/language-guide/language-manual.html#type-tags), but I'm not even sure what that means. The docs don't really explain it, they just start using `#` in some places but not others.
+
+Why is it better to have just a Node type instead of my two distinct types? Element nodes don't have a Text field, and Text nodes don't have any children. Shouldn't those be different types? I think maybe I've never worked in a language with "full variant type"; I'm not sure what that means.
+
+Lastly, why did you choose to use two `type` definitions instead of two classes? Won't I need a constructor for my objects?
+
+Thanks for clearing some of this up for me as I try to wrap my head around this new language.
+
+-------------------------
+
+chenyan | 2020-12-31 00:38:53 UTC | #4
+
+We have some docs about variant pattern matching: https://sdk.dfinity.org/docs/language-guide/pattern-matching.html, and a tree example for using variant: https://sdk.dfinity.org/docs/language-guide/motoko.html#_modern_type_system. But we probably need more documentation on this topic.
+
+`#tag` is the same as `tag0: Text` in your example. It represents an or/union relation. 
+
+In your example, you have a type `Node`, which can be either an `ElementNode` or a `TextNode`. In the OOP world, you represent this union relation via a tree-structure class inheritance.
+
+In Motoko, we use `#element` and `#text` to distinguish these two variants of `Node`. Then for each variant, we can define different payload types. For example, `#element: [Node]` means that the `element` variant contains an array of `Node`, whose value can be either `#element(...)` or `#text(...)`.
+
+If we remove `#`, the Node type becomes a record type, which means the Node type contains both `element` and `text`, which is not what we want.
+
+> Lastly, why did you choose to use two `type` definitions instead of two classes? Won’t I need a constructor for my objects?
+
+Class is also a kind of type definitions, and you don't have to provide a constructor for initializing data. For example, `#element([#text("first"), #text("second")])` represents an `ElementNode`.
+
+-------------------------
+
+Gabriel | 2020-12-31 07:19:46 UTC | #5
+
+Along with @chenyan greeat answer:
+
+I found out the best way to handle motoko is to check rust docs. They're not 100% identical but the behaviour is almost the same. 
+
+https://doc.rust-lang.org/book/ch06-01-defining-an-enum.html
+
+https://medium.com/swlh/rust-structs-options-and-traits-485eecd9c718
+
+Usually for behaviour I compare with rust and for primitives with haskell
+
+-------------------------
+
+claudio | 2021-01-08 11:37:57 UTC | #6
+
+https://en.wikipedia.org/wiki/Tagged_union has a decent introduction to variant types.
+
+-------------------------
+
+icme | 2022-09-14 09:31:44 UTC | #7
+
+Let's say that I have a library with an actor "template" that I'd like developers to pull in and use specific existing functions and APIs from (that exist in the base actor) to build upon, without actually making the consuming developers write additional boilerplate.
+
+For example, let's say that my actor class looks something like this
+
+```
+actor class BaseZoo() {
+  stable var animalCount = 0;
+
+  public func getAnimalCount(): async Nat { animalCount };
+}
+```
+
+I'd like for a developer to be able to do something like this:
+
+```
+import BaseZoo "mo:zoo/BaseZoo";
+
+// extending BaseZoo incorporates all instance variables and functions in it
+actor class NewYorkZoo extends BaseZoo() {
+  stable var gorillaCount = 0;
+
+  public func percentGorillas(): async Nat {
+    // I have access to getAnimalCount(), and the animalCount variable is implicitly included and stable
+    gorillaCount / getAnimalCount()
+  };
+
+};
+```
+
+
+Is this/could this be possible?
+
+Is there a pattern that the team recommends for sharing or reusing actor logic and cutting down on boilerplate?
+
+-------------------------
+
+skilesare | 2022-09-14 10:51:40 UTC | #8
+
+I’ve run into this elsewhere: https://forum.dfinity.org/t/how-are-awaits-handled-that-dont-call-an-async-function/7254/17?u=skilesare
+
+The big issue being the awaits and potential hidden logic in the async functions that make these kind of things less safe to do when trying to wrap the source actor function with an enhanced function(ie trying to derive from dip20 and wrap it in an standardizing function).  State can be committed out from under a dev with little understanding of the underlying code.
+
+That being said…I’d love this feature and it would make the creation and Integration of utility actors much easier.
+
+-------------------------
+

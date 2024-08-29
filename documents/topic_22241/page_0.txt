@@ -1,0 +1,133 @@
+Gekctek | 2023-08-17 23:40:23 UTC | #1
+
+My goal is to have 2+ canisters be able to communicate with one another. 
+I try using the `import X "canister:X"` method in my 2 actor motoko files but I get a circular dependency error on build. Im assuming this is just because of type compiling but all I want is a simple way for them to reference each other, because in my head it seems that 2 independent actors can call back and forth with no problem.
+What are my best alternatives besides hardcoding in a principal?
+I normally put the actor type in a separate file, but I still need the principal of each canister.
+
+-------------------------
+
+infu | 2023-08-20 23:18:54 UTC | #2
+
+The dependency error probably comes from (never tried it) the ability to return a type coming from another canister. 
+CanisterA code:
+```
+public func something() : asnyc CanisterB.Something {
+ ...
+}
+```
+
+-------------------------
+
+Gekctek | 2023-11-02 20:25:50 UTC | #3
+
+The options I can possibly see are
+1) Have 2 actors be able to somehow reference each other's canister ids without importing the types (doesn't seem like a possibility right now)
+2) Make one a an actor class and pass the id of the actor to the actor class on creation. The problem with this is that i dont want to have to create it manually everytime and i dont need the other one to have multi instances
+
+@claudio any insights into this? 2 actors should be able to talk to each other if they are both actors, but cant seem to share the canister ids
+
+-------------------------
+
+kpeacock | 2023-11-02 21:30:09 UTC | #4
+
+The other approach is to not import the other one. If you have canister X and Y, you could do something like this:
+
+- create canisters for each of them and write down the IDs
+- compile or handwrite a Motoko Actor type for canister X
+- in canister Y, 
+```
+let xCanister : X.Self = actor ("<canister-x-id>");
+await x.doSomething()
+```
+
+And then do the same for Y. 
+
+The interface you need can be seen on the [dashboard](https://dashboard.internetcomputer.org/canister/ivcos-eqaaa-aaaab-qablq-cai), and will look something like this:
+```
+module {
+  public type Self = actor { whoami : shared query () -> async Principal }
+}
+```
+
+As long as you know the canister ids and relevant portions of the interface (it doesn't have to reflect methods you aren't using) you should be good to go
+
+-------------------------
+
+kpeacock | 2023-11-02 21:51:38 UTC | #5
+
+Here's a working circular dependency example: 
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1299908116
+
+You can deploy the Bob canister, then the Alice canister from `main.mo`. Alice can make a call to Bob, which then calls Alice back, by constructing an `actor` dynamically from Alice's principal
+
+-------------------------
+
+Gekctek | 2023-11-02 22:57:46 UTC | #6
+
+I'm trying to avoid hard coding, but if i must, is there a way to have it dynamic based on local vs ic, or do i just need to keep the canister id the same between environments?
+
+-------------------------
+
+kpeacock | 2023-11-02 23:12:44 UTC | #7
+
+there probably is, but not anyway I can think of using motoko playground
+
+-------------------------
+
+claudio | 2023-11-03 10:52:21 UTC | #8
+
+A variation on the actor class is to have a single actor in the project and have it locally import an actor class that you then instantiate (once) on demand programmatically. But then the canister id of the instance will be dynamic which may not be what you want. The code will probably also be awkward.
+
+If you are using dfx, another solution might be to use `custom` project types for one or both actors and use the provided .did files to break the dependency but I haven't got the time to experiment with that just now and it might be a red herring.
+
+One thing one could maybe do, as language features, is allow actor imports to declare their local interface, or, perhaps bettter, allow actors to declare their interface via a did file so they can be removed from the build dependencies when imported. All moc actually needs to know to compile against an imported actor is its canister id and candid interface. At the moment, we have to compile the code of an import to infer its interface, rather than just being able to rely on a forward declaration of the interface, leading to the circular dependency problem.
+
+-------------------------
+
+claudio | 2023-11-03 13:09:39 UTC | #9
+
+I've managed to create canisters with mutually recursive dependencies using custom projects and build scripts but it's pretty hacky (and in current form only works for the local network).
+
+https://github.com/crusso/circ
+
+Only adopt and adapt if truly desperate, I'd say.
+
+-------------------------
+
+Gekctek | 2023-11-04 01:29:01 UTC | #10
+
+Appreciate this. I'll try it out but probably just stick to what i have
+I separate the actor type definitions to a separate file anyway and make the actor classes implement those types. So all i really need are canister ids vs the entire canister reference
+
+Side note:
+Is there a way to enforce a return type for an actor (not class)? My actor classes are like `actor MyActor() : async Types.MyActor = this {` but i can't seem to do it with normal actors
+
+-------------------------
+
+claudio | 2023-11-04 21:51:16 UTC | #11
+
+
+
+> Side note:
+Is there a way to enforce a return type for an actor (not class)? My actor classes are like `actor MyActor() : async Types.MyActor = this {` but i can't seem to do it with normal actors
+
+Hmm, that seems to be a deficiency in our grammar.
+
+You can work around it (awkwardly) like this though:
+
+```
+actor this {
+    
+    func check() : actor {get : () -> async ()} { this };
+    
+    public func get() : async () {};
+
+}
+```
+That forces a check on the type of the actor. It needs to be under a function though, otherwise the reference to this is (currently) considered as use before definition.
+
+https://play.motoko.org/?tag=2465536885
+
+-------------------------
+

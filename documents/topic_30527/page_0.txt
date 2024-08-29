@@ -1,0 +1,122 @@
+jasonzhu | 2024-05-08 22:15:49 UTC | #1
+
+# TL;DR
+
+Dissolving neurons with age bonus will be corrected to no longer have age bonus, which is consistent with the current design. Some dissolved neurons will have slightly different representations for better maintainability, which shouldn’t be noticeable by users interacting with UI interfaces.
+
+# Motivation
+
+A previous incident ([52-year neuron](https://forum.dfinity.org/t/icp-neuron-age-is-52-years/21261)) was caused partly because of a suboptimal representation of neuron data, which makes it difficult to reason about all the possible states of a neuron. In a [follow-up post](https://forum.dfinity.org/t/52-year-neuron-fixes/21301) after the incident, some long-term improvements were proposed. In this post we discuss a concrete plan for the improvements.
+
+# Context
+
+## Neuron Properties
+
+A neuron can either be dissolving, non-dissolving, or dissolved. In addition, a non-dissolving neuron also has some age associated with it, denoting how long it has been in the non-dissolving state.
+
+In the NNS code, these states are represented by the following two properties of a neuron:
+
+* dissolve_state which can be one of the 2 variants:
+  * WhenDissolvedTimestampSeconds(timestamp) where timestamp is the time when the neuron was or will be dissolved. Here, the countdown clock is running (if timestamp is in the future), or has already run out (if timestamp is in the past or present). Dissolving neurons are represented with this variant.
+  * DissolveDelaySeconds(num_seconds) where num_seconds is the dissolve delay. Here, the count down clock is not running. Non-dissolving neurons are represented with this variant.
+* aging_since_timestamp_seconds is the timestamp since which the aging has started. Since only non-dissolving neurons have an age, this attribute is valid only when dissolve_state is DissolveDelaySeconds(positive_number). Otherwise, the neuron's age is 0, which is represented in governance by setting the field to u64::MAX.
+
+## Related NNS Governance Methods
+
+### NeuronInfo (list_neurons/get_neuron_info)
+
+When using list_neurons or get_neuron, the NNS Governance returns NeuronInfo which exposes fields that are related to the above properties:
+
+* Dissolve_delay_seconds: This is the remaining dissolve delay of a neuron. If a neuron is non-dissolving, this would be the num_seconds described above, and if a neuron is dissolving, this is `now - timestamp`.
+* state: This is the state that a neuron has which is one of NotDissolving/Dissolving/Dissolved. It is calculated from the dissolve_state and the current time.
+* age_seconds: This is the neuron’s age and it is calculated by the aging_since_timestamp_seconds and the current time.
+
+### Neuron (list_neurons)
+
+When the caller principal has special permission on the neuron, the list_neurons method also returns “full neurons”, which exposes the dissolve_state and aging_since_timestamp_seconds directly.
+
+# Problem
+
+## Multiple “Dissolved State” Representation
+
+When a neuron is first claimed, it has:
+
+* dissolve_state: DissolveDelaySeconds(0)
+* aging_since_timestamp_seconds: now
+
+and the neuron is considered dissolved.
+
+This is less than ideal because:
+
+* There are two different representations of a dissolved neuron: the above case and the case where a dissolving neuron waits enough time to become dissolved, which is represented by dissolve_state = WhenDissolvedTimestampSeconds(timestamp) where timestamp is in the past.
+* A dissolved neuron should not have an age (aging_since_timestamp_seconds should be u64::MAX), but this is not true for the case of a newly created neuron
+  * Note that in practice the age bonus doesn’t really matter, because such a neuron cannot vote due to its dissolved status, and the aging_since_timestamp_seconds will be reset if such a neuron is changed so that it can vote
+
+## Dissolving Neurons with Age Bonus
+
+Although dissolving neurons should not have an age bonus (except for the DissolveDelaySeconds(0) case above), a bug in the merge neuron method caused dissolving neurons with age bonus, when a non-dissolving neuron was merged into a dissolving neuron.
+
+# Solution
+
+## Overview
+
+We propose to simplify the neuron state and age properties, so that all existing and future neurons fall into the following two categories:
+
+* Non-dissolving neurons have dissolve delay > 0, and an aging_since_timestamp_seconds in the past (or now, when it first becomes non-dissolving)
+  * dissolve_state = DissolveDelaySeconds(num_seconds) where num_seconds > 0
+  * aging_since_timestamp_seconds <= now
+
+* Dissolving and dissolved neurons has no aging bonus
+  * dissolve_state = WhenDissolvedTimestampSeconds(_)
+  * aging_since_timestamp_seconds = u64::MAX
+
+To achieve this, we propose the following changes.
+
+### Change 1: Stop Creating Neurons with DissolveDelaySeconds(0)
+
+To achieve this, we propose to create neurons (when claimed) with the following setup:
+
+* dissolve_state = WhenDissolvedTimestampSeconds(now)
+* aging_since_timestamp_seconds = u64::MAX
+
+### Change 2: Correct Existing Neurons
+
+We propose to ensure that all existing neurons are in a valid state. This can be achieved by scanning through all the existing neurons and change some invalid states into valid states:
+
+* For dissolved neurons with DissolveDelaySeconds(0):
+
+  * Change dissolve_state to WhenDissolvedTimestampSeconds(creating_timestamp)
+  * Change aging_since_timestamp_seconds to u64::MAX
+
+* For dissolving/dissolved neurons with an age bonus (WhenDissolvedTimestampSeconds(_)):
+
+  * Change aging_since_timestamp_seconds to u64::MAX
+
+* For neurons with dissolve_state = None, there should be no neuron for which this applies. But to ensure we cover all possible options,we should treat this case the same way as case 1.
+
+### User Visible Impact
+
+If a user queries an NNS Governance API, they can observe the following changes:
+
+* For neurons freshly claimed:
+  * When querying the NNS Governance API for NeuronInfo (through list_neurons or get_neuron_info), instead of seeing a positive age_seconds, they will see 0
+  * Note that UIs like the NNS Dapp, the IC Dashboard, and VPGeek already take into account that dissolved neurons should not have an age bonus, so there are no visible impacts from those UIs.
+  * When querying the NNS Governance API for “full neurons” (only possible for the owners of the neurons), corresponding changes in dissolve_state and aging_since_timestamp can be observed
+* For dissolving/dissolved neurons with age bonus, the age bonus will be set back (which applies to the API as well as all the UIs)
+
+## Ensure valid states going forward
+
+To help make sure that there are only neurons in valid states, we already proposed a series of refactoring (without changing the current behavior) so that all logic related to modifying the age and the dissolve state can only reside in a small module ([dissolve_state_and_age.rs](https://sourcegraph.com/github.com/dfinity/ic@bb76748d1d225c08d88037e99ca9a066f97de496/-/blob/rs/nns/governance/src/neuron/dissolve_state_and_age.rs)), and it uses a combined enum DissolveStateAndAge to represent the 2 properties, and hence it will be impossible to create neurons with invalid states once the legacy cases are removed from the enum.
+
+## Next steps
+
+If there are no concerns raised in this forum post, we plan to propose an NNS Governance version which includes the changes discussed above as part of the normal release process.
+
+-------------------------
+
+jasonzhu | 2024-05-29 21:57:16 UTC | #2
+
+Update: the changes discussed above are adopted as part of https://dashboard.internetcomputer.org/proposal/130085
+
+-------------------------
+

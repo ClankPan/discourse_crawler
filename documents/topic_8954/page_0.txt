@@ -1,0 +1,287 @@
+akhilesh.singhania | 2021-11-19 14:38:17 UTC | #1
+
+In general, the canister upgrade story still has a lot of foot guns that need addressing.  I want to highlight the following known foot guns.  I may have missed some 
+
+# Bugs in `pre_upgrade` hooks
+If there is a bug in your `pre_upgrade` hook that causes it to panic, the canister can no longer be upgraded.  This is because the `pre_upgrade` hook is part of the currently deployed wasm module and the system will always execute it before deploying the new wasm module and if the `pre_upgrade` hook fails, then the system will fail the whole upgrade.
+
+Currently we do not have a good mitigation around this issue other than urging developers to make sure that their `pre_upgrade` is bug free by doing a lot of testing.
+
+# Long running upgrades
+Generally speaking, when a canister is being upgraded, the logic in the `pre_upgrade` hook serialises state from the wasm heap to stable memory and the logic in the `post_upgrade` hook deserialises it from stable memory back to wasm heap.  There is an instructions bound on how long the upgrade process can run for.  So it is possible that if the canister has too much state or the [de]serialising logic is not very efficient, then the whole process does not finish in time.
+
+The recommended mitigation here is to ensure that the state that needs to be persisted across upgrades does not exceed what the canister can [de]serialise during the upgrade process.
+
+# [de]serialiser requiring additional wasm memory
+Related issue in Motoko: https://github.com/dfinity/motoko/issues/2909.  Generally speaking, it is possible that the serialising logic requires some additional wasm heap to run.  Let's say that the canister has 3.5GiB of wasm heap and the serialising logic requires an additional 600MiB to serialise the data, given that the wasm heap is limited to 4GiB, the upgrade process will again fail.  Note that this issue will also be present for canisters written in Rust.
+
+The recommended mitigation here is to again ensure that the state that needs to be persisted across upgrades does not exceed what the canister can [de]serialise during the upgrade process.
+
+# Planned features
+We are continuously thinking about designs and improvements that we can make to address the above foot guns and balancing that with working on other various high priority projects.  Some features that I am hoping that the team can prioritise working on in the near future are listed below.  Note that the design for these features is not worked out at all and I may not be able to answer all questions related to them just yet.
+
+## Allow developers to download / upload canister state
+Despite all the testing that a developer may do, they may still end up with a bricked canister.  At this point, the least that the platform can do is allow the developer to download the state of the canister for backup.  There are already existing developers like @rckprtr who are building this functionality into their canisters so that they can always backup their data.
+
+## Deterministic time slicing
+Programming against a platform where messages have a bound on how long they can execute for is quite complicated.  This is difficult not just for upgrading the canisters but also for general message execution.  The idea of this feature would be that when a message hits the execution limit, instead of failing it, we pause execution, let some other canister execute for a while and then resume execution later.  This way we could in theory let messages execute for arbitrarily long.
+
+-------------------------
+
+jzxchiang | 2021-11-20 00:23:17 UTC | #2
+
+> If there is a bug in your `pre_upgrade` hook that causes it to panic, the canister can no longer be upgraded.
+
+Do you mean that one upgrade would fail (and revert the canister to its previous state, with all its previous data intact), or that the canister would also permanently lose its previous data?
+
+> Allow developers to download / upload canister state
+
+This would be so useful! Even for local development.
+
+-------------------------
+
+nomeata | 2021-11-20 14:19:42 UTC | #3
+
+Maybe worth adding to this list that (most) canisters must be stopped before upgrading, but that can be delayed (or even be impossible) depending what kind of canisters you call?
+
+We can make it safe enough to upgrade canisters without stopping in some cases, but it's yet another of those system API changes that are not super sexy and are competing with the many other important things waiting…
+
+-------------------------
+
+akhilesh.singhania | 2021-11-22 08:16:05 UTC | #4
+
+[quote="jzxchiang, post:2, topic:8954"]
+Do you mean that one upgrade would fail (and revert the canister to its previous state, with all its previous data intact), or that the canister would also permanently lose its previous data?
+[/quote]
+
+I mean that the canister will be reverted to its previous state with all previous data intact.  
+
+[quote="jzxchiang, post:2, topic:8954"]
+This would be so useful! Even for local development.
+[/quote]
+
+Indeed, there are multiple reasons to get this going!
+
+[quote="nomeata, post:3, topic:8954, full:true"]
+Maybe worth adding to this list that (most) canisters must be stopped before upgrading, but that can be delayed (or even be impossible) depending what kind of canisters you call?
+
+We can make it safe enough to upgrade canisters without stopping in some cases, but it’s yet another of those system API changes that are not super sexy and are competing with the many other important things waiting…
+[/quote]
+
+Good points.  Note that we are trying to get a wiki going.  I am going to make a list of current "limitations" on it and use this thread as to seed it.
+
+-------------------------
+
+anthonymq | 2021-11-22 10:42:48 UTC | #5
+
+Oh really ? We have to stop the canisters before an upgrade ?
+I'm following @rckprtr pattern to backup and restore my data until a clear solution is found.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-22 10:57:21 UTC | #6
+
+[quote="anthonymq, post:5, topic:8954"]
+Oh really ? We have to stop the canisters before an upgrade ?
+[/quote]
+
+Generally speaking, yes, it is a good idea to only upgrade `Stopped` canisters.  Otherwise, it is possible that a `Response` from the previous version of the wasm module is executed against the newer wasm module and new state which may not be compatible and subtle corruptions could occur.
+
+-------------------------
+
+jzxchiang | 2021-11-24 05:59:56 UTC | #7
+
+Wow interesting. So upgrading stopped canisters is merely a recommendation and not a requirement, is that right?
+
+Also, can you clarify what you mean by `Response`?
+
+-------------------------
+
+akhilesh.singhania | 2021-11-24 08:59:44 UTC | #8
+
+[quote="jzxchiang, post:7, topic:8954"]
+Wow interesting. So upgrading stopped canisters is merely a recommendation and not a requirement, is that right?
+[/quote]
+
+I personally think that it should be a requirement.  AFAIK, no compiler can guarantee that the new wasm will be compatible with the older wasm, so no realistic wasm module (i.e. not hand crafted) can manage this.  
+
+[quote="jzxchiang, post:7, topic:8954"]
+Also, can you clarify what you mean by `Response` ?
+[/quote]
+
+All messages between canisters must be either `Request`s or `Response`s.  See https://smartcontracts.org/docs/interface-spec/index.html#system-api-call and https://smartcontracts.org/docs/interface-spec/index.html#responding for more details.  When a canister calls `ic0.call_perform()`, it is sending a `Request` to another canister.  When a canister calls `ic0.msg_reply()` or `ic0.msg_reject` (when replying to a `Request` from a canister), it sends a `Response`.  
+
+https://smartcontracts.org/docs/interface-spec/index.html#ic-stop_canister has some more discussion as well.
+
+-------------------------
+
+nomeata | 2021-11-24 14:06:50 UTC | #9
+
+[quote="akhilesh.singhania, post:8, topic:8954"]
+so no realistic wasm module (i.e. not hand crafted) can manage this.
+[/quote]
+
+I think that's too pessimistic. Just because the two compilers we use right now can't do this doesn't mean that we should at least allow someone to do better - either improving the compilers, or maybe using postprocessing. And with a better system API (see other thread) it's in reach for Rust.
+
+The whole idea of having to stop a canister like this, and thus always have downtimes of unpredictable length, is just silly given our claims about the Internet Computer (always available, people can put important stuff on it…). I hope we can fix these problems, than continuing to only manage them.
+
+(That said, now that we introduce custom sections in the wasm for IC-specific metadata, maybe we can consider a section that indicates whether the canister _can_ be upgraded without stopping, to prevent foot guns.)
+
+-------------------------
+
+claudio | 2021-11-24 15:10:49 UTC | #10
+
+Motoko will actually prevent an upgrade if the canister has pending call-backs.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-24 15:23:03 UTC | #11
+
+I was of course referring to all the wasm modules that I have seen in the wild and what our developers are building.  IMO, having a more restrictive system initially and then relax the constraints when we have built sufficient capabilities is probably a more user friendly approach than having a less restrictive system with many footguns.
+
+-------------------------
+
+nomeata | 2021-11-24 17:41:40 UTC | #12
+
+Foot gun guards are better placed in layers above the system, I'd say. And as Claudio points out Motoko does that - the rust CDK should probably too.
+
+The problem with putting restrictions into the system is that it stifles innovation:
+
+Assume the system would prevent such upgrades, and you'd be in the position of implementing the first CDK (maybe for rust, maybe for another language) that allows safe instantaneous upgrades. Now you have a killer feature, but you can't even use it before you convince DFINITY to flip a switch in their code, with all the fluff and politics involved. (See canisters holding ICPs).
+
+In contrast, assume the system is like it is now. Someone forks the rust CDK to provide safe instantaneous upgrades, their developers immediately benefit.
+
+Plus, allowing immediate upgrades and reinstallation can be useful as matter of last resort (the bug fixed by the upgrade may incur higher risks than the possible state corruption, which can for a concrete case even be assessed by a wasm-reading person).
+
+Plus, allowing these upgrades keeps having a safer API for that on the agenda , and keeps us on track to having canisters like the ledger (and many user's canisters) upgradable.
+
+(The ledger only sends notifies without caring about the result, just throwing them away, and makes no other calls? Then it would be easy to make it safely upgradable even with the current system API and compilers. I can expand if the ledger team would be interested.)
+
+-------------------------
+
+jzxchiang | 2021-11-25 00:41:49 UTC | #13
+
+Thanks. What's the difference between `ic0.msg_reply` / `ic0.msg_reject` and the inter-canister call callbacks that are stored inside the canister table?
+
+-------------------------
+
+akhilesh.singhania | 2021-11-25 09:06:30 UTC | #14
+
+Let's say canister A sends a request to canister B.
+
+If you look at the arguments to `ic0.call_new()` here: https://smartcontracts.org/docs/interface-spec/index.html#system-api-call, the `reply_fun` and `reply_env` identify the function to be called if B replies to A using `ic0.msg_reply` and `reject_fun` and `reject_env` identify the function to be called B replies to A using `ic0.msg_reject`.
+
+-------------------------
+
+akhilesh.singhania | 2021-11-25 09:07:50 UTC | #15
+
+Looks like we are in agreement here.  I am perfectly happy if it is the CDKs that are protecting the users from the footguns.  The system should indeed be more expressive.
+
+-------------------------
+
+nomeata | 2021-11-25 11:02:59 UTC | #16
+
+[quote="nomeata, post:12, topic:8954"]
+The ledger only sends notifies without caring about the result, just throwing them away, and makes no other calls?
+[/quote]
+
+Just checked, unfortunately the ledger does not just use “one-shot” calls, but has logic in the response handler. Too bad.
+
+But we can still extract a pattern: if you want your canister to be upgradable anytime with zero downtime, try to structure your service that it only makes calls without caring about the response (e.g. a pattern of notify and explicit acknowledge). Then you can use the existing system API in a way that upgrades don't need stopping (in a nutshell: pass an invalid table index, e.g. -1, for the callbacks. This will always _safely_ trap, even after upgrade).
+
+-------------------------
+
+akhilesh.singhania | 2021-11-29 09:17:27 UTC | #17
+
+I am maintaining a list of current limitations of the IC on https://wiki.internetcomputer.org/index.php?title=Current_limitations_of_the_IC.  I would love to clean up the discussion there and add more limitations to the page.  Contributions are welcome!
+
+-------------------------
+
+jzxchiang | 2021-11-30 05:46:42 UTC | #18
+
+> If you look at the arguments to `ic0.call_new()` here: [The Internet Computer Interface Specification :: Internet Computer](https://smartcontracts.org/docs/interface-spec/index.html#system-api-call), the `reply_fun` and `reply_env` identify the function to be called if B replies to A using `ic0.msg_reply` and `reject_fun` and `reject_env` identify the function to be called B replies to A using `ic0.msg_reject` .
+
+Gotcha, thanks. I had to read this sentence 3 times, but it makes sense now. I forgot that anything a canister does in terms of interacting with the outside world has to go through an IC system call. Hence, the distinction.
+
+> I am maintaining a list of current limitations of the IC on [Current limitations of the IC - Internet Computer ](https://wiki.internetcomputer.org/index.php?title=Current_limitations_of_the_IC). I would love to clean up the discussion there and add more limitations to the page. Contributions are welcome!
+
+Nice! I feel like it might be better if some of this is put in the official docs, especially the upgrades part. Also, more people may see it.
+
+-------------------------
+
+jzxchiang | 2022-01-25 07:32:48 UTC | #19
+
+One question of clarification:
+
+If there's a bug in the `pre_upgade` hook, then the canister will become permanently un-upgradable. Does that also happen if a canister's `pre_upgrade` hook is functionally correct but exceeds the instruction limit for the upgrade?
+
+I didn't read this right the first time, but this definitely sounds like a huge problem, especially for Motoko canisters that rely on stable variables...
+
+-------------------------
+
+akhilesh.singhania | 2022-01-25 09:35:12 UTC | #20
+
+Yes both are problems.  If the upgrades take too long to run then the canister cannot be upgraded and if there is a bug in the `pre_upgrade` hook then it cannot be upgraded.  These are huge problems.
+
+The team has managed to start working on a feature called time slicing which allows messages to execute for very long time without impacting the performance of the subnet which will solve the too long issue.  We are going to announce the details on this feature soon after a couple of more internal reviews are done.
+
+We still need to figure out how to handle the case where there is a bug in the pre_upgrade hook.  Ideas are welcome.
+
+-------------------------
+
+stopak | 2022-01-25 14:26:28 UTC | #21
+
+Great topic, your wiki is wonderfull!
+
+-------------------------
+
+jzxchiang | 2022-01-25 23:36:46 UTC | #22
+
+If I make a change to the `pre_upgrade` hook for a canister and then redeploy the canister, maybe that pre-upgrade code could take effect immediately (on the pre-upgrade for the current upgrade) instead of for future upgrades (which is what currently happens, I think)? Is that a bad idea?
+
+-------------------------
+
+akhilesh.singhania | 2022-01-26 10:23:52 UTC | #23
+
+So if we imagine the canister as two separate pieces of state: the wasm module and the wasm memory, then I think your proposal is to have an ability to replace the wasm module without replacing the wasm memory.  Is that correct?
+
+Yes, I think this will help but this may not solve all the problems that fall under the class of "bugs in the `pre_upgrade` hook" I think.  What if the bug is in the wasm memory itself?  
+
+The current idea that I am contemplating is to allow the developer to be able to download the entire canister state.  Then the developer could (using some additional tools that we may have to develop) fix the canister (by either modifying the wasm module or the memory itself); run a bunch of tests to make sure they fixed it properly; and then have the ability to upload the canister state.  
+
+I think it might be better to let developers do debugging offline where if they make mistakes, they do not make a bad problem worse.
+
+-------------------------
+
+nomeata | 2022-01-28 12:44:33 UTC | #24
+
+[quote="akhilesh.singhania, post:23, topic:8954"]
+The current idea that I am contemplating is to allow the developer to be able to download the entire canister state
+[/quote]
+
+I think we need that anyways for debugging (and I think I'm not the only one) eventually, and agree that it's a good measure of last resort. Else, the advice to avoid `preupgrade` and ideally make you canister upgradeable without stopping stands :-)
+
+-------------------------
+
+jzxchiang | 2022-01-28 23:35:26 UTC | #25
+
+> The current idea that I am contemplating is to allow the developer to be able to download the entire canister state. Then the developer could (using some additional tools that we may have to develop) fix the canister (by either modifying the wasm module or the memory itself); run a bunch of tests to make sure they fixed it properly; and then have the ability to upload the canister state.
+
+Interesting, that sounds quite useful. I suppose this would be used more for fixing bugs rather than performing schema migrations + backfills, since modifying stable memory wouldn't be possible off-chain I think.
+
+-------------------------
+
+ovictor | 2022-07-24 20:19:01 UTC | #26
+
+I was testing upgrade today and realized what he said, if the pre_upgrade traps, you literary cannot upgrade the canister ever again. The pre_upgrade that run is the one installed in the canister, not the one you are deployng. I took a long time to understand this, this should be more clear in the docs, I would put a big red flag on this.
+
+-------------------------
+
+paulyoung | 2022-07-24 20:45:37 UTC | #27
+
+I only realized that during this discussion:
+
+https://forum.dfinity.org/t/queue-failing-heartbeat-stopping-canister-death-spiral/13328/18?u=paulyoung
+
+-------------------------
+

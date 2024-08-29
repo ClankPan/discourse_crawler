@@ -1,0 +1,66 @@
+icme | 2022-04-25 23:06:52 UTC | #1
+
+Let's say I have a single action that updates a single “source of truth” canister, but this action has side effects that also update canisters for two additional users, allowing these users to quickly look up the result of this action.
+
+This circumstance can be thought of as a “transactions API”, where multiple updates/insertions happen at once. In this case of a multi-canister architecture, there are two main approaches.
+
+If it’s vital that the multiple changes all succeed or fail, then this must be an asynchronous API involving an intermediate canister that has a queue. Imagine that one of the 3 canisters is on a subnet that gets overloaded - we need a Kafka or SQS equivalent to accept and process requests with retry, and then to reject the update in the case of a subnet outage (Maybe send the failed request to a DLQ). All of this work must be done on the backend, using a intermediate “queuing canister”, which is a grant project in itself.
+
+In the case that one or more update can be allowed to fail (in this rare outage condition), we can perform all of the updates coordinated by the frontend/client, with a built in ping and retry mechanism (that isn’t as resilient as a queueing implementation on the backend).
+
+We haven’t even discussed the performance trade offs of these frontend/client vs. backend implementations - which definitely figure into the equation as well. 
+
+I’m curious if any of you have thought about how to solve transactional updates that involve multiple canisters, and some of the approaches you have taken (pokes @hpeebles).
+
+-------------------------
+
+jzxchiang | 2022-04-26 00:37:45 UTC | #2
+
+I'm wondering the same thing!
+
+I think this is an example of distributed transactions, and one solution that's been suggested here before is a two-phase commit protocol (so a queue is not the only option, I think).
+
+-------------------------
+
+hpeebles | 2022-05-06 00:38:56 UTC | #3
+
+Sorry for the slow response, I haven't checked on here in a while!
+
+Within all the services I've worked on we always try to avoid ever needed distributed transactions.
+
+We have many cases where a call is made into canister A which in turn calls into canister B (and sometimes even then has canister B call into canister C). In these scenarios we attempt to make the call, but if it fails we queue up the message to be tried again in the near future. This could either be when the next update request is received or by using heartbeat.
+
+Building something like SQS would be hard but maybe doable, it would probably need to use a push model to avoid having loads of canisters polling it (unless you can make the polling use queries in which case they'd still be cheap). It could attempt to deliver each message immediately, and any that fail can be retried using heartbeat after a short wait.
+
+But then what if you want to push a message to that SQS canister and that call fails? How would you handle that? You'd need to have retry logic there too. This retry logic pretty much needs to be everywhere :dizzy_face:
+
+-------------------------
+
+icme | 2022-05-06 05:04:33 UTC | #4
+
+Thanks for your response and outlining how you handle this problem
+
+[quote="hpeebles, post:3, topic:12421"]
+Within all the services I’ve worked on we always try to avoid ever needed distributed transactions.
+[/quote]
+
+Thanks for your response and outlining how you handle this problem - your architecture makes a lot of sense. There's significant potential for inconsistency, and this isn't acceptable in various cases (i.e. financial transactions).
+
+In the case of OpenChat, as you've mentioned and demoed previously, the application works well using nested inter-canister query calls because you are using WebRTC and P2P connections to provide a snappy UX while waiting for requests to propogate out from canister to canister on the IC.
+
+I would imagine, however that you could still run into an issue where a message goes through over the P2P connection, but a user's message/data canister is unresponsive and they don't receive the update. The frontend can try to keep sending this out to the canister, but for example maybe the user just sent the message "bye!" and exited the application before the frontend had the opportunity to successfully persist this message to the backend. In this case, we still end up with an inconsistent state as the receiving user received this message via P2P.
+
+For other applications that will rely on P2P and have higher volumes of activity per second, I see this same potential edge case issue popping up.
+
+**Question:** How are you thinking about resolving inconsistencies between your P2P state and your canister state?
+
+For many applications outside of chat or where it doesn't make sense to use P2P, I see waiting 4+ seconds as being highly undesirable to the user experience and engagement, and therefore there's a need to "flatten" the canister architecture to reduce the amount of required inter-canister calls.
+
+As @jzxchiang mentioned, there's a two-phase commit protocol solution, say where I buy something online, but then cancel it before that item is shipped out. In this case the original order request data isn't deleted, but there's a new insertion/record that invalidates the transaction. This same general idea applies to the handling inconsistent P2P and canister state.
+
+I could see this working out where for a particular distributed transaction, the developer and application defines a fallback mechanism if one or more of the original updates in the distributed transaction fail. However, this fallback mechanism would benefit greatly from something like an SQS on the IC.
+
+Your points regarding SQS make a lot of sense. I've thought very generally about building queues on the IC, but I hear you loud and clear regarding inter-canister update calls overloading the SQS canister and the retry rabbit hole. I think there might be a solution, but I'm not going to dwell on this too much until we have a firmer grasp of what inter-canister query calls look like  :slight_smile:
+
+-------------------------
+

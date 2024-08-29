@@ -1,0 +1,787 @@
+cryptoschindler | 2023-02-10 11:01:54 UTC | #1
+
+a) What exactly is the difference between `rts_heap_size` and `rts_memory_size`?
+
+b) We are testing how big we can grow a `Buffer` in a Motoko canister that is serialized into an Array in stable memory in the `preupgrade` hook before we exceed the instruction limit. The Buffer is initalized from the Array in stable memory and in the `postupgrade` hook we reset the stable variables to free memory. 
+
+memory size is the result of a call to `Prim.rts_memory_size` and heap size the result of a call to `Prim.rts_heap_size`. The order of call is 
+
+- `growBuffer`
+- `memory_size`
+- upgrade canister
+- `heap_size`
+for each index in the table.
+
+```
+Growing transaction size to 4000000...
+Upgrading...
+┌─────────┬──────────────┬────────────────────────────┬──────────────────────────┬───────────────────────────┬─────────────────────────┬────────────────────┐
+│ (index) │   canister   │ memory size before upgrade │ heap size before upgrade │ memory size after upgrade │ heap size after upgrade │ upgrade successful │
+├─────────┼──────────────┼────────────────────────────┼──────────────────────────┼───────────────────────────┼─────────────────────────┼────────────────────┤
+│    0    │ 'copying-gc' │         '2.19 MB'          │ '0.7237930297851562 MB'  │        '17.69 MB'         │ '5.959255218505859 MB'  │        true        │
+│    1    │ 'copying-gc' │         '4.88 MB'          │ '2.0765953063964844 MB'  │        '52.56 MB'         │ '17.86111068725586 MB'  │        true        │
+│    2    │ 'copying-gc' │         '6.38 MB'          │  '4.254154205322266 MB'  │        '87.44 MB'         │ '29.76296615600586 MB'  │        true        │
+│    3    │ 'copying-gc' │         '12.75 MB'         │  '7.533042907714844 MB'  │        '174.56 MB'        │ '59.51760482788086 MB'  │        true        │
+│    4    │ 'copying-gc' │         '26.13 MB'         │ '15.255535125732422 MB'  │        '348.94 MB'        │ '119.02688217163086 MB' │        true        │
+│    5    │ 'copying-gc' │         '57.13 MB'         │ '29.706295013427734 MB'  │        '697.56 MB'        │ '238.04543685913086 MB' │        true        │
+│    6    │ 'copying-gc' │         '57.13 MB'         │ '38.922794342041016 MB'  │        '871.94 MB'        │ '297.55471420288086 MB' │        true        │
+│    7    │ 'copying-gc' │         '98.56 MB'         │  '50.66817855834961 MB'  │       '1220.56 MB'        │ '416.5734405517578 MB'  │        true        │
+│    8    │ 'copying-gc' │        '125.50 MB'         │  '76.66597366333008 MB'  │       '1743.56 MB'        │ '595.1012725830078 MB'  │        true        │
+│    9    │ 'copying-gc' │        '214.94 MB'         │  '99.41592025756836 MB'  │       '2440.88 MB'        │ '833.1383819580078 MB'  │        true        │
+│   10    │ 'copying-gc' │        '284.06 MB'         │ '149.36919784545898 MB'  │       '3486.88 MB'        │ '1190.1940460205078 MB' │        true        │
+└─────────┴──────────────┴────────────────────────────┴──────────────────────────┴───────────────────────────┴─────────────────────────┴────────────────────┘
+```
+why is the heap size significantly bigger after the upgrade? for the memory size, i think it is because this number can only grow, but never shrink and [throughout the upgrade](https://forum.dfinity.org/t/motoko-canister-memory-size-increased-after-upgrade/6448/2?u=cryptoschindler) process the canister somehow consumes this amount of memory. does it still hold true that we pay for `Prim.rts_memory_size`, not for the actual memory being consumed by the canister?
+c) what is the best way to determine the actual memory used by the heap? what is the best way to determine the actual memory used by the stable memory?
+
+-------------------------
+
+timo | 2023-02-09 10:33:32 UTC | #2
+
+[quote="cryptoschindler, post:1, topic:18429"]
+The Buffer is initalized from the Array in stable memory and in the `postupgrade` hook we reset the stable variables to free memory.
+[/quote]
+
+It would be helpful, to be able to give a better answer, if you can provide the code. I can guess how you are doing it but I am not 100% certain about it.
+
+So index 0-10 are independent experiments? Not building on each other (like grow, upgrade, grow, upgrade again, grow again, etc.), right? How large is the Buffer in experiment with index i and what is the data type of the elements? 
+
+The heap size after upgrade is bigger because the deserialization creates an additional copy of the data in the heap. First Motoko fills the stable var Array and then your postupgrade copies it into another Buffer.  Not sure why it becomes 8x larger though as opposed to only 2x. Do you create the Buffer with initial capacity? Or do you let it grow naturally (geometrically by a factor of 1.5x). I suspect the latter because that will explain the additional allocations that will increase the heap (before GC runs, which didn't happen yet in your experiments).
+
+Just curious, what is the goal of the experiment?
+
+-------------------------
+
+cryptoschindler | 2023-02-10 16:55:17 UTC | #3
+
+This is how the Buffer is initialised from the stable variable after the upgrade
+```
+    private var _transactions : Buffer.Buffer<Types.Transaction> = Buffer.fromArray(state._transactionsState);
+```
+This is how the Buffer is grown
+```
+    public func grow(n : Nat): Nat {
+      let token = Principal.toText(this);
+      let buyer = AID.fromPrincipal(this, null);
+      let time = Time.now();
+      for (i in Iter.range(1, n)) {
+        _transactions.add({
+          token = token;
+          seller = this;
+          price = 1000;
+          buyer = buyer;
+          time = time;
+        });
+      };
+      _transactions.size();
+    };
+```
+In the `postupgrade`, `transactionsState` is set to an empty array.
+
+Index 0-10 are independent experiments, the canister is reinstalled between the rounds. 
+The Buffer in index i contains the amount of transactions specified in the `transactions` column, you can see the structure of a `transaction` in the above `grow` method.
+
+I understand that the deserialisation take up additional space, but I'm using the `force` garbage collectors as well with the same results and expected them to garbage collect after each message. As the calls after the upgrade are all separate messages, shouldn't the extra copy in the heap be garbage collected by the time I call the methods to get the `heap`, `memory` and `max_live_size`?
+
+In the the `postupgrade` really only empties the stable variable, the copying from stable variable to the Buffer happens with the initialisation of the replacement actor. The Buffer has no initial capacity. 
+
+The goal of the experiment is to asses under what conditions our canister won't be upgradeable because of a `Cycle limit exceeded` error.
+
+This is the run with `live_heap_size` and the `force` gb
+```
+Reinstalling...
+Reinstalled
+Growing transaction size to 2,800,000...
+Upgrading...
+┌─────────┬─────────────────┬──────────────┬───────────┬────────────┬────────────┬─────────────┬────────────────────┬──────────────────────┬──────────────────┬────────────────────┐
+│ (index) │       gc        │ transactions │ reinstall │  max live  │    heap    │   memory    │ upgrade successful │ max live postupgrade │ heap postupgrade │ memory postupgrade │
+├─────────┼─────────────────┼──────────────┼───────────┼────────────┼────────────┼─────────────┼────────────────────┼──────────────────────┼──────────────────┼────────────────────┤
+│    0    │ 'copying-force' │   '40,000'   │   true    │ '1.39 MB'  │ '1.39 MB'  │  '3.44 MB'  │        true        │      '11.99 MB'      │    '11.99 MB'    │     '35.31 MB'     │
+│    1    │ 'copying-force' │  '100,000'   │   true    │ '3.59 MB'  │ '3.59 MB'  │  '8.13 MB'  │        true        │      '29.95 MB'      │    '29.95 MB'    │     '87.81 MB'     │
+│    2    │ 'copying-force' │  '400,000'   │   true    │ '14.01 MB' │ '14.01 MB' │ '28.63 MB'  │        true        │     '119.79 MB'      │   '119.79 MB'    │    '350.44 MB'     │
+│    3    │ 'copying-force' │  '800,000'   │   true    │ '28.46 MB' │ '28.46 MB' │ '57.50 MB'  │        true        │     '239.57 MB'      │   '239.57 MB'    │    '700.69 MB'     │
+│    4    │ 'copying-force' │ '1,000,000'  │   true    │ '34.58 MB' │ '34.58 MB' │ '69.75 MB'  │        true        │     '299.46 MB'      │   '299.46 MB'    │    '875.75 MB'     │
+│    5    │ 'copying-force' │ '1,400,000'  │   true    │ '48.81 MB' │ '48.81 MB' │ '98.19 MB'  │        true        │     '419.24 MB'      │   '419.24 MB'    │    '1225.94 MB'    │
+│    6    │ 'copying-force' │ '2,000,000'  │   true    │ '70.15 MB' │ '70.15 MB' │ '140.88 MB' │        true        │     '598.92 MB'      │   '598.92 MB'    │    '1751.25 MB'    │
+│    7    │ 'copying-force' │ '2,800,000'  │   true    │ '99.11 MB' │ '99.11 MB' │ '198.75 MB' │        true        │     '838.48 MB'      │   '838.48 MB'    │    '2451.63 MB'    │
+└─────────┴─────────────────┴──────────────┴───────────┴────────────┴────────────┴─────────────┴────────────────────┴──────────────────────┴──────────────────┴────────────────────┘
+```
+
+-------------------------
+
+timo | 2023-02-10 21:24:32 UTC | #4
+
+The fact that max live equals heap seems to indicate that GC has just run, for otherwise they should differ. So your force GC seems to be in effect.
+
+Does index i in your first post match index i in your last post, i.e. are they expected to have the same buffer size?
+
+The heap size post upgrade is larger than pre upgrade because pre upgrade you only have the buffer (`_transactions`) on the heap and the stable array (`state`) is empty. After the upgrade you might have both full. You say " In the the `postupgrade` really only empties the stable variable". But how are you emptying it? Are you deleting the stable variable, setting it to the empty array within postupgrade?
+
+In either case, I can't explain why the heap is larger by a factor of 8. I would expect it to be less than 2x because the data isn't really copied. At worst pointers are duplicated in `_transactions` and `state`, not the actual record.
+
+-------------------------
+
+timo | 2023-02-10 21:30:32 UTC | #5
+
+I think this is the reason: Before upgrade you have an array (inside Buffer) of transaction records. Each transaction is the same. The `token` fields in all those transactions are just pointers to the same Text. The Text (Principal.toText(this)) only exists once on the heap. The same happens to seller, buyer, time. But this "sharing" gets lost during serialization. After deserialization all the data is multiplied.
+
+-------------------------
+
+cryptoschindler | 2023-02-11 10:38:35 UTC | #6
+
+> Does index i in your first post match index i in your last post, i.e. are they expected to have the same buffer size?
+
+Yes
+
+> You say " In the the `postupgrade` really only empties the stable variable". But how are you emptying it? Are you deleting the stable variable, setting it to the empty array within postupgrade?
+
+That's exactly what I'm doing
+
+> Before upgrade you have an array (inside Buffer) of transaction records
+
+Not sure why there is an array inside my Buffer :thinking:.
+
+I rewrote `grow` to this
+```
+    public func grow(n : Nat) : Nat {
+      for (i in Iter.range(1, n)) {
+        let token = Principal.toText(this);
+        let seller = this;
+        let buyer = AID.fromPrincipal(this, null);
+        let time = Time.now();
+        _transactions.add({
+          token;
+          seller;
+          price = 1000;
+          buyer;
+          time;
+        });
+      };
+      _transactions.size();
+    };
+```
+
+And the new results look like this:
+```
+Reinstalling...
+Reinstalled
+Growing transaction size to 100,000...
+Upgrading...
+┌─────────┬─────────────────┬──────────────┬───────────┬────────────┬────────────┬─────────────┬────────────────────┬──────────────────────┬──────────────────┬────────────────────┐
+│ (index) │       gc        │ transactions │ reinstall │  max live  │    heap    │   memory    │ upgrade successful │ max live postupgrade │ heap postupgrade │ memory postupgrade │
+├─────────┼─────────────────┼──────────────┼───────────┼────────────┼────────────┼─────────────┼────────────────────┼──────────────────────┼──────────────────┼────────────────────┤
+│    0    │ 'copying-force' │   '40,000'   │   true    │ '38.92 MB' │ '38.92 MB' │ '180.38 MB' │        true        │      '11.99 MB'      │    '11.99 MB'    │     '35.31 MB'     │
+│    1    │ 'copying-force' │  '100,000'   │   true    │ '97.43 MB' │ '97.43 MB' │ '297.63 MB' │        true        │      '29.95 MB'      │    '29.95 MB'    │     '87.81 MB'     │
+└─────────┴─────────────────┴──────────────┴───────────┴────────────┴────────────┴─────────────┴────────────────────┴──────────────────────┴──────────────────┴────────────────────┘
+--------------------------------------------------
+```
+
+TBH I'm equally confused, why is the `max_live` smaller after the upgrade now :thinking:. 
+Also I can't even grow the Buffer to 400.000 transactions (heap of roughly 400MB), is this fishy for you or does it sound realistic?
+`Growing transaction size to 400,000...
+Error: Failed update call.
+Caused by: Failed update call.
+  The Replica returned an error: code 5, message: "Canister r7inp-6aaaa-aaaaa-aaabq-cai exceeded the instruction limit for single message execution."
+unexpected error Error: Command failed: dfx canister call copying-force grow 20000`
+
+Why would I exceed the instruction limit when growing the Buffer?
+
+-------------------------
+
+timo | 2023-02-11 10:49:07 UTC | #7
+
+[quote="cryptoschindler, post:6, topic:18429"]
+Why would I exceed the instruction limit when growing the Buffer?
+[/quote]
+
+Try it with specifying an initial capacity of 400000 when you first create the _transactions Buffer. And then add to it like you do now. Then there will be less allocations happening, making both your code and the GC cheaper. See what size you can reach like that. 
+
+Generally I am not surprised that you hit the cycle limit. There are a lot of allocations happening.
+
+-------------------------
+
+cryptoschindler | 2023-02-11 12:15:06 UTC | #8
+
+I was under the impression that the Buffer size (except for when we have to resize) does not impact the cycle cost for equivalent insertion operations 🧐
+
+-------------------------
+
+timo | 2023-02-11 14:58:13 UTC | #9
+
+Right, that’s true. Just give it sufficient initial capacity and avoid the occasional resizing events because they are expensive.
+
+-------------------------
+
+cryptoschindler | 2023-02-12 12:42:00 UTC | #10
+
+EDIT: Buffer capacuty is increased by 1.5x
+
+Is the Buffer size doubled if the limit is reached? 
+And do you have an explanation why after the upgrade the heap size is smaller than before?
+
+-------------------------
+
+cryptoschindler | 2023-02-11 17:07:40 UTC | #11
+
+EDIT: I made a temporary change to initialise the Buffer with a capacity of 400k, and I'm still not able to grow it beyond 280k entries... Why are calls exceeding the cycles limit after a certain size?
+
+I can't really give the buffer a sufficient initial capacity, as it's always initialised from the stable variable, which initially is an empty array :confused:
+
+-------------------------
+
+cryptoschindler | 2023-02-11 17:16:42 UTC | #12
+
+BTW, I'm using `moc-0.7.5` and the base library from [this package set](https://github.com/dfinity/vessel-package-set/releases/tag/mo-0.7.5-20230118)
+
+-------------------------
+
+timo | 2023-02-13 12:21:21 UTC | #13
+
+[quote="cryptoschindler, post:11, topic:18429"]
+EDIT: I made a temporary change to initialise the Buffer with a capacity of 400k
+[/quote]
+
+And did the numbers change in any way? Can you post the table for index 0,1 with this temporary change (maybe initial capacity 100k if index 1 is only 100k)? At least the memory size should change and be close to the heap size. 
+
+[quote="cryptoschindler, post:10, topic:18429"]
+And do you have an explanation why after the upgrade the heap size is smaller than before?
+[/quote]
+
+No.  
+
+[quote="cryptoschindler, post:11, topic:18429"]
+I’m still not able to grow it beyond 280k entries… Why are calls exceeding the cycles limit after a certain size?
+[/quote]
+
+Well, that's just where the cycle limit is.  280k times the code in the for loop plus the memory allocation that comes with it reaches the limit. Nothing surprising about that.
+
+-------------------------
+
+cryptoschindler | 2023-02-14 12:58:10 UTC | #14
+
+[quote="timo, post:13, topic:18429"]
+Well, that’s just where the cycle limit is. 280k times the code in the for loop plus the memory allocation that comes with it reaches the limit. Nothing surprising about that.
+[/quote]
+ I'm not calling `grow` with `280k` as an argument, I grow the buffer incrementally by making subsequent calls to `grow` always passing `20_000` as an argument until I reach the desired maximum size. That's why I'm confused, are insertions more costly the bigger the `Buffer` grows? 
+
+Even if I set the initial capacity of the Buffer to 400k and with the rewrite of `grow` to this
+```
+    public func grow(n : Nat) : Nat {
+      for (i in Iter.range(1, n)) {
+        let token = Principal.toText(this);
+        let seller = this;
+        let buyer = AID.fromPrincipal(this, null);
+        let time = Time.now();
+        _transactions.add({
+          token;
+          seller;
+          price = 1000;
+          buyer;
+          time;
+        });
+      };
+      _transactions.size();
+    };
+```
+I'm not able to grow beyond ~280k entries.
+
+```
+Reinstalling...
+Reinstalled
+Growing transaction size to 100,000...
+Upgrading...
+┌─────────┬─────────────────┬──────────────┬───────────┬────────────┬────────────┬─────────────┬────────────────────┬──────────────────────┬──────────────────┬────────────────────┐
+│ (index) │       gc        │ transactions │ reinstall │  max live  │    heap    │   memory    │ upgrade successful │ max live postupgrade │ heap postupgrade │ memory postupgrade │
+├─────────┼─────────────────┼──────────────┼───────────┼────────────┼────────────┼─────────────┼────────────────────┼──────────────────────┼──────────────────┼────────────────────┤
+│    0    │ 'copying-force' │   '40,000'   │   true    │ '40.29 MB' │ '40.29 MB' │ '183.00 MB' │        true        │      '1.53 MB'       │    '1.53 MB'     │     '25.56 MB'     │
+│    1    │ 'copying-force' │  '100,000'   │   true    │ '98.43 MB' │ '98.43 MB' │ '299.25 MB' │        true        │      '1.53 MB'       │    '1.53 MB'     │     '58.81 MB'     │
+└─────────┴─────────────────┴──────────────┴───────────┴────────────┴────────────┴─────────────┴────────────────────┴──────────────────────┴──────────────────┴────────────────────┘
+--------------------------------------------------
+Reinstalling...
+Reinstalled
+Growing transaction size to 400,000...
+Error: Failed update call.
+Caused by: Failed update call.
+  The Replica returned an error: code 5, message: "Canister r7inp-6aaaa-aaaaa-aaabq-cai exceeded the instruction limit for single message execution."
+unexpected error Error: Command failed: dfx canister call copying-force grow 20000
+Error: Failed update call.
+Caused by: Failed update call.
+  The Replica returned an error: code 5, message: "Canister r7inp-6aaaa-aaaaa-aaabq-cai exceeded the instruction limit for single message execution."
+
+    at checkExecSyncError (node:child_process:817:11)
+    at execSync (node:child_process:888:15)
+    at grow (/Users/moritz/projects/ic/flower-power-dao/power-equalizer/test-upgrade.js:21:13)
+    at Object.<anonymous> (/Users/moritz/projects/ic/flower-power-dao/power-equalizer/test-upgrade.js:106:9)
+    at Module._compile (node:internal/modules/cjs/loader:1105:14)
+    at Module._extensions..js (node:internal/modules/cjs/loader:1159:10)
+    at Module.load (node:internal/modules/cjs/loader:981:32)
+    at Module._load (node:internal/modules/cjs/loader:827:12)
+    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:77:12) {
+  status: 255,
+  signal: null,
+  output: [
+    null,
+    <Buffer >,
+    <Buffer 1b 5b 33 31 6d 45 72 72 6f 72 3a 20 1b 28 42 1b 5b 6d 46 61 69 6c 65 64 20 75 70 64 61 74 65 20 63 61 6c 6c 2e 0a 1b 5b 33 33 6d 43 61 75 73 65 64 20 ... 180 more bytes>
+  ],
+  pid: 89917,
+  stdout: <Buffer >,
+  stderr: <Buffer 1b 5b 33 31 6d 45 72 72 6f 72 3a 20 1b 28 42 1b 5b 6d 46 61 69 6c 65 64 20 75 70 64 61 74 65 20 63 61 6c 6c 2e 0a 1b 5b 33 33 6d 43 61 75 73 65 64 20 ... 180 more bytes>
+}
+```
+
+-------------------------
+
+timo | 2023-02-15 15:57:35 UTC | #15
+
+I see. Actually I now see the 20,000 argument value in the logs further above. If you set the initial capacity to 400,000 then the cost for all insertions below that level must be the same. The only thing that gets more costly as the Buffer fills up is garbage collection. The number of objects that the GC has to look at is at least the 400k entries (even if they are null) and then 280k * 5 (for each of the five fields in your objects). That's in the order of 2m. Then possibly more, but I don't know the types of buyer and this. In other experiments I have hit the GC limit at 200-300m small object. You are still 100x below that. But your situation differs in these ways:
+* larger size of the objects may contribute to higher GC cost
+* maybe more objects hidden/nested in `this`
+* you grow first by 20,000 and only have the remaining cycles for GC (I only ran GC and nothing before)
+
+It may be helpful to do your experiment with less complicated records where you know the exact size, or even with primitive types instead of a record.
+
+Your postupgrade numbers are way too small. Something must have gone wrong. The data cannot possibly fit in 1.53MB.
+
+I still don't understand why your memory size is so much larger than heap. Given the initial capacity of 400,000 I would expect heap and memory to be close to each other.
+
+EDIT: You can try grow in smaller increments, like 1,000 instead of 20,000. Leaving a higher cycle budget for GC may let it succeed and you can grow the Buffer further.
+
+-------------------------
+
+cryptoschindler | 2023-02-15 17:56:57 UTC | #16
+
+[quote="timo, post:15, topic:18429"]
+but I don’t know the types of buyer and this.
+[/quote]
+
+`buyer` is of type `Text`, `this` of type `Principal`. 
+
+[quote="timo, post:15, topic:18429"]
+It may be helpful to do your experiment with less complicated records where you know the exact size, or even with primitive types instead of a record.
+[/quote]
+
+I could do that, but then my results aren't really helpful for what I'm trying to achieve, right?
+
+[quote="timo, post:15, topic:18429"]
+Your postupgrade numbers are way too small. Something must have gone wrong. The data cannot possibly fit in 1.53MB.
+[/quote]
+
+I realized that now that I initialize the Buffer with an initial capacity, I don't populate it from the `stable` Array anymore and thus the state is just discarded after the upgrade. So that makes sense and I can ignore it until I figured out why I can't grow the Buffer more :slight_smile: 
+
+[quote="timo, post:15, topic:18429"]
+I still don’t understand why your memory size is so much larger than heap. Given the initial capacity of 400,000 I would expect heap and memory to be close to each other.
+[/quote]
+
+Maybe @claudio or @matthewhammer have some ideas? 
+
+
+
+[quote="timo, post:15, topic:18429"]
+EDIT: You can try grow in smaller increments, like 1,000 instead of 20,000. Leaving a higher cycle budget for GC may let it succeed and you can grow the Buffer further.
+[/quote]
+
+I did this previously with 5k, with the exact same results. But will try 1k now and see if something changes. Thanks for all your help, it's really appreciated!
+
+-------------------------
+
+matthewhammer | 2023-02-15 19:00:49 UTC | #17
+
+[quote="timo, post:5, topic:18429"]
+But this “sharing” gets lost during serialization. After deserialization all the data is multiplied.
+[/quote]
+
+This is my expectation of the main issue as well.
+
+[quote="cryptoschindler, post:6, topic:18429"]
+Not sure why there is an array inside my Buffer :thinking:.
+[/quote]
+
+If you look at how `Buffer` is implemented (as Motoko code in `base`), 
+you will find a mutable array that holds its elements.
+
+[quote="cryptoschindler, post:3, topic:18429"]
+```
+      let buyer = AID.fromPrincipal(this, null);
+```
+[/quote]
+
+How long are text values for `buyer`? (how big is it to serialize and deserialize?)
+
+[quote="cryptoschindler, post:16, topic:18429"]
+[quote="timo, post:15, topic:18429"]
+It may be helpful to do your experiment with less complicated records where you know the exact size, or even with primitive types instead of a record.
+[/quote]
+
+I could do that, but then my results aren’t really helpful for what I’m trying to achieve, right?
+[/quote]
+
+There are enough complex factors now, the clarity about what is going wrong is already lost, right?
+
+FWIW, I also strongly advocate what Timo is recommending, as an experiment to get more data about the issue.  For instance, if you try using `Blob`s of a fixed size as a stand in for these records and if the same issue happens, then we know it has nothing to do with the complexities of the records in the buffer, and is more about the buffer implementation itself, and how it is used here.  Without doing that experiment, I don't see how to reduce the confusion further, unfortunately.
+
+-------------------------
+
+matthewhammer | 2023-02-15 19:03:17 UTC | #18
+
+[quote="cryptoschindler, post:1, topic:18429"]
+The order of call is...
+[/quote]
+
+Why not measure both at both points?  (Why measure one, then wait and do stuff, and then measure the other?)
+
+-------------------------
+
+claudio | 2023-02-15 22:51:49 UTC | #19
+
+In ExperimentalStableMemory.mo, there is a function called stableVarQuery, that returns a query you can call to get the exact size of your stable variables in serialized format. it basically runs the pre-upgrade hook and then computes the size taken by stable variable data.
+
+Eg:
+```
+actor {
+  stable var state = "";
+  public func example() : async Text {
+    let memoryUsage = StableMemory.stableVarQuery();
+    let beforeSize = (await memoryUsage()).size;
+    state #= "abcdefghijklmnopqrstuvwxyz";
+    let afterSize = (await memoryUsage()).size;
+    debug_show (afterSize - beforeSize)
+  };
+};
+```
+
+https://internetcomputer.org/docs/current/references/motoko-ref/ExperimentalStableMemory#value-stablevarquery
+
+I haven't had time to read the thread in detail, but as Timo and Matthew suggested, I strongly suspect that you are being hit by loss of sharing during stabilization. If your buffer entries contains duplicated references to the same Text value, Principal or Blob or immutable array or any other structured object each reference to the same unique object will get expanded to a copy of that object in the serialized format, leading to blow up atter deserialization. The only stuff that isn't un-shared is the mutable data within, to preserve identity.
+
+Although the array backing the buffer is only serialized once, any repeated references within its entries will still get copied.
+
+This is a serious problem that ultimately is due to the fact that we (currently) use a mild extension of Candid to save stable variables, and Candid was not designed for that purpose.
+
+We have some mitigations in mind, but the real solution  (for us) is not to use Candid.
+
+One possible workaround is to introduce separate tables to map each large Principal, Blob etc to unique small ids and then reference those entities in transaction records by their small id. You can then invert the tables and id when you need to decode the transactions.
+
+-------------------------
+
+claudio | 2023-02-15 22:57:17 UTC | #20
+
+This post describes the rts functions:
+
+https://forum.dfinity.org/t/motoko-array-memory/5324/5?u=claudio
+
+-------------------------
+
+timo | 2023-02-16 06:08:35 UTC | #21
+
+[quote="claudio, post:19, topic:18429"]
+The only stuff that isn’t un-shared is the mutable data within, to preserve identity
+[/quote]
+
+So that is what makes circular references not a problem because a circular reference isn’t possible with immutable data alone?
+
+Does it make serializing records with mutable fields more expensive than immutable-only data? Because of the additional tracking involved.
+
+-------------------------
+
+cryptoschindler | 2023-02-28 23:35:25 UTC | #22
+
+I was able to grow the `Buffer` further by growing in smaller increments (1k items per call), so it really seems like the issue stemmed from the fact that GC became too expensive at some point to insert 20k elements within the same message.
+
+I rewrote `grow` to this
+```
+    public func grow(n : Nat) : Nat {
+      for (i in Iter.range(1, n)) {
+        _transactions.add({
+          token = "abc";
+          seller = Principal.fromText("aaaaa-aa");
+          price = 1000;
+          buyer = "abc";
+          time = Time.now();
+        });
+      };
+      _transactions.size();
+    };
+```
+This table is from a run were the initial `Buffer` size is 0 and the Buffer is serialised into stable memory using an array, and initialised from that array after the upgrade
+```
+┌─────────┬─────────────────┬──────────────┬───────────┬─────────────┬─────────────┬─────────────┬────────────────────┬──────────────────────┬──────────────────┬────────────────────┐
+│ (index) │       gc        │ transactions │ reinstall │  max live   │    heap     │   memory    │ upgrade successful │ max live postupgrade │ heap postupgrade │ memory postupgrade │
+├─────────┼─────────────────┼──────────────┼───────────┼─────────────┼─────────────┼─────────────┼────────────────────┼──────────────────────┼──────────────────┼────────────────────┤
+│    0    │ 'copying-force' │  '400,000'   │   true    │ '73.50 MB'  │ '73.50 MB'  │ '147.38 MB' │        true        │      '83.18 MB'      │    '83.18 MB'    │    '241.00 MB'     │
+│    1    │ 'copying-force' │  '800,000'   │   true    │ '147.27 MB' │ '147.27 MB' │ '294.94 MB' │        true        │     '166.13 MB'      │   '166.13 MB'    │    '481.13 MB'     │
+└─────────┴─────────────────┴──────────────┴───────────┴─────────────┴─────────────┴─────────────┴────────────────────┴──────────────────────┴──────────────────┴────────────────────┘
+```
+
+Thanks to everyone who participated in this thread :slight_smile:
+
+-------------------------
+
+timo | 2023-03-01 09:35:57 UTC | #23
+
+Can you show the code in your pre/post-upgrade functions? Just wondering why the heap size increased across the upgrade.
+
+Is your original question answered? You wanted to know how large you can make the Buffer while it still survives the upgrade. Did you push it to the limit?
+
+-------------------------
+
+timo | 2023-03-01 09:40:41 UTC | #24
+
+[quote="claudio, post:19, topic:18429"]
+In ExperimentalStableMemory.mo, there is a function called stableVarQuery, that returns a query you can call to get the exact size of your stable variables in serialized format. it basically runs the pre-upgrade hook and then computes the size taken by stable variable data.
+[/quote]
+
+What does this tell me or how shall I use it? I suppose I have to make sure that my current heap size plus the value returned by this function `stableVarQuery` together fit in 4GB?
+
+-------------------------
+
+cryptoschindler | 2023-03-03 11:32:19 UTC | #25
+
+>Can you show the code in your pre/post-upgrade functions? Just wondering why the heap size increased across the upgrade.
+
+https://github.com/flowerpowerdao/power-equalizer/blob/7627a1b0eacfc1d15e658617bfed681479aa1e3f/src/main.mo#L72
+
+> Is your original question answered? You wanted to know how large you can make the Buffer while it still survives the upgrade. Did you push it to the limit?
+
+I was able to push it to the limit without the `--force-gc` flag:
+```
+┌─────────┬────────────────┬──────────────┬───────────┬──────────────┬──────────────┬──────────────┬────────────────────┬──────────────────────┬──────────────────┬────────────────────┐
+│ (index) │       gc       │ transactions │ reinstall │   max live   │     heap     │    memory    │ upgrade successful │ max live postupgrade │ heap postupgrade │ memory postupgrade │
+├─────────┼────────────────┼──────────────┼───────────┼──────────────┼──────────────┼──────────────┼────────────────────┼──────────────────────┼──────────────────┼────────────────────┤
+│    0    │   'copying'    │  '400,000'   │   false   │  '61.85 MB'  │  '77.73 MB'  │ '130.88 MB'  │        true        │      '83.17 MB'      │    '83.23 MB'    │    '241.00 MB'     │
+│    1    │   'copying'    │  '800,000'   │   false   │ '154.06 MB'  │ '156.80 MB'  │ '325.19 MB'  │        true        │     '166.33 MB'      │   '166.43 MB'    │    '481.75 MB'     │
+│    2    │   'copying'    │ '1,000,000'  │   false   │ '166.33 MB'  │ '215.48 MB'  │ '481.75 MB'  │        true        │     '207.91 MB'      │   '208.02 MB'    │    '602.13 MB'     │
+│    3    │   'copying'    │ '1,400,000'  │   false   │ '207.91 MB'  │ '306.11 MB'  │ '602.13 MB'  │        true        │     '291.07 MB'      │   '291.18 MB'    │    '842.81 MB'     │
+│    4    │   'copying'    │ '2,000,000'  │   false   │ '397.57 MB'  │ '399.14 MB'  │ '842.81 MB'  │        true        │     '415.82 MB'      │   '415.92 MB'    │    '1203.88 MB'    │
+│    5    │   'copying'    │ '2,800,000'  │   false   │ '415.82 MB'  │ '612.17 MB'  │ '1203.88 MB' │        true        │     '582.14 MB'      │   '582.24 MB'    │    '1685.31 MB'    │
+│    6    │   'copying'    │ '3,400,000'  │   false   │ '582.14 MB'  │ '729.55 MB'  │ '1685.31 MB' │        true        │     '706.88 MB'      │   '706.98 MB'    │    '2046.38 MB'    │
+│    7    │   'copying'    │ '4,000,000'  │   false   │ '706.88 MB'  │ '854.31 MB'  │ '2046.38 MB' │        true        │     '831.62 MB'      │   '831.72 MB'    │    '2407.44 MB'    │
+│    8    │   'copying'    │ '5,000,000'  │   false   │ '831.62 MB'  │ '1077.29 MB' │ '2407.44 MB' │        true        │     '1039.52 MB'     │   '1039.62 MB'   │    '3009.19 MB'    │
+│    9    │  'compacting'  │  '400,000'   │   false   │  '61.85 MB'  │  '77.73 MB'  │  '78.06 MB'  │        true        │      '83.17 MB'      │    '83.23 MB'    │    '162.81 MB'     │
+│   10    │  'compacting'  │  '800,000'   │   false   │ '154.06 MB'  │ '156.80 MB'  │ '176.44 MB'  │        true        │     '166.33 MB'      │   '166.41 MB'    │    '325.25 MB'     │
+│   11    │  'compacting'  │ '1,000,000'  │   false   │ '166.33 MB'  │ '215.46 MB'  │ '325.25 MB'  │        true        │     '207.91 MB'      │   '207.99 MB'    │    '406.50 MB'     │
+│   12    │  'compacting'  │ '1,400,000'  │   false   │ '207.91 MB'  │ '306.08 MB'  │ '406.50 MB'  │        true        │     '291.07 MB'      │   '291.18 MB'    │    '569.00 MB'     │
+│   13    │  'compacting'  │ '2,000,000'  │   false   │ '397.57 MB'  │ '399.09 MB'  │ '569.00 MB'  │        true        │     '415.82 MB'      │   '415.92 MB'    │    '812.69 MB'     │
+│   14    │  'compacting'  │ '2,800,000'  │   false   │ '415.82 MB'  │ '612.26 MB'  │ '812.69 MB'  │        true        │     '582.14 MB'      │   '582.24 MB'    │    '1137.63 MB'    │
+│   15    │  'compacting'  │ '3,400,000'  │   false   │ '582.14 MB'  │ '729.50 MB'  │ '1137.63 MB' │        true        │     '706.88 MB'      │   '706.98 MB'    │    '1381.31 MB'    │
+│   16    │  'compacting'  │ '4,000,000'  │   false   │ '706.88 MB'  │ '854.29 MB'  │ '1381.31 MB' │        true        │     '831.62 MB'      │   '831.72 MB'    │    '1625.06 MB'    │
+│   17    │  'compacting'  │ '5,000,000'  │   false   │ '831.62 MB'  │ '1077.24 MB' │ '1625.06 MB' │        true        │     '1039.52 MB'     │   '1039.62 MB'   │    '2031.19 MB'    │
+│   18    │ 'generational' │  '400,000'   │   false   │  '72.75 MB'  │  '79.12 MB'  │  '79.44 MB'  │        true        │      '83.18 MB'      │    '83.24 MB'    │    '162.81 MB'     │
+│   19    │ 'generational' │  '800,000'   │   false   │ '153.85 MB'  │ '160.98 MB'  │ '162.81 MB'  │        true        │     '166.34 MB'      │   '166.45 MB'    │    '325.25 MB'     │
+│   20    │ 'generational' │ '1,000,000'  │   false   │ '197.54 MB'  │ '204.91 MB'  │ '325.25 MB'  │        true        │     '207.92 MB'      │   '208.06 MB'    │    '406.50 MB'     │
+│   21    │ 'generational' │ '1,400,000'  │   false   │ '275.52 MB'  │ '282.18 MB'  │ '406.50 MB'  │        true        │     '291.08 MB'      │   '291.24 MB'    │    '569.00 MB'     │
+│   22    │ 'generational' │ '2,000,000'  │   false   │ '394.90 MB'  │ '400.55 MB'  │ '569.00 MB'  │        true        │     '415.83 MB'      │   '416.01 MB'    │    '812.69 MB'     │
+│   23    │ 'generational' │ '2,800,000'  │   false   │ '556.03 MB'  │ '560.95 MB'  │ '812.69 MB'  │        true        │     '582.15 MB'      │   '582.33 MB'    │    '1137.63 MB'    │
+│   24    │ 'generational' │ '3,400,000'  │   false   │ '685.96 MB'  │ '691.61 MB'  │ '1137.63 MB' │        true        │     '706.89 MB'      │   '707.07 MB'    │    '1381.31 MB'    │
+│   25    │ 'generational' │ '4,000,000'  │   false   │ '810.52 MB'  │ '816.94 MB'  │ '1381.31 MB' │        true        │     '831.63 MB'      │   '831.81 MB'    │    '1625.06 MB'    │
+│   26    │ 'generational' │ '5,000,000'  │   false   │ '1008.23 MB' │ '1012.42 MB' │ '1625.06 MB' │        true        │     '1039.53 MB'     │   '1039.73 MB'   │    '2031.19 MB'    │
+└─────────┴────────────────┴──────────────┴───────────┴──────────────┴──────────────┴──────────────┴────────────────────┴──────────────────────┴──────────────────┴────────────────────┘
+Creating canister copying-force.
+```
+
+To speed things up, I ran 10 parallel calls of `grow(1000)`. With the `--force-gc` flag, message execution took so long, that the messages in the queue timed out when the Buffer was already filled with a couple hundred thousand entries. The bigger the buffer, the longer it took for the messages to be executed. After upgrading the canister, the execution time grew significantly (130 instead of 30 seconds).
+```
+Creating canister copying-force...
+copying-force canister created with canister id: rno2w-sqaaa-aaaaa-aaacq-cai
+--------------------------------------------------
+Reinstalling...
+Reinstalled
+Fabricating cycles...
+Fabricated cycles
+Growing transaction size to 400,000...
+Growing transactions to 10000/400000
+All commands executed successfully
+Took 2.304730499267578 seconds to execute
+Growing transactions to 20000/400000
+All commands executed successfully
+Took 2.301433624267578 seconds to execute
+Growing transactions to 30000/400000
+All commands executed successfully
+Took 3.324260457992554 seconds to execute
+Growing transactions to 40000/400000
+All commands executed successfully
+Took 4.344848001480103 seconds to execute
+Growing transactions to 50000/400000
+All commands executed successfully
+Took 4.319609043121338 seconds to execute
+Growing transactions to 60000/400000
+All commands executed successfully
+Took 5.3472237911224365 seconds to execute
+Growing transactions to 70000/400000
+All commands executed successfully
+Took 6.4522719593048095 seconds to execute
+Growing transactions to 80000/400000
+All commands executed successfully
+Took 6.912330875396728 seconds to execute
+Growing transactions to 90000/400000
+All commands executed successfully
+Took 7.903315542221069 seconds to execute
+Growing transactions to 100000/400000
+All commands executed successfully
+Took 8.698994625091553 seconds to execute
+Growing transactions to 110000/400000
+All commands executed successfully
+Took 9.754751081466674 seconds to execute
+Growing transactions to 120000/400000
+All commands executed successfully
+Took 9.749219499588012 seconds to execute
+Growing transactions to 130000/400000
+All commands executed successfully
+Took 10.777633541107178 seconds to execute
+Growing transactions to 140000/400000
+All commands executed successfully
+Took 11.79283745956421 seconds to execute
+Growing transactions to 150000/400000
+All commands executed successfully
+Took 11.806708457946778 seconds to execute
+Growing transactions to 160000/400000
+All commands executed successfully
+Took 12.830129793167114 seconds to execute
+Growing transactions to 170000/400000
+All commands executed successfully
+Took 13.80576591682434 seconds to execute
+Growing transactions to 180000/400000
+All commands executed successfully
+Took 13.832445833206176 seconds to execute
+Growing transactions to 190000/400000
+All commands executed successfully
+Took 14.815648916244507 seconds to execute
+Growing transactions to 200000/400000
+All commands executed successfully
+Took 15.839829708099366 seconds to execute
+Growing transactions to 210000/400000
+All commands executed successfully
+Took 16.926885665893554 seconds to execute
+Growing transactions to 220000/400000
+All commands executed successfully
+Took 16.886094667434694 seconds to execute
+Growing transactions to 230000/400000
+All commands executed successfully
+Took 17.888822666168213 seconds to execute
+Growing transactions to 240000/400000
+All commands executed successfully
+Took 18.95769966506958 seconds to execute
+Growing transactions to 250000/400000
+All commands executed successfully
+Took 18.909073709487917 seconds to execute
+Growing transactions to 260000/400000
+All commands executed successfully
+Took 18.9390909576416 seconds to execute
+Growing transactions to 270000/400000
+All commands executed successfully
+Took 20.993517957687377 seconds to execute
+Growing transactions to 280000/400000
+All commands executed successfully
+Took 22.009947999954225 seconds to execute
+Growing transactions to 290000/400000
+All commands executed successfully
+Took 22.038469083786012 seconds to execute
+Growing transactions to 300000/400000
+All commands executed successfully
+Took 21.959165000915526 seconds to execute
+Growing transactions to 310000/400000
+All commands executed successfully
+Took 24.003851585388183 seconds to execute
+Growing transactions to 320000/400000
+All commands executed successfully
+Took 24.038773332595824 seconds to execute
+Growing transactions to 330000/400000
+All commands executed successfully
+Took 25.039592500686645 seconds to execute
+Growing transactions to 340000/400000
+All commands executed successfully
+Took 25.01791833305359 seconds to execute
+Growing transactions to 350000/400000
+All commands executed successfully
+Took 26.073978666305543 seconds to execute
+Growing transactions to 360000/400000
+All commands executed successfully
+Took 27.148988082885744 seconds to execute
+Growing transactions to 370000/400000
+All commands executed successfully
+Took 28.092508998870848 seconds to execute
+Growing transactions to 380000/400000
+All commands executed successfully
+Took 28.07980354309082 seconds to execute
+Growing transactions to 390000/400000
+All commands executed successfully
+Took 29.12529295730591 seconds to execute
+Growing transactions to 400000/400000
+All commands executed successfully
+Took 30.15587545776367 seconds to execute
+Took a total of 640.3228264160156 seconds to execute
+Stopping...
+Upgrading...
+Starting...
+┌─────────┬─────────────────┬──────────────┬───────────┬────────────┬────────────┬─────────────┬────────────────────┬──────────────────────┬──────────────────┬────────────────────┐
+│ (index) │       gc        │ transactions │ reinstall │  max live  │    heap    │   memory    │ upgrade successful │ max live postupgrade │ heap postupgrade │ memory postupgrade │
+├─────────┼─────────────────┼──────────────┼───────────┼────────────┼────────────┼─────────────┼────────────────────┼──────────────────────┼──────────────────┼────────────────────┤
+│    0    │ 'copying-force' │  '400,000'   │   false   │ '73.50 MB' │ '73.50 MB' │ '147.38 MB' │        true        │      '83.18 MB'      │    '83.18 MB'    │    '241.00 MB'     │
+└─────────┴─────────────────┴──────────────┴───────────┴────────────┴────────────┴─────────────┴────────────────────┴──────────────────────┴──────────────────┴────────────────────┘
+--------------------------------------------------
+Growing transaction size to 800,000...
+Growing transactions to 410000/800000
+All commands executed successfully
+Took 130.0328239593506 seconds to execute
+Growing transactions to 420000/800000
+All commands executed successfully
+Took 136.77689070701598 seconds to execute
+Growing transactions to 430000/800000
+.
+.
+.
+```
+I have a couple of questions regarding that behaviour:
+- Why does the garbage collector take so much more time after a canister upgrade?
+- 136s/10 means that there have to be messages that take longer than 12s, i thought DTS was enabled for 6 rounds, and a round is ~2s, how is it possible that a message takes longer than that? @ulan 
+- Without the `--force-gc` flag, I don't really see any iterations that stand out, it always seems to take ~2s for ten `grow(1000)` calls to execute without `gc`, with `gc` I see mesages that take up to 7s when the Buffer has more than 500k entries. Why aren't those messages where the `gc` is run taking the same amount of time to execute as for messages with the `--force-gc` on, namely ~13s?
+
+If you want to try the test yourself, the code is in the [`test-upgrade` branch.](https://github.com/flowerpowerdao/power-equalizer/tree/test-upgrade)
+You can modify the test logic in [`test-upgrade.js`](https://github.com/flowerpowerdao/power-equalizer/blob/test-upgrade/test-upgrade.js)  and find the `grow` implementation [here](https://github.com/flowerpowerdao/power-equalizer/blob/7627a1b0eacfc1d15e658617bfed681479aa1e3f/src/Marketplace/lib.mo#L46).
+
+Run `npm run replica` to start a clean local replica, and `npm run test-upgrade` to start the tests.
+
+-------------------------
+
+ulan | 2023-03-03 12:00:52 UTC | #26
+
+>  i thought DTS was enabled for 6 rounds, and a round is ~2s, how is it possible that a message takes longer than that?
+
+DTS executes about 2B instructions per round. The message instruction limit is currently 20B instructions, so a message with DTS would run for 10 rounds.
+
+-------------------------
+
+claudio | 2023-03-03 17:31:14 UTC | #27
+
+[quote="cryptoschindler, post:25, topic:18429"]
+* Why does the garbage collector take so much more time after a canister upgrade?
+* 136s/10 means that there have to be messages that take longer than 12s, i thought DTS was enabled for 6 rounds, and a round is ~2s, how is it possible that a message takes longer than that? @ulan
+* Without the `--force-gc` flag, I don’t really see any iterations that stand out, it always seems to take ~2s for ten `grow(1000)` calls to execute without `gc`, with `gc` I see mesages that take up to 7s when the Buffer has more than 500k entries. Why aren’t those messages where the `gc` is run taking the same amount of time to execute as for messages with the `--force-gc` on, namely ~13s?
+[/quote]
+
+Looking at your script, I'm not really sure you are measuring the time to gc rather than the elapsed time to go through the replica with an increasing number of concurrent calls.
+There's  Motoko prims you can call rts_mutator_instructions and rts_collector_instructions  that return the instruction counts for computation/gc of the previous message (use with care). That might give you more accurate measurements of what the motoko code, rather than the replica/OS etc are doing.
+Since the heap size doesn't seem to grow radically after upgrade, I'd expect the gc to not get drastically more expense, but maybe we have a bug or you are actually measuring something else, like the cost of contention on the replica. (The memory size doubling after upgrade is probably due to the fact that deserializaion first copied the stable variable serialized data into memory then deserializes it into memory, leading to doubling.)
+
+-------------------------
+
+cryptoschindler | 2023-03-07 15:03:11 UTC | #28
+
+[quote="claudio, post:27, topic:18429"]
+I’m not really sure you are measuring the time to gc rather than the elapsed time to go through the replica with an increasing number of concurrent calls.
+[/quote]
+
+The amount of concurrent calls stays the same (10) after the update. But true, I'm not measuring the time it takes to `gc`, I'm measuring the time it takes to execute all of the concurrent calls. Sometimes this includes `gc`, sometimes it doesn't. Sometimes all messages fit within a block, sometimes a block only contains one message.
+
+I still don't understand those two observations :thinking: 
+
+[quote="cryptoschindler, post:25, topic:18429"]
+Without the `--force-gc` flag, I don’t really see any iterations that stand out, it always seems to take ~2s for ten `grow(1000)` calls to execute without `gc`, with `gc` I see mesages that take up to 7s when the Buffer has more than 500k entries. Why aren’t those messages where the `gc` is run taking the same amount of time to execute as for messages with the `--force-gc` on, namely ~13s?
+[/quote]
+
+[quote="cryptoschindler, post:25, topic:18429"]
+* Why does the garbage collector take so much more time after a canister upgrade?
+[/quote]
+
+-------------------------
+

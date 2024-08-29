@@ -1,0 +1,675 @@
+icme | 2023-01-03 06:59:03 UTC | #1
+
+A lifecycle hook or method is a common way of allowing developers a **passive** way to tie into and handle the occurrence of specific and important events. In the context of React and Angular, lifecycle hooks allow developers to tie into a component mounting or state changes, and in the context of AWS EC2 these hooks are triggered when auto-scaling an instance.
+
+On the IC, developers are currently able to **actively** interact with canisters but are limited in their ability to passively tie into specific important events in the lifecycle of a canister. This proposal aims to introduce an initial set of these lifecycle hooks for canisters on the IC.
+
+<br/>
+
+## Types of Lifecycle Hooks Proposed
+
+### Canister Metric Hooks
+
+* `canister_on_low_cycles(cyclesThreshold: Nat): async ()`
+-> triggers when the canister has `cycles <= cyclesThreshold`
+
+* `canister_on_low_heap_memory(heapMemoryThreshold: Nat): async ()`
+-> triggers when the canister has `heapMemory >= heapMemoryThreshold`
+
+Currently in order to monitor canisters, developers need to to proactively reach out to the canister or call a system level API. Providing canister metric lifecycle hooks allows developers to define their own thresholds for canisters and react when these thresholds are breached. Each of these thresholds will use 8 bytes and be stored in the canister settings within the replica.
+
+If a canister metric threshold has been provided, once the replica detects that a canister has crossed that threshold it will send a message to the specific endpoint (i.e. `canister_on_low_cycles()`) of the canister, triggering that specific lifecycle hook once the canister is able to process the message.
+
+### Canister Error Hooks
+
+* `canister_on_error(methodName: Text, args: Blob, error: Error): async()`
+-> triggers on uncaught canister runtime error (trap), allows the developer to capture, analyze, and log different types of errors
+
+Currently, there is no way for canister developers to catch synchronous errors occuring within a single canister, including heartbeat errors. By introducing the `canister_on_error()` hook, after executing a message/heartbeat/timer, if the execution fails the replica will schedule a message to be sent to the canister_on_error() endpoint of the canister passing the error message.
+
+### Canister Lifecycle Hooks
+
+* `canister_post_init(): async()`
+-> triggers immediately after the `canister_init()` (i.e. constructor) function of the canister
+
+Currently, there is no way to execute inter-canister/asynchronous calls during the canister `canister_init()` method. In order to ensure that the asynchronous call happens before any other message is executed, the current workaround is to add a guard in place that either awaits on the completion of the asynchronous task or rejects any messages until that task is completed.
+
+The `canister_post_init()` lifecycle hook would create a message in the per-canister task queue abstraction mentioned here https://forum.dfinity.org/t/cross-canister-compatible-post-init-hook/16929/5 to ensure that the `canister_post_init()` hook is executed before any other “regular” message.
+
+### Wish List Hooks (additional, nice to have)
+
+* `canister_output_queue_size(): Nat` → synchronous call that exposes the output queue size of a canister, helping a developer to throttle/pace outgoing calls from a canister.
+* `canister_on_output_queue_full(): ()` → synchronous call that triggers when a canister’s output queue is full
+
+
+<br/>
+<br/>
+<br/>
+
+
+Special thanks to @ulan for his technical background and expertise, and encouraging me to take on this proposal.
+
+-------------------------
+
+berestovskyy | 2022-12-06 10:53:53 UTC | #2
+
+I like the proposal! Two suggestions:
+
+1. Similar to `canister_post_init()`, would it be also useful to have a hook to be executed after the canister upgrade? If so, those two might be merged into one hook...
+2. It seems the low cycles and low heap memory hooks seems like just a special case of an error, so we might have just one `canister_on_error()` hook with some predefined set of errors...
+
+WDYT?
+
+-------------------------
+
+dsarlis | 2022-12-06 11:00:43 UTC | #3
+
+Thanks for starting this thread @icme. I think this is a very reasonable proposal and I like it.
+
+> Currently, there is no way for canister developers to catch synchronous errors occuring within a single canister, including heartbeat errors.
+
+Nit: I think that's true for Motoko but in Rust you can actually catch synchronous errors in your canister, e.g. a queue being full or the canister not having enough cycles when attempting to send an inter-canister call (the heartbeat errors are still problematic and thus it's still a good example).
+
+I also have one clarifying question on the `canister_post_init` hook. It sounds to me like one important aspect you want from it is the ability to execute inter-canister/asynchronous calls after the canister's initialization. Adding a task in the per-canister task queue to ensure `canister_post_init` is triggered first before any other regular messages doesn't seem to ensure that any inter-canister calls triggered by it would also be executed before anything else. Unless, that is, we somehow keep adding some task in the queue until the outgoing requests from `canister_post_init` are already handled.
+
+So, to confirm, you expect that any calls initiated by `canister_post_init` would also be processed before any other messages right?
+
+-------------------------
+
+icme | 2022-12-06 12:15:28 UTC | #4
+
+[quote="berestovskyy, post:2, topic:17089"]
+Similar to `canister_post_init()`, would it be also useful to have a hook to be executed after the canister upgrade? If so, those two might be merged into one hook
+[/quote]
+
+I think this makes sense - the only question potential issue I see is then confusion with the `postupgrade()` system function hook in Motoko. That also runs after immediately after an upgrade, and is meant to deserialize `stable` variables from stable memory back into the heap or run something immediately after an upgrade.
+
+In my opinion, `canister_post_init()` should run after Motoko's `postupgrade()`. Tagging @claudio to pull in some of his thoughts on how this might work from the Motoko side.
+
+[quote="berestovskyy, post:2, topic:17089"]
+It seems the low cycles and low heap memory hooks seems like just a special case of an error, so we might have just one `canister_on_error()` hook with some predefined set of errors…
+[/quote]
+
+The `canister_on_low_cycles` and `canister_on_low_heap_memory` actually is meant as a warning and should be triggered well **before** the respective canister cycles freezing threshold or canister heap memory limit is reached. In this way, it's less of an error message and more of a "hurry up and do something before this becomes an error" message.
+
+[quote="dsarlis, post:3, topic:17089"]
+So, to confirm, you expect that any calls initiated by `canister_post_init` would also be processed before any other messages right?
+[/quote]
+
+Correct. Since each of these hooks are `async()`, would it be possible to `await` the response of `canister_post_init` before any other messages are executed?
+
+[quote="dsarlis, post:3, topic:17089"]
+Adding a task in the per-canister task queue to ensure `canister_post_init` is triggered first before any other regular messages doesn’t seem to ensure that any inter-canister calls triggered by it would also be executed before anything else.
+[/quote]
+
+Doesn't the IC's deterministic execution (preservation of message ordering) take care of this?
+
+-------------------------
+
+GLdev | 2022-12-06 12:24:38 UTC | #5
+
+[quote="berestovskyy, post:2, topic:17089"]
+It seems the low cycles and low heap memory hooks seems like just a special case of an error, so we might have just one `canister_on_error()` hook with some predefined set of errors…
+[/quote]
+
+If I understand the intent behind this correctly, then I'd disagree. You probably want to treat low_* hooks as a warning rather than an error. To borrow an analogy from rust, canister_on_error is a panic! (and you need to rethink something in your code, probably can't recover at runtime), while low_* would be a Result<Err> that you can and should cover in your code (e.g. by adding more cycles, or freeing up some buffers if possible, or spinning up new canisters depending on your use-case).
+
+-------------------------
+
+dsarlis | 2022-12-06 12:37:42 UTC | #6
+
+[quote="icme, post:4, topic:17089"]
+Since each of these hooks are `async()`, would it be possible to `await` the response of `canister_post_init` before any other messages are executed?
+[/quote]
+
+Sure it's possible, but I'm not sure it's as simple as "add a task in the canister's task queue" or we need something like a different state to know whether the canister is still being initialized (and so we can know that other messages should be rejected or queued up).
+
+> Doesn’t the IC’s deterministic execution (preservation of message ordering) take care of this?
+
+I think there's some misunderstanding here or maybe I wasn't clear enough. If we send a message from `canister_post_init` I don't see how it's guaranteed that we won't process any other messages before the response to this message is received. Your canister might have received ingress messages or other inter-canister calls in the mean time. Nothing prevents that. (Are you suggesting that we do?)
+
+So, if we want to really make sure that `canister_post_init` is "fully" done, a (one-time) task added in the canister's task queue will not be enough in itself I think. You'll need either to keep injecting tasks in the queue until the responses for `canister_post_init` are processed or we use some intermediate state for the canister to know that certain responses need to be handled before other messages (and likely reject other messages while we're waiting for those responses).
+
+-------------------------
+
+berestovskyy | 2022-12-06 17:26:52 UTC | #7
+
+[quote="icme, post:4, topic:17089"]
+the only question potential issue I see is then confusion with the `postupgrade()` system function hook in Motoko
+[/quote]
+
+To avoid confusions, we could rename the hook to `canister_ready_to_serve()` or so...
+
+[quote="icme, post:4, topic:17089"]
+The `canister_on_low_cycles` and `canister_on_low_heap_memory` actually is meant as a warning
+[/quote]
+
+[quote="GLdev, post:5, topic:17089"]
+You probably want to treat low_* hooks as a warning rather than an error.
+[/quote]
+
+I agree, there are warnings and errors. But at the end, in both cases, all we can do from the canister's perspective is to log this error/warning or to send an alert elsewhere.
+
+If we have something more neutral, like `canister_system_notification()`, we could handle errors and warnings in one place, as the logic might be quite similar...
+
+-------------------------
+
+icme | 2022-12-06 22:58:31 UTC | #8
+
+[quote="berestovskyy, post:7, topic:17089"]
+If we have something more neutral, like `canister_system_notification()`, we could handle errors and warnings in one place
+[/quote]
+
+What do you see as some of the pros and cons of having one system API vs. multiple system APIs?
+
+From an DevX perspective, I'd personally like to handle each of these events in a different API, rather than having one single endpoint where the developer has to parse/match on different system notification codes.
+
+[quote="dsarlis, post:6, topic:17089"]
+If we send a message from `canister_post_init` I don’t see how it’s guaranteed that we won’t process any other messages before the response to this message is received. Your canister might have received ingress messages or other inter-canister calls in the mean time. Nothing prevents that. (Are you suggesting that we do?)
+[/quote]
+
+Ideally this would both execute the `canister_post_init()` call and await it's resolution before any other messages in the queue are executed. This would allow a newly created canister to fully sync with the rest of a multi-canister application before opening up its message queues. Maybe this would look like opening up the task queue, but closing off/halting the canister message ingress, input, output queues until `canister_post_init()` completes (and then opening back up the ingress/input/output queues).
+
+From the implementation and feasibility side of things I'm a bit out of my depth here, and am just going off the videos I've seen, some brief browsing of the IC code, and what I read about the canister task queue that was implemented specifically for DTS. I'll rope in @ulan.
+
+-------------------------
+
+ulan | 2022-12-07 08:11:42 UTC | #9
+
+> Ideally this would both execute the `canister_post_init()` call and await it’s resolution before any other messages in the queue are executed.
+
+We can ensure that `canister_post_init()` is executed before any other message, but if it makes other calls, then these calls will be regular calls. In other words, we can guarantee that the part of `canister_post_init()` until the first await executes before any other messages. After the await, other messages may execute (i.e. the standard async/await semantics).
+
+To ensure that all awaits also happen before other messages, we would need some kind of atomic inter-canister transactions, which is super difficult.
+
+Does this limitation greatly reduce usefulness of `canister_post_init()` ?
+
+-------------------------
+
+berestovskyy | 2022-12-07 10:03:01 UTC | #10
+
+[quote="icme, post:8, topic:17089"]
+I’d personally like to handle each of these events in a different API, rather than having one single endpoint where the developer has to parse/match on different system notification codes.
+[/quote]
+
+Yeah, we might want to purge some memory on low heap or something, it might be useful to have a dedicated hook for that...
+
+-------------------------
+
+dansteren | 2022-12-07 18:22:52 UTC | #11
+
+> Does this limitation greatly reduce usefulness of `canister_post_init()` ?
+
+Yes. I think the driving motivation behind a `canister_post_init()` hook (or whatever we end up naming it) is **specifically** to await cross-canister calls. If you just want to execute non-async code I'd imagine you would just add it to your `init()` or `postUpgrade()` methods. It's specifically the async stuff that we're trying to provide a handle for.
+
+To provide a concrete use case, consider the need to seed custom randomness. This requires making a cross-canister call to the management canister's `raw_rand()` method. You'd most assuredly want that to complete before you attempted to use random in your other canister methods. If other methods start getting hit before the randomness is fully seeded it could cause significant problems.
+
+Seeding randomness is just one example. I imagine there will be many scenarios where external data is needed to get a canister into the correct start state.
+
+Furthermore, when asking about how to guarantee async code happens before other messages, the [currently accepted solution](https://forum.dfinity.org/t/cross-canister-compatible-post-init-hook/16929/4) is to add a guard clause inside each update method. I see the `canister_post_init()` hook as the replacement to those initialization guards, so I think it must provide the same level of assurance.
+
+-------------------------
+
+ulan | 2022-12-08 18:47:43 UTC | #12
+
+Thanks for explaining @dansteren!
+
+When I was thinking about feasibility of `canister_post_init()`, I was only thinking about calling that function before other messages, but didn't consider that we also want to wait for all its calls to complete, which makes a lot of sense in the hindsight.
+
+I am afraid, it is very difficult to support the full solution that waits for all the outgoing calls of `canister_post_init()`.
+
+-------------------------
+
+icme | 2022-12-09 03:39:28 UTC | #13
+
+@ulan  Given the complexity around a full async block until `canister_post_init()` is completed, a non-blocking `canister_post_init()` is still valuable in guaranteeing that it is the first message after the `init()` function is called (as long as the canister implements `canister_post_init()`). It's also valuable in being able to provoke async canister calls without requiring a heartbeat or external message trigger.
+
+
+
+@dansteren  Looking at the other thread, I was thinking about the guards solution and came up with another potential solution to your problem.
+
+1. Have 2 wasms, wA and wB. wA initializes the canister and has only the `canister_post_init()` method and no other public APIs. The wB extends wA and has all of your public APIs and other business logic, and is able to upgrade wA without a breaking change or loss of state.
+2. Create canister C with wA. `canister_post_init()` will run directly after and create your seed for C and make any needed calls elsewhere, but no additional ingress or input calls will be able to come through to canister C since no endpoints/APIs are enabled it.
+3. Upgrade canister C with wB. `canister_post_init()` might still run immediately after the upgrade, but just include logic inside `canister_post_init()` that says if your seed has already been generated/exists, don't repeat the logic. Now canister C will already have its seed set up prior to receiving any messages and you don't have to worry about adding any additional guards/blocking logic.
+
+-------------------------
+
+dansteren | 2022-12-09 17:02:24 UTC | #14
+
+[quote="icme, post:13, topic:17089"]
+@ulan Given the complexity around a full async block until `canister_post_init()` is completed, a non-blocking `canister_post_init()` is still valuable in guaranteeing that it is the first message after the `init()` function is called (as long as the canister implements `canister_post_init()`). It’s also valuable in being able to provoke async canister calls without requiring a heartbeat or external message trigger.
+[/quote]
+
+I agree, kicking off an async call could still be valuable. Not as great as assuring it returns, but it's a step in the right direction since you can't even kick calls off from the `init()` method.
+
+[quote="icme, post:13, topic:17089"]
+@dansteren Looking at the other thread, I was thinking about the guards solution and came up with another potential solution to your problem.
+[/quote]
+
+This is a decent solution, but it won't really work for my specific use case. Basically you're saying, when deploying a canister, first deploy a very basic canister that only contains `init` and `canister_post_init`. Then afterwords add all the rest of your functionality.
+
+That could be an alright solution for some, but my team and I are building CDKs, i.e. working at the language level ([Typescript](https://github.com/demergent-labs/azle) and [Python](https://github.com/demergent-labs/kybra)). We don't have control over when our users deploy their canisters. They just expect `Math.random()` and `random.random()` to work in TS and Python respectively. So it's up to us to seed the randomness for them, meaning, inject some underlying code that calls the management canister's `raw_rand` method, and do so as early as possible.
+
+So I think having a `canister_post_init` would still be helpful. It would be ideal if we knew the call to `raw_rand` had fully returned, but if not, even just kicking it off from there would be better than putting a guard at the top of every method, especially since that wouldn't work for query methods.
+
+-------------------------
+
+icme | 2023-01-03 06:57:41 UTC | #15
+
+Given the new year, I'd like to revive this thread and potentially add canister lifecycle hooks to the DFINITY roadmap somewhere :slight_smile: 
+
+So far, I haven't seen any red flags that would hold these back, with the one limitation being that the `canister_post_init` implementation may not perfectly meet @dansteren's use case, but would meet others' use cases such as mentioned here https://forum.dfinity.org/t/question-how-do-i-make-an-inter-canister-call-from-the-post-upgrade-hook
+
+Also, I'd like to add one additional metric hook to the wish list that canisters could tie into related to their output queues.
+
+* `canister_output_queue_size(): Nat` -> synchronous call that exposes the output queue size of a canister, helping a developer to throttle/pace outgoing calls from a canister.
+* `canister_on_output_queue_full(): ()` -> triggers when a canister's output queue is full
+
+
+I've added this to the "wish list" section of the main post in an edit
+
+-------------------------
+
+ulan | 2023-01-04 11:38:26 UTC | #16
+
+Wdyt about the following plan?
+
+1. Submit an NNS motion proposal to add the three non-controversial hooks to the roadmap:
+    * `canister_on_low_cycles()`
+    * `canister_on_low_heap_memory()`
+    * `canister_on_error()`
+2. Postpone `canister_post_init()` until we have ideas on how to implement the useful version of it.
+3. Move `canister_output_queue_size()` into a standalone feature. It sounds like a very useful API orthogonal to the hooks.
+4. Drop `canister_on_output_queue_full()` because it doesn't seem very actionable. By the time when the hook runs the queue can change arbitrarily (the messages may be drained from the queue or added to it).
+
+-------------------------
+
+ulan | 2023-01-19 15:41:05 UTC | #17
+
+I'd like to summarize an offline discussion with @berestovskyy. Andriy, please correct me if I missed something.
+
+* `canister_on_error()`:
+  * The main downside is that non-replicated queries are not supported. To make errors in non-replicated queries observable to the developers, we would need to implement an off-chain mechanism that allows the canister owner to access statistics on executed queries and errors that occurred. If this mechanism were in place, it could also be used to gather statistics on replicated message execution, making the `canister_on_error()` hook unnecessary.
+  * The hook could also become redundant if we would support some generic logging mechanism. E.g. if there was a way for the developer to pull the last N `debug_print()` output of the canister from all nodes and if a trapped execution would be automatically logged, then it would work both for replicated and non-replicated messages.
+* `canister_on_low_memory()`, `canister_on_low_cycles()`:
+  * If there was a way to query the balance and memory statistics for a set of controlled canisters in a single message (without querying each canister individually), then the monitoring canister or the off-chain monitoring service could periodically poll the statistics and detect the low-memory/low-cycles conditions.
+  * Nevertheless, it might still be useful to have these hooks because they might allow the canister to react faster and adjust its behavior.
+
+After this discussion, I am not sure if we should include `canister_on_error()` in the proposal. I am still optimistic about `canister_on_low_memory()`, `canister_on_low_cycles()` because they make it easy for a canister to react to these corner-case conditions without building a complex monitoring system.
+
+@icme: wdyt?
+
+-------------------------
+
+icme | 2023-01-23 04:30:41 UTC | #18
+
+[quote="ulan, post:17, topic:17089"]
+The main downside is that non-replicated queries are not supported.
+[/quote]
+
+I'm not proposing catching errors in query calls at this point in time.
+
+[quote="ulan, post:17, topic:17089"]
+To make errors in non-replicated queries observable to the developers, we would need to implement an off-chain mechanism that allows the canister owner to access statistics on executed queries and errors that occurred. If this mechanism were in place, it could also be used to gather statistics on replicated message execution, making the `canister_on_error()` hook unnecessary.
+[/quote]
+
+Could this off-chain mechanism be implemented by a non-DFINITY developer team, or do you have something in mind at the protocol level?
+
+If we're having this discussion, it might be even better to build some sort of DLQ tooling at the protocol level. I've had some thoughts about what a general purpose DLQ would look like on at a higher software level, but it seems like something like that could utilize the `canister_on_error()` type of failures and send these raw error metadata to an DLQ/logger type of canister. You could then imagine the user being able to redrive API calls and events that had failed through inter-canister calls instead of ingress messages.
+
+[quote="ulan, post:17, topic:17089"]
+I am still optimistic about `canister_on_low_memory()`, `canister_on_low_cycles()` because they make it easy for a canister to react to these corner-case conditions without building a complex monitoring system.
+[/quote]
+
+I'm perfectly fine with starting small and building from that. Start with one or two hooks, and see what the residual effects on the canister message queues, etc. look like before adding more.
+
+In fact, if we were ordering these "hook" type of features in terms of ease of implementation and immediate developer impact, I really think that https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794 should come first since it's synchronous, followed by `canister_on_low_memory()` and `canister_on_low_cycles()`.
+
+I agree `canister_on_error()` and `canister_post_init()` could use some more time to marinate!
+
+-------------------------
+
+ulan | 2023-01-23 14:35:43 UTC | #19
+
+[quote="icme, post:18, topic:17089"]
+I’m not proposing catching errors in query calls at this point in time.
+[/quote]
+
+Yep, my initial thinking was the same: that we could handle update errors first and then tackle the query errors at some point in the future. However, it seems better to think the query case through to ensure that we don't build a hook that will become redundant in the future. 
+
+[quote="icme, post:18, topic:17089"]
+Could this off-chain mechanism be implemented by a non-DFINITY developer team, or do you have something in mind at the protocol level?
+[/quote]
+
+The idea was to add some replica endpoint that the developers can query to get stats and logs from the messages of their canisters:
+
+* The number of executed messages (updates/queries).
+* The latency of executed messages.
+* The number of executed instructions per message type.
+* The number of consumed cycles per message type.
+* The number of errors/failures per message type.
+* The output of `ic0.debug_print()`.
+* etc.
+
+This would require changes in the replica code, so the DFINITY team would need to help with the implementation. I am not sure if it needs to be specified at the protocol level or not. If we allow only off-chain queries of the endpoint, the we probably don't need to specify it. If we want to feed the data to other canisters, then we need to specify it.
+
+>  it might be even better to build some sort of DLQ tooling at the protocol level
+
+If we limit the scope only to update (~ replicated) messages and ignore queries, then `canister_on_error()` would be sufficient to build such as DLQ system at the canister level, right?
+
+I don't have a good idea on how to implement DLQ for queries. It depends on whether we want to protect against malicious nodes or not. 
+
+[quote="icme, post:18, topic:17089"]
+In fact, if we were ordering these “hook” type of features in terms of ease of implementation and immediate developer impact, I really think that [Proposal: Configurable Wasm Heap Limit ](https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794) should come first since it’s synchronous, followed by `canister_on_low_memory()` and `canister_on_low_cycles()`.
+[/quote]
+
+This plan sgtm!
+
+-------------------------
+
+ulan | 2023-02-06 16:18:16 UTC | #20
+
+The NNS motion proposal: https://dashboard.internetcomputer.org/proposal/106146
+
+-------------------------
+
+ulan | 2023-02-22 09:50:05 UTC | #21
+
+The motion proposal has been accepted. The feature is in the [roadmap](https://internetcomputer.org/roadmap). We will start working on it after https://forum.dfinity.org/t/proposal-configurable-wasm-heap-limit/17794.
+
+-------------------------
+
+cryptoschindler | 2024-06-22 07:57:47 UTC | #22
+
+I think a hook that is triggered upon unfreezing a canister would be really helpful as well. 
+
+Imagine a canister that upon deployment starts calling itself indefinitely. At some point the cycle balance falls below the freezing threshold and the self call loop will be interrupted. The canister is topped up again and unfrozen, but now the self call loop has to be triggered manually. Ideally I can just specify a lifecycle hook for the event that a canister is unfrozen :)
+
+-------------------------
+
+berestovskyy | 2024-06-22 09:20:08 UTC | #23
+
+[quote="cryptoschindler, post:22, topic:17089"]
+the self call loop will be interrupted
+[/quote]
+
+Do you have an example of this behavior? I believe it was fixed a while back, but if it hasn't, let's investigate further...
+
+-------------------------
+
+cryptoschindler | 2024-06-22 13:59:49 UTC | #24
+
+Last time I used this to stop a canister that was trapped in a self-loop so I can upgrade it was in July last year. Maybe things have changed since then? 
+To clarify, I'm not suggesting we change the behaviour, I'd just be happy to have a lifecycle hook for a canister that becomes unfrozen.
+
+I could reproduce the behaviour locally with this Motoko Canister
+```
+actor {
+  var counter = 0;
+
+  public query func getCounter() : async Nat {
+    counter;
+  };
+
+  public func incrementCounter() : async () {
+    counter += 1;
+  };
+
+  public func selfCallLoop() : async () {
+
+    while true {
+      await incrementCounter();
+    };
+  };
+};
+```
+
+1. deploy the canister
+2. call `selfCallLoop`
+3. call `getCounter` repeatedly to verify messages are being executed continiously
+4. increase freezing threshold such that canister is frozen
+5. decrease freezing  treshold such that canister is unfrozen
+6. repeatedly call `getCounter` to verify counter is not being incremented anymore and therefore execution of `selfCallLoop` came to a halt from freezing the canister
+
+Ideally I would be able to specify a lifecycle hook that is triggered as soon as the canister is unfrozen so I can make another call to `selfCallLoop` and continue my work of incrementing the counter.
+
+-------------------------
+
+berestovskyy | 2024-06-22 22:54:02 UTC | #25
+
+I'm not a Motoko expert, but looking at the example from the [IC specification](https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-call) perspective, it seems to be missing error handling.
+
+Following the Motoko documentation on [Asynchronous errors](https://internetcomputer.org/docs/current/motoko/main/writing-motoko/errors#asynchronous-errors), here how the error handling in this loop could look:
+
+```
+while true {
+    try {
+        await incrementCounter();
+    } catch (e) {
+        switch Error.code(e) {
+            case #system_transient {
+                // Here goes the lifecycle logic.
+            }
+        }
+    }
+}
+```
+
+There might be other `await` errors beyond the "unfrozen" hook would cover. Here's a scenario illustrating this:
+
+1. The `await incrementCounter();` traps because the canister queue is full.
+2. The "unfrozen" lifecycle hook will never be called because the canister is full of cycles.
+3. The `selfCallLoop` must still be manually triggered...
+
+-------------------------
+
+cryptoschindler | 2024-06-25 06:07:25 UTC | #26
+
+That's true, it misses error handling. I was just trying to give a quick example to better illustrate the use case for this hook :innocent: 
+But even with the error handling, once the canister broke out of the loop I have to manually trigger it. In Motoko the code above won't fill up the canister queue as every self call is a separate message.
+
+-------------------------
+
+berestovskyy | 2024-06-25 07:21:36 UTC | #27
+
+> once the canister broke out of the loop I have to manually trigger it
+
+Maybe, setting a timer in error handler could be used to "try again later"?
+
+>  the code above won’t fill up the canister queue as every self call is a separate message
+
+I agree, but in general there are 9 system transient errors. And these should all be handled the same way - by retrying them later...
+
+-------------------------
+
+cryptoschindler | 2024-06-25 10:08:41 UTC | #28
+
+What is a "transient" error?
+
+> Maybe, setting a timer in error handler could be used to “try again later”?
+
+I don't think there is an error for a frozen canister thrown :thinking: 
+This code does not show anything when calling `dfx canister logs` after repeating the steps mentioned in the previous message. Also timers stop executing and don't resume if a canister is below the freezing threshold.
+```
+import Error "mo:base/Error";
+import Debug "mo:base/Debug";
+import Timer "mo:base/Timer";
+
+actor {
+  var counter = 0;
+
+  func printCounter() : async () {
+    Debug.print(debug_show (counter));
+  };
+
+  ignore Timer.recurringTimer<system>(#seconds 2, printCounter);
+
+  public query func getCounter() : async Nat {
+    counter;
+  };
+
+  public func incrementCounter() : async () {
+    counter += 1;
+  };
+
+  public func selfCallLoop() : async () {
+
+    while true {
+      try {
+        await incrementCounter();
+      } catch (e) {
+        Debug.print("this was caught: " # debug_show (Error.message(e)));
+      };
+    };
+  };
+};
+```
+
+So without the hook, how would that work?
+
+-------------------------
+
+berestovskyy | 2024-06-25 11:39:16 UTC | #29
+
+> What is a “transient” error?
+
+Here is [the spec definition](https://internetcomputer.org/docs/current/references/ic-interface-spec#reject-codes), and here is how it's [defined in the code](https://github.com/dfinity/ic/blob/e01c6e787cd13718b24abbd27ef9dbae54075bc7/rs/types/error_types/src/lib.rs#L102).
+
+For the rest, I'm not an expert in Motoko, maybe @ggreif or @claudio could have a look?
+
+The similar Rust example would look like:
+
+```
+thread_local! {
+    static COUNTER: std::cell::RefCell<u64> = 0.into();
+}
+
+#[ic_cdk::query]
+fn get_counter() -> u64 {
+    COUNTER.with_borrow(|c| c.clone())
+}
+
+#[ic_cdk::update]
+fn inc_counter() {
+    COUNTER.with_borrow_mut(|c| *c += 1)
+}
+
+#[ic_cdk::update]
+fn self_call_loop() {
+    ic_cdk_timers::set_timer_interval(std::time::Duration::from_secs(1), inc_counter);
+}
+```
+
+And it survives the freezing/unfreezing just fine without going into the reject code details, as those are handled by the timers library.
+
+-------------------------
+
+cryptoschindler | 2024-06-29 13:17:43 UTC | #30
+
+Very cool, I didn't know Rust and Motoko behaved that differently regarding timers. This is what I wanted. 
+```rust
+use ic_cdk::{api::call, println};
+
+thread_local! {
+    static COUNTER: std::cell::RefCell<u64> = 0.into();
+    static IS_CALLING_ITSELF  : std::cell::RefCell<bool> = false.into();
+}
+
+#[ic_cdk::query]
+fn get_counter() -> u64 {
+    COUNTER.with_borrow(|c| *c)
+}
+
+fn print_counter() {
+    println!("Counter: {}", get_counter());
+}
+
+#[ic_cdk::init]
+fn init() {
+    ic_cdk_timers::set_timer_interval(std::time::Duration::from_secs(2), print_counter);
+    ic_cdk_timers::set_timer_interval(std::time::Duration::from_secs(5), || {
+        ic_cdk::spawn(async { self_call_loop().await })
+    });
+}
+
+#[ic_cdk::update]
+fn inc_counter() {
+    COUNTER.with_borrow_mut(|c| *c += 1)
+}
+
+#[ic_cdk::update]
+async fn self_call_loop() {
+    if !IS_CALLING_ITSELF.with_borrow(|c| *c) {
+        println!("Calling itself");
+        IS_CALLING_ITSELF.with_borrow_mut(|c| *c = true);
+        loop {
+            match call::call::<(), ()>(ic_cdk::id(), "inc_counter", ()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("This was caught: {:?}", e);
+                    IS_CALLING_ITSELF.with_borrow_mut(|c| *c = false);
+                    break;
+                }
+            }
+        }
+    } else {
+        println!("Already calling itself");
+    }
+}
+```
+
+I assume the `break` statement in the loop is important because otherwise the canister will still try to call `inc_counter` indefinitely, depleting it's cycles?
+
+Also, do the failed `canister_global_timer` still costs cycles?
+
+-------------------------
+
+cryptoschindler | 2024-06-29 13:26:43 UTC | #31
+
+I found this in the interface specification, how does the Rust timers implementation work around that :thinking: 
+
+> The global timer is also deactivated upon changes to the canister's Wasm module (calling `install_code` , `install_chunked_code` , `uninstall_code` methods of the management canister or if the canister runs out of cycles).
+
+-------------------------
+
+berestovskyy | 2024-07-01 10:24:43 UTC | #32
+
+> I assume the `break` statement in the loop is important because otherwise the canister will still try to call `inc_counter` indefinitely, depleting it’s cycles?
+
+I have a feeling that it's a XY problem. What do you think about starting a new topic describing the problem we're trying to solve?
+
+> Also, do the failed `canister_global_timer` still costs cycles?
+
+Any message execution cost cycles.
+
+> how does the Rust timers implementation work around that
+
+There is no workaround in Rust timers library, and the timer will be deactivated on the listed cases. Some workarounds could be implemented on the app level though.
+
+-------------------------
+
+icme | 2024-07-24 21:36:23 UTC | #33
+
+Clarifying question about the current implementation of Canister Lifecycle Hooks.
+
+Are they one-time events, or can they be fired multiple times?
+
+Take this example of the heap memory lifecycle hook:
+
+1. My canister crosses the heap memory threshold -> hook is fired
+2. Garbage collection runs (passive) freeing up heap memory -> canister is back under the heap memory threshold
+3. Canister writes more data and crosses the heap threshold again -> is the hook fired again?
+
+
+Similarly, this same question applies to the low cycles balance lifecycle hook.
+
+Say I top up a canister with a micro cycles payment every time it falls below the cycles threshold. Is there a maximum # of times that a lifecycle hook can be fired within a given time period (checkpoint)?
+
+-------------------------
+
+dsarlis | 2024-07-25 16:11:29 UTC | #34
+
+In the example you provide, yes, the hooks will be fired multiple times as the condition was hit multiple times. However, if the condition is hit and nothing changes (i.e. your canister remains at high memory usage or low in cycles), the hook will not trigger again.
+
+-------------------------
+

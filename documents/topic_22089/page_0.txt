@@ -1,0 +1,99 @@
+ulan | 2023-08-11 12:10:16 UTC | #1
+
+# Summary
+
+A DFINITY engineer discovered a critical bug in the cycles bookkeeping code. In theory under specific circumstances, cycles consumed during a message execution could be added to the cycle balance of the canister instead of being subtracted from it, creating cycles out of thin air. The bug that causes this vulnerability was introduced on March 3, 2023 in replica version `e4843a1`.
+
+# Impact
+
+Based on analyzing metrics of cycles minted, cycles burned, and cycle balances of canisters, we believe that this bug has not been exploited and that it had no impact.
+
+# Timeline
+
+2023-08-08:
+
+* The bug is discovered in cycles bookkeeping code.
+
+2023-08-09:
+
+* The proof of concept exploit is constructed and verified as working in a test.
+* The security hotfix process starts according to the procedure outlined in [proposal 48792](https://dashboard.internetcomputer.org/proposal/48792).
+* The hotfix patches are prepared.
+
+2023-08-10:
+
+* The hotfix patches pass qualification and reproducibility tests.
+* NNS proposals [123976](https://dashboard.internetcomputer.org/proposal/123976) and [123977](https://dashboard.internetcomputer.org/proposal/123977) to elect new replica versions with hotfix patches.
+* Forum post [announces](https://forum.dfinity.org/t/voting-is-open-for-replica-security-fixes-148ca44e-and-de57fd51/22065) the security fixes.
+* NNS proposals to upgrade subnets.
+
+2023-08-11:
+
+* The hotfix patches are published: [rc--2023-07-26_23-01](https://github.com/dfinity/ic/commits/hotfix-1187-rc--2023-07-26_23-01) and [rc--2023-08-01_23-01](https://github.com/dfinity/ic/commits/hotfix-1187-rc--2023-08-01_23-01).
+
+# What went wrong?
+
+* The [apply_balance_changes](https://github.com/dfinity/ic/blob/d48dfc043aa4b8b5ea7302bdeb424ef2dcbd8890/rs/system_api/src/sandbox_safe_system_state.rs#L426) function in the replica had a bug that due to saturating arithmetic operations in the cycles data type could lead to mis-accounting of cycles consumed during a message execution.
+* The bug was not caught by the code review and tests.
+
+# What went right?
+
+* The bug was found by a DFINITY engineer.
+* Metrics were in place to confirm that the bug was not exploited.
+* The rollout of the fixes was smooth.
+
+# Action items
+
+* Audit code for similar bugs.
+* Require a review and approval from the security team for all code changes related to cycles.
+* Invest engineering time in refactoring and simplification of code related to cycles.
+* Consider replacing the saturating arithmetic operations in the cycles data type with checked arithmetic operations.
+
+# Technical details
+
+A bug in the `apply_balance_changes` [function](https://github.com/dfinity/ic/blob/d48dfc043aa4b8b5ea7302bdeb424ef2dcbd8890/rs/system_api/src/sandbox_safe_system_state.rs#L426) makes it possible for a canister to incorrectly create cycles out of consumed cycles. The proof of concept exploit can create 4 trillion cycles per message execution.
+
+The bug was introduced in commit [6b3fd6](https://github.com/dfinity/ic/commit/6b3fd69d49330c37ff18c329ff7480b0acb475df) of replica. Previously the cycle balance changes coming from the Wasm execution were applied directly to the canister cycle balance. The commit aimed to keep track of consumed cycles by type. For this purpose, the initial operation was split into two steps:
+
+1. Apply changes in consumed cycles by type.
+2. Apply the main cycle balance change without the already applied consumed cycle changes.
+
+Overall it relied on the following equation:
+```
+cycles_balance_change =
+  - consumed_cycles + cycles_balance_change + consumed_cycles
+```
+Mathematically this equation is correct. However, since the cycles data type uses saturating operations, this equation does not necessarily hold in practice. If the cycle balance of the canister is close to zero, then subtracting consumed_cycles will be a no-op change capped at zero. However, after that subtraction, the code adds `consumed_cycles` thus creating cycles out of thin air.
+
+-------------------------
+
+FranHefner | 2023-08-11 14:06:54 UTC | #2
+
+[quote="ulan, post:1, topic:22089"]
+Based on analyzing metrics of cycles minted, cycles burned, and cycle balances of canisters, we believe that this bug has not been exploited and that it had no impact.
+[/quote]
+
+Although you say that the error was not exploited, but can you confirm that the containers have the correct cycles simply by use?  This is what you mean by this point?
+
+On the other hand, I think that you can have a validation of creating cycles, simply doing reverse engineering of the conversion, and calculating how many ICP each conversion equals. Then you would have to match the number of ICP with the number of cycles converted to ICP. It would be a long process to calculate but not impossible. What do you think of having an accounting of ICP and cycles in real time?
+
+Thx !!
+
+-------------------------
+
+ulan | 2023-08-11 18:19:18 UTC | #3
+
+> Although you say that the error was not exploited, but can you confirm that the containers have the correct cycles simply by use? This is what you mean by this point?
+
+Yes, based on the cycle metrics we know that the incorrect case never triggered, which also means that the canister have correct cycles.
+
+> On the other hand, I think that you can have a validation of creating cycles, simply doing reverse engineering of the conversion, and calculating how many ICP each conversion equals.
+
+There are a metric for the total minted cycles, so we don't have to reverse engineer from ICP conversion.
+
+> What do you think of having an accounting of ICP and cycles in real time?
+
+The cycle metrics that I know are updated in real time. I don't know about the ICP accounting because I am not familiar with that part.
+
+-------------------------
+

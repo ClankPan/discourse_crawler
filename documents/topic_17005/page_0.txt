@@ -1,0 +1,348 @@
+Manu | 2022-12-02 14:47:11 UTC | #1
+
+**Summary**
+
+During the SNS-1 decentralization sale users experienced high latency and errors when interacting with the NNS front-end dapp creating a massive load on the NNS subnet which is configured on purpose to prioritize security and correctness over performance, as it hosts protocol-critical canisters like the registry and the ledger.
+
+The root cause of the incident was that the NNS front-end dapp executes user queries as update calls. Such queries are also known as replicated queries and they provide the maximum level of security. However, they are also more expensive compared to single replica queries, as the message goes through consensus and is processed by all replicas of the subnet.
+
+During the sale of 45 minutes, the NNS processed 3K decentralization sale participations, but this was just a fraction of the transactions processed: due to all the other ingress messages (replicated queries) coming from the users of the NNS front end dapp, the NNS subnet processed over 120K transactions in this duration.
+
+The high rate of replicated queries increased pressure onto the ingress message pool and slowed down processing of actual update messages. Due to several bottlenecks in the ingress message pool, the NNS subnet was processing only ~50 ingress messages per second during the launch. Almost all of these messages were replicated queries coming from automatic retries on the client side.
+
+If the NNS front-end dapp were to use single replica queries with certified variables, then it would be able to handle more than 10K queries per second.
+
+Unrelated to the main issue above, high load caused the SNS subnet to stall due to a bug in state serialization. Note that there were other SNS specific issues like duplicate transitions that will get their own retrospective.
+
+**Timeline**
+
+2022-11-29:
+
+* 16:43 UTC: Increasing amount of ingress traffic on the NNS subnet ahead of SNS-1 decentralization sale launch, presumably induced by users refreshing the NNS Dapp
+* 16:46 UTC: Decentralization sale started as Proposal [93763](https://dashboard.internetcomputer.org/proposal/93763) is executed.
+* 16:48 UTC: Reports of performance degradation of the Dapp and “503 Service is overloaded, try again later.” responses, due to filled up ingress pool and ingress rate limiting.
+* 16:54 UTC: API health check alert indicates API HTTP timeouts
+* 17:20 UTC: Proposal [94416](https://dashboard.internetcomputer.org/proposal/94416) to increase the max ingress per block on NNS to 400 is submitted.
+* 17:28 UTC: Proposal [94416](https://dashboard.internetcomputer.org/proposal/94416) is executed.
+* 17:32 UTC: Decentralization sale has ended.
+* 17:40 UTC: NNS processed pending messages and returned to normal operation.
+
+**What went wrong**
+
+* The NNS front-end dapp used expensive replicated queries instead of single replica queries with certified variables.
+* The NNS subnet was conservatively configured to allow at most 150 ingress messages per block. Other subnets allow 1000 ingress messages per block.
+* The pre-launch stress test of SNS-1 was performed against the backend canisters but end-to-end tests including the frontend were only done at a smaller scale. This did not allow us to see the impact of the replicated queries coming from the frontend.
+* Internet Identity ingress messages are more expensive to verify, and since the blocks contained many such ingress messages, the block rate slowed down.
+* Automatic retries on the client side did not use exponential backoff and contributed significantly to the load.
+* All ingress messages sent by the Internet Identity contain two BLS signatures, which are currently not aggregated and are very expensive to validate before they get injected into the blocks.
+* The state serialization bug causing the SNS subnet to stall had been identified before during an unrelated load test on a testnet and the fix was in the process of rolling out to subnets as part of the regular release process (but not yet deployed to the SNS and NNS subnets, which are updated last).
+
+**What went right**
+
+* The NNS subnet did not crash and processed all accepted ingress messages. It returned to normal operation after the sale ended.
+
+**Action items**
+
+* Consider implementing queries with certified variables instead of replicated queries in the NNS front-end dapp.
+* Require all big launches of DFINITY-led projects to perform an end-to-end dry run with the load that exceeds the expected load of the launch.
+* Optimize ingress message validation for Internet Identity ingress messages.
+* Use increasing delay in js-agent for retried calls instead of firing them off immediately after rejection.
+* Implement caching wherever possible on the NNS front-end dapp.
+* Optimize SNS APIs for more efficient interaction with the front-end.
+
+**Technical details**
+
+The main bottleneck in processing of ingress messages on the NNS subnet was a configuration parameter that was conservatively set to allow only 150 ingress messages per block. Other subnets have this parameter set to 1000. Another bottleneck was in validation of BLS signatures. All ingress messages sent by the Internet Identity contain two BLS signatures, which are currently not aggregated and are very expensive to validate before they get injected into the blocks. That caused the block rate of the NNS subnet to drop to ~0.3 blocks per second.
+
+Additionally, the current implementation of agent-js library automatically retries all failed requests up to 3 times on the client side, without exponential backoff.
+
+-------------------------
+
+emiss | 2022-12-02 17:04:19 UTC | #2
+
+Good to know that the mistakes are identified and can be fixed . Hope to see great result with the next launchpad .
+
+-------------------------
+
+janman1970 | 2022-12-03 01:18:26 UTC | #3
+
+@Manu when you say expensive, are you talking actual money or that the processing of data is eating more resources than readily available?
+
+-------------------------
+
+WalterCheung | 2022-12-03 02:02:33 UTC | #4
+
+Thanks for this report.  
+
+However, I think your analysis is not deep enough.  One more question: Why didn't 'high latency and errors when interacting with the NNS front-end dapp' be considered?  If the team has a system architect engineer, it should take this situation into consideration in advance and conduct targeted testing.
+
+Please consider improvements in team management.
+
+-------------------------
+
+jzxchiang | 2022-12-03 07:00:00 UTC | #5
+
+> All ingress messages sent by the Internet Identity contain two BLS signatures
+
+Can you clarify what this means? Do you mean ingress messages from the II frontend for authenticating with the NNS?
+
+-------------------------
+
+jzxchiang | 2022-12-03 07:01:28 UTC | #6
+
+Also, is the plan to rollback proposal 94416? Or will proposed optimizations to ingress message validation for II ingress messages render a rollback unnecessary?
+
+-------------------------
+
+icme | 2022-12-03 07:58:08 UTC | #7
+
+[quote="Manu, post:1, topic:17005"]
+* 17:20 UTC: Proposal [94416 ](https://dashboard.internetcomputer.org/proposal/94416) to increase the max ingress per block on NNS to 400 is submitted.
+* 17:28 UTC: Proposal [94416 ](https://dashboard.internetcomputer.org/proposal/94416) is executed.
+[/quote]
+
+Impressive this patch was rolled out so quickly. What was the original reason for using such a conservative threshold for the ingress per block?
+
+
+[quote="Manu, post:1, topic:17005"]
+Consider implementing queries with certified variables instead of replicated queries in the NNS front-end dapp.
+[/quote]
+
+Can this be done without impacting security?
+
+
+[quote="Manu, post:1, topic:17005"]
+Require all big launches of DFINITY-led projects to perform an end-to-end dry run with the load that exceeds the expected load of the launch.
+[/quote]
+
+This is great! It might also be good not just to test the app beyond DFINITY’s expectations, but to also have an idea of when the dapp and subnet will break.
+
+Then you can put in safeguards to protect the user experience in this case (something like a friendly message saying “the sale queue is currently full, refresh and try again” on 5xx subnet/canister overloaded errors). 
+
+Design to anticipate failure and still delight the end users 😅
+
+-------------------------
+
+nlh | 2022-12-03 08:00:25 UTC | #8
+
+This might be an unpopular opinion but one thing we should learn from the SNS-1 sale is that NNS is not really the right place to conduct a public sale.
+It is just incredible to say that "Dfinity does not endorse the sale" then made it available in NNS.
+I think it's fine to vote for SNS DAO creation or so in NNS. But the public sale and after-sale services/supports should have been done in an independent launch pad.
+
+-------------------------
+
+Manu | 2022-12-03 16:27:06 UTC | #9
+
+[quote="janman1970, post:3, topic:17005, full:true"]
+@Manu when you say expensive, are you talking actual money or that the processing of data is eating more resources than readily available?
+[/quote]
+
+I mean that they put more load on the subnet / nodes, not actual money. 
+
+[quote="jzxchiang, post:5, topic:17005"]
+Can you clarify what this means? Do you mean ingress messages from the II frontend for authenticating with the NNS?
+[/quote]
+
+If you submit ingress messages from eg DFX, they are just signed by an ECDSA signature, and those are super cheap to verify. If you log into the NNS dapp with II and submit ingress messages that way, they are authenticated with https://internetcomputer.org/docs/current/references/ic-interface-spec#canister-signatures which contains BLS signatures, and those are computationally much more intensive to verify. 
+
+[quote="jzxchiang, post:6, topic:17005, full:true"]
+Also, is the plan to rollback proposal 94416? Or will proposed optimizations to ingress message validation for II ingress messages render a rollback unnecessary?
+[/quote]
+
+I dont think there is a need to roll that back, the previous setting was imo overly conservative. But if we optimize the ingress message validation, we actually get more benefit out of proposal 94416, because now the main bottleneck was ingress validation. 
+
+[quote="icme, post:7, topic:17005"]
+What was the original reason for using such a conservative threshold for the ingress per block?
+[/quote]
+
+We did not expect a lot of load on the NNS subnet so we thought we would launch it initially with extremely conservative settings as it wouldn't matter much anyway. 
+
+[quote="icme, post:7, topic:17005"]
+Can this be done without impacting security?
+[/quote]
+
+Yes I think so, the "certified" part in "certified variables" would mean that it is signed by a subnet.
+
+-------------------------
+
+timo | 2022-12-03 19:10:40 UTC | #10
+
+[quote="nlh, post:8, topic:17005"]
+This might be an unpopular opinion but one thing we should learn from the SNS-1 sale is that NNS is not really the right place to conduct a public sale.
+[/quote]
+
+You can also argue that any kind of sale or auction should never be done in a way that everyone has to be online at the same time. Instead one can collect the requests/bids/offers over a long time up to a deadline to spread the load and then execute them after the deadline. The sybil resistance, if it's oversubscribed, has to be solved either way because bots will show up regardless, so that is not really an argument against spreading it out over a longer time.
+
+-------------------------
+
+skilesare | 2022-12-03 20:52:43 UTC | #11
+
+This!!!!  Please move the sales out of the NNS. It isn't just a tech risk, it is a regulatory risk as well.
+
+-------------------------
+
+dfisher | 2022-12-03 21:38:36 UTC | #12
+
+@skilesare lets say you are correct and the regulators are annoyed. Do you think this is a case where we do it and ask for forgiveness later (and move SNS to new front end) or get ahead of it? Clearly the benefit to sharing the same front end is eye balls and usage. I do see a risk the regulators don’t like it but I don’t see why we can’t shift front ends at that point. In healthcare, we cannot do things and ask for forgiveness later. Any transgression can put you in serious hot water. But for Uber, for example, it was clearly advantageous to flout the law and then say sorry later. I’m not entirely convinced being cautious is the correct path when we really do need to kickstart the SNS and the IC is lagging behind.
+
+-------------------------
+
+skilesare | 2022-12-03 21:57:21 UTC | #13
+
+I'll be posting more later, but I have had a number legal opinions that voting to launch a token sale puts people(particularly named neurons and their followers) at unnecessary risk. If you are a US citizen or want to travel to the us in the future then you need to pay very close attention to what you are participating in. Is the risk low? Probably. Is it greater than zero? Yes. Lots of people have different risk profiles, but it seems like unnecessary risk to take at all when we have so many options on the table.
+
+-------------------------
+
+superduper | 2022-12-03 22:06:36 UTC | #14
+
+why would neurons need to be involved in someone launching a token sale? no one needs to approve someone uploading an ICO contract onto ethereum for example.  why is that even an option??? seems odd and unnecessary
+
+-------------------------
+
+dfisher | 2022-12-03 22:45:10 UTC | #15
+
+Ok but do you mind describing what you perceive to be the worst case scenario of things going wrong? 
+
+Just trying to gauge the downside that you’re trying to avoid.
+
+-------------------------
+
+skilesare | 2022-12-03 22:52:28 UTC | #16
+
+Worst case: I end up in jail as the director of ICDevs for voting to launch the sale of unregulated securities and am asked to provide records on followers of our neurons. NNS.ic0.app is blocked by US boundary nodes for selling unregulated securities US citizens and US ICP holders lose access to their neurons. 
+
+The fact that these are not technically correct is irrelevant because the regulators could likely be trying to make an example and they have the power to do so.
+
+-------------------------
+
+Zane | 2022-12-03 23:07:14 UTC | #17
+
+The motivation isn't clear at least not to me. My educated guess is Dfinity did this so the community can filter the legit projects from the shady ones and let them use the NNS as a store front to advertise their crowdfunding campaign. Those who don't want to go through that process can take the SNS code and upload it to a regular subnet and run their funding campaign however they prefer.
+
+-------------------------
+
+skilesare | 2022-12-03 23:29:56 UTC | #18
+
+The fallacy of this assumption(to me) that the NNS will be a filter is the belief that the community can self regulate and self discern what is a utility token from what is a security and/or what is a useful new protocol vs what is a Ponzi scheme. Further, there is nothing to keep a protocol from going ponzi after approval and undoing the diligence the community attempted before hand. The public won't care...they will just see the next Luna or FTX and point at the people that voted to approve the sale as having violated any number of SEC regulations. 
+
+The fact that the NNS is becoming a store front for advertising these things is an even more flagrant nose thumbing at the specific rules against doing that. I know we have a genuine, hardy, and justified opposition to the current status quo in the regulatory space, but there is reality to deal with and if we're going to engage in civil disobedience we need to be very clear that that usually ends up with people in jail and significant legal fees.  It is unlikely that everyone using the NNS has that level of buy in and it seems....unfair?....maybe even unethical? To drag people into that that don't know what they are getting into.
+
+-------------------------
+
+dfisher | 2022-12-03 23:50:49 UTC | #19
+
+Do we have any precedents for this type of punishment? I do know that the Ookie DAO ongoing case seems to be a litmus test 
+
+https://www.coindesk.com/policy/2022/11/22/cftc-bypassed-legal-requirement-in-trying-to-serve-ooki-dao-crypto-supporters-claim/
+
+-------------------------
+
+Zane | 2022-12-03 23:58:30 UTC | #20
+
+I agree with you, but as I said that's my educated guess, maybe Dfinity had different reasons behind the choice.
+
+[quote="skilesare, post:18, topic:17005"]
+The fallacy of this assumption(to me) that the NNS will be a filter is the belief that the community can self regulate and self discern what is a utility token from what is a security and/or what is a useful new protocol vs what is a Ponzi scheme
+[/quote]
+I mean even if in an ideal world that were the case, the NNS should rule over the IC and that by itself is already a HUGE task, do we really want stakers to spread their limited time and mental capacity to think about matters not related to protocol governance? It seems live a violation of the single responsibility principle.
+
+-------------------------
+
+skilesare | 2022-12-04 00:50:35 UTC | #21
+
+I think the DAO group got a pass, but the SEC was pretty direct in the wording they included with the opinion:
+
+“Those participating in unregistered offerings also may be liable for violations of the securities laws. Additionally, securities exchanges providing for trading in these securities must register unless they are exempt. The purpose of the registration provisions of the federal securities laws is to ensure that investors are sold investments that include all the proper disclosures and are subject to regulatory scrutiny for investors' protection.”
+
+The violations of these referred security law is a felony.  I think most enforcement has been in the form of fines to date.  It the tornado cash guy is in jail still, although that is more of a national security issue.
+
+-------------------------
+
+justmythoughts | 2022-12-04 01:43:37 UTC | #22
+
+[quote="Manu, post:1, topic:17005"]
+The state serialization bug causing the SNS subnet to stall had been identified before during an unrelated load test on a testnet and the fix was in the process of rolling out to subnets as part of the regular release process (but not yet deployed to the SNS and NNS subnets, which are updated last).
+[/quote]
+
+Can you provide more information on this bug and what the fix was? As it brought the subnet to a halt, it sounds like the most serious one identified.
+
+-------------------------
+
+dfisher | 2022-12-04 03:23:39 UTC | #23
+
+I do think one consideration of how the regulators respond is what kind of app is becoming a DAO. I don’t see the regulators freaking out about the SNS1 which is essentially a website with a poem. I don’t see the regulators freaking out about OpenChat which is a messaging app whose token allows you to pay for things like disappearing messages. 
+
+I could see the regulators freaking out about anything defi - a DEX like InfinitySwap.
+
+I do think it is likely inevitable that the SNS will split off from the NNS because of the regulators coming down on the SNS. But if the regulators come down on the NNS, then that means it’s getting traction and getting used and the authorities are taking notice.
+
+What I would say is that if you truly think the risk isn’t worth the squeeze you should argue why the downside case is existential. I think Dom is fighting to be relevant and wouldn’t put the IC in existential risk - unless he was convinced his actions are putting the whole project in danger. 
+
+At a minimum, Dfinity should create another SNS front end and launch pad with voting so that when the time comes it can quickly transition away from the NNS front end. That would at least be the prudent thing to do. Hope for the best but plan for the worst. 
+
+If you think even this isn’t good enough because named neuron representatives could actually go to jail, I think the job is somehow to convince Dfinity of this. As they clearly don’t believe it right now.
+
+-------------------------
+
+kvic | 2022-12-04 03:41:47 UTC | #24
+
+[quote="Manu, post:9, topic:17005"]
+We did not expect a lot of load on the NNS subnet so we thought we would launch it initially with extremely conservative settings as it wouldn’t matter much anyway.
+[/quote]
+
+Is it a real problem when you don't expect this much traffic live and if it should happen didn't it preform as expected and you have found a couple of adjustment to improve the issue?
+
+-------------------------
+
+Denis | 2022-12-04 05:05:32 UTC | #25
+
+[quote="timo, post:10, topic:17005"]
+You can also argue that any kind of sale or auction should never be done in a way that everyone has to be online at the same time. Instead one can collect the requests/bids/offers over a long time up to a deadline to spread the load and then execute them after the deadline.
+[/quote]
+
+Alternatively, never do free or nearly free airdrops / public sales through the NNS. Projects should price their tokens so demand is sufficient for full subscription and not so low that demand overwhelms supply and leads to network congestion. I imagine that most dapps looking to raise funds will aim to do precisely that. SNS-1 was far from what will be typical in this respect. The NNS should be a place for serious fundraising, not giveaways. If tokens are priced properly, nobody will have incentive to create an army of bots to bid.
+
+-------------------------
+
+justmythoughts | 2022-12-04 05:41:40 UTC | #26
+
+[quote="Denis, post:25, topic:17005"]
+Alternatively, never do free or nearly free airdrops / public sales through the NNS. Projects should price their tokens so demand is sufficient for full subscription and not so low that demand overwhelms supply and leads to network congestion.
+[/quote]
+
+Regardless of whether or not the SNS sale is attached to the NNS (it probably shouldn't be), the focus should be to expand the capacity of the network (and subnets) to be able to handle a large enough # of txn/s for any reasonable event, including against a potential DDOS attack of the NNS.
+
+[quote="icme, post:1, topic:16927"]
+When an unusually large amount of requests started hitting the SNS-1 decentralization sale, 5xxs were regularly returned and slowed down not just the SNS-1 participation sale, but the entire NNS subnet, including the ability to vote on proposals (potential NNS and IC security vulnerability), the IC Dashboard, and the ability to transact ICP throughout the IC via the ICP Ledger.
+[/quote]
+
+@icme raises a red flag here - if I were to stage an attack on the NNS, I'd upload a malicious wasm, get a few whale bad actors on board, vote (pass 3% voting threshold), and attempt to DDOS the NNS to block any votes going through afterwards until the replica/canister upgrade is made. 
+
+Maybe a bit more manageable of an attack would be to wait until a few hours before a less controversial proposal ends but named neurons haven't voted yet (DFINITY, ICPMN, etc.) and then DDOS the NNS for just a few hours to prevent votes from being cast.
+
+I don't know how reasonable/manageable this is, but it might also make sense to try to decouple the ICP ledger from the NNS. It's concerning that an attack (intentional or not) on the NNS halts IC-wide transactions (unless that's by design :thinking:).
+
+-------------------------
+
+superduper | 2022-12-04 16:11:38 UTC | #27
+
+huh a bit strange they should stay out of it.  there are so many places where things can go wrong from securities regulations in different countries, to sanctions, to KYC and AML...
+
+-------------------------
+
+nlh | 2022-12-05 05:31:17 UTC | #28
+
+I think you basically raised all of the potential issues I can see with the SNS-1 matter.
+
+The more I look into it, the more nervous I feel, especially when SNS-1 is currently traded at a highly speculative and manipulated price in the secondary markets. Folks will get screwed up and who will they blame for their loss?
+
+Conducting a public sale in the NNS will always be considered as an unofficial endorsement and enablement of Dfinity. And that is just a ticking bomb.
+
+-------------------------
+
+Sabr | 2022-12-05 13:31:47 UTC | #29
+
+A "speculative price" for SNS-1? What exactly are they "speculating" on - that the SNS-1 poem is actually a cryptic guide to a hidden treasure (e.g., Forrest Fenn 2.0)? Where is this token even being traded?
+
+-------------------------
+

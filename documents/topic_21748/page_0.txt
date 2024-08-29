@@ -1,0 +1,88 @@
+lara | 2023-07-27 13:11:14 UTC | #1
+
+## TL;DR
+
+Following the NNS neuron incidents from the last weeks, we propose 1) to simplify the implementation of merge_neurons by keeping the current behavior that only allows merging of two non-dissolving neurons and 2) to perform a (second) cleanup of NNS and SNS neurons that might have an inconsistent state due to one of the bugs.
+
+## Intro
+
+In the last few weeks, two related issues were detected in NNS governance. One of the bugs was in merge_neurons, the method that allows two neurons to be unified for easier management, and one in refresh_neuron that allows to top up a neuron with additional stake.
+
+For both topics, we propose a small follow up improvement.
+
+We first recap the different states that a neuron can have, which helps understanding both issues and the proposed follow ups better.
+
+For each of the relevant issues, we then recap what happened, how the issues were addressed, and what follow up we propose.
+
+## Possible states of a neuron
+
+Every neuron has a *dissolve state*. One can think of the dissolve state as a countdown. A neuron can be *dissolving*, which means that the clock is counting down as time passes, or it can be *non-dissolving*, which means that the countdown is stopped. When a neuron is dissolving, the countdown can be stopped and the neuron will be non-dissolving. Vice versa when a neuron is non-dissolving, the countdown can be started again and the neuron will be dissolving again. When the countdown reaches zero, a neuron is *dissolved*. This means that the neuron can be disbursed, i.e., the neuron’s staked tokens can be liquidated.
+
+A neuron can also have an age. A neuron’s age and dissolve state should always be in a particular relationship. Let us understand this by looking how each of the neuron’s states is defined by a neuron’s attributes.
+
+* A non-dissolving neuron
+  * has a dissolve state that is defined by a positive dissolve delay denoting the *number of seconds* that the neuron would take to fully dissolve once dissolving is started
+  * has an age which is defined by the attribute aging_since_timestamp_seconds, denoting the *point in time* since when the neuron is aging. This is the point in time when the neuron last entered the non-dissolving state.
+* A dissolving neuron:
+  * has a dissolve state that is defined by the *point in time* when the neuron will be fully dissolved (assuming dissolving is not stopped) and this point in time is in the future.
+  * has no age. The NNS and SNS governance canisters denote “no age” by setting the field aging_since_timestamp_seconds to the *reserved value u64::MAX*. This is a timestamp that will for a long time be in the future, thus the age, computed by taking the difference between the current time and aging_since_timestamp_seconds, is zero.
+* A dissolved neuron can be defined in two possible ways:
+  * It can be defined similarly to a non-dissolving neuron, where the dissolve delay (the *number of seconds* until this neuron is dissolved) is zero.
+  * It can be defined similarly to a dissolving neuron, where the *point in time* when the neuron is fully dissolved is in the past.
+
+## Merge neurons (NNS)
+
+Merge_neurons is a neuron command on the NNS governance that can be used to merge together two neurons to simplify their management. Note that this only affects the NNS governance as merging neurons is not available in SNS governance canisters.
+
+### What happened
+
+* There was a bug in merge neurons which had the effect that if one of the two neurons to be merged was in state dissolved, then the neurons’ age was not adjusted correctly and could result in a value far bigger than what the age of neurons can be at this point. The details are explained in [this forum post](https://forum.dfinity.org/t/52-year-neuron-fixes/21301).
+* As a stop gap, a security patch was released in [this proposal](https://dashboard.internetcomputer.org/proposal/123434) which disabled the merging of any two neurons.
+* Following that, and as part of the normal release process, the merging of two neurons was re-enabled but only for two non-dissolving neurons. The other cases were disabled, but not removed from the code.
+Moreover, a clean up process decreased the age of all neurons with an unexpectedly large age.
+These changes were voted on and executed in [this proposal](https://dashboard.internetcomputer.org/proposal/123472) and further explained in [these release notes](https://forum.dfinity.org/t/nns-update-july-17-2023/21363).
+
+### Proposed next step
+
+One of the complexities that likely contributed to the bug was that the implementation of merge_neurons had to handle many different side conditions depending on the state of the two neurons to be merged.
+
+**We propose to only allow the merging of two neurons that are both non-dissolving going forward.**
+
+This means that the functionality would be kept as it is right now after the last NNS governance release, but the code could be further cleaned up and simplified as the other cases would not be needed going forward.
+
+The main purpose of merging two neurons is to make neuron management simpler by moving the stakes of the two neurons in one sole neuron that must be managed. Note that this is still possible with all kinds of neurons:
+
+* If a user would like to merge two non-dissolving neurons, this is enabled.
+* If a user would like to merge two neurons, one of which is dissolved, they can disburse the dissolved neuron and refresh the other neuron with the disbursed ICP tokens.
+* If a user would like to merge two neurons, one of which is dissolving, they can first stop dissolving and then merge the two neurons.
+
+The fact that this method would have a more limited scope would not only make the code easier but would also make it easier for users to understand how merging of neurons works.
+
+## Refresh stake (NNS & SNSs)
+
+The neuron command refresh_stake allows a neuron holder to top up the neuron’s stake with additional tokens. This is possible both in the NNS governance and in the SNS governance canisters.
+
+### What happened
+
+* There was a bug in refresh_stake, specifically in update_stake that is used as part of it. This bug was explained in detail in [this forum post](https://forum.dfinity.org/t/security-patch-nns-governance-neuron-aging-2023-07-17/21455) and was fixed in a security patch in [this proposal](https://dashboard.internetcomputer.org/proposal/123485).
+* One of the effects of this bug was that some neurons had an age even though they should not have one. In particular, this was the case for dissolving neurons and for some dissolved neurons, namely the ones that are represented similarly to dissolving neurons (see above).
+* Even though the bug was fixed with the above patch, there are now still neurons that are in this “inconsistent” state and have an age even though they shouldn’t have one.
+
+### Proposed next step
+
+**We propose to clean up the neurons and remove the age from those that should not have an age.**
+
+More technically, this means that the governance canister would go through all neurons and set the aging_since_timestamp_seconds to the reserved value u64::MAX for all neurons that are dissolving or dissolved and defined by a point in time when the neuron is fully dissolved that is in the past.
+
+We propose to perform this cleanup both in the NNS governance and in the SNS governance.
+
+## Next Steps
+
+We are looking forward to your feedback on these proposals. If there seems to be consensus here that these are good ideas, we plan to start working on these changes and propose them to the NNS as part of the normal release process.
+
+## Outlook
+
+We think that these two steps are good immediate improvements and a step in the right direction. Going forward we would also like to look into whether there are other possible simplifications that can make the governance canister both easier to understand and easier to implement. One candidate is to look into whether we can simplify the above explained neuron states so that there is only one way to describe a dissolved neuron.
+
+-------------------------
+

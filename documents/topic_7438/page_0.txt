@@ -1,0 +1,414 @@
+diegop | 2021-10-21 05:50:20 UTC | #1
+
+## Summary
+
+Proper sandboxing has come up as a **security** concern in a few projects:
+
+* [Bitcoin integration with ICP](https://forum.dfinity.org/t/direct-integration-with-bitcoin/6147/48?u=diegop)
+* [Enabling Canisters to hold ICP](https://forum.dfinity.org/t/enable-canisters-to-hold-icp/6153/29)
+
+Example:
+
+> I am getting worried about the security of canisters running on non-system subnets, that hold large amounts of monetary value.
+> 
+> I’m not sure enough security precautions have been taken to feel confident that canisters running alongside possibly malicious canisters will be safe.
+> 
+> I did not realize that each canister was running within the same process on each replica within a subnet, at least that seems to be the case.
+> 
+> Perhaps a prerequisite to this project moving forward is process sandboxing, so that even if malicious canisters break out of the Wasm environment, they’ll be stopped by the process boundary.
+
+## People involved
+
+Helge Bahmann (@hcb ), Ulan (@ulan) Dieter Sommer (@dieter.sommer )
+
+## Status
+Early stages: Formulating a plan and discussing.
+
+## Timelines
+- [x] 1-pager posted on the forum for review: *October 6, 2021*
+- [ ] Community Conversation with Ulan and Helge: *October 27 2021*
+- [ ] NNS Motion Proposal (to approve design + project) submission:  *October 27, 2021, 15:00 UTC*  
+- [ ] NNS Motion Proposal (to approve design + project) expiration: *October 27, 2021, 15:00 UTC* 
+- [ ] If NNS Motion Proposal passes, implementation + deploy would take weeks: *Q4 2021.*
+
+-------------------------
+
+diegop | 2021-10-06 16:14:09 UTC | #2
+
+**Update on this project:**
+
+@hcb has been quietly working away with @ulan. He has a project proposal for sandboxing that he is polishing. I will post it in a subsequent message for folks to take a look.
+
+-------------------------
+
+diegop | 2021-10-06 16:18:29 UTC | #3
+
+# Proposal: Sandboxing mechanism for canister wasm execution
+
+Main Authors: @hcb , @ulan 
+
+## Objective
+
+Protect IC nodes and canisters hosted on them from rogue canisters that try to exploit holes in the WebAssembly through maliciously crafted canister code. The attack scenarios include:
+
+* side-channel data reads of secrets in nodes and canisters,
+* all classes of remote code execution vulnerabilities in the WebAssembly JIT compiler and runtime
+
+## Background
+
+Canister code execution is confined by the WebAssembly runtime. The constraints of the runtime are enforced by a) limiting access through the system API and b) correctness of the JIT-compiled native code derived from the WebAssembly code. The full implementation correctness cannot necessarily be fully assumed due to the complexity of the components.
+
+Additionally, even assuming a perfectly correctly operating JIT compiler, the generated native code executes in the context of its host process. This makes it indistinguishable from all other code executing in the same process to the CPU. As a consequence, the CPU fundamentally cannot be stopped from performing speculative access to any memory reachable to the host process. This can be abused by completely legitimate WebAssembly code to trigger such speculative access. Timing measurements against code execution paths may then reveal secrets.
+
+Stopping this class of attacks at its core is difficult or outright impossible. They can however be rendered harmless by confining the attack scope to a strongly confined "sandbox process". No sensitive information must be held or be accessible to this process. Information that can be obtained by an attacker through other means (e.g. through the official system API through their own canisters) is not sensitive. As a consequence, a breach of the sandbox process in itself does not gain an attacker anything.
+
+## Proposal
+
+Implement a process sandboxing mechanism for canister wasm execution. The scope will be "one sandbox per canister" to protect both the IC node itself as well as other canisters. Guarantee integrity and confidentiality of all system components under the following attack scenarios:
+
+* side channel attack allowing arbitrary memory of the host process through side channels
+* WebAssembly runtime flaws allowing remote code execution
+
+The design of the sandbox process is such that the security properties of the IC hold under the assumption that the sandbox process is under complete attacker control.
+
+The implementation consists of a re-design of the canister runtime to allow for separation into multiple processes, and system means to enforce isolation and confinement of the processes.
+
+## Compatibility & performance
+
+The sandboxing mechanism will incur no user-visible functional changes to how canisters operate -- there is nothing developers need to change about their canisters. It is possible that the introduction of the isolation mechanism has observable performance effects. It is believed that the initial version will exhibit some performance degradation, but it is also believed that a fully optimized revision will long-term even improve performance over the non-sandboxed execution through better memory management parallelism in the system.
+
+## Security
+
+This proposal aims to improve security of the IC through canister process sandboxing. Under the assumption of a compromise through specially crafted code in one canister, the system guarantees the confidentiality of the following assets (meaning that a successful attacker cannot read them):
+
+* IC node data itself (including private keys)
+* User data of other canisters (including Wasm memory, stable memory and all metadata)
+* System data of other canisters (including cycles, tokens & similar assets)
+* Artifact pool
+* Ingress / egress messages of other canisters
+
+The system guarantees the integrity of the following assets (meaning that a successful attacker cannot modify them):
+
+* IC node data itself (including private keys)
+* User data of other canisters (including Wasm memory, stable memory and all metadata)
+* System data of all canisters (including cycles, tokens & similar assets)
+* Artifact pool
+* Ingress / egress messages of all canisters
+
+In the initial version we may not be able to guarantee availability of the system under all attack scenarios. This means that a successful attacker might still be able to hamper or disrupt the IC service until corrective administrative action can be taken.
+
+## Development and rollout plan
+
+The risks of the feature are two-fold:
+
+* complexity/stability: sandboxing is an architectural change that incurs stability risks due to complexity of implementation
+* performance: we anticipate initial performance degradation, heavily loaded subnets might be pushed beyond their operational bounds
+
+Development and rollout structure is intended to minimize these risks.
+
+An initial functional, slow, and non-launchable version of the feature is under preparation already. It will not be rolled out onto mainnet but will serve as validation for proper design proposals to be published in the course of this process. It also allows very early rigorous continuous testing to validate system stability.
+
+The initially launched version of this feature will provide all of the desired security properties, but may need to make performance compromises. It needs to be rolled out to the IC mainnet in a controlled fashion: We anticipate it to be activated first to head-runner subnet blockchains for live testing (especially regarding performance considerations), and then be activated throughout the entire IC mainnet over time. During this roll-out process, both the code to run “sandboxed” and “non-sandboxed” WebAssembly execution will be part of the image distributed as updates to IC nodes. Per-subnet / per-node customizations will allow selective activation.
+
+Future versions will close the performance gap and will likely also go beyond the performance of the status quo. They will be rolled out as incremental improvements over the sandboxing mechanism activated on all IC nodes.
+
+-------------------------
+
+jzxchiang | 2021-10-17 06:46:13 UTC | #4
+
+Thanks for the update.
+
+A few questions I had reading this:
+
+1. Will this block the BTC integration?
+2. What is the "artifact pool" referenced above?
+3. What type of changes will "close the performance gap"? My understanding is that process sandboxing incurs a performance penalty for the same reason multiprocessing is generally more expensive than multithreading: context switches are heavier with processes, IPC is expensive, etc. How will those fundamental OS-imposed limitations be overcome in a "one canister, one process" world?
+
+Thanks!
+
+-------------------------
+
+diegop | 2021-10-20 04:09:46 UTC | #5
+
+I will let @hcb and @ulan answer, but I did want to note three things:
+
+1. This project is being accelerated because others depend on it and it is baked enough
+2. Ulan and Helge are focusing on it
+3. We have a basic enough plan to have folks question it, ask on, so we are scheduling a community conversation and NNS motion proposal for folks to engage with
+
+-------------------------
+
+hcb | 2021-10-20 06:07:15 UTC | #6
+
+@jzxchiang partial answers to your questions:
+1. I do not think there is a decision that this will block BTC integration, but some people have expressed an opinion that stronger security measures should be a prerequisite
+2. The "artifact pool" is an internal data store of an IC node replica that holds data communicated between nodes for replication purposes.
+3. Context switching between threads and processes is only marginally different to the point that it practically does not matter. There is no fundamental OS-imposed limitation, and actually multiple processes will eventually be faster than threads for the IC (canister operation heavily relies on dynamically mapping/unmapping memory, and with a single process this causes contention on locks protecting the address space data structures; with multiple processes this contention goes away, we also verified all of this with measurements). The performance gap presently exists because data structures were not originally designed to place data in shared memory (to avoid copies that are otherwise necessary to transfer across process boundaries), and that system API implementation is not structured to "collect & batch" updates but rather cause IPCs due to tying resolution too much to internal data structures. There is no conceptual hurdle to overcoming all of this, just that it takes time to implement and we are more willing to temporarily sacrifice performance in order to ensure correctness & security from day 1 and leaving performance to be reclaimed over time.
+
+-------------------------
+
+lastmjs | 2021-10-20 14:08:44 UTC | #7
+
+[quote="hcb, post:6, topic:7438"]
+we are more willing to temporarily sacrifice performance in order to ensure correctness & security from day 1 and leaving performance to be reclaimed over time.
+[/quote]
+
+Wise words, very happy with them
+
+-------------------------
+
+diegop | 2021-10-20 19:18:21 UTC | #8
+
+[quote="jzxchiang, post:4, topic:7438"]
+What is the “artifact pool” referenced above?
+[/quote]
+
+This I can answer.
+
+The "artifact pool" is a reference to the P2P/Networking layer of the IC. The component has an a "pool" of artifacts that are received from other replicas or from Consensus layer (the layer above). Artifacts can be anything like consensus shares, signing things, update calls, etc...
+
+You can read more here: https://medium.com/dfinity/secure-scalability-the-internet-computers-peer-to-peer-layer-6662d451f2cc
+
+-------------------------
+
+diegop | 2021-10-21 05:50:02 UTC | #9
+
+**Update:**
+
+As I mentioned earlier in the thread, this project is increasingly more baked and is also important for other projects so we are doing the following:
+
+**What DFINITY is doing:**
+* Scheduling a community conversation for next Wednesday, October 27th (I have updated the summary at the top to reflect this)
+
+**What I encourage folks in the ICP community to do:**
+
+* Ask Helge or Ulan questions about their project, poke holes, etc... in the forum (or during the Community Conversation) using the 1-pager posted or other pieces
+
+If there seems to be soft consensus in the forums, my ideal is that we submit an NNS motion proposal next Wednesday, October 27th, If it turns out that based on the forum feedback that this project is not sufficiently baked or there are alternatives that should be considered, then the team will go back to the drawing board.
+
+Does that work for folks? if not, please let me know!
+
+-------------------------
+
+diegop | 2021-10-26 22:50:25 UTC | #10
+
+**Update:**
+
+It seems to me that the current trajectory for this project baked and scoped enough to move to the next stage, so following up on the above, here are next the next steps:
+
+
+1. **Wednesday, October 27th:** I submit an NNS motion proposal based on the 1-pager on this forum thread.
+
+2. **Thursday, October 28th:** @ulan and @hcb lead a community conversation on Canister Sandboxing: https://dfinity.zoom.us/webinar/register/WN_YdYmbUKBTzOiFVbAdGEiFQ
+
+-------------------------
+
+diegop | 2021-10-27 22:06:12 UTC | #11
+
+Update:
+
+Proposal is live: https://dashboard.internetcomputer.org/proposal/26999 
+
+Community Conversation is tomorrow Thursday, October 28. If you cannot attend, you can put questions on this thread for Ulan and Helge to answer as well.
+
+-------------------------
+
+diegop | 2021-10-29 21:11:26 UTC | #12
+
+NNS motion proposal passed!
+
+@ulan @hcb will post more as they start to make progress
+
+-------------------------
+
+diegop | 2021-11-06 01:50:43 UTC | #13
+
+Fwiw, @ulan and @hcb will post an update on this project. They made strides this week. I will let them discuss though.
+
+-------------------------
+
+ulan | 2021-11-06 10:37:43 UTC | #14
+
+**Update**
+
+As mentioned in the community conversation, we have a prototype implementation that passes all test, but is quite slow. To fix the performance we:
+
+* Found a memory representation that allows sharing of memory pages between processes [[design doc](https://docs.google.com/document/d/10X9qo3XK5pKpdO7W23yqspMI-T8em0khO8ig5VCQeS0/edit#)]. 
+* Implemented a file-based page allocator for `PageDelta` pages according to the design.
+* Refactored the execution layer to unify the handling of Wasm and stable memory such that both benefit from memory sharing.
+* Added support for transfering file descriptors between the replica and the sandbox processes.
+
+There is more implementation work remaining to switch sandbox to the new shared memory representation.
+
+-------------------------
+
+lastmjs | 2021-11-06 14:55:12 UTC | #15
+
+Such excellent work I love hearing about this
+
+-------------------------
+
+pyd | 2021-11-18 03:43:51 UTC | #16
+
+[quote="diegop, post:3, topic:7438"]
+In the initial version we may not be able to guarantee availability of the system under all attack scenarios. This means that a successful attacker might still be able to hamper or disrupt the IC service until corrective administrative action can be taken.
+[/quote]
+
+I want to know if a canister can be processed in a sandbox, the canister was processed by only one node in a subnet or all the nodes in the subnet. And if only one node run the canister, can the security be encsured?
+
+-------------------------
+
+ulan | 2021-11-18 12:21:23 UTC | #17
+
+[quote="pyd, post:16, topic:7438"]
+I want to know if a canister can be processed in a sandbox, the canister was processed by only one node in a subnet or all the nodes in the subnet. And if only one node run the canister, can the security be encsured?
+[/quote]
+
+Replication will remain the same as before, so an update message of a canister will be processed by all nodes in the subnet. What is changing is that each node gets a sandbox process per canister in order to isolate the canister from the system and other canisters on that node.
+
+-------------------------
+
+weedpatch2 | 2021-11-19 00:15:04 UTC | #18
+
+Sorry if this was already answered, but I didn't see it explicitly specified in the original proposal: is the sandboxing something that will be unilaterally applied to all canisters on the IC, or is this an additional feature that will be available to specific canisters/subnets?
+
+-------------------------
+
+diegop | 2021-11-19 01:36:55 UTC | #19
+
+I believe it is for all canisters and all subnets, however maybe @ulan and @hcb want to roll out across subnets and test the feature at different stages. 
+
+I will let @ulan @hcb add more color
+
+-------------------------
+
+hcb | 2021-11-19 07:18:30 UTC | #20
+
+Sandboxing will be applied unilaterally to all canisters on each subnet, once the feature is launched on a subnet. The purpose of sandboxing is to protect the IC and other canisters "from" a sandboxed canister, but its own sandbox awards no protection to the sandboxed canister by itself. Hence, it makes no sense for canisters to "opt in" to sandboxing, it only makes sense to treat all equally.
+
+-------------------------
+
+ulan | 2021-11-22 12:53:15 UTC | #21
+
+**Update**
+
+A lot has happened in the last two weeks:
+
+* Sandbox is now fully switched to the shared memory representation.
+* Stable memory operations are handled within the sandbox process without IPC.
+* System calls that return static data such as (canister_id, controller, and canister_state) are also handled within the sandbox process without IPC.
+* The `SubnetAvailableMemory` counter is now maintained properly.
+* The existing performance optimization to avoid tracking dirty pages for queries is ported to sandbox.
+* Now the unittests automatically rebuild the sandbox binary if there were wany changes.
+* A lot of investigation and debugging work was done on the infrastructure side to identify issues blocking CI with sandboxing.
+
+Preliminary benchmarking shows that the performance of sandboxed query calls is on par with the non-sandboxed version. Performance of update calls in *memory-intensive* workloads has improved by 100x compared to the state two weeks ago, but it is still 2x slower compared to the non-sandboxed version. We are currently experimenting with the optimization that should bring the performance gap down to 20%-30%.
+
+Remaining work:
+
+* Fix numerous infrastructure issues to enable CI with sandboxing.
+* Enable sandboxing in `ic-replay` that is used for disaster recovery.
+* Implement the performance optimization for memory-intensive updates calls (mentioned above).
+* Port `WasmExecutor::create_execution_state` to sandbox so that module instantiation happens in the sandbox process.
+* Improve error logging and metrics reporting in the sandbox process.
+
+-------------------------
+
+ulan | 2022-01-15 08:14:56 UTC | #22
+
+**Update**
+
+I am happy to share that the implementation of sandboxing is almost complete. We are aiming for the launch in two weeks and will host [a community conversation](https://dfinity.org/conversations/) with a detailed update on January 25.
+
+The work mentioned in my previous post is done. The sandboxed version now passes all our qualification tests. We also implemented optimizations that fixed the performance blockers.
+
+You can follow most of the sandboxing work since December [here](https://github.com/dfinity/ic/commits/master?before=b54e8c4d8051a21353d7ad750f6b0b19c8f558e9+35&branch=master&path%5B%5D=rs&path%5B%5D=canister_sandbox) and [here](https://github.com/dfinity/ic/commits/master/rs/replicated_state/src/page_map/page_allocator) (doesn't include infra, guest image changes).
+
+-------------------------
+
+lastmjs | 2022-02-18 16:42:26 UTC | #23
+
+What's the current status of sandboxing? Is it deployed now on all subnets?
+
+-------------------------
+
+ulan | 2022-02-18 17:14:56 UTC | #24
+
+We had to disable sandboxing after the initial launch because of the issues discovered on large subnets like `pjljw`:
+
+* The static process allocation strategy (create a process lazily on the first message and keep it alive) did not work well.
+* The process spawn duration increased over time from 10ms to 500ms as more processes are spawned.
+
+Good news is that we fixed  these issues in the meantime and will enable sandboxing again in the next release (that rolls out next week):
+
+* We have dynamic process allocation where idle processes are terminated.
+* We optimized process spawning to 2ms that doesn't regress over time.
+
+-------------------------
+
+lastmjs | 2022-02-18 17:56:08 UTC | #25
+
+Awesome! And will it be rolled out to all subnets initially or will you expand per subnet over time?
+
+-------------------------
+
+ulan | 2022-02-18 18:20:06 UTC | #26
+
+It will roll out to all subnets (as part of a normal release process) except for `eq6en` and `tdb26`:
+- `eq6en` has high memory usage,
+- `tdb26` is the NNS.
+
+In both cases we want to be extra-careful and enable sandboxing after confirming that it works well.
+
+-------------------------
+
+diegop | 2022-02-19 00:44:23 UTC | #27
+
+Fwiw, the disabling  was in the release change log, but I didn’t think to post here. My bad.
+
+https://forum.dfinity.org/t/release-notes-for-new-replica-version-04fe/10900?u=diegop
+
+-------------------------
+
+ulan | 2022-02-28 08:49:26 UTC | #28
+
+Sandboxing rolled out for all subnets except `eq6en`, `w4rem`, and `tdb26`.  These three subnets will get sandboxing in the next release.
+
+There are no issues so far.
+
+-------------------------
+
+lastmjs | 2022-03-02 19:45:21 UTC | #29
+
+Legendary comment, excellent work
+
+-------------------------
+
+ulan | 2022-03-03 08:25:43 UTC | #30
+
+> There are no issues so far.
+
+The sandbox process crashed on a single node on `pjljw` and we had to disable sandboxing there. The investigation is in progress. Until we have a fix we will keep sandboxing disabled on `pjljw`, `eq6en` , `tdb26`.
+
+-------------------------
+
+ulan | 2022-03-04 17:35:55 UTC | #31
+
+We found the root cause of the crash. It was caused by an old bug in the state manager. Sandboxing changed the timing and made the crash more likely to happen.
+
+The fix is in review and will make into the next release cut that will be deployed in two weeks.
+
+-------------------------
+
+ulan | 2022-03-22 12:25:15 UTC | #32
+
+Canister sandboxing is deployed on all subnets and is running without any issues so far.
+
+-------------------------
+
+LightningLad91 | 2022-03-22 15:36:39 UTC | #33
+
+That is awesome, congratulations!
+
+-------------------------
+

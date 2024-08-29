@@ -1,0 +1,76 @@
+Manu | 2022-05-09 16:10:17 UTC | #1
+
+# Summary
+
+In the morning of May 5th, 2022, the subnet mpubz stopped finalizing blocks. In practice, this means that no changes could be made to its state and a read-only mode remained.
+
+DFINITY engineers got alerted by the automated system health surveillance system and immediately reacted to the incident by preparing NNS proposals to recover the subnet. During the subnet recovery process, the bug was identified in block payload size computation that caused honest replicas to propose blocks that were invalid due to their large size when they received ingress messages of a very specific size.
+
+The new replica versions in proposals [58376](https://dashboard.internetcomputer.org/proposal/58376) and [58479](https://dashboard.internetcomputer.org/proposal/58479) contain the hotfix and the corresponding tests to ensure that a block size computation is consistent between blockmaking and validation. The hotfix is released to all subnets.
+
+# Impact
+
+The subnet mpubz remained in read-only mode for 6 hours (which means that the canisters on this subnet could not accept update calls) and was down for an hour during the state sync, the last phase of subnet recovery.
+
+# Timeline (UTC)
+
+2022-05-05:
+
+* 06:21: Faulty blocks are proposed.
+* 06:29: IC_Subnet_SlowFinalization alert is triggered.
+* 07:37: Status page is updated with the incident.
+* 08:28: [Proposal 58311](https://dashboard.internetcomputer.org/proposal/58311) - Halt subnet mpubz for subnet recovery.
+* 11:34: [Proposal 58333](https://dashboard.internetcomputer.org/proposal/58333) - Recover subnet mpubz from the last computed and certified state.
+* 11:43: Quiet period starts: Mirroring to the public github repository is disabled according to the IC’s [security patch policy](https://dashboard.internetcomputer.org/proposal/48792) until the issue has been fixed.
+* 12:37: [Proposal 58340](https://dashboard.internetcomputer.org/proposal/58340) - Unhalt subnet mpubz.
+* 13:35: State sync is completed and the subnet is fully operational.
+* 17:35 - 18:35: A new replica version with hotfix is elected (proposal [58376](https://dashboard.internetcomputer.org/proposal/58376), which applies the hotfix on top of the version elected in proposal [57150](https://dashboard.internetcomputer.org/proposal/57150)) and rolled out to 8 subnets (all subnets that were on the version elected in proposal [57150](https://dashboard.internetcomputer.org/proposal/57150)), including mpubz.
+* 19:42: Hotfix rolled out to NNS
+
+2022-05-06:
+
+* 9:35: A new replica version with hotfix is elected (proposal [58479](https://dashboard.internetcomputer.org/proposal/58479), which applies the hotfix on top of the version elected in proposal [57395](https://dashboard.internetcomputer.org/proposal/57395)).
+* 10:00 - 18:00: The new replica version is rolled out to all subnets that were on the version elected in proposal [57395](https://dashboard.internetcomputer.org/proposal/57395).
+* 18:00 quiet period ends and the source of the elected replica versions with the hotfix are available on github.
+
+# What went wrong?
+
+* A size calculation bug was introduced in a critical section of the code many months ago
+  * It was not sufficiently covered by unit tests.
+  * Excessive system testing never uncovered the bug even though we have tests for heavy ingress load that lead to the bug getting triggered.
+  * Safety measures existed, but failed to cover this specific case.
+* State sync happened from 1 to 12 nodes. Because the gossip protocol sees the state at a given height as one artifact and does not advertise it until it is fully received.
+* No queries were handled during this state sync time, even though the replicas had sufficient subnet state available to answer query calls.
+
+# What went right?
+
+* Monitoring reported the broken subnet within minutes.
+* Subnet recovery proposals successfully had the subnet unstuck.
+* All replicas had all subnet state at all times, no state was lost.
+
+# Technical details
+
+The blockmaker consists of multiple payload builders (such as ingress, xnet). Each payload builder has a build_payload method and a validate_payload method. During the block proposal, the blockmaker constructs a payload by calling the build_payload methods, specifying how much space each payload builder can take up. When receiving a proposed block, the validate_payload methods are called as part of the validation routine to validate the block.
+
+It is crucial that non-malicious nodes build payloads that non-malicious nodes running the same version of the code would also accept.
+
+As an additional safety measure, the build_payload methods call their own validate_payload method, to catch invalid payloads and prevent bugs in the payload builder from stalling the subnet.
+
+One condition that can’t be checked on the individual payload builder level is, that the overall block is not oversized (as each part might be within its limits, but the overall block could be too large). Therefore, during payload validation, after validating each individual payload section, a size check on the overall block is performed.
+
+This size check used a different method of calculating the ingress payload size than the IngressManager (the component building IngressPayload) itself. Specifically, the size of the IngressPayload struct is used in the size check while the IngressManager sums over Vec<SignedIngress>, the former being the serialized form of the latter. The size calculation of the serialized form includes the size of some metadata, which is not included when calculating the size in the deserialized form, i.e. calculates a value that is larger by a few bytes.
+
+This means, it is possible that, given an ingress message of exactly the right size, the ingress payload builder constructs an ingress payload that is considered valid by the ingress payload builder itself, but once this payload is included into a block (without adding another payload), the block as a whole is considered invalid.
+
+Before the incident, the subnet was processing a high load of ingress messages. This drastically increased the chance of this condition occurring. At height 27569484, the described condition was met by accident. Since all block makers used the same set of ingress messages to construct a block, they all in short succession proposed invalid blocks, stalling the subnet.
+
+# Action items
+
+* The IngressManager should always build payloads that pass size validation even after serialization.
+* Rather than calling validate_payload on the individual payload builders, the blockmaker should validate the whole block once, before proposing it.
+* After the two aforementioned items are implemented, we should revert to the old IngressPayload size implementation, as the hotfixed version is expensive.
+* Improve test coverage of block making and validation, e.g. via proptests.
+* Investigate if replicas can continue answering query calls (based on latest available state) while state syncing.
+
+-------------------------
+

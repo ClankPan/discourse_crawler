@@ -1,0 +1,264 @@
+peterparker | 2023-07-28 16:38:15 UTC | #1
+
+Not IC related but, Rust noob related question: has anyone a (noob friendly) sample code that displays how to pass an **async** function or closure (not sure that's possible) as parameter of another function to share?
+
+Got a bit a hard time putting this together and a sample code would hopefully help me gets it. Few examples I found so far weren't that enlightening.
+
+-------------------------
+
+peterparker | 2023-07-28 16:50:04 UTC | #2
+
+Current status:
+
+```
+pub async fn create_satellite(
+   ...
+   ) -> Result<Principal, String> {
+      ...
+      
+      // My closure
+      let create =
+                async || create_satellite_wasm(&console, &mission_control_id, &caller).await;
+
+     // The other  method call
+      return create_satellite_with_credits(create, &user).await;
+}
+
+// The other method
+async fn create_satellite_with_credits<Fut>(
+    create: impl Fn() -> Fut,
+    user: &UserId,
+) -> Result<Principal, String>
+where
+    Fut: Future<Output = Result<Principal, String>>,
+{
+    // Create the satellite
+    let create_canister_result = create().await;
+```
+```
+
+But I got the compilation issue:
+
+> error[E0658]: async closures are unstable
+  --> src/console/src/factory/satellite.rs:34:17
+   |
+34 |                 async || {create_satellite_wasm(&console, &mission_control_id, &caller).await};
+   |                 ^^^^^
+   |
+   = note: see issue #62290 <https://github.com/rust-lang/rust/issues/62290> for more information
+   = help: to use an async block, remove the `||`: `async {`
+
+For more information about this error, try `rustc --explain E0658`.
+
+-------------------------
+
+peterparker | 2023-07-29 08:22:24 UTC | #3
+
+Trying now to not use a closure but, pass the function itself but got the issue `one type is more general than the other` 🤔
+
+```
+create_satellite_with_credits(
+                    create_satellite_wasm, // <--- here pass the function without wrapping it in a closure
+                    &console,
+                    &mission_control_id,
+                    &user,
+                )
+                .await;
+
+...
+
+async fn create_satellite_with_credits<F, Fut>(
+    create: F,
+    console: &Principal,
+    mission_control_id: &MissionControlId,
+    user: &UserId,
+) -> Result<Principal, String>
+where
+    F: FnOnce(&Principal, &MissionControlId, &UserId) -> Fut,
+    Fut: Future<Output = Result<Principal, String>>,
+{
+```
+
+-------------------------
+
+senior.joinu | 2023-07-29 10:38:12 UTC | #4
+
+Hey there!
+
+Don't pass a closure, pass a struct with an impl.
+
+Closures desugar into structs which implement one of `Fn` traits. Don't let the compiler desugar it for you, desugar it yourself and everything will become much simpler immediately.
+
+```rust
+struct CreateSatelite {
+  console: Console,
+  mission_control_id: Id,
+  caller: Principal
+}
+
+impl CreateSatelite {
+  async fn run(&self) -> CreateCanisterResult {
+    create_satellite_wasm(&self.console, &self.mission_control_id, &self.caller).await
+  }
+}
+
+pub async fn create_satellite(
+   ...
+   ) -> Result<Principal, String> {
+      ...
+      
+      // My closure
+      let create = CreateSatelite { console, mission_control_id, caller };
+
+     // The other  method call
+      return create_satellite_with_credits(create, &user).await;
+}
+
+// The other method
+async fn create_satellite_with_credits(
+    create: CreateSatelite,
+    user: &UserId,
+) -> Result<Principal, String> {
+    // Create the satellite
+    let create_canister_result = create.run().await;
+
+    ...
+}
+```
+
+Some further reading - https://rustyyato.github.io/rust/syntactic/sugar/2019/01/17/Closures-Magic-Functions.html.
+
+Another benefit of doing that is the fact that when you desugar a closure manually, you have full control over the struct. Which means that you can derive a bunch of stuff for it and even make it serializable. Which means, that you can pass computations even between canisters, not just between functions of a single canister.
+
+Hope this helps!
+
+-------------------------
+
+peterparker | 2023-07-29 11:18:51 UTC | #5
+
+It's like a zillion times more easy with a struct with an impl than what I was trying to achieve! Thanks a lot.
+
+-------------------------
+
+peterparker | 2023-07-29 11:25:09 UTC | #6
+
+That said I'm not sure it's exactly what I want because ultimately what interest me is to call the function with various function as parameter. With a struct impl would mean I would need various impl. Have to go offline now, will continue next time I'm online.
+
+-------------------------
+
+senior.joinu | 2023-07-29 11:32:24 UTC | #7
+
+[quote="peterparker, post:6, topic:21785"]
+to call the function with various function as parameter
+[/quote]
+Then you might need a trait like:
+```rust
+#[async_trait]
+trait Closure {
+  async fn run(&self) -> ClosureResult;
+}
+```
+
+And your function that executes closures might look like this:
+```rust
+async fn execute_closure(cl: Box<dyn Closure>) -> ClosureResult {
+  ...
+  
+  cl.run().await
+
+  ...
+}
+```
+
+Then the only thing you would need to do is to implement this trait for various structs you need to execute:
+
+```rust
+impl Closure for Struct1 { ... }
+
+impl Closure for Struct2 { ... }
+```
+
+Which is not much different from implementing native Rust closures.
+
+-------------------------
+
+peterparker | 2023-07-30 12:00:15 UTC | #8
+
+Thanks a lot!!! I was considering using your latest approach, but I noticed it required an additional crate. So, I decided to take one last look at my current non-building solution before attempting it. Surprisingly, I was actually closer to a solution than I thought. The issue I reported earlier - `one type is more general than the other` - could be resolved by not borrowing the parameters.
+
+Solution:
+
+```
+// The function passed as parameter
+async fn create_satellite_wasm(
+    console: Principal,
+    mission_control_id: MissionControlId,
+    user: UserId,
+) -> Result<Principal, String> {
+  ...
+}
+
+// The function that receives the function as parameter
+async fn create_satellite_with_credits<F, Fut>(
+    create: F,
+    console: Principal,
+    mission_control_id: MissionControlId,
+    user: UserId,
+) -> Result<Principal, String>
+where
+    F: FnOnce(Principal, MissionControlId, UserId) -> Fut,
+    Fut: Future<Output = Result<Principal, String>>,
+{
+    // Create the satellite
+    let create_canister_result = create(console, mission_control_id, user).await;
+    ...
+}
+
+// The call of the function with the function as param
+create_satellite_with_credits(
+                    create_satellite_wasm,
+                    console,
+                    mission_control_id,
+                    user,
+                )
+                .await;
+```
+
+-------------------------
+
+peterparker | 2023-07-30 12:23:51 UTC | #9
+
+If someone ever lands on this in the future, here a sample async function passed as parameter which can be run in the Rust playground:
+
+```
+use std::future::Future;
+
+type MyParam = u64;
+type MyResult = u64;
+
+async fn count(
+    value: MyParam,
+) -> MyResult {
+    value + 1
+}
+
+async fn execute<F, Fut>(
+    f: F,
+    value: MyParam,
+) -> MyResult
+where
+    F: FnOnce(MyParam) -> Fut,
+    Fut: Future<Output = MyResult>,
+{
+    f(value).await
+}
+
+#[tokio::main]
+async fn main() {
+    let value = execute(count, 1).await;
+    println!("{:?}", value);
+}
+```
+
+-------------------------
+

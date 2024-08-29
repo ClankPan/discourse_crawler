@@ -1,0 +1,68 @@
+nomeata | 2021-09-22 07:48:58 UTC | #1
+
+I just noticed the following possible security flaw:
+
+There are some URLs within the “secure” domain of canister applications that are passed through by the HTTP Gateway and the service worker right to the node. For example, `https://identity.ic0.app/api/v2/status` will show you the CBOR value as produced by the replica. This happens both when you have no service worker installed (e.g. with `curl`), meaning that the Boundary Node has a forward configured here (And I wish we’d [see the code](https://forum.dfinity.org/t/boundary-nodes-source-code/7203) to check), and when you have the service worker installed (due to [these lines](https://github.com/dfinity/agent-js/blob/7102eb715dc026d90ebd3b86b11adeaa4e2fde9f/apps/sw-cert/src/sw/http_request.ts#L208-L210)).
+
+Why is this a problem? It means a single node provider (or even someone controlling the network around the node, possibly) can mount an attack that will break the security of the application, in this case the Internet Identity. My assumption here is that the node provider can either change the replica, or can MITM the connection between boundary node and the replica. 
+
+1. They create an innocent looking web site that, maybe in a hidden `iframe`, load one of these pass-through-URLs.
+2. They make their victim visit that website. This will cause them to load that URL.
+
+    The boundary node will round-robin the request, so it may hit one of the other replicas. To make this less easily detectable, maybe choose a URL path that causes a 404 or return plain text.
+
+    Repeat this until it hits the malicious node (or include many `iframes`, I guess…)
+3. The malicious replica, instead of returning a 404 or whatever, it returns a webpage that loads malicious JS code.
+
+4. Now the attacker was able to inject malicious JS that runs in the `https://identity.ic0.app` origin. If they now also trick the user in touching their fingerprint sensor or yubikey, they can otherwise silently sign into the Internet Identity and then interact with Internet Identity enabled applications. For example, stake all ICPs for 8 years, or post bad jokes on DSCVR.
+
+To avoid this:
+
+ * Both service worker and HTTP Gateway must not have _any_ uncertified pass through routes for non-raw URLs. No `/api/…`, no `/_`.
+
+   Instead, the HTTP Gateway must _always_ return the service worker (or, possibly, other _trustworthy_ results, e.g. results it produces itself, or where it checked the certification, or other sanitation).
+
+   And the service worker must only allow responses where it could check the certification. Again, no pass-through routes, and also no unredacted error pages (the latter is done correctly, I think.)
+
+ * Whoever needed these paths (maybe the frontend application?) before must access them using a _different_ URL. For `/api/` access, simply using `https://ic0.app` (no canister name) might work. This is the default `IC_GATEWAY` in the rust agent, but not the JS agent, it seems.
+   
+   Although someone really needs to check what happens if a malicious node can inject JS that runs in that origin, and whether that can take over subdomains then.
+
+(I wondered if this issue serious enough to require a non-public disclosure, but it seems not needed. At this point of the project I expect seriously malicious node providers might have better ways to cause havoc. Also, everything that I describe here can be done by a malicious _boundary node provider_ anyways, and that seems unavoidable in the current architecture, so in practice this attack doesn't change a lot.)
+
+-------------------------
+
+bitdivine | 2021-09-23 21:03:20 UTC | #2
+
+Good timing.  We are working on a secure solution for boundary nodes.  Some dependencies that we rely on are not ready yet, which is why we still keep tight control over the boundary nodes.  As soon as we have all the required parts we can finish the plan and you are welcome to try to break it! :slight_smile: 
+
+I will make sure that your post above is covered by our security model.
+
+I do however think that the whole design of https is badly suited to blockchains, which certify data and explicitly do not trust any particular endpoint.  I wish there were ssl certificates that said "The holder is  a certified representative of $CANISTER_NAME and is authorized to serve only files that hash to X, Y and Z".
+
+-------------------------
+
+robin-kunzler | 2021-09-24 06:43:19 UTC | #3
+
+Hi Joachim, 
+
+Thanks a lot for reporting this and for the detailed description of the issue. We have to look into what actions are necessary and will get back.
+
+-------------------------
+
+nomeata | 2021-09-24 07:08:30 UTC | #4
+
+Great! Looking forward to breaking the next version, or at least trying :slightly_smiling_face: 
+
+Note that the issue above isn't really due to TLS, but due to the lack of checking “our” certification scheme on some paths.
+
+But if it's redone anyways, not a big deal for now.
+
+-------------------------
+
+nomeata | 2022-04-01 11:22:48 UTC | #5
+
+Hmm, if <https://github.com/dfinity/icx-proxy/pull/26> was supposed to fix this, then I think it didn’t: While it stops forwarding `/_/raw`, it still forwards `/api/` and `/_/`.
+
+-------------------------
+

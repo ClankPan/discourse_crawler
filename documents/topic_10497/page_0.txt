@@ -1,0 +1,536 @@
+goose | 2022-01-28 09:12:24 UTC | #1
+
+canister id : 5su7s-vqaaa-aaaai-abgua-cai
+When  upgrade, get err:
+The invocation to the wallet call forward method failed with the error: An error happened during the call: 5: Canister  .....  trapped: heap out of bounds
+
+![heapout|690x270](upload://8EkGjovtlvhWB1EcEFZguAc2VMI.png)
+
+method:
+```
+heap_size        = Prim.rts_heap_size();
+        memory_size      = Prim.rts_memory_size();
+        max_live_size    = Prim.rts_max_live_size();
+        total_allocation = Prim.rts_total_allocation();
+        reclaimed        = Prim.rts_reclaimed();
+        rts_version      = Prim.rts_version();
+        cycles           = Cycles.balance();
+```
+
+Why heap out of bounds ,How can I solve this problem？？This problem is that I feel extremely painful and sad.  I also want to know: does the canisters written by rust have this problem？
+
+-------------------------
+
+goose | 2022-01-27 02:46:41 UTC | #2
+
+Is the canister's memory management similar to linux's virtual memory?
+  public func push<T>(x : T, l : List<T>) : List<T> = ?(x, l); 
+Adding items to the linked list, will it be similar to the malloc implementation of c language, allocating memory from virtual space？
+
+-------------------------
+
+cyberowl | 2022-01-30 04:16:05 UTC | #3
+
+Where can I find more information on Prim?
+
+-------------------------
+
+jzxchiang | 2022-02-24 06:51:24 UTC | #4
+
+I'm getting this same error when I try to upgrade my canister locally.
+
+```
+Installing canisters...
+Upgrading code for canister service, with canister_id rrkah-fqaaa-aaaaa-aaaaq-cai
+The invocation to the wallet call forward method failed with the error: An error happened during the call: 5: Canister rrkah-fqaaa-aaaaa-aaaaq-cai trapped: heap out of bounds
+```
+
+Here is the canister info from the replica UI:
+
+```
+Scheduler state
+last_full_execution_round	2220754
+compute_allocation	0%
+freeze_threshold (seconds)	2592000
+memory_usage	768365333
+accumulated_priority	-1600
+Cycles balance	4000000000000
+```
+
+I'm surprised I'm running out of heap space, when I'm only using 768 MB of memory pre-upgrade. I knew Motoko stable variable serialization took up space, but I didn't think it would take up 3+ GB.
+
+@claudio @rossberg Do you know what may be going wrong here? To confirm, I didn't modify any stable variable types (or make any changes) between the last canister upgrade and the current one.
+
+EDIT: When I reduce the memory_usage of my canister (by reinstalling and populating it with fresh data) to 753 MB and run `dfx deploy`, it works... Is the pre-upgrade memory_usage cutoff really somewhere between 753 MB and 768 MB above which canister upgrades don't work??
+
+-------------------------
+
+rossberg | 2022-02-24 07:47:55 UTC | #5
+
+@ggreif or @ulan might have an idea what's going on and what the message means.
+
+-------------------------
+
+ggreif | 2022-02-24 12:47:49 UTC | #6
+
+When `preupgrade` is running in a fragmented heap, there may not be enough capacity to push all the information into stable variables _and_ externalize them into a monolithic buffer (which then will be copied to the stable memory space). We are aware of these two problems:
+ - need to run an explicit GC before `preupgrade` (and possibly after)
+ - need to use a streaming technique to write stable variables to stable memory.
+
+I am working on the former and @claudio is about to tackle the latter.
+
+-------------------------
+
+jzxchiang | 2022-02-25 01:55:17 UTC | #7
+
+Thanks for the response.
+
+I knew there was an intermediate buffer, but I didn't know it would take that much space... From <800 MB to "heap out of bounds" (i.e. 3.2 GB used) seems quite extreme.
+
+But yeah, those two workarounds sound good. Do you happen to have an ETA on either of those solutions? (No rush but would be helpful to plan.) Also, would you recommend users migrate to using the `ExperimentalStableMemory` Motoko library, which I assume avoids these problems?
+
+-------------------------
+
+claudio | 2022-02-28 22:32:31 UTC | #8
+
+That doesn't look like Motoko allocation failure to me, which produces a different error message (IIRC) and more like trying to address wasm memory that hasn't been pre-allocated by a memory grow. 
+
+Is there any chance you could share the offending code or a smaller repro?
+
+-------------------------
+
+claudio | 2022-03-01 16:58:43 UTC | #9
+
+If you have a repro, is there any chance you could share the code? I'd like to check we don't have a bug.
+
+-------------------------
+
+PaulLiu | 2022-03-01 17:30:17 UTC | #10
+
+More likely than not, you have changed your data structure used in stable variables which violated the upgrade rules. Please see a previous discussion https://forum.dfinity.org/t/dfx-deploy-network-ic-heap-out-of-bounds/6031/11?u=paulliu
+
+-------------------------
+
+bitbruce | 2022-11-29 14:52:10 UTC | #11
+
+[quote="ggreif, post:6, topic:10497, full:true"]
+When `preupgrade` is running in a fragmented heap, there may not be enough capacity to push all the information into stable variables *and* externalize them into a monolithic buffer (which then will be copied to the stable memory space). We are aware of these two problems:
+
+* need to run an explicit GC before `preupgrade` (and possibly after)
+* need to use a streaming technique to write stable variables to stable memory.
+
+I am working on the former and @claudio is about to tackle the latter.
+[/quote]
+
+This issue still seems to be unresolved. When I upgrade the same wasm (motoko), the canister with little memory usage can be upgraded successfully, but the canister with 70M memory usage cannot be upgraded, and the error "Canister qhssc-vaaaa-aaaak-adh2a-cai trapped: heap out of bounds" is reported. This problem has been encountered several times.
+
+Memory allocation: 0
+Compute allocation: 0
+Freezing threshold: 2_592_000
+Memory Size: Nat(70311386)
+Balance: 14_558_822_050_955 Cycles
+Module hash: 0xa2edf6ff68c0b00dc9e971602d7542f542289a62c6d108d60dda64273406e8b0
+
+-------------------------
+
+ggreif | 2022-11-29 20:45:19 UTC | #12
+
+Thanks for the report! Though 70 MB doesn't seem to be so high that the heap would be in danger due to serialisation of stable variables. Would you mind giving us the `moc` version used and a few hints about how the heap structure differs between the "little memory" and the "70M memory"? Ideally, if this is a test canister, a reproducible example of canister code + message sequence leading to the problem would allow us to come up with the fastest bug fix.
+
+-------------------------
+
+claudio | 2022-11-29 23:23:34 UTC | #13
+
+Is there any chance your data structure has a lot of internal sharing of immutable values, i.e. is a graph, not tree, of data? The serialisation step can turn a graph into a tree by duplicating shared values, which might exhaust memory on deserialisation.
+
+-------------------------
+
+bitbruce | 2022-11-30 07:53:36 UTC | #14
+
+After repeated tests, we found that.
+- If all the stable vars are left unchanged, the upgrade can be done successfully.
+- This issue occurs if a stable var (trie structure) with thousands of data is deleted. It seems to trigger a reorganization of the whole stable memory, because we found that canister memory increased to more than 100M during the upgrade.
+
+-------------------------
+
+claudio | 2022-11-30 10:46:47 UTC | #15
+
+Would you be able to provide a repro for the problem? It would be interesting to figure out what is going wrong.
+
+-------------------------
+
+bitbruce | 2022-12-01 00:19:10 UTC | #16
+
+I wrote an ICRC1 contract f2r76-wqaaa-aaaak-adpzq-cai and now have 27M of memory with 18590 records in Trie.
+I didn't change any stable vars and this issue occurred when I upgraded. It seems to be related to the number of records.
+
+Upgraded code: (one element of the array can not put too much data?)
+```
+    // upgrade
+    private stable var __drc202Data: [DRC202.DataTemp] = [];
+    system func preupgrade() {
+        __drc202Data := [drc202.getData()];
+    };
+    system func postupgrade() {
+        if (__drc202Data.size() > 0){
+            drc202.setData(__drc202Data[0]);
+            __drc202Data := [];
+        };
+    };
+```
+
+-------------------------
+
+claudio | 2022-12-01 11:23:28 UTC | #17
+
+Looking at https://github.com/iclighthouse/DRC_standards/blob/main/DRC202, which I'm guessing what you are using, I think the problem *might* be the 64 byte (?) transaction ids (Blobs):
+
+https://github.com/iclighthouse/DRC_standards/blob/cb25d11a61526531c6fd897cbb35682b1c6a4806/DRC202/examples/ICLighthouse/lib/DRC202Types.mo#L90 which are uses as key for various maps in DataTemp.
+
+In memory, a Blob is representated by a 4-byte pointer to a byte vector, and references to the same blob share the vector using an indirection.
+
+Your tries use those blobs as keys in a number of places (the fields of `TempData`)
+
+https://github.com/iclighthouse/DRC_standards/blob/cb25d11a61526531c6fd897cbb35682b1c6a4806/DRC202/examples/ICLighthouse/lib/DRC202.mo#L38
+
+When multiple reference to the same blob are serialized during upgrade, each reference to the 
+blob is serialized to its own vector of byes in the stream, losing all sharing that was present in the in memory representation.
+
+I think that may be the problem here. It's a known issue that the current stable representation of data can blow up do to loss of sharing. I think, unfortunately, you may have been bitten by this.
+
+If that is the problem, the only workaround I can see would be to introduce another map that maps TxId to a small integer, storing the large blobs just once as key, that you then use as small key for the other tries.
+
+If it's any help, you can use this https://internetcomputer.org/docs/current/references/motoko-ref/ExperimentalStableMemory#value-stablevarquery to calculate the size of memory needed for stable variables.
+
+-------------------------
+
+bitbruce | 2022-12-01 11:44:14 UTC | #18
+
+[quote="claudio, post:17, topic:10497"]
+[DRC_standards/DRC202Types.mo at cb25d11a61526531c6fd897cbb35682b1c6a4806 · iclighthouse/DRC_standards · GitHub](https://github.com/iclighthouse/DRC_standards/blob/cb25d11a61526531c6fd897cbb35682b1c6a4806/DRC202/examples/ICLighthouse/lib/DRC202Types.mo#L90) which are uses as key for various maps in DataTemp.
+
+In memory, a Blob is representated by a 4-byte pointer to a byte vector, and references to the same blob share the vector using an indirection.
+[/quote]
+
+The key is a 32-byte blob, using a trie structure, and inside the trie the key is 4 bytes (generated using Blob.hash). .
+Does this cause any problem? 32-byte keys are common in blockchain applications.
+Our key is not integer incremental, it is generated according to a rule that requires 32 bytes to avoid collisions. You know, BTC, ETH are such rules.
+If this is the reason, what can be done to improve it?
+
+Should I use the ExperimentalStableMemory tool? But there is no `didc` toolkit in motoko to convert structural data to blob.
+
+-------------------------
+
+claudio | 2022-12-03 19:39:30 UTC | #19
+
+Right, but I think the leaves of the trie will actually still store the full 32-byte (not bit) key, to resolve collisions. So each trie will contain its own reference to the key blob, which is then unshared on upgrade. But maybe I'm barking up the wrong tree.
+
+-------------------------
+
+claudio | 2022-12-01 12:10:03 UTC | #20
+
+
+The AccountId's are also Blobs - how large are those?
+
+You could try to use ExperimentalStableMemory to store the data. 
+
+Motoko provides to_candid and from_candid overations to map values of shared types to/from blobs:
+
+https://internetcomputer.org/docs/current/developer-docs/build/cdks/motoko-dfinity/language-manual#candid-serialization
+
+But I think it would be wiser to figure out where the blow-up, if any, is coming from before rewriting everything to use stable memory.
+
+I think getting a small repro of the behaviour would be best to figure out how to fix it.
+
+-------------------------
+
+bitbruce | 2022-12-01 12:12:02 UTC | #21
+
+[quote="claudio, post:20, topic:10497"]
+The AccountId’s are also Blobs - how large are those?
+[/quote]
+
+All blob keys are 32 bytes
+
+-------------------------
+
+bitbruce | 2022-12-01 12:16:29 UTC | #22
+
+[quote="claudio, post:20, topic:10497"]
+I think getting a small repro of the behaviour would be best to figure out how to fix it.
+[/quote]
+
+This is an issue that is bound to happen. Anyone can deploy a token canister and generate 20,000 transactions and then try to upgrade.
+https://github.com/iclighthouse/DRC_standards/blob/main/DRC20/examples/ICLighthouse/ICRC1.mo
+
+-------------------------
+
+claudio | 2022-12-01 12:59:50 UTC | #23
+
+I don't disagree that what Motoko provides is insufficient and we actually want to improve it in future. But that won't happen soon.
+
+Given the current state, I can make these observations:
+
+There are a few more stable Tries indexed on Blobs, and each transaction, of which there could be many, stores a sender and receiver Blob, many of which I'd imagine to be shared between transactions (same sender or receiver).
+
+Can you not maintain a two way map from Blob to BlobId internally, and then just use the 
+small BlobId to reference that particular Blob from other data structures (like a data base table and key). That, would, I hope, mitigate the explosion on upgrade.
+
+If easy to arrange, maintaining the large data in stable memory directly would also avoid the issue, but that's probably a lot more work.
+
+-------------------------
+
+bitbruce | 2022-12-01 15:57:23 UTC | #24
+
+It may work, but it doesn't solve the problem at all. I don't think a 32 byte blob is a big overhead, compared to the 32 bytes per int on EVM. This feels like maintaining a database. But there is no database engine in canister, and it is impossible for the subnet to allocate enough computational resources to each canister.
+So I would like to make a suggestion.
+Be upfront with reality: Canister is first and foremost a blockchain category, it is not a server or a database. It is not the same as EVM, but it is blockchain based, so draw on Solidty's years of experience and solutions. More support for k-v map structure and restrict full table traversal comparison. There are enough Dapps on eth to prove that most of the business logic that relies on full table matching comparison can be achieved by k-v reading and writing through technical modifications. IC has higher scalability than ETH, so there is an opportunity to support it better.
+
+Mechanisms can be designed to guide developers into a new paradigm. For example, it is possible to allow a controller to deploy a group of canisters on a subnet, and calls between this group of canisters are treated as internal calls, supporting atomicity. Then the developer can design the proxy-impl-data (MVC) pattern to separate the entry, business, and data in different canisters, and in fact the developer just needs to upgrade the impl canister frequently.
+
+-------------------------
+
+claudio | 2023-02-08 11:00:56 UTC | #25
+
+After some experimentation with upgrades,  I manage to provoke the same error. It is a bug in the deserialization code, which requires more Rust/C stack than it has available as well as a better stack guard.
+
+A fix is under review that should mitigate the failures, if not rule them out.
+
+https://github.com/dfinity/motoko/pull/3782
+
+-------------------------
+
+claudio | 2023-02-17 20:55:02 UTC | #26
+
+Although we just released 0.8.2 which mentions an improvement in this area, the second half of the fix is still under review but will hopefully be out in 0.8.3. Just to set expectations correctly.
+
+The PR to watch is this one:
+
+https://github.com/dfinity/motoko/pull/3809
+
+-------------------------
+
+claudio | 2023-02-24 17:17:28 UTC | #27
+
+Ok, Motoko 0.8.3 is out which I am hoping will fix these particular heap out of bounds issues, at least to the point where deserialization should no longer stack overflow  when serialization does not stack overflow.
+
+https://github.com/dfinity/motoko/releases/tag/0.8.3
+
+Note that storing large amounts of data in stable variables (I'm thinking 1.5GB or more) may well fail to deserialize due to memory exhaustion, but that's a different issue which we hope to tackle shortly.
+
+-------------------------
+
+infu | 2023-06-19 21:56:06 UTC | #28
+
+@claudio @ZhenyaUsenko @skilesare I've got a similar problem. 
+At first, I thought it was my Mac, but then I deployed in the motoko playground and I am getting the same results. 
+
+<https://m7sm4-2iaaa-aaaab-qabra-cai.ic0.app/?tag=2112554174>
+
+repo:
+<https://github.com/infu/bug_x_weird>
+
+You will probably need "Internet Base" VS Code extension so you can run the `./check.blast` (from repo)  to populate it with 100k records.
+These records look like this:
+![image|542x499, 75%](upload://5cQjYlZGfYqTP2wEETjEzJtINtz.png)
+
+Once they get inserted, the canister won't upgrade. Sometimes it throws "stack overflow" and on rare occasions "heap out of bounds". The memory is ~52mb
+
+I've tried various dfx versions and also hashmap's previous version.
+
+I've tried using nhash instead of thash (Nat keys). I've tried removing skills:[Text].
+Tried removing the id from the document as well so it doesn't repeat.
+I've also tried inserting the records in smaller portions, 100 per request instead of 1000.
+Nothing seems to help with the error. Everything seems to work fine until you try to upgrade it.
+
+-------------------------
+
+claudio | 2023-06-20 09:51:02 UTC | #29
+
+Taking a look.
+
+Have you tried using `ExperimentalStableMemory.stableVarQuery()`
+
+https://internetcomputer.org/docs/current/motoko/main/base/ExperimentalStableMemory#value-stablevarquery
+
+to determine the serialized size of the stable variables without actually doing the serialization.
+Serialization can sometimes non-linearly expand the size of the source data if it contained a lot of internal sharing.
+
+My other suspicion is that there is some large linked list (or unbalance tree) in the data that is causing serialization or deserialization to run out of stack.
+
+it would also be good to figure out if this happens in pre-upgrade or post-upgrade using dfx (not playground) and some Debug.prints in a postupgrade system method.
+
+-------------------------
+
+infu | 2023-06-20 10:03:07 UTC | #30
+
+Thanks for the tip, I'll add it to the stats function and see. 
+
+I've just tried @timo 's Vector with the same record type and managed to get 1.4mil (haven't tested with more), upgrades work.
+canister stats:
+"documents": "1400000",
+"memory_size": "608043008",
+"max_live_size": "246481600",
+"stable_size": "112850245",
+"heap_size": "246483248",
+"total_allocation": "359333728",
+"reclaimed": "112850480"
+
+-------------------------
+
+infu | 2023-06-20 10:08:39 UTC | #31
+
+With the Map, I get "stack overflow" when running the same stableVarQuery that works in the Vector test.
+stable_size      = (await Prim.stableVarQuery()()).size;
+
+-------------------------
+
+claudio | 2023-06-20 10:17:20 UTC | #32
+
+So I think it might be a problem with the motoko_hash_map data structure. 
+
+Indeed someone seems to have reported a similar issue https://github.com/ZhenyaUsenko/motoko-hash-map/issues/1 with version 8 of that.
+
+I looked at the code for master and it seems to both rely on internal sharing and a recursive type that could degenerate to a linked list, causing the stack overflow when deep.
+
+Version 7 uses a simpler data structure, I think, so might survive serialization better.
+
+I noticed your dfx.json is using a rather old version of Motoko, it would be worth upgrading Motoko or dfx since we did some work on improving the capacity of deserialization since (see above https://forum.dfinity.org/t/heap-out-of-bounds-use-motoko/10497/27?u=claudio).
+
+-------------------------
+
+infu | 2023-06-20 10:26:22 UTC | #33
+
+I've tried with multiple versions, the repo is using the older one, because I tried it last. The latest tests are with dfx 0.14.1 
+Yes, confirmed. I've just tried @icme 's BTree and it also works. 
+I'll be lying if I say I understand what "internal sharing and a recursive type that could degenerate to a linked list" means completely. 
+
+However, I am thinking of having all indexes (BTree's) point to the same object. I suppose that will be putting a reference to the object and not cloning it. I can also put the text key instead, but it will make things slower when trying to filter it. Maybe that's what you mean by internal sharing and it may be bad?
+Anyway I am about to find out soon if it works
+
+-------------------------
+
+claudio | 2023-06-20 10:41:13 UTC | #34
+
+Yeah, sorry that was a bit obscure.
+
+The problem is that we use Candid for serialization of stable variables.
+
+In Motoko, in memory data-structures are represented as a graphs. So multiple references to the same object are represented as small pointers to the one object.
+
+Candid, unfortunately, can only represent trees, not graphs, so multiple Motoko references to the same object in memory will get expanded to several serialized copies of that object in Candid data.
+
+If you don't start with a graph like data structure with multiple references to a shared object, you're ok. But if you don't, the size of the data can blow up (exponentially, in fact).
+
+Independently, the overflow can happen because Candid serialization is a recursive algorithm, driven by the (static) type of the data being serialized. If the data has a recursive type, and the value is deeply recursive, serialization can blow the stack (like any recursive algorithm).
+
+It's not really the data structures fault here, but the fact that Motoko uses an unsuitable format for stable variable serialization. We'd like to fix that, but it's not easy given all the requirements we need to meet.
+
+The serialization format we use is actually a mild extension of Candid that supports some sharing, but only for mutable arrays and mutable fields. All Motoko references to the same mutable array or field are represented by a unique object in the stable variable format so that we can preserve the identity of those values on deserialization. However, we only preserve sharing of mutable value, not immutable values and it's unfortunately not trivial to do more than that in the current scheme.
+
+-------------------------
+
+infu | 2023-06-20 10:42:24 UTC | #35
+
+Thanks for clarifying. So I should not link to the same object from all indexes, because when it tries to upgrade it will expand too much, and also probably after the upgrade it will end as cloned objects.
+
+I suppose then using Vector to store all data and placing Nat indexes to it in Btrees and Maps will be the best current solution. My only problem with Vector is that I'll be leaving empty Array cells when someone deletes things, which makes it a bit opinionated.
+
+-------------------------
+
+claudio | 2023-06-20 10:47:56 UTC | #36
+
+> I suppose then using Vector to store all data and placing Nat indexes to it in Btrees and Maps will be the best current solution. My only problem with Vector is that I’ll be leaving empty Array cells when someone deletes things, which makes it a bit opinionated.
+
+I think that's one solution, yes. Another (untried by me) would be to wrap each object in a singleton, mutable array and then reference the arrays, not the objects. The arrays will get shared because they have identity. Might be awkward though.
+
+-------------------------
+
+infu | 2023-06-20 10:57:19 UTC | #37
+
+Ha, interesting hack. I may try it out. So [var E] ok.
+
+Well, it didn't fix the Map `Map.set(mmm, thash, doc.id, [var doc]);` still upgrading errors
+
+I suppose if I want to reuse old Vector cells, I can keep track of them and insert new records there
+
+-------------------------
+
+claudio | 2023-06-20 11:40:02 UTC | #38
+
+No, I don't think this will fix motoko-hash-map unless used internally in the implementation. I was suggesting it more for your own use. I'm also not 100 certain it will help and not push the problem elsewhere.
+
+-------------------------
+
+ZhenyaUsenko | 2023-06-20 12:35:15 UTC | #39
+
+[quote="infu, post:37, topic:10497"]
+Well, it didn’t fix the Map `Map.set(mmm, thash, doc.id, [var doc]);` still upgrading errors
+[/quote]
+
+Does the issue persist even with map v7?
+
+...I'll look into fixing the issue for v8. Will share my findings a bit later
+
+-------------------------
+
+ZhenyaUsenko | 2023-06-20 12:48:13 UTC | #40
+
+To be fair I thought that `--rts-stack-pages <n>` option introduced in **moc 8.2** should've eliminated this. @claudio do I misunderstand its purpose? @infu Did you try increasing it?
+
+-------------------------
+
+infu | 2023-06-20 13:51:30 UTC | #41
+
+haven't tried --rts-stack-pages also haven't tested v7. I've shared the repo, you can check it out. Or I will a bit later
+
+-------------------------
+
+ZhenyaUsenko | 2023-06-20 16:19:51 UTC | #42
+
+@claudio I just implemented your singleton suggestion for v8 map
+Here is the branch https://github.com/ZhenyaUsenko/motoko-hash-map/tree/stack-overflow-fix-attempt
+Still fails to upgrade. Increasing `--rts-stack-pages <n>` doesn't help either
+
+-------------------------
+
+claudio | 2023-06-21 20:59:51 UTC | #43
+
+Sorry, didn't see this and will try to take a look tomorrow.
+
+The flag only affects one of the stacks used by the compiled code. The hard limit is determined by the Wasm stack which we can't configure but is set by the IC. So it can help, but only so much.
+
+-------------------------
+
+claudio | 2023-06-22 10:44:50 UTC | #44
+
+
+So the introduction of [var _] as you did should improve sharing, but I think if its failing with a stack overflow then it might be the use of deeply nested recursive value (of type Entry) that might be the other problem. Reading the code and this, https://forum.dfinity.org/t/map-v8-0-0-its-finally-here/18962, I wonder if it's the support for the previous and next pointers,preserving insertion order, that (I guess) are linking all entries in a long list.
+
+Just a hunch, I'm afraid. Could you record the hashes of previous and next entries instead and link them that way?
+
+-------------------------
+
+ZhenyaUsenko | 2023-06-22 12:03:36 UTC | #45
+
+[quote="claudio, post:44, topic:10497"]
+Could you record the hashes of previous and next entries instead and link them that way?
+[/quote]
+
+That's an interesting idea. Could definitely be a temporary solution until we have a better serialization/deserialization algorithm on upgrades. One problem I see immediately is
+current structure `(..., links: [var Entry<K, V>])` will be replaced with
+double array `(..., branches: [var Entry<K, V>], prevNext: [var Nat32])`
+which as far as I understand will increase space per entry by 12 bytes
+
+-------------------------
+
+claudio | 2023-06-23 10:43:03 UTC | #46
+
+That sounds about right. It will be another 4 bytes larger in the incremental gc (as all objects are).
+
+Still might be worth the experiment to see if it fixes the issue (or just take out support for pre and next to determine that).
+
+It is just a hunch though. Sorry if it wastes your time in the end.
+
+-------------------------
+

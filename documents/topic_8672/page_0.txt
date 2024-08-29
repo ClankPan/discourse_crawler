@@ -1,0 +1,201 @@
+infu | 2021-11-18 09:49:44 UTC | #1
+
+This is a barebones example:
+```
+actor Test {
+
+  type Entry = {
+    desc: Text;
+    phone: Text;
+  };
+
+  stable var boo: ?Entry = null;
+ 
+  public shared func set() : async () {
+    boo := ?{desc="Some"; phone="12345678"};
+  };
+
+  public query func get() : async ?Entry {
+    return boo;
+  };
+
+};
+```
+
+I know what you are thinking "Nobody does that! You! Time-wasting edgecaser" So I have also made a real-world example too. Something used in token implementations:
+
+https://m7sm4-2iaaa-aaaab-qabra-cai.raw.ic0.app/?tag=1583117559
+
+The problem arises once you change the Entry type and add a field. 
+From: 
+```  
+type Entry = {
+    desc: Text;
+    phone: Phone;
+  };
+```
+Change to 
+```  
+type Entry = {
+    desc: Text;
+    phone: Phone;
+    another: Text;
+  };
+```
+ :bomb: **And then when you upgrade. You silently lose all your data.** :bomb:
+
+I would expect it to cancel the upgrade since it's not compatible.
+
+There is a quick solution. All new fields have to be optional. (?Text instead of Text). Then data won't be lost. This will work fine:
+```  
+type Entry = {
+    desc: Text;
+    phone: Phone;
+    another: ?Text;
+  };
+```
+
+-------------------------
+
+infu | 2021-11-18 10:03:31 UTC | #2
+
+Dfinity is working on this. I couldn't initially find it. https://github.com/dfinity/motoko/issues/2692
+
+-------------------------
+
+claudio | 2021-11-18 11:07:24 UTC | #3
+
+Actually, that quick solution will not be recommended going forward since it relies on an implementation detail of the serialization mechanism to work. Once we start statically checking upgrades, by checking the types of the stable variables according to motoko subtyping rules (not, for example, Candid ones), this will be rejected.
+
+Although it happens to work now, please don't do this (or follow this advice).
+
+The simple rule will be that you can a
+- promote an existing stable variable to a Motoko supertype (so it can consume the previous value without silently discarding it on failure)
+- add a new stable variable
+
+Discarding a stable variable, or changing its mutability will initially be an error (but may get changed to just a warning).
+
+-------------------------
+
+claudio | 2021-11-18 17:43:14 UTC | #4
+
+
+
+v1:
+```
+actor Test {
+
+  type Entry = {
+    desc: Text;
+    phone: Text;
+  };
+
+  stable var boo: ?Entry = null;
+ 
+  public shared func set() : async () {
+    boo := ?{desc="Some"; phone="12345678"};
+  };
+
+  public query func get() : async ?Entry {
+    return boo;
+  };
+
+};
+```
+
+Declare a new type and new variable, initialized from the old variable of the old type.
+
+v2:
+```
+actor Test {
+
+  type Entry = {
+    desc: Text;
+    phone: Text;
+  };
+
+  type NewEntry = {
+    desc: Text;
+    phone: Text;
+    description: Text
+  };
+  
+  stable var boo: ?Entry = null;
+  
+  stable var newBoo  : ? NewEntry = 
+     switch (boo) { 
+        case null :  null; 
+        case {desc,phone} : {desc;phone;another = ""};
+     };
+ 
+  public shared func set() : async () {
+    newBoo := ?{desc="Some"; phone="12345678"; another = ""};
+  };
+
+  public query func get() : async ?NewEntry {
+    return newBoo;
+  };
+
+};
+```
+
+Finally, deprecate the old variable to type `Any` and modify the initializer for the new one to `null` (or some other value that doesn't depend on the old stable field.
+At this point, you could also rename  type NewEntry to Entry (but are stuck with `boo` and `newBoo`, I'm afraid.
+
+v3:
+```
+actor Test {
+
+  type NewEntry = {
+    desc: Text;
+    phone: Text;
+    description: Text
+  };
+  
+  stable var boo: Any = null;
+  
+  stable var newBoo  : ? NewEntry = null; // only used on fresh installations
+ 
+  public shared func set() : async () {
+    newBoo := ?{desc="Some"; phone="12345678"; another = ""};
+  };
+
+  public query func get() : async ?NewEntry {
+    return newBoo;
+  };
+
+};
+```
+
+I'm very much open to better patterns, since I agree this is quite cumbersome and ugly.
+
+-------------------------
+
+claudio | 2021-11-18 17:45:43 UTC | #5
+
+(There's a typo in the pattern, but the forum won't let me fix it - sigh).
+
+-------------------------
+
+infu | 2021-11-18 21:18:55 UTC | #6
+
+Ok, let's suppose the magicians at Dfinity will do the 3 step upgrade in the background with magic code and we just have to fantasize about the prettiest upgrade code. I would personally prefer to have it like this:
+```
+actor Test {
+
+  type Entry = {
+    desc: Text;
+    phone: Text;
+    another: Text;
+  };
+
+  typeupgrade func Entry({desc; phone}):Entry {  
+     {desc; phone; another="werwer"}
+  };
+
+  stable var boo: ?Entry = null;
+ ```
+So whenever the system encounters an incompatible type, it will try to use the `typeupgrade` function. Even in Hash of Records or Hash of Hash of Records.
+
+-------------------------
+

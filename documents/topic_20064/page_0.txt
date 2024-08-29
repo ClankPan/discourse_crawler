@@ -1,0 +1,125 @@
+qwertytrewq | 2023-05-17 15:41:52 UTC | #1
+
+Will an operator like
+```
+result := [await c1.f(), await c2.f(), await c3.f()];
+```
+be potentially parallelized executing calls for canisters `c1`, `c2`, `c3` simultaneously?
+
+-------------------------
+
+rossberg | 2023-05-18 12:48:14 UTC | #2
+
+No, to parallise, you have to perform the calls _before_ the awaits. In your version, they are still interleaved, i.e., the next call only starts after the previous await has returned. That's because array expressions are evaluated left to right.
+
+Here is what you want to do:
+```
+let r1 = c1.f();
+let r2 = c2.f();
+let r3 = c3.f();
+result := [await r1, await r2, await r3];
+```
+Of course, you can also use loops or Array.map, etc., just be sure that the first await occurs after the last call.
+
+-------------------------
+
+stopak | 2023-05-18 15:14:20 UTC | #3
+
+If you are using JS/TS use Promise.all()
+
+```
+let items = [c1.f(), c2.f(), c3.f()];
+let results = await Promise.all(items);
+```
+
+-------------------------
+
+rossberg | 2023-05-18 15:47:10 UTC | #4
+
+@stopak, yeah, it would be great if Motoko could express that as well. Unfortunately, due to the way the IC works, it's a bit more difficult. You would think that something like
+```
+  func all(xs : [async Nat]) : async [Nat] {
+    let buf = Buffer.Buffer<Nat>(0);
+    for (x in xs.vals()) { buf.add(await x) };
+    buf.toArray();
+  };
+```
+should be possible, but due to the way how async has to be compiled to the IC, we would need some form of scope parameters to indicate and ensure that all asyncs involved are from the same scope, like:
+```
+  func awaitAll<scope S>(xs : [async<S> Nat]) : async<S> [Nat] {
+    let buf = Buffer.Buffer<Nat>(0);
+    for (x in xs.vals()) { buf.add(await x) };
+    buf.toArray();
+  };
+```
+I'm hopeful that Motoko will support that eventually.
+
+(The other issue is that you'd want this to be generic over the content of the async type, which also isn't allowed at the moment.)
+
+-------------------------
+
+stopak | 2023-05-19 07:06:03 UTC | #5
+
+I do not know, how exactly it is implemented in Motoko, however in rust SDK you can only have one inter-canister call at once :confused:
+
+-------------------------
+
+rossberg | 2023-05-19 15:10:18 UTC | #6
+
+I believe that is a consequence of Rust's more monolithic async model, which is less composable than Motoko's first-class futures.
+
+-------------------------
+
+levi | 2023-05-19 15:40:47 UTC | #7
+
+@stopak @rossberg,
+In rust you can do the same using https://docs.rs/futures/latest/futures/future/fn.join_all.html
+
+This awesome post by @free shows how it works: https://forum.dfinity.org/t/can-i-run-multiple-inter-canister-update-calls-in-parallel/13115/2?u=levi.
+
+-------------------------
+
+timo | 2023-08-20 14:15:45 UTC | #8
+
+[quote="rossberg, post:2, topic:20064"]
+Of course, you can also use loops or Array.map, etc.
+[/quote]
+
+I would be interested in how to use Array.map, Array.tabulate or something similar. When I try something like
+```
+let r = Array.map<Nat, async X>([1,2,3], func(i) { c.f(i) });
+```
+then I get the error `send capability required, but not available
+ (need an enclosing async expression or function body)(M0047)`. It seems I cannot send from within a lambda expression.
+
+Is there a way to create an array of futures? Workarounds are of course possible such using Array of option type or a Buffer and writing to it in a loop. But I would be interested to know if an immutable array is possible somehow.
+
+-------------------------
+
+infu | 2023-08-20 14:57:10 UTC | #9
+
+I stumbled upon the same (related) problem. Discussions here <https://forum.dfinity.org/t/rxmo-update-examples/21029> and <https://forum.dfinity.org/t/motoko-sharable-generics/9021/14>
+
+Additionally, I'd like to propose an enhancement to the Motoko promises system:
+
+As it stands, promises in Motoko can't be resolved or rejected externally from within the executor function. In contrast, JavaScript allows us to create and manage promise resolution outside of the initial executor context. Here's an illustrative example in JavaScript:
+(Deferred promise pattern)
+```
+var myResolution = null;
+
+let myPromise = new Promise((resolve, reject) => {
+    myResolution ={resolve, reject}
+});
+
+setTimeout(() => {
+  // resolve it after 10sec
+  myResolution.resolve(123);
+}, 10000);
+
+let a = await myPromise();
+// a = 123
+```
+You'll have to currently write such things with callback functions. Not sure if deferred promises can fit, but would be nice to have.
+
+-------------------------
+

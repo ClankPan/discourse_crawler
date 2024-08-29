@@ -1,0 +1,138 @@
+peterparker | 2024-02-29 08:32:13 UTC | #1
+
+This is a follow-up of the issue I had yesterday ([thread](https://forum.dfinity.org/t/http-outcall-error-systransient-connection-refused/27981)) which is actually not solved.
+
+If I start a fresh container locally and perform some HTTP outcalls, everything is fine but, if I stop my replica and container and start it again, then all HTTP outcalls start failing with following error:
+
+> qe/ic_replicated_state/subnet_call_context_manager Received the response for HttpRequest with callback id 5 from CanisterId(jx5yt-yyaaa-aaaal-abzbq-cai)
+juno-satellite-1  | 2024-02-29 08:19:15.468552131 UTC: [Canister jx5yt-yyaaa-aaaal-abzbq-cai] HTTP request error. RejectionCode: SysTransient, Error: error trying to connect: Connection refused (os error 111)
+
+Therefore I'm guessing the root cause of my issue seems to be linked to `ic-https-outcalls-adapter` or some related tool when deployed locally.
+
+Does that tool preserve some sort of cache or need to be cleared each time it is started?
+Or does the tool requires some specific flag when started again?
+
+This is how `ic-https-outcalls-adapter` is mounted in my container:
+
+```
+#!/usr/bin/env bash
+
+CONFIG_PATH=./ic-https-outcalls-adapter.json
+SOCK_PATH=/juno/.juno/sock
+
+# Note: "The socks proxy field needs to be set but is not relevant for local development."
+# Source: https://forum.dfinity.org/t/failed-to-add-canister-http-request-to-queue-brokenconnection/27434/6?u=peterparker
+function create_config() {
+  cat << EOF > "$CONFIG_PATH"
+{
+  "incoming_source": {
+    "Path": "$SOCK_PATH"
+  },
+  "socks_proxy": "socks5://notaproxy:1080",
+  "logger": {
+    "level": "error"
+  }
+}
+EOF
+}
+
+if [ ! -f "$CONFIG_PATH" ]; then
+  create_config
+fi
+
+./target/ic-https-outcalls-adapter "$CONFIG_PATH"
+```
+
+-------------------------
+
+peterparker | 2024-02-29 12:07:36 UTC | #2
+
+Ah just noticed
+
+> juno-satellite-1  | Feb 29 08:30:55.295 INFO s:/n:/ic_starter/ic_starter Executing "./target/replica" "--replica-version" "0.9.0" "--config-file" "/juno/.juno/replica/ic.json5"
+juno-satellite-1  | thread 'main' panicked at rs/async_utils/src/unix.rs:24:52:
+juno-satellite-1  | Failed to bind path.: Os { code: 98, kind: AddrInUse, message: "Address already in use" }
+
+When I re-start. So probably some cleanup or service not properly closed when the image is stopped.
+
+Now, how? ~~Yeah it's on me. I should either stop/cleanup the services on stop or start only once.~~
+
+Actually no, when it restrats, it start without state therefore no reason it fails nor a port to be open.
+
+-------------------------
+
+peterparker | 2024-02-29 12:24:00 UTC | #3
+
+> juno-satellite-1  | thread 'main' panicked at rs/async_utils/src/unix.rs:24:52:
+juno-satellite-1  | Failed to bind path.: Os { code: 98, kind: AddrInUse, message: "Address already in use" }
+juno-satellite-1  | note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+juno-satellite-1  | ./docker/ic-https-outcalls-adapter: line 26:    17 Aborted                 ./target/ic-https-outcalls-adapter "$CONFIG_PATH"
+
+I trimmed my script and I think that the logs above are thrown by `ic-https-outcalls-adapter` when restarting the container.
+
+-------------------------
+
+peterparker | 2024-02-29 12:29:34 UTC | #4
+
+> juno-satellite-1  | Failed to bind path.: Os { code: 98, kind: AddrInUse, message: "Address already in use" }
+juno-satellite-1  | note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+juno-satellite-1  | ./docker/ic-https-outcalls-adapter: line 24:    15 Aborted                 ./target/ic-https-outcalls-adapter "$CONFIG_PATH"
+
+
+This explains my original thread issue and why I coulnd't do an HTTP outcall I guess.
+
+-------------------------
+
+peterparker | 2024-02-29 12:51:20 UTC | #5
+
+I'm out of idea. Given there is to my knowledge absolutely zero documentation, @tim1 can you maybe share a hint or where to look at?
+
+-------------------------
+
+tim1 | 2024-02-29 13:08:33 UTC | #6
+
+(mostly guessing) I suspect it is caused that the socket is not properly cleaned up. I suggest that in your mounting script you add `rm $SOCK_PATH` in the beginning. 
+
+Let me know if this didn't help and I will take a better look at the issue.
+
+-------------------------
+
+peterparker | 2024-02-29 13:11:37 UTC | #7
+
+Thanks Tim! I was actually about to comment that. For some reason, it seems I indeed must delete first the socket path otherwise it fails. Weirdly enough there is no socket open, `PID=$(lsof -t $SOCKET_PATH)` returns empty but, nevertheless, `rm $SOCK_PATH` is the solution. :man_shrugging:
+
+```
+#!/usr/bin/env bash
+
+CONFIG_PATH=./ic-https-outcalls-adapter.json
+SOCK_PATH=/juno/.juno/sock
+
+# Clean-up previous socket file otherwise the ic-https-outcalls-adapter cannot starts again and make HTTP Outcalls fails when the container is restarted
+# See: https://forum.dfinity.org/t/local-http-ic-https-outcalls-adapter-cache-cleanup-and-errors/27992
+rm $SOCK_PATH 2> /dev/null
+
+# Note: "The socks proxy field needs to be set but is not relevant for local development."
+# Source: https://forum.dfinity.org/t/failed-to-add-canister-http-request-to-queue-brokenconnection/27434/6?u=peterparker
+function create_config() {
+  cat << EOF > "$CONFIG_PATH"
+{
+  "incoming_source": {
+    "Path": "$SOCK_PATH"
+  },
+  "socks_proxy": "socks5://notaproxy:1080",
+  "logger": {
+    "level": "error"
+  }
+}
+EOF
+}
+
+if [ ! -f "$CONFIG_PATH" ]; then
+  create_config
+fi
+
+./target/ic-https-outcalls-adapter "$CONFIG_PATH"
+```
+
+-------------------------
+

@@ -1,0 +1,195 @@
+cwb2819259 | 2022-08-30 14:27:24 UTC | #1
+
+This is an error message: (variant {Err=record {variant {DestinationInvalid}; "No route to canister aaaaa-aa"}})
+```
+let arg = InstallCodeArgument {
+            mode: CanisterInstallMode::Install,
+            canister_id,
+            // A minimal valid wasm module
+            // wat2wasm "(module)"
+            wasm_module: b"\x00asm\x01\x00\x00\x00".to_vec(),
+            arg: vec![],
+        };
+        install_code(arg).await.unwrap();
+```
+
+-------------------------
+
+abk | 2022-09-06 09:09:28 UTC | #2
+
+Hey @cwb2819259, sorry for this bad error message. Are you sure the `canister_id` field you passed in was for an existing canister? I'd expect this error to show up if you try to use a `canister_id` that doesn't exist.
+
+We've also merged a change that fixes the error message here, so after the current release the error should indicate that the subnet for the requested canister couldn't be found.
+
+-------------------------
+
+cwb2819259 | 2022-10-10 15:53:52 UTC | #3
+
+Yes, I'm sure, because I just created canister.
+
+-------------------------
+
+abk | 2022-10-11 06:48:33 UTC | #4
+
+Ok, then I'm not sure exactly what's going wrong. Can you send some steps to reproduce this (the sequence of dfx commands and canister source)? Also what does the error look like now when you run try it on mainnet?
+
+-------------------------
+
+saikatdas0790 | 2022-10-13 11:52:07 UTC | #5
+
+Hi @cwb2819259 
+
+Were you able to resolve this? I am running into the same issue.
+
+-------------------------
+
+bertiespell | 2022-10-31 06:07:21 UTC | #6
+
+Has anyone managed to reproduce/fix this? Here is a minimally reproducible snippet which shows the canister ID should be correct, unless I'm missing something? This code produces the same error described above: `Err((DestinationInvalid, "No route to canister aaaaa-aa"))`
+
+```
+#[update]
+async fn install() {
+    let arg = CreateCanisterArgument {
+        settings: Some(CanisterSettings {
+            controllers: Some(vec![ic_cdk::id()]),
+            compute_allocation: None,
+            memory_allocation: None,
+            freezing_threshold: None,
+        }),
+    };
+
+    let created_canister = ic_cdk::api::management_canister::main::create_canister(arg)
+        .await
+        .ok()
+        .unwrap();
+
+    let install_arg = InstallCodeArgument {
+        canister_id: created_canister.0.canister_id,
+        mode: CanisterInstallMode::Install,
+        wasm_module: b"\x00asm\x01\x00\x00\x00".to_vec(),
+        arg: vec![],
+    };
+
+    ic_cdk::api::management_canister::main::install_code(install_arg)
+        .await
+        .unwrap();
+}
+```
+
+-------------------------
+
+abk | 2022-10-31 09:53:14 UTC | #7
+
+Thanks, I can look into this. Do you see this error on mainnet or in dfx?
+
+-------------------------
+
+bertiespell | 2022-10-31 10:16:56 UTC | #8
+
+That error was produced locally on dfx (I'm using latest - 0.11.2).
+
+I've just deployed that same snippet to mainnet :sweat_smile: , and it seems in this case, related to a Candid error. Though I'm still trying to decode what it's saying :mag: :thinking: 
+
+```
+(DestinationInvalid, "Unable to route management canister request install_code: CandidError(Custom(Fail to decode argument 0 from table0 to record {\n  arg : vec nat8;\n  wasm_module : vec nat8;\n  mode : variant { reinstall; upgrade; install };\n  canister_id : principal;\n  query_allocation : opt nat;\n  memory_allocation : opt nat;\n  compute_allocation : opt nat;\n}\n\nCaused by:\n    0: input: 4449444c036c04d6fca70201a79fc97e01e3a683c30402b3c4b1f204686d7b6b03fcb88b84037ffbf9afd7057fa8fbd5fe0a7f0100_00080061736d0100000001010a00000000015006110101\n       table: type table0 = record {\n         4_849_238 : table1;\n         265_441_191 : table1;\n         1_214_305_123 : table2;\n         1_313_628_723 : principal;\n       }\n       type table1 = vec nat8\n       type table2 = variant { 813_882_492; 1_525_415_163; 2_950_004_136 }\n       wire_type: table0, expect_type: record {\n         arg : vec nat8;\n         wasm_module : vec nat8;\n         mode : variant { reinstall; upgrade; install };\n         canister_id : principal;\n         query_allocation : opt nat;\n         memory_allocation : opt nat;\n         compute_allocation : opt nat;\n       }\n    1: table0 is not a subtype of record {\n         arg : vec nat8;\n         wasm_module : vec nat8;\n         mode : variant { reinstall; upgrade; install };\n         canister_id : principal;\n         query_allocation : opt nat;\n         memory_allocation : opt nat;\n         compute_allocation : opt nat;\n       }\n    2: Record field mode: table2 is not a subtype of variant { reinstall; upgrade; install }\n    3: Variant field 813_882_492 not found in the expected type))")',
+```
+
+-------------------------
+
+bertiespell | 2022-10-31 10:35:18 UTC | #9
+
+After inspecting this error, it looked like the issue was coming from the `CanisterInstallMode::Install` variant (which I was importing from `management_canister::main`).
+
+I've just rewritten this type and it now works :thinking:, with this code:
+
+```
+#[update]
+async fn install() -> String {
+    #[derive(CandidType, Serialize, Deserialize)]
+    enum InstallMode {
+        #[serde(rename = "install")]
+        Install,
+        #[serde(rename = "reinstall")]
+        Reinstall,
+        #[serde(rename = "upgrade")]
+        Upgrade,
+    }
+
+    #[derive(CandidType, Serialize, Deserialize)]
+    struct CanisterInstall {
+        mode: InstallMode,
+        canister_id: Principal,
+        #[serde(with = "serde_bytes")]
+        wasm_module: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        arg: Vec<u8>,
+    }
+
+    let arg = CreateCanisterArgument {
+        settings: Some(CanisterSettings {
+            controllers: Some(vec![ic_cdk::id()]),
+            compute_allocation: None,
+            memory_allocation: None,
+            freezing_threshold: None,
+        }),
+    };
+    let created_canister = ic_cdk::api::management_canister::main::create_canister(arg)
+        .await
+        .ok()
+        .unwrap();
+
+    let install_arg = CanisterInstall {
+        canister_id: created_canister.0.canister_id,
+        mode: InstallMode::Install,
+        wasm_module: b"\x00asm\x01\x00\x00\x00".to_vec(),
+        arg: vec![],
+    };
+
+    let (_,): ((),) = ic_cdk::api::call::call(
+        Principal::management_canister(),
+        "install_code",
+        (install_arg,),
+    )
+    .await
+    .unwrap();
+
+    created_canister.0.canister_id.to_text()
+}
+```
+
+-------------------------
+
+abk | 2022-11-01 13:42:20 UTC | #10
+
+[quote="bertiespell, post:8, topic:15188"]
+I’ve just deployed that same snippet to mainnet :sweat_smile: , and it seems in this case, related to a Candid error.
+[/quote]
+
+This could just be the same problem you were seeing in `dfx`. As mentioned earlier in the thread, the "No route to canister aaaaa-aa" message wasn't the real error and we've rolled out changes to mainnet to show the real error. But it looks like those changes haven't hit dfx yet.
+
+Which version of the `ic_cdk` rust library do you have in your `Cargo.lock`? I just tried to reproduce the error with your first snippet and it succeeded. Here's exactly what I did:
+```
+dfx new create_canister_error --type rust --no-frontend
+cd test
+# copy your first snippet into `src/create_canister_error_backend/src/lib.rs` and add required imports
+# Add `"install": () -> ();` to `create_canister_error_backend.did`
+dfx start --background
+dfx deploy
+dfx canister call create_canister_error_backend install '()'
+```
+
+-------------------------
+
+bertiespell | 2022-11-02 12:59:54 UTC | #11
+
+Ah actually I was using 0.5.7 :grimacing: sorry! I've just updated to the latest and the original code I posted works now - thank you! :pray:
+
+-------------------------
+
+abk | 2022-11-02 15:23:06 UTC | #12
+
+No problem, glad it's working now!
+
+-------------------------
+

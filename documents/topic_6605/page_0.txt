@@ -1,0 +1,101 @@
+Hazel | 2021-08-20 03:58:49 UTC | #1
+
+I might be missing it, but I can't find where the behavior of a canisters mailbox is described. 
+
+Couple of questions:
+1. Can an actors mailbox "fill up" and reject new messages?
+2. Is it possible to upgrade a canister while it still has messages to process? If so, do those messages remain enqueued or is the queue purged?
+
+-------------------------
+
+akhilesh.singhania | 2021-08-21 03:31:35 UTC | #2
+
+Hi Hazel!
+
+> Can an actors mailbox “fill up” and reject new messages?
+
+Between each pair of canisters, there is a queue of outstanding messages.  If this queue is full, then canisters will not be allowed to create new messages.
+
+Note that the IC has guaranteed responses so we want to make sure that when a canister is trying to produce a response, it never hits the full queue issue.  Hence, when a canister tries to produce a request, we reserve a slot for the eventual response.  So a canister should only experience the full queue error when trying to produce a request.
+
+> 1. Is it possible to upgrade a canister while it still has messages to process? If so, do those messages remain enqueued or is the queue purged?
+
+A canister can always be upgraded regardless of how many messages it has in its input queues.  However, in practice, it is generally hard to write applications that one can upgrade and still be able to make sense of old messages.  More specifically, if a canister sends a request to another canister, it may create some state locally to help process the eventual response.  If the canister is upgraded before the response comes back, making sense of the state might be a difficult problem to solve.
+
+Hence, we have the feature to "stop" a canister.  We generally recommend that the controller of a canister should first stop it and only try to upgrade a stopped canister.  When you stop a canister, it stops processing new requests (just responses) and when it has processed all responses, it becomes stopped.
+
+I hope this helps.
+
+-------------------------
+
+Hazel | 2021-08-21 00:40:15 UTC | #3
+
+[quote="akhilesh.singhania, post:2, topic:6605"]
+Between each pair of canisters,
+[/quote]
+
+Thanks for your response! Two questions after sitting on this for a day:
+1. Did I understand this correctly? So, for a bucket B and two caller C1 C2 -> (C1 calling B) and (C2 calling B). Both C1 and C2 would have their own queue limits between B?
+2. Is this behavior the same from the context of an ingress message? Anon Principal / Self-Identifying.
+
+-------------------------
+
+akhilesh.singhania | 2021-08-23 13:41:15 UTC | #4
+
+> 1. Did I understand this correctly? So, for a bucket B and two caller C1 C2 → (C1 calling B) and (C2 calling B). Both C1 and C2 would have their own queue limits between B?
+
+Yes.  B has two distinct queues, one for C1 and for C2, each with their own limits.  So you should not have the problem of C1 using up all the queue space for B preventing C2 from getting its messages through.  
+
+Some other related notes though:
+
+- Currently the system does round robin scheduling of messages so in this case, B will first execute one message from C1 and then one from C2.  
+- If all three canisters are on the same subnet, then you should not see any contention between the different canisters.  However, if C1 and C2 are on subnet A and B is on subnet B, then there is a single queue of messages between the two subnets and here you could see some contention.  We have some ongoing design work to help improve the fair sharing of resources here.
+
+> 2. Is this behavior the same from the context of an ingress message? Anon Principal / Self-Identifying.
+
+Each canister currently has a single queue for all ingress messages.  So if you U1 produces a ton of messages for a canister and then U2 produces a single message, U2 will have to wait for all of the messages from U1 to processed before it gets a chance to run.
+
+Another property of the ingress queue is that it is technically an infinite queue as in you can always push more messages on it.  However, because ingress messages have an expiry time and due to the block rate limit of the subnet, there is an upper limit on how many ingress messages can be produced per minute, we do have an upper bound on how many ingress messages can be in a given queue.
+
+As you can see, there is room for improvement all over here.  We hope to be able to make the desired improvements in iterations.
+
+-------------------------
+
+C-B-Elite | 2021-12-09 04:05:16 UTC | #5
+
+Hello, thank you for your detailed answer, but I still have two questions about the canister mailbox.
+1.  According to the answer about actor mailbox as above,  a canister actually have many queues between canister and canister, canister and users.Is that right ? 
+2. The queues of canister and canister use the RR scheduling, but how about the canister and users messages?
+
+-------------------------
+
+jzxchiang | 2021-12-09 05:17:13 UTC | #6
+
+Based on my understanding of Akhilesh's response:
+
+> 1. According to the answer about actor mailbox as above, a canister actually have many queues between canister and canister, canister and users.Is that right ?
+
+Yes, a single canister has multiple queues. One for each canister that calls it (i.e. inter-canister calls), but a single shared queue for all users that call it (i.e. ingress calls).
+
+> 2. The queues of canister and canister use the RR scheduling, but how about the canister and users messages?
+
+All ingress messages (produced by users) go to a single queue for a given canister. So round-robin doesn't make sense here, since there's only one queue. It's just regular FIFO.
+
+-------------------------
+
+akhilesh.singhania | 2021-12-09 17:06:42 UTC | #7
+
+Thanks @jzxchiang !  That reply's spot on!
+
+-------------------------
+
+saikatdas0790 | 2021-12-10 09:04:49 UTC | #8
+
+This is the corresponding technical talk on this. Relevant part [here](https://youtu.be/YexfeByBXlo?t=508)
+
+https://youtu.be/YexfeByBXlo?t=508
+
+Though I would advise watching the whole thing :slight_smile:
+
+-------------------------
+
